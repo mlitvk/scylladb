@@ -1241,7 +1241,7 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "The multishard reader has a read-ahead feature to improve latencies of range-scans. This feature can be detrimental when the multishard reader is used under repair, as is the case with repair in mixed-shard clusters."
         " This configuration option is disabled by default and it serves as a fall-back, to re-enable read-ahead in case it turns out that some mixed-shard repair suffer from disabling it.")
     , enable_small_table_optimization_for_rbno(this, "enable_small_table_optimization_for_rbno", liveness::LiveUpdate, value_status::Used, true, "Set true to enable small table optimization for repair based node operations")
-    , ring_delay_ms(this, "ring_delay_ms", value_status::Used, 30 * 1000, "Time a node waits to hear from other nodes before joining the ring in milliseconds. Same as -Dcassandra.ring_delay_ms in cassandra.")
+    , ring_delay_ms(this, "ring_delay_ms", value_status::Used, 1 * 1000, "Time a node waits to hear from other nodes before joining the ring in milliseconds. Same as -Dcassandra.ring_delay_ms in cassandra.")
     , shadow_round_ms(this, "shadow_round_ms", value_status::Used, 300 * 1000, "The maximum gossip shadow round time. Can be used to reduce the gossip feature check time during node boot up.")
     , fd_max_interval_ms(this, "fd_max_interval_ms", value_status::Used, 2 * 1000, "The maximum failure_detector interval time in milliseconds. Interval larger than the maximum will be ignored. Larger cluster may need to increase the default.")
     , fd_initial_value_ms(this, "fd_initial_value_ms", value_status::Used, 2 * 1000, "The initial failure_detector interval time in milliseconds.")
@@ -1490,7 +1490,7 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "keyspaces, attempting to start a node with this option ON will fail.")
     // FIXME: make frequency per table in order to reduce work in each iteration.
     // Bigger tables will take longer to be resized. similar-sized tables can be batched into same iteration.
-    , tablet_load_stats_refresh_interval_in_seconds(this, "tablet_load_stats_refresh_interval_in_seconds", liveness::LiveUpdate, value_status::Used, 60,
+    , tablet_load_stats_refresh_interval_in_seconds(this, "tablet_load_stats_refresh_interval_in_seconds", liveness::LiveUpdate, value_status::Used, 1,
         "Tablet load stats refresh rate in seconds.")
     , default_log_level(this, "default_log_level", value_status::Used, seastar::log_level::info, "Default log level for log messages")
     , logger_log_level(this, "logger_log_level", value_status::Used, {}, "Map of logger name to log level. Valid log levels are 'error', 'warn', 'info', 'debug' and 'trace'")
