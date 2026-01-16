@@ -342,6 +342,8 @@ schema_ptr scylla_tables(schema_features features) {
         // since it is written to only after the cluster feature is enabled.
         sb.with_column("tablets", map_type_impl::get_instance(utf8_type, utf8_type, false));
 
+        sb.with_column("storage_engine", utf8_type);
+
         sb.with_hash_version();
         s = sb.build();
     }
@@ -1779,6 +1781,9 @@ mutation make_scylla_tables_mutation(schema_ptr table, api::timestamp_type times
             m.set_clustered_cell(ckey, cdef, make_map_mutation(map, cdef, timestamp));
         }
     }
+    if (table->kv_storage_enabled()) {
+        m.set_clustered_cell(ckey, "storage_engine", "kv", timestamp);
+    }
     // In-memory tables are deprecated since scylla-2024.1.0
     // FIXME: delete the column when there's no live version supporting it anymore.
     // Writing it here breaks upgrade rollback to versions that do not support the in_memory schema_feature
@@ -2262,6 +2267,13 @@ static void prepare_builder_from_scylla_tables_row(const schema_ctxt& ctxt, sche
     if (auto opt_map = get_map<sstring, sstring>(table_row, "tablets")) {
         auto tablet_options = db::tablet_options(*opt_map);
         builder.set_tablet_options(tablet_options.to_map());
+    }
+    if (auto storage_engine = table_row.get<sstring>("storage_engine")) {
+        if (*storage_engine == "kv") {
+            builder.set_kv_storage();
+        } else {
+            throw std::invalid_argument(format("Invalid value for storage_engine: {}", *storage_engine));
+        }
     }
 }
 

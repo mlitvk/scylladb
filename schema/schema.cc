@@ -592,6 +592,7 @@ bool operator==(const schema::user_properties& lhs, const schema::user_propertie
         && lhs.compaction_strategy == rhs.compaction_strategy
         && lhs.compaction_strategy_options == rhs.compaction_strategy_options
         && lhs.compaction_enabled == rhs.compaction_enabled
+        && lhs.storage_engine == rhs.storage_engine
         && lhs.caching_options == rhs.caching_options
         && lhs.tablet_options == rhs.tablet_options
         && lhs.get_paxos_grace_seconds() == rhs.get_paxos_grace_seconds()
@@ -698,6 +699,7 @@ table_schema_version schema::calculate_digest(const schema::raw_schema& r) {
     feed_hash(h, r._view_info);
     feed_hash(h, r._indices_by_name);
     feed_hash(h, r._is_counter);
+    feed_hash(h, r._props.storage_engine);
 
     for (auto&& [name, ext] : r._props.extensions) {
         feed_hash(h, name);
@@ -874,6 +876,9 @@ auto fmt::formatter<schema>::format(const schema& s, fmt::format_context& ctx) c
     out = fmt::format_to(out, ",minIndexInterval={}", s._raw._props.min_index_interval);
     out = fmt::format_to(out, ",maxIndexInterval={}", s._raw._props.max_index_interval);
     out = fmt::format_to(out, ",speculativeRetry={}", s._raw._props.speculative_retry.to_sstring());
+    if (s.kv_storage_enabled()) {
+        out = fmt::format_to(out, ",kv_storage=true");
+    }
     out = fmt::format_to(out, ",tablets={{");
     if (s._raw._props.tablet_options) {
         n = 0;
@@ -1210,6 +1215,9 @@ fragmented_ostringstream& schema::schema_properties(const schema_describe_helper
     os << "\n    AND memtable_flush_period_in_ms = " << fmt::to_string(memtable_flush_period());
     os << "\n    AND min_index_interval = " << fmt::to_string(min_index_interval());
     os << "\n    AND speculative_retry = '" << speculative_retry().to_sstring() << "'";
+    if (kv_storage_enabled()) {
+        os << "\n    AND kv_storage = true";
+    }
 
     if (has_tablet_options()) {
         os << "\n    AND tablets = {";
