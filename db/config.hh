@@ -366,6 +366,7 @@ public:
     named_value<bool> enable_in_memory_data_store;
     named_value<bool> enable_cache;
     named_value<bool> enable_commitlog;
+    named_value<bool> enable_log_structured_storage;
     named_value<bool> volatile_system_keyspace_for_testing;
     named_value<uint16_t> api_port;
     named_value<sstring> api_address;

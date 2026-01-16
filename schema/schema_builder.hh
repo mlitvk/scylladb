@@ -267,6 +267,11 @@ public:
         _static_props.is_group0_table = enabled;
     }
 
+    schema_builder& set_log_structured_storage_enabled(bool enabled) {
+        _raw._props.log_structured_storage_enabled = enabled;
+        return *this;
+    }
+
     class default_names {
     public:
         default_names(const schema_builder&);
