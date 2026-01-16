@@ -68,6 +68,13 @@ public:
     /// Read a mutation from the log structured storage
     future<std::optional<canonical_mutation>> read(const schema&, const dht::decorated_key& key);
 
+    /// Create a mutation reader for a specific key
+    mutation_reader make_reader_for_key(schema_ptr schema,
+                                       reader_permit permit,
+                                       const dht::decorated_key& key,
+                                       const query::partition_slice& slice,
+                                       tracing::trace_state_ptr trace_state = nullptr);
+
 };
 
 } // namespace log_structured

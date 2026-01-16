@@ -16,6 +16,7 @@
 #include "locator/network_topology_strategy.hh"
 #include "locator/tablets.hh"
 #include "locator/token_metadata_fwd.hh"
+#include "replica/log_structured/logstor.hh"
 #include "utils/log.hh"
 #include "replica/database_fwd.hh"
 #include <seastar/core/shard_id.hh>
@@ -76,6 +77,7 @@
 #include "locator/abstract_replication_strategy.hh"
 #include "timeout_config.hh"
 #include "tombstone_gc.hh"
+#include "log_structured/logstor.hh"
 #include "service/qos/service_level_controller.hh"
 
 #include "replica/data_dictionary_impl.hh"
@@ -902,6 +904,30 @@ database::init_commitlog() {
     });
 }
 
+future<>
+database::init_log_structured_storage() {
+    dblog.info("Initializing log-structured storage");
+
+    const auto& data_dirs = _cfg.data_file_directories();
+    if (data_dirs.empty()) {
+        throw std::runtime_error("No data directories configured, cannot initialize log-structured storage");
+    }
+    auto base_dir = format("{}/logstor", data_dirs[0]); // For now, use the first data directory
+    dblog.info("Log-structured storage base directory: {}", base_dir);
+
+    auto cfg = log_structured::logstor_config{
+        .base_dir = std::filesystem::path(base_dir),
+        .compaction_cfg = {
+            .compaction_sg = _dbcfg.compaction_scheduling_group,
+        },
+        .flush_sg = _dbcfg.commitlog_scheduling_group,
+    };
+    _logstor = std::make_unique<log_structured::logstor>(std::move(cfg));
+    co_await _logstor->start();
+
+    dblog.info("Log-structured storage initialized");
+}
+
 future<> database::modify_keyspace_on_all_shards(sharded<database>& sharded_db, std::function<future<>(replica::database&)> func) {
     // Run func first on shard 0
     // to allow "seeding" of the effective_replication_map
@@ -1122,6 +1148,11 @@ void database::add_column_family(keyspace& ks, schema_ptr schema, column_family:
     if (is_new) {
         cf->mark_ready_for_writes(commitlog_for(schema));
         cf->set_truncation_time(db_clock::time_point::min());
+    }
+
+    if (_cfg.enable_log_structured_storage() && schema->log_structured_storage_enabled()) {
+        cf->set_log_structured_storage(_logstor.get());
+        dblog.info("Table {}.{} is using log-structured storage", schema->ks_name(), schema->cf_name());
     }
 
     auto uuid = schema->id();
@@ -2635,6 +2666,9 @@ future<> database::start(sharded<qos::service_level_controller>& sl_controller, 
         _compaction_manager.enable();
     }
     co_await init_commitlog();
+    if (_cfg.enable_log_structured_storage()) {
+        co_await init_log_structured_storage();
+    }
 }
 
 future<> database::shutdown() {
@@ -2674,6 +2708,11 @@ future<> database::stop() {
         dblog.info("Shutting down commitlog");
         co_await _commitlog->shutdown();
         dblog.info("Shutting down commitlog complete");
+    }
+    if (_logstor) {
+        dblog.info("Shutting down log-structured storage");
+        co_await _logstor->stop();
+        dblog.info("Shutting down log-structured storage complete");
     }
     if (_schema_commitlog) {
         dblog.info("Shutting down schema commitlog");
