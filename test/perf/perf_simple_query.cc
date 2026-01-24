@@ -39,14 +39,20 @@ static bytes make_key(uint64_t sequence) {
     return b;
 };
 
-static void execute_update_for_key(cql_test_env& env, const bytes& key) {
-    env.execute_cql(fmt::format("UPDATE cf SET "
-        "\"C0\" = 0x8f75da6b3dcec90c8a404fb9a5f6b0621e62d39c69ba5758e5f41b78311fbb26cc7a,"
-        "\"C1\" = 0xa8761a2127160003033a8f4f3d1069b7833ebe24ef56b3beee728c2b686ca516fa51,"
-        "\"C2\" = 0x583449ce81bfebc2e1a695eb59aad5fcc74d6d7311fc6197b10693e1a161ca2e1c64,"
-        "\"C3\" = 0x62bcb1dbc0ff953abc703bcb63ea954f437064c0c45366799658bd6b91d0f92908d7,"
-        "\"C4\" = 0x222fcbe31ffa1e689540e1499b87fa3f9c781065fccd10e4772b4c7039c2efd0fb27 "
-        "WHERE \"KEY\"= 0x{};", to_hex(key))).get();
+static void execute_update_for_key(cql_test_env& env, const bytes& key, bool kv) {
+    if (kv) {
+        env.execute_cql(fmt::format("UPDATE cf SET "
+            "\"V\" = 0x8f75da6b3dcec90c8a404fb9a5f6b0621e62d39c69ba5758e5f41b78311fbb26cc7a "
+            "WHERE \"KEY\"= 0x{};", to_hex(key))).get();
+    } else {
+        env.execute_cql(fmt::format("UPDATE cf SET "
+            "\"C0\" = 0x8f75da6b3dcec90c8a404fb9a5f6b0621e62d39c69ba5758e5f41b78311fbb26cc7a,"
+            "\"C1\" = 0xa8761a2127160003033a8f4f3d1069b7833ebe24ef56b3beee728c2b686ca516fa51,"
+            "\"C2\" = 0x583449ce81bfebc2e1a695eb59aad5fcc74d6d7311fc6197b10693e1a161ca2e1c64,"
+            "\"C3\" = 0x62bcb1dbc0ff953abc703bcb63ea954f437064c0c45366799658bd6b91d0f92908d7,"
+            "\"C4\" = 0x222fcbe31ffa1e689540e1499b87fa3f9c781065fccd10e4772b4c7039c2efd0fb27 "
+            "WHERE \"KEY\"= 0x{};", to_hex(key))).get();
+    }
 };
 
 static void execute_counter_update_for_key(cql_test_env& env, const bytes& key) {
@@ -75,6 +81,7 @@ struct test_config {
     bool bypass_cache;
     bool use_log_structured_storage = false;
     std::optional<unsigned> initial_tablets;
+    bool kv = false;
 };
 
 std::ostream& operator<<(std::ostream& os, const test_config::run_mode& m) {
@@ -103,7 +110,7 @@ static void create_partitions(cql_test_env& env, test_config& cfg) {
         if (cfg.counters) {
             execute_counter_update_for_key(env, make_key(sequence));
         } else {
-            execute_update_for_key(env, make_key(sequence));
+            execute_update_for_key(env, make_key(sequence), cfg.kv);
         }
         if (sequence + 1 >= next_flush) {
             env.db().invoke_on_all(&replica::database::flush_all_memtables).get();
@@ -127,7 +134,9 @@ static bytes make_random_key(test_config& cfg) {
 
 static std::vector<perf_result> test_read(cql_test_env& env, test_config& cfg) {
     create_partitions(env, cfg);
-    sstring query = "select \"C0\", \"C1\", \"C2\", \"C3\", \"C4\" from cf where \"KEY\" = ?";
+    sstring query = cfg.kv
+        ? "select \"V\" from cf where \"KEY\" = ?"
+        : "select \"C0\", \"C1\", \"C2\", \"C3\", \"C4\" from cf where \"KEY\" = ?";
     if (cfg.bypass_cache) {
         query += " bypass cache";
     }
@@ -146,13 +155,20 @@ static std::vector<perf_result> test_write(cql_test_env& env, test_config& cfg) 
     if (!cfg.timeout.empty()) {
         usings += "USING TIMEOUT " + cfg.timeout;
     }
-    sstring query = format("UPDATE cf {}SET "
+    sstring query;
+    if (cfg.kv) {
+        query = format("UPDATE cf {}SET "
+            "\"V\" = 0x8f75da6b3dcec90c8a404fb9a5f6b0621e62d39c69ba5758e5f41b78311fbb26cc7a "
+            "WHERE \"KEY\" = ?", usings);
+    } else {
+        query = format("UPDATE cf {}SET "
             "\"C0\" = 0x8f75da6b3dcec90c8a404fb9a5f6b0621e62d39c69ba5758e5f41b78311fbb26cc7a,"
             "\"C1\" = 0xa8761a2127160003033a8f4f3d1069b7833ebe24ef56b3beee728c2b686ca516fa51,"
             "\"C2\" = 0x583449ce81bfebc2e1a695eb59aad5fcc74d6d7311fc6197b10693e1a161ca2e1c64,"
             "\"C3\" = 0x62bcb1dbc0ff953abc703bcb63ea954f437064c0c45366799658bd6b91d0f92908d7,"
             "\"C4\" = 0x222fcbe31ffa1e689540e1499b87fa3f9c781065fccd10e4772b4c7039c2efd0fb27 "
             "WHERE \"KEY\" = ?", usings);
+    }
     auto id = env.prepare(query).get();
     return time_parallel([&env, &cfg, id] {
             bytes key = make_random_key(cfg);
@@ -166,7 +182,9 @@ static std::vector<perf_result> test_delete(cql_test_env& env, test_config& cfg)
     if (!cfg.timeout.empty()) {
         usings += "USING TIMEOUT " + cfg.timeout;
     }
-    sstring query = format("DELETE \"C0\", \"C1\", \"C2\", \"C3\", \"C4\" FROM cf {}WHERE \"KEY\" = ?", usings);
+    sstring query = cfg.kv
+        ? format("DELETE \"V\" FROM cf {}WHERE \"KEY\" = ?", usings)
+        : format("DELETE \"C0\", \"C1\", \"C2\", \"C3\", \"C4\" FROM cf {}WHERE \"KEY\" = ?", usings);
     auto id = env.prepare(query).get();
     return time_parallel([&env, &cfg, id] {
             bytes key = make_random_key(cfg);
@@ -209,6 +227,13 @@ static std::vector<perf_result> do_cql_test(cql_test_env& env, test_config& cfg)
     env.create_table([&cfg] (auto ks_name) {
         if (cfg.counters) {
             return *make_counter_schema(ks_name);
+        }
+        if (cfg.kv) {
+            return *schema_builder(ks_name, "cf")
+                    .with_column("KEY", bytes_type, column_kind::partition_key)
+                    .with_column("V", bytes_type)
+                    .set_log_structured_storage_enabled(cfg.use_log_structured_storage)
+                    .build();
         }
         return *schema_builder(ks_name, "cf")
                 .with_column("KEY", bytes_type, column_kind::partition_key)
@@ -341,6 +366,7 @@ int scylla_simple_query_main(int argc, char** argv) {
         ("timeout", bpo::value<std::string>()->default_value(""), "use timeout")
         ("bypass-cache", "use bypass cache when querying")
         ("log-structured-storage", "use log-structured storage for the table")
+        ("kv", "use key-value schema with single partition key and single value column")
         ("audit", bpo::value<std::string>(), "value for audit config entry")
         ("audit-keyspaces", bpo::value<std::string>(), "value for audit_keyspaces config entry")
         ("audit-tables", bpo::value<std::string>(), "value for audit_tables config entry")
@@ -381,6 +407,7 @@ int scylla_simple_query_main(int argc, char** argv) {
             cfg.counters = app.configuration().contains("counters");
             cfg.flush_memtables = app.configuration().contains("flush");
             cfg.use_log_structured_storage = app.configuration().contains("log-structured-storage");
+            cfg.kv = app.configuration().contains("kv");
             if (app.configuration().contains("tablets")) {
                 cfg.initial_tablets = app.configuration()["initial-tablets"].as<unsigned>();
             }
