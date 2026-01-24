@@ -73,6 +73,7 @@ struct test_config {
     bool stop_on_error;
     sstring timeout;
     bool bypass_cache;
+    bool use_log_structured_storage = false;
     std::optional<unsigned> initial_tablets;
 };
 
@@ -91,6 +92,7 @@ std::ostream& operator<<(std::ostream& os, const test_config& cfg) {
            << ", mode=" << cfg.mode
            << ", query_single_key=" << (cfg.query_single_key ? "yes" : "no")
            << ", counters=" << (cfg.counters ? "yes" : "no")
+           << ", log_structured_storage=" << (cfg.use_log_structured_storage ? "yes" : "no")
            << "}";
 }
 
@@ -215,6 +217,7 @@ static std::vector<perf_result> do_cql_test(cql_test_env& env, test_config& cfg)
                 .with_column("C2", bytes_type)
                 .with_column("C3", bytes_type)
                 .with_column("C4", bytes_type)
+                .set_log_structured_storage_enabled(cfg.use_log_structured_storage)
                 .build();
     }).get();
 
@@ -337,6 +340,7 @@ int scylla_simple_query_main(int argc, char** argv) {
         ("stop-on-error", bpo::value<bool>()->default_value(true), "stop after encountering the first error")
         ("timeout", bpo::value<std::string>()->default_value(""), "use timeout")
         ("bypass-cache", "use bypass cache when querying")
+        ("log-structured-storage", "use log-structured storage for the table")
         ("audit", bpo::value<std::string>(), "value for audit config entry")
         ("audit-keyspaces", bpo::value<std::string>(), "value for audit_keyspaces config entry")
         ("audit-tables", bpo::value<std::string>(), "value for audit_tables config entry")
@@ -376,6 +380,7 @@ int scylla_simple_query_main(int argc, char** argv) {
             cfg.query_single_key = app.configuration().contains("query-single-key");
             cfg.counters = app.configuration().contains("counters");
             cfg.flush_memtables = app.configuration().contains("flush");
+            cfg.use_log_structured_storage = app.configuration().contains("log-structured-storage");
             if (app.configuration().contains("tablets")) {
                 cfg.initial_tablets = app.configuration()["initial-tablets"].as<unsigned>();
             }
