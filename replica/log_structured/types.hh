@@ -30,7 +30,9 @@ struct log_location {
 };
 
 struct index_key {
-    uint64_t key;
+    static constexpr size_t digest_size = 20;
+
+    std::array<uint8_t, digest_size> digest;
 
     bool operator==(const index_key& other) const noexcept = default;
     auto operator<=>(const index_key& other) const noexcept = default;
@@ -68,9 +70,9 @@ struct fmt::formatter<replica::log_structured::log_location> : fmt::formatter<st
 };
 
 template <>
-struct fmt::formatter<replica::log_structured::index_key> : fmt::formatter<uint64_t> {
+struct fmt::formatter<replica::log_structured::index_key> : fmt::formatter<string_view> {
     template <typename FormatContext>
     auto format(const replica::log_structured::index_key& key, FormatContext& ctx) const {
-        return fmt::formatter<uint64_t>::format(key.key, ctx);
+        return fmt::format_to(ctx.out(), "{:02x}", fmt::join(key.digest, ""));
     }
 };

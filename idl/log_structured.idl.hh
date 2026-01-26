@@ -13,7 +13,7 @@ namespace replica {
 namespace log_structured {
 
 struct index_key {
-    uint64_t key;
+    std::array<uint8_t, 20> digest;
 };
 
 class log_structured_segment_record {

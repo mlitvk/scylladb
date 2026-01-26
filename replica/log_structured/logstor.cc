@@ -10,6 +10,8 @@
 #include <seastar/util/log.hh>
 #include <seastar/core/future.hh>
 #include "readers/from_mutations.hh"
+#include "keys/keys.hh"
+#include "rmd160.hh"
 
 namespace replica {
 namespace log_structured {
@@ -229,15 +231,61 @@ mutation_reader logstor::make_reader_for_key(schema_ptr schema,
 
 index_key logstor::calculate_key(const schema& s, const dht::decorated_key& key) {
     // hash of (ks name, table name, partition key)
-    return index_key {
-        utils::hash_combine(
-            dht::token::to_int64(key.token()),
-            utils::hash_combine(
-                std::hash<sstring>()(s.ks_name()),
-                std::hash<sstring>()(s.cf_name())
-            )
-        )
+
+    dword MDbuf[5];
+    MDinit(MDbuf);
+
+    dword X[16];
+
+    auto hash_bytes_view = [&](bytes_view bv) {
+        const byte* data = reinterpret_cast<const byte*>(bv.data());
+        size_t len = bv.size();
+
+        while (len >= 64) {
+            for (unsigned i = 0; i < 16; i++) {
+                X[i] = BYTES_TO_DWORD(data + 4 * i);
+            }
+            compress(MDbuf, X);
+            data += 64;
+            len -= 64;
+        }
+        return std::pair{data, len};
     };
+
+    // Hash keyspace name
+    auto ks_bytes = to_bytes(s.ks_name());
+    auto [ks_data, ks_len] = hash_bytes_view(ks_bytes);
+
+    // Hash table name
+    auto cf_bytes = to_bytes(s.cf_name());
+    auto [cf_data, cf_len] = hash_bytes_view(cf_bytes);
+
+    // Hash partition key
+    std::pair<const byte*, size_t> key_remaining;
+    with_linearized(managed_bytes_view(key.key()), [&](bytes_view bv) {
+        key_remaining = hash_bytes_view(bv);
+    });
+
+    // Combine remaining bytes and finalize
+    size_t total_remaining = ks_len + cf_len + key_remaining.second;
+    std::vector<byte> remaining;
+    remaining.reserve(total_remaining);
+    remaining.insert(remaining.end(), ks_data, ks_data + ks_len);
+    remaining.insert(remaining.end(), cf_data, cf_data + cf_len);
+    remaining.insert(remaining.end(), key_remaining.first, key_remaining.first + key_remaining.second);
+
+    MDfinish(MDbuf, remaining.data(), total_remaining, 0);
+
+    // Extract digest
+    index_key result;
+    for (size_t i = 0; i < 5; i++) {
+        result.digest[4*i + 0] = static_cast<uint8_t>(MDbuf[i]);
+        result.digest[4*i + 1] = static_cast<uint8_t>(MDbuf[i] >> 8);
+        result.digest[4*i + 2] = static_cast<uint8_t>(MDbuf[i] >> 16);
+        result.digest[4*i + 3] = static_cast<uint8_t>(MDbuf[i] >> 24);
+    }
+
+    return result;
 }
 
 }
