@@ -13,6 +13,7 @@ target_sources(replica
     log_structured/logstor.cc
     log_structured/write_buffer.cc
     log_structured/compaction.cc
+    log_structured/rmd160.cc
     multishard_query.cc
     mutation_dump.cc
     schema_describe_helper.cc
