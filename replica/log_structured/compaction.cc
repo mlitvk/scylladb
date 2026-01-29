@@ -24,7 +24,9 @@ compaction_manager::compaction_manager(segment_manager& seg_mgr, log_index& inde
     : _sm(seg_mgr)
     , _index(index)
     , _config(std::move(config))
-    , _compaction_timer([this] { schedule_compaction(); }) {
+    , _compaction_action([this] {
+        return compact();
+    }) {
 
     namespace sm = seastar::metrics;
 
@@ -47,12 +49,11 @@ future<> compaction_manager::start() {
                        _config.min_live_ratio, _config.compaction_interval.count());
     _running = true;
 
-    _sm.set_compaction_trigger([] {
+    _sm.set_compaction_trigger([this] {
         logstor_logger.debug("Compaction triggered by segment manager");
-        // TODO
+        return _compaction_action.trigger();
     });
 
-    _compaction_timer.arm(_config.compaction_interval);
     co_return;
 }
 
@@ -63,9 +64,10 @@ future<> compaction_manager::stop() {
 
     logstor_logger.info("Stopping compaction manager");
     _running = false;
-    _compaction_timer.cancel();
 
     co_await _async_gate.close();
+    co_await _compaction_action.join();
+
     logstor_logger.info("compaction manager stopped");
 }
 
@@ -77,55 +79,34 @@ void compaction_manager::enable_auto_compaction() {
 future<> compaction_manager::disable_auto_compaction() {
     logstor_logger.info("Disabling automatic compaction");
     _config.compaction_enabled = false;
-    co_return;
+    co_await _compaction_action.join();
 }
 
-void compaction_manager::schedule_compaction() {
-    if (!_running) {
-        return;
-    }
-
-    (void)with_gate(_async_gate, [this] () -> future<> {
-        try {
-            if (_config.compaction_enabled) {
-                co_await compact();
-            }
-        } catch (...) {
-            logstor_logger.error("Compaction failed: {}", std::current_exception());
-        }
-
-        if (_running) {
-            _compaction_timer.arm(_config.compaction_interval);
-        }
-    });
-}
-
-std::vector<log_segment_id> compaction_manager::find_compaction_candidates() {
-    std::vector<log_segment_id> candidates;
-
-    auto compaction_segments = _sm.find_segments_for_compaction(
-        _config.min_live_ratio, _config.max_segments_per_compaction);
-
-    for (auto segment_id : compaction_segments) {
-        candidates.push_back(segment_id);
-    }
-
-    return candidates;
+future<> compaction_manager::trigger_compaction() {
+    logstor_logger.debug("Manual compaction triggered");
+    return _compaction_action.trigger();
 }
 
 future<> compaction_manager::compact() {
-    auto holder = _async_gate.hold();
+    if (!_config.compaction_enabled) {
+        logstor_logger.debug("Compaction is disabled, skipping");
+        co_return;
+    }
 
-    auto candidates = find_compaction_candidates();
+    auto candidates = _sm.find_segments_for_compaction(_config.min_live_ratio, _config.max_segments_per_compaction);
     if (candidates.size() < 2) {
         logstor_logger.debug("Not enough segments for compaction");
         co_return;
     }
 
+    auto holder = _async_gate.hold();
+
     logstor_logger.info("Starting compaction of {} segments", candidates.size());
     co_await with_scheduling_group(_config.compaction_sg, [this, candidates = std::move(candidates)] mutable {
         return compact_segments(std::move(candidates));
     });
+
+    (void)_compaction_action.trigger_later();
 }
 
 future<> compaction_manager::compact_segments(std::vector<log_segment_id> segments) {

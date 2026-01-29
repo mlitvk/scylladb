@@ -9,10 +9,10 @@
 
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
-#include <seastar/core/timer.hh>
 #include <seastar/core/metrics.hh>
 #include <seastar/core/scheduling.hh>
 #include "types.hh"
+#include "utils/serialized_action.hh"
 
 namespace replica::log_structured {
 
@@ -41,7 +41,7 @@ class compaction_manager {
     compaction_config _config;
 
     seastar::gate _async_gate;
-    seastar::timer<> _compaction_timer;
+    serialized_action _compaction_action;
     bool _running{false};
 
     struct stats {
@@ -66,18 +66,13 @@ public:
     future<> start();
     future<> stop();
 
-    /// Trigger a compaction cycle manually
-    future<> compact();
-
     void enable_auto_compaction();
     future<> disable_auto_compaction();
 
-private:
-    /// Background task that periodically checks for compaction candidates
-    void schedule_compaction();
+    future<> trigger_compaction();
 
-    /// Find segments that need compaction based on live ratio
-    std::vector<log_segment_id> find_compaction_candidates();
+private:
+    future<> compact();
 
     /// Compact a set of segments by rewriting their live records
     future<> compact_segments(std::vector<log_segment_id> segments);
