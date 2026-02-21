@@ -4647,6 +4647,10 @@ table::enable_auto_compaction() {
     //      see table::disable_auto_compaction() notes.
     _compaction_disabled_by_user = false;
     trigger_compaction();
+
+    if (_logstor) {
+        _logstor->enable_auto_compaction(_schema->id());
+    }
 }
 
 future<>
@@ -4678,11 +4682,16 @@ table::disable_auto_compaction() {
     // - it will break computation of major compaction descriptor
     //   for new submissions
     _compaction_disabled_by_user = true;
-    return with_gate(_async_gate, [this] {
-        return parallel_foreach_compaction_group_view([this] (compaction::compaction_group_view& view) {
-            return _compaction_manager.stop_ongoing_compactions("disable auto-compaction", &view, compaction::compaction_type::Compaction);
-        });
+
+    auto holder = _async_gate.hold();
+
+    co_await parallel_foreach_compaction_group_view([this] (compaction::compaction_group_view& view) {
+        return _compaction_manager.stop_ongoing_compactions("disable auto-compaction", &view, compaction::compaction_type::Compaction);
     });
+
+    if (_logstor) {
+        co_await _logstor->disable_auto_compaction(_schema->id());
+    }
 }
 
 void table::set_tombstone_gc_enabled(bool tombstone_gc_enabled) noexcept {
