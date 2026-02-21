@@ -1065,6 +1065,7 @@ public:
     bool needs_flush() const;
     future<> clear(); // discards memtable(s) without flushing them to disk.
     future<db::replay_position> discard_sstables(db_clock::time_point);
+    future<> discard_kv_storage();
 
     bool can_flush() const;
 
