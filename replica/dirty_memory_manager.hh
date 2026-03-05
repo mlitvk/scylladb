@@ -268,6 +268,8 @@ public:
     }
     void update_unspooled(ssize_t delta);
 
+    void update_limits(size_t unspooled_hard_limit, size_t unspooled_soft_limit, size_t real_hard_limit);
+
     void increase_usage(logalloc::region* r) { // Called by memtable's region_listener
         // It would be easier to call update, but it is unfortunately broken in boost versions up to at
         // least 1.59.
@@ -395,6 +397,9 @@ class dirty_memory_manager {
     // memory usage minus bytes that were already written to disk.
     dirty_memory_manager_logalloc::region_group _region_group;
 
+    size_t _threshold;
+    double _soft_limit;
+
     // We would like to serialize the flushing of memtables. While flushing many memtables
     // simultaneously can sustain high levels of throughput, the memory is not freed until the
     // memtable is totally gone. That means that if we have throttled requests, they will stay
@@ -482,6 +487,8 @@ public:
     const dirty_memory_manager_logalloc::region_group& region_group() const noexcept {
         return _region_group;
     }
+
+    void update_threshold(size_t threshold);
 
     void revert_potentially_cleaned_up_memory(logalloc::region* from, int64_t delta) {
         _region_group.update_real(-delta);

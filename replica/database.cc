@@ -394,6 +394,12 @@ database::database(const db::config& cfg, database_config dbcfg, service::migrat
     // Allow system tables a pool of 10 MB memory to write, but never block on other regions.
     , _system_dirty_memory_manager(*this, 10 << 20, cfg.unspooled_dirty_soft_limit(), default_scheduling_group())
     , _dirty_memory_manager(*this, dbcfg.available_memory * 0.50, cfg.unspooled_dirty_soft_limit(), dbcfg.statement_scheduling_group)
+    , _dirty_memory_threshold_controller([this] {
+        if (_logstor) {
+            size_t available_memory = _dbcfg.available_memory > _logstor->get_memory_usage() ? _dbcfg.available_memory - _logstor->get_memory_usage() : 0;
+            _dirty_memory_manager.update_threshold(available_memory * 0.50);
+        }
+    })
     , _dbcfg(dbcfg)
     , _memtable_controller(make_flush_controller(_cfg, _dbcfg, [this, limit = float(_dirty_memory_manager.throttle_threshold())] {
         auto backlog = (_dirty_memory_manager.unspooled_dirty_memory()) / limit;
@@ -925,6 +931,8 @@ database::init_kv_storage() {
     };
     _logstor = std::make_unique<logstor::logstor>(std::move(cfg));
     co_await _logstor->start();
+
+    _dirty_memory_threshold_controller.arm_periodic(std::chrono::seconds(3));
 
     dblog.info("key-value storage initialized");
 }

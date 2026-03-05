@@ -1634,6 +1634,8 @@ private:
     dirty_memory_manager _system_dirty_memory_manager;
     dirty_memory_manager _dirty_memory_manager;
 
+    timer<lowres_clock> _dirty_memory_threshold_controller;
+
     database_config _dbcfg;
     flush_controller _memtable_controller;
     drain_progress _drain_progress {};

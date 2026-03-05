@@ -142,6 +142,16 @@ void region_group::notify_unspooled_pressure_relieved() {
     _relief.signal();
 }
 
+void region_group::update_limits(size_t unspooled_hard_limit, size_t unspooled_soft_limit, size_t real_hard_limit) {
+    _cfg.unspooled_hard_limit = unspooled_hard_limit;
+    _cfg.unspooled_soft_limit = unspooled_soft_limit;
+    _cfg.real_hard_limit = real_hard_limit;
+
+    // check pressure with the new limits
+    update_real(0);
+    update_unspooled(0);
+}
+
 bool region_group::do_update_real_and_check_relief(ssize_t delta) {
     _real_total_memory += delta;
 
@@ -211,8 +221,17 @@ dirty_memory_manager::dirty_memory_manager(replica::database& db, size_t thresho
             .real_hard_limit = threshold,
             .start_reclaiming = std::bind_front(&dirty_memory_manager::start_reclaiming, this)
       }, deferred_work_sg)
+    , _threshold(threshold)
+    , _soft_limit(soft_limit)
     , _flush_serializer(1)
     , _waiting_flush(flush_when_needed()) {}
+
+void dirty_memory_manager::update_threshold(size_t threshold) {
+    if (threshold != _threshold) {
+        _threshold = threshold;
+        _region_group.update_limits(threshold / 2, threshold * _soft_limit / 2, threshold);
+    }
+}
 
 void
 dirty_memory_manager::setup_collectd(sstring namestr) {
