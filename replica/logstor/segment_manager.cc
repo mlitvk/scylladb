@@ -953,6 +953,10 @@ public:
         return _compaction_mgr.get_table_segment_stats(table);
     }
 
+    size_t get_memory_usage() const {
+        return _cfg.max_separator_memory;
+    }
+
 private:
 
     struct segment_allocation_guard {
@@ -2397,6 +2401,10 @@ future<> segment_manager::truncate_table(table_id table) {
 
 future<table_segment_stats> segment_manager::get_table_segment_stats(table_id table) const {
     return _impl->get_table_segment_stats(table);
+}
+
+size_t segment_manager::get_memory_usage() const {
+    return _impl->get_memory_usage();
 }
 
 }

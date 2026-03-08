@@ -73,11 +73,13 @@ public:
         }
     }
 
-    void erase(const index_key& key, log_location loc) {
+    bool erase(const index_key& key, log_location loc) {
         auto it = _index.find(key);
         if (it != _index.end() && it->location == loc) {
             _index.erase(key);
+            return true;
         }
+        return false;
     }
 
     auto begin() const { return _index.begin(); }
@@ -91,6 +93,7 @@ class log_index {
     using bucket_array = std::array<log_index_bucket, NUM_BUCKETS>;
 
     bucket_array _buckets;
+    size_t _key_count = 0;
 
     size_t bucket_index(const index_key& key) const noexcept {
         uint32_t prefix;
@@ -114,7 +117,11 @@ public:
     }
 
     std::optional<index_entry> exchange(const index_key& key, index_entry new_entry) {
-        return get_bucket(key).exchange(key, std::move(new_entry));
+        auto prev = get_bucket(key).exchange(key, std::move(new_entry));
+        if (!prev) {
+            ++_key_count;
+        }
+        return prev;
     }
 
     bool update_record_location(const index_key& key, log_location old_location, log_location new_location) {
@@ -122,11 +129,19 @@ public:
     }
 
     std::pair<bool, std::optional<index_entry>> insert_if_newer(const index_key& key, index_entry new_entry) {
-        return get_bucket(key).insert_if_newer(key, std::move(new_entry));
+        auto res = get_bucket(key).insert_if_newer(key, std::move(new_entry));
+        if (res.first && !res.second) {
+            ++_key_count;
+        }
+        return res;
     }
 
-    void erase(const index_key& key, log_location loc) {
-        get_bucket(key).erase(key, loc);
+    bool erase(const index_key& key, log_location loc) {
+        bool erased = get_bucket(key).erase(key, loc);
+        if (erased) {
+            --_key_count;
+        }
+        return erased;
     }
 
     class const_iterator {
@@ -214,6 +229,14 @@ public:
         return _reads_phaser.advance_and_await();
     }
 
+    size_t get_memory_usage() const {
+        // approximate
+        return sizeof(log_index_bucket) * NUM_BUCKETS + _key_count * sizeof(index_entry);
+    }
+
+    size_t get_key_count() const {
+        return _key_count;
+    }
 };
 
 }

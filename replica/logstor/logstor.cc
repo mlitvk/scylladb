@@ -80,6 +80,10 @@ future<table_segment_stats> logstor::get_table_segment_stats(table_id tid) const
     return _segment_manager.get_table_segment_stats(tid);
 }
 
+size_t logstor::get_memory_usage() const {
+    return _index.get_memory_usage() + _segment_manager.get_memory_usage();
+}
+
 future<> logstor::write(const mutation& m, group_id group) {
     auto key = calculate_key(*m.schema(), m.decorated_key());
 

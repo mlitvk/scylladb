@@ -62,6 +62,8 @@ public:
 
     future<table_segment_stats> get_table_segment_stats(table_id) const;
 
+    size_t get_memory_usage() const;
+
     static index_key calculate_key(const schema&, const dht::decorated_key&);
 
     future<> write(const mutation&, group_id);
