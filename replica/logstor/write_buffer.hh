@@ -20,7 +20,11 @@
 #include "types.hh"
 #include "serializer.hh"
 
-namespace replica::logstor {
+namespace replica {
+
+class compaction_group;
+
+namespace logstor {
 
 class segment_manager;
 
@@ -123,6 +127,8 @@ private:
         size_t offset_in_buffer;
         size_t data_size;
         future<log_location> loc;
+        compaction_group* cg;
+        seastar::gate::holder cg_holder;
     };
 
     bool _with_record_copy;
@@ -162,13 +168,17 @@ public:
     // Returns a future that will be resolved with the log location once flushed and a gate holder
     // that keeps the write buffer open. The gate should be held for index updates after the write
     // is done.
-    future<log_location_with_holder> write_with_holder(log_record_writer);
+    future<log_location_with_holder> write(log_record_writer, compaction_group*, seastar::gate::holder cg_holder);
+
+    future<log_location_with_holder> write(log_record_writer writer) {
+        return write(std::move(writer), nullptr, {});
+    }
 
     // Write a record to the buffer.
     // Returns a future that will be resolved with the log location once flushed.
     // If there are follow-up operations to the write such as index updates then consider
     // using write_with_holder instead to keep the write buffer open until those operations are complete.
-    future<log_location> write(log_record_writer);
+    future<log_location> write_no_holder(log_record_writer);
 
     static size_t estimate_required_segments(size_t net_data_size, size_t record_count, size_t segment_size);
 
@@ -190,7 +200,7 @@ private:
     void finalize(size_t alignment);
 
     friend class segment_manager_impl;
-    friend class compaction_manager;
+    friend class compaction_manager_impl;
 };
 
 // Manages multiple buffers, a single active buffer and multiple flushing buffers.
@@ -221,7 +231,7 @@ public:
     future<> start();
     future<> stop();
 
-    future<log_location_with_holder> write(log_record);
+    future<log_location_with_holder> write(log_record, compaction_group* cg = nullptr, seastar::gate::holder cg_holder = {});
 
 private:
     future<write_buffer*> switch_buffer();
@@ -229,6 +239,7 @@ private:
 
 };
 
+}
 }
 
 namespace ser {

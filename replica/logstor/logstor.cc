@@ -11,6 +11,7 @@
 #include <seastar/core/future.hh>
 #include "readers/from_mutations.hh"
 #include "keys/keys.hh"
+#include "replica/logstor/segment_manager.hh"
 #include "replica/logstor/types.hh"
 #include "utils/managed_bytes.hh"
 #include <openssl/ripemd.h>
@@ -52,40 +53,17 @@ void logstor::enable_auto_compaction() {
     _segment_manager.enable_auto_compaction();
 }
 
-void logstor::enable_auto_compaction(table_id tid) {
-    _segment_manager.enable_auto_compaction(tid);
-}
-
 future<> logstor::disable_auto_compaction() {
     return _segment_manager.disable_auto_compaction();
-}
-
-future<> logstor::disable_auto_compaction(table_id tid) {
-    return _segment_manager.disable_auto_compaction(tid);
-}
-
-future<> logstor::trigger_compaction(bool major) {
-    return _segment_manager.trigger_compaction(major);
-}
-
-future<> logstor::do_barrier() {
-    return _segment_manager.do_barrier();
-}
-
-future<> logstor::truncate_table(table_id tid) {
-    return _segment_manager.truncate_table(tid);
-}
-
-future<table_segment_stats> logstor::get_table_segment_stats(table_id tid) const {
-    return _segment_manager.get_table_segment_stats(tid);
 }
 
 size_t logstor::get_memory_usage() const {
     return _index.get_memory_usage() + _segment_manager.get_memory_usage();
 }
 
-future<> logstor::write(const mutation& m, group_id group) {
+future<> logstor::write(compaction_group& cg, const mutation& m, seastar::gate::holder cg_holder) {
     auto key = calculate_key(*m.schema(), m.decorated_key());
+    table_id table = m.schema()->id();
 
     // TODO ?
     record_generation gen = _index.get(key)
@@ -96,11 +74,11 @@ future<> logstor::write(const mutation& m, group_id group) {
     log_record record {
         .key = key,
         .generation = gen,
-        .group = group,
+        .table = table,
         .mut = canonical_mutation(m)
     };
 
-    return _write_buffer.write(std::move(record)).then_unpack([this, gen, key = std::move(key)]
+    return _write_buffer.write(std::move(record), &cg, std::move(cg_holder)).then_unpack([this, gen, key = std::move(key)]
             (log_location location, seastar::gate::holder op) {
         index_entry new_entry {
             .location = location,
@@ -160,6 +138,22 @@ future<std::optional<canonical_mutation>> logstor::read(const schema& s, const d
 
         return std::optional<canonical_mutation>(std::move(record.mut));
     });
+}
+
+segment_manager& logstor::get_segment_manager() noexcept {
+    return _segment_manager;
+}
+
+const segment_manager& logstor::get_segment_manager() const noexcept {
+    return _segment_manager;
+}
+
+compaction_manager& logstor::get_compaction_manager() noexcept {
+    return _segment_manager.get_compaction_manager();
+}
+
+const compaction_manager& logstor::get_compaction_manager() const noexcept {
+    return _segment_manager.get_compaction_manager();
 }
 
 mutation_reader logstor::make_reader_for_key(schema_ptr schema,
@@ -265,6 +259,10 @@ mutation_reader logstor::make_reader_for_key(schema_ptr schema,
         slice,
         std::move(trace_state)
     );
+}
+
+void logstor::set_trigger_compaction_hook(std::function<void()> fn) {
+    _segment_manager.set_trigger_compaction_hook(std::move(fn));
 }
 
 // Cache RIPEMD-160 algorithm descriptor and context

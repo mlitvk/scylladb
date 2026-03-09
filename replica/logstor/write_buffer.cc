@@ -76,7 +76,7 @@ bool write_buffer::has_data() const noexcept {
     return offset_in_buffer() > buffer_header_size;
 }
 
-future<log_location_with_holder> write_buffer::write_with_holder(log_record_writer writer) {
+future<log_location_with_holder> write_buffer::write(log_record_writer writer, compaction_group* cg, seastar::gate::holder cg_holder) {
     const auto data_size = writer.size();
 
     if (!can_fit(data_size)) {
@@ -112,7 +112,9 @@ future<log_location_with_holder> write_buffer::write_with_holder(log_record_writ
             .writer = std::move(writer),
             .offset_in_buffer = data_offset_in_buffer,
             .data_size = data_size,
-            .loc = _written.get_shared_future().then(record_location)
+            .loc = _written.get_shared_future().then(record_location),
+            .cg = cg,
+            .cg_holder = std::move(cg_holder)
         });
     }
 
@@ -126,10 +128,10 @@ future<log_location_with_holder> write_buffer::write_with_holder(log_record_writ
     });
 }
 
-future<log_location> write_buffer::write(log_record_writer writer) {
+future<log_location> write_buffer::write_no_holder(log_record_writer writer) {
     // write and leave the gate immediately after the write.
     // use carefully when the gate it not needed.
-    return write_with_holder(std::move(writer)).then_unpack([] (log_location loc, seastar::gate::holder op) {
+    return write(std::move(writer)).then_unpack([] (log_location loc, seastar::gate::holder op) {
         return loc;
     });
 }
@@ -220,7 +222,7 @@ future<> buffered_writer::stop() {
     logstor_logger.info("Write buffer stopped");
 }
 
-future<log_location_with_holder> buffered_writer::write(log_record record) {
+future<log_location_with_holder> buffered_writer::write(log_record record, compaction_group* cg, seastar::gate::holder cg_holder) {
     auto holder = _async_gate.hold();
 
     log_record_writer writer(std::move(record));
@@ -235,7 +237,7 @@ future<log_location_with_holder> buffered_writer::write(log_record record) {
     }
 
     // Write to buffer at current position
-    auto fut = _active_buffer.buf->write_with_holder(std::move(writer));
+    auto fut = _active_buffer.buf->write(std::move(writer), cg, std::move(cg_holder));
 
     // Trigger flush for the active buffer if not in progress
     if (!std::exchange(_active_buffer.flush_requested, true)) {

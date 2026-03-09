@@ -17,6 +17,7 @@
 // FIXME: un-nest compaction_reenabler, so we can forward declare it and remove this include.
 #include "compaction/compaction_manager.hh"
 #include "locator/tablets.hh"
+#include "replica/logstor/compaction.hh"
 #include "sstables/sstable_set.hh"
 #include "utils/chunked_vector.hh"
 #include <absl/container/flat_hash_map.h>
@@ -91,6 +92,11 @@ class compaction_group {
     bool _tombstone_gc_enabled = true;
     std::optional<compaction::compaction_backlog_tracker> _backlog_tracker;
     repair_classifier_func _repair_sstable_classifier;
+
+    lw_shared_ptr<logstor::segment_set> _logstor_segments;
+    std::optional<logstor::separator_buffer> _logstor_separator;
+    std::vector<future<>> _separator_flushes;
+
 private:
     std::unique_ptr<compaction_group_view> make_compacting_view();
     std::unique_ptr<compaction_group_view> make_non_compacting_view();
@@ -223,6 +229,7 @@ public:
     const std::vector<sstables::shared_sstable>& compacted_undeleted_sstables() const noexcept;
     // Triggers regular compaction.
     void trigger_compaction();
+    void trigger_logstor_compaction();
     bool compaction_disabled() const;
     future<unsigned> estimate_pending_compactions() const;
 
@@ -262,10 +269,29 @@ public:
     compaction::compaction_manager& get_compaction_manager() noexcept;
     const compaction::compaction_manager& get_compaction_manager() const noexcept;
 
+    logstor::segment_manager& get_logstor_segment_manager() noexcept;
+    const logstor::segment_manager& get_logstor_segment_manager() const noexcept;
+
+    logstor::compaction_manager& get_logstor_compaction_manager() noexcept;
+    const logstor::compaction_manager& get_logstor_compaction_manager() const noexcept;
+
     future<> split(compaction::compaction_type_options::split opt, tasks::task_info tablet_split_task_info);
 
     void set_repair_sstable_classifier(repair_classifier_func repair_sstable_classifier) {
         _repair_sstable_classifier = std::move(repair_sstable_classifier);
+    }
+
+    void add_logstor_segment(logstor::segment_descriptor& desc) {
+        _logstor_segments->add_segment(desc);
+    }
+
+    future<> discard_logstor_segments();
+
+    future<> flush_separator();
+    logstor::separator_buffer& get_separator_buffer(size_t write_size);
+
+    logstor::segment_set& logstor_segments() noexcept {
+        return *_logstor_segments;
     }
 
     friend class storage_group;

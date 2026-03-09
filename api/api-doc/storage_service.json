@@ -1320,13 +1320,13 @@
          ]
       },
       {
-         "path":"/storage_service/logstor_barrier",
+         "path":"/storage_service/logstor_flush",
          "operations":[
             {
                "method":"POST",
-               "summary":"Trigger barrier of the key-value storage",
+               "summary":"Trigger flush of logstor storage",
                "type":"void",
-               "nickname":"logstor_barrier",
+               "nickname":"logstor_flush",
                "produces":[
                   "application/json"
                ],

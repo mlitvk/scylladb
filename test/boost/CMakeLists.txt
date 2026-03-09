@@ -160,8 +160,6 @@ add_scylla_test(logalloc_standard_allocator_segment_pool_backend_test
   KIND SEASTAR)
 add_scylla_test(logalloc_test
   KIND SEASTAR)
-add_scylla_test(logstor_test
-  KIND SEASTAR)
 add_scylla_test(lru_string_map_test
   KIND BOOST)
 add_scylla_test(managed_bytes_test

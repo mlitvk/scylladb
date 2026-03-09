@@ -21,6 +21,9 @@
 
 namespace replica::logstor {
 
+class compaction_manager;
+class segment_set;
+
 static constexpr size_t default_segment_size = 128 * 1024;
 static constexpr size_t default_file_size = 32 * 1024 * 1024;
 
@@ -81,24 +84,20 @@ public:
                             std::function<future<>(log_location, log_record)> callback);
 
     void enable_auto_compaction();
-    void enable_auto_compaction(table_id);
-
     future<> disable_auto_compaction();
-    future<> disable_auto_compaction(table_id);
 
-    future<> trigger_compaction(bool major = false);
+    compaction_manager& get_compaction_manager() noexcept;
+    const compaction_manager& get_compaction_manager() const noexcept;
+
+    void set_trigger_compaction_hook(std::function<void()> fn);
 
     size_t get_segment_size() const noexcept;
 
-    // After the barrier, all previous writes will be written in a non-mixed segment according
-    // to their group_id.
-    future<> do_barrier();
-
-    future<> truncate_table(table_id);
-
-    future<table_segment_stats> get_table_segment_stats(table_id) const;
+    future<> discard_segments(segment_set&);
 
     size_t get_memory_usage() const;
+
+    future<> await_pending_writes();
 
     friend class segment_manager_impl;
 

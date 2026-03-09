@@ -848,10 +848,10 @@ rest_logstor_compaction(http_context& ctx, std::unique_ptr<http::request> req) {
 
 static
 future<json::json_return_type>
-rest_logstor_barrier(http_context& ctx, std::unique_ptr<http::request> req) {
-        apilog.info("logstor_barrier");
+rest_logstor_flush(http_context& ctx, std::unique_ptr<http::request> req) {
+        apilog.info("logstor_flush");
         auto& db = ctx.db;
-        co_await replica::database::trigger_logstor_barrier_on_all_shards(db);
+        co_await replica::database::flush_logstor_separator_on_all_shards(db);
         co_return json_void();
 }
 
@@ -1895,7 +1895,7 @@ void set_storage_service(http_context& ctx, routes& r, sharded<service::storage_
     ss::force_flush.set(r, rest_bind(rest_force_flush, ctx));
     ss::force_keyspace_flush.set(r, rest_bind(rest_force_keyspace_flush, ctx));
     ss::logstor_compaction.set(r, rest_bind(rest_logstor_compaction, ctx));
-    ss::logstor_barrier.set(r, rest_bind(rest_logstor_barrier, ctx));
+    ss::logstor_flush.set(r, rest_bind(rest_logstor_flush, ctx));
     ss::decommission.set(r, rest_bind(rest_decommission, ss));
     ss::move.set(r, rest_bind(rest_move, ss));
     ss::remove_node.set(r, rest_bind(rest_remove_node, ss));
@@ -1977,7 +1977,7 @@ void unset_storage_service(http_context& ctx, routes& r) {
     ss::force_flush.unset(r);
     ss::force_keyspace_flush.unset(r);
     ss::logstor_compaction.unset(r);
-    ss::logstor_barrier.unset(r);
+    ss::logstor_flush.unset(r);
     ss::decommission.unset(r);
     ss::move.unset(r);
     ss::remove_node.unset(r);

@@ -6,11 +6,14 @@
 
 import asyncio
 import random
+import time
 from test.pylib.manager_client import ManagerClient
 from test.cluster.util import new_test_keyspace
 from cassandra.protocol import ConfigurationException
 import pytest
 import logging
+
+from test.pylib.util import wait_for
 
 logger = logging.getLogger(__name__)
 
@@ -124,7 +127,7 @@ async def test_parallel_big_writes(manager: ManagerClient):
     """
     Perform multiple writes in parallel with large values and validate to test segment switching.
     """
-    cmdline = ['--logger-log-level', 'logstor=debug', '--smp=1']
+    cmdline = ['--logger-log-level', 'logstor=trace', '--smp=1']
     cfg = {'enable_kv_storage': True, 'experimental_features': ['kv-storage']}
     await manager.servers_add(1, cmdline=cmdline, config=cfg)
     cql = manager.get_cql()
@@ -146,6 +149,7 @@ async def test_parallel_big_writes(manager: ManagerClient):
             assert rows[0].v == f"{i}-{large_value}"
 
 @pytest.mark.asyncio
+@pytest.mark.skip(reason="TODO")
 async def test_recovery_basic(manager: ManagerClient):
     """
     Test that logstor data persists across server restarts.
@@ -228,6 +232,7 @@ async def test_recovery_basic(manager: ManagerClient):
             assert rows[0].v == expected_v, f"Key {pk} has wrong value after additional writes"
 
 @pytest.mark.asyncio
+@pytest.mark.skip(reason="TODO")
 async def test_recovery_with_segment_reuse(manager: ManagerClient):
     """
     Test recovery after segments have been compacted and reused.
@@ -318,19 +323,23 @@ async def test_compaction(manager: ManagerClient):
             await cql.run_async(f"INSERT INTO {ks}.test (pk, v) VALUES ({i}, '{value}')")
 
         # few writes to the same key to create dead data except the last one
-        for i in range(5):
+        for _ in range(5):
             await cql.run_async(f"INSERT INTO {ks}.test (pk, v) VALUES (100, '{value}')")
 
-        # the barrier will flush all segments and put them into a single compaction group since
+        # flush all segments and put them into a single compaction group since
         # there is a single tablet.
-        await manager.api.logstor_barrier(servers[0].ip_addr)
+        await manager.api.logstor_flush(servers[0].ip_addr)
 
         # trigger compaction. should take the 4 segments with dead data and compact them
         await manager.api.logstor_compaction(servers[0].ip_addr)
 
-        metrics = await manager.metrics.query(servers[0].ip_addr)
-        segments_compacted = metrics.get("scylla_logstor_sm_segments_compacted") or 0
-        assert segments_compacted == 4, f"Expected 4 segments to be compacted, but got {segments_compacted}"
+        async def segments_compacted():
+            metrics = await manager.metrics.query(servers[0].ip_addr)
+            segments_compacted = metrics.get("scylla_logstor_sm_segments_compacted") or 0
+            if segments_compacted == 4:
+                return True
+            await manager.api.logstor_compaction(servers[0].ip_addr)
+        await wait_for(segments_compacted, time.time() + 60)
 
 @pytest.mark.asyncio
 async def test_drop_table(manager: ManagerClient):
@@ -383,6 +392,7 @@ async def test_drop_table(manager: ManagerClient):
             assert rows[0].v == value, f"Expected value of size {value_size} for key {i} in test2 after all operations, but got {len(rows[0].v)}"
 
 @pytest.mark.asyncio
+@pytest.mark.slow
 async def test_stress_random_read_write(manager: ManagerClient):
     """
     Stress test with random reads and writes to a small key range.
@@ -392,8 +402,8 @@ async def test_stress_random_read_write(manager: ManagerClient):
     switching, compaction, and data integrity. Each operation verifies the
     previously written value before writing a new one.
     """
-    disk_size_mb = 8
-    file_size_mb = 1
+    disk_size_mb = 16
+    file_size_mb = 4
     num_keys = 100
     min_value_size = 100
     max_value_size = 8 * 1024

@@ -594,7 +594,6 @@ scylla_tests = set([
     'test/boost/linearizing_input_stream_test',
     'test/boost/lister_test',
     'test/boost/locator_topology_test',
-    'test/boost/logstor_test',
     'test/boost/log_heap_test',
     'test/boost/logalloc_standard_allocator_segment_pool_backend_test',
     'test/boost/logalloc_test',

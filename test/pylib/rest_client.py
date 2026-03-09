@@ -452,9 +452,9 @@ class ScyllaRESTAPIClient:
         params = {"major": "true" if major else "false"}
         await self.client.post(url, host=node_ip, params=params)
 
-    async def logstor_barrier(self, node_ip: str) -> None:
-        """Trigger logstor barrier"""
-        url = "/storage_service/logstor_barrier"
+    async def logstor_flush(self, node_ip: str) -> None:
+        """Trigger logstor flush"""
+        url = "/storage_service/logstor_flush"
         await self.client.post(url, host=node_ip)
 
     async def dump_llvm_profile(self, node_ip : str):

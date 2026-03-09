@@ -1065,7 +1065,7 @@ public:
     bool needs_flush() const;
     future<> clear(); // discards memtable(s) without flushing them to disk.
     future<db::replay_position> discard_sstables(db_clock::time_point);
-    future<> discard_kv_storage();
+    future<> discard_logstor_segments();
 
     bool can_flush() const;
 
@@ -1117,6 +1117,7 @@ public:
     void start_compaction();
     void trigger_compaction();
     void try_trigger_compaction(compaction_group& cg) noexcept;
+    void trigger_logstor_compaction();
     // Triggers offstrategy compaction, if needed, in the background.
     void trigger_offstrategy_compaction();
     // Performs offstrategy compaction, if needed, returning
@@ -1144,6 +1145,16 @@ public:
     compaction::compaction_manager& get_compaction_manager() noexcept {
         return _compaction_manager;
     }
+
+    logstor::segment_manager& get_logstor_segment_manager() noexcept {
+        return _logstor->get_segment_manager();
+    }
+
+    logstor::compaction_manager& get_logstor_compaction_manager() noexcept {
+        return _logstor->get_compaction_manager();
+    }
+
+    future<> flush_separator();
 
     table_stats& get_stats() const {
         return _stats;
@@ -2023,9 +2034,9 @@ public:
     future<> flush_commitlog() { return flush_all_tables(); }
 
     static future<> trigger_logstor_compaction_on_all_shards(sharded<database>& sharded_db, bool major);
-    future<> trigger_logstor_compaction(bool major);
-    static future<> trigger_logstor_barrier_on_all_shards(sharded<database>& sharded_db);
-    future<> trigger_logstor_barrier();
+    void trigger_logstor_compaction(bool major);
+    static future<> flush_logstor_separator_on_all_shards(sharded<database>& sharded_db);
+    future<> flush_logstor_separator();
     future<logstor::table_segment_stats> get_logstor_table_segment_stats(table_id table) const;
 
     static future<db_clock::time_point> get_all_tables_flushed_at(sharded<database>& sharded_db);
