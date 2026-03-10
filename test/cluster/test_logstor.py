@@ -5,6 +5,7 @@
 #
 
 import asyncio
+import random
 from test.pylib.manager_client import ManagerClient
 from test.cluster.util import new_test_keyspace
 from cassandra.protocol import ConfigurationException
@@ -380,3 +381,73 @@ async def test_drop_table(manager: ManagerClient):
             rows = await cql.run_async(f"SELECT pk, v FROM {ks}.test2 WHERE pk = {i}")
             assert len(rows) == 1, f"Expected 1 row for key {i} in test2 after all operations, but got {len(rows)}"
             assert rows[0].v == value, f"Expected value of size {value_size} for key {i} in test2 after all operations, but got {len(rows[0].v)}"
+
+@pytest.mark.asyncio
+async def test_stress_random_read_write(manager: ManagerClient):
+    """
+    Stress test with random reads and writes to a small key range.
+
+    This test performs random read-write operations on keys 0-100 with random
+    value sizes, filling the disk multiple times to stress test segment
+    switching, compaction, and data integrity. Each operation verifies the
+    previously written value before writing a new one.
+    """
+    disk_size_mb = 8
+    file_size_mb = 1
+    num_keys = 100
+    min_value_size = 100
+    max_value_size = 8 * 1024
+    num_iterations = 5000
+
+    cmdline = ['--logger-log-level', 'logstor=trace', '--smp=1']
+    cfg = {
+        'enable_kv_storage': True,
+        'kv_storage_disk_size_in_mb': disk_size_mb,
+        'kv_storage_file_size_in_mb': file_size_mb,
+        'experimental_features': ['kv-storage']
+    }
+    servers = await manager.servers_add(1, cmdline=cmdline, config=cfg)
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v text) WITH kv_storage = true")
+
+        # Track expected values for each key
+        expected_values = {}
+
+        for iteration in range(num_iterations):
+            # Choose a random key
+            pk = random.randint(0, num_keys - 1)
+
+            # If key exists, read and verify
+            if pk in expected_values:
+                rows = await cql.run_async(f"SELECT v FROM {ks}.test WHERE pk = {pk}")
+                assert len(rows) == 1, f"Iteration {iteration}: Expected 1 row for key {pk}, but got {len(rows)}"
+                assert rows[0].v == expected_values[pk], f"Iteration {iteration}: Value mismatch for key {pk}"
+
+            # Generate random value with random size
+            value_size = random.randint(min_value_size, max_value_size)
+            value = f"iter{iteration}_key{pk}_" + ('x' * (value_size - 30))
+
+            # Write new value
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, v) VALUES ({pk}, '{value}')")
+
+            # Update expected values
+            expected_values[pk] = value
+
+            # Log progress every 100 iterations
+            if (iteration + 1) % 100 == 0:
+                logger.info(f"Completed {iteration + 1}/{num_iterations} iterations, {len(expected_values)} unique keys written")
+
+        # Final verification: read all keys and verify they match expected values
+        logger.info(f"Final verification of {len(expected_values)} keys")
+        for pk, expected_v in expected_values.items():
+            rows = await cql.run_async(f"SELECT v FROM {ks}.test WHERE pk = {pk}")
+            assert len(rows) == 1, f"Final check: Expected 1 row for key {pk}, but got {len(rows)}"
+            assert rows[0].v == expected_v, f"Final check: Value mismatch for key {pk}"
+
+        # Verify that compaction ran due to filling disk multiple times
+        metrics = await manager.metrics.query(servers[0].ip_addr)
+        segments_compacted = metrics.get("scylla_logstor_sm_segments_compacted") or 0
+        logger.info(f"Total segments compacted: {segments_compacted}")
+        assert segments_compacted > 0, "Expected compaction to run when filling disk multiple times"
