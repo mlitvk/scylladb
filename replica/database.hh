@@ -546,6 +546,7 @@ private:
     std::vector<view_ptr> _views;
 
     logstor::logstor* _logstor = nullptr;
+    std::unique_ptr<logstor::primary_index> _logstor_index;
 
     std::unique_ptr<cell_locker> _counter_cell_locks; // Memory-intensive; allocate only when needed.
 
@@ -598,8 +599,6 @@ private:
 
     bool _is_bootstrap_or_replace = false;
     sstables::shared_sstable make_sstable(sstables::sstable_state state);
-
-    logstor::primary_index _logstor_index;
 
 public:
     void on_flush_timer();
@@ -837,12 +836,17 @@ public:
     // to issue disk operations safely.
     void mark_ready_for_writes(db::commitlog* cl);
 
-    void set_kv_storage(logstor::logstor* ls) {
-        _logstor = ls;
-    }
+    void init_kv_storage(logstor::logstor* ls);
 
     bool uses_kv_storage() const {
         return _logstor != nullptr;
+    }
+
+    logstor::primary_index& logstor_index() noexcept {
+        return *_logstor_index;
+    }
+    const logstor::primary_index& logstor_index() const noexcept {
+        return *_logstor_index;
     }
 
     // Creates a mutation reader which covers all data sources for this column family.

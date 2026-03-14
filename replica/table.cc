@@ -227,7 +227,7 @@ table::make_logstor_mutation_reader(schema_ptr s,
                                    mutation_reader::forwarding fwd_mr) const {
     if (pr.is_singular() && pr.start()->value().has_key()) {
         const dht::decorated_key& key = pr.start()->value().as_decorated_key();
-        return _logstor->make_reader_for_key(std::move(s), std::move(permit), key, slice, std::move(trace_state));
+        return _logstor->make_reader_for_key(std::move(s), logstor_index(), std::move(permit), key, slice, std::move(trace_state));
     } else {
         throw std::runtime_error("Range queries over key-value storage are not supported");
     }
@@ -4238,6 +4238,11 @@ void table::mark_ready_for_writes(db::commitlog* cl) {
     _readonly = false;
 }
 
+void table::init_kv_storage(logstor::logstor* ls) {
+    _logstor = ls;
+    _logstor_index = std::make_unique<logstor::primary_index>(_schema);
+}
+
 db::commitlog* table::commitlog() const {
     if (_readonly) [[unlikely]] {
         on_internal_error(dblog, ::format("table {}.{} is readonly", _schema->ks_name(), _schema->cf_name()));
@@ -4980,6 +4985,10 @@ logstor::compaction_manager& compaction_group::get_logstor_compaction_manager() 
 
 const logstor::compaction_manager& compaction_group::get_logstor_compaction_manager() const noexcept {
     return _t.get_logstor_compaction_manager();
+}
+
+logstor::primary_index& compaction_group::get_logstor_index() noexcept {
+    return _t.logstor_index();
 }
 
 compaction::compaction_group_view& compaction_group::as_view_for_static_sharding() const {

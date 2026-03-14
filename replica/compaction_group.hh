@@ -34,6 +34,10 @@ class effective_replication_map;
 
 namespace replica {
 
+namespace logstor {
+class primary_index;
+}
+
 using enable_backlog_tracker = bool_class<class enable_backlog_tracker_tag>;
 
 enum class repair_sstable_classification {
@@ -274,6 +278,8 @@ public:
 
     logstor::compaction_manager& get_logstor_compaction_manager() noexcept;
     const logstor::compaction_manager& get_logstor_compaction_manager() const noexcept;
+
+    logstor::primary_index& get_logstor_index() noexcept;
 
     future<> split(compaction::compaction_type_options::split opt, tasks::task_info tablet_split_task_info);
 

@@ -39,6 +39,8 @@ class logstor {
     segment_manager _segment_manager;
     buffered_writer _write_buffer;
 
+    utils::phased_barrier _reads_phaser{"logstor_reads"};
+
 public:
 
     explicit logstor(logstor_config);
@@ -61,9 +63,9 @@ public:
 
     future<> write(const mutation&, compaction_group&, seastar::gate::holder cg_holder);
 
-    future<std::optional<log_record>> read(index_key);
+    future<std::optional<log_record>> read(const primary_index&, primary_index_key);
 
-    future<std::optional<canonical_mutation>> read(const schema&, const dht::decorated_key&);
+    future<std::optional<canonical_mutation>> read(const schema&, const primary_index&, const dht::decorated_key&);
 
     segment_manager& get_segment_manager() noexcept;
     const segment_manager& get_segment_manager() const noexcept;
@@ -73,12 +75,17 @@ public:
 
     /// Create a mutation reader for a specific key
     mutation_reader make_reader_for_key(schema_ptr schema,
+                                       const primary_index& index,
                                        reader_permit permit,
                                        const dht::decorated_key& key,
                                        const query::partition_slice& slice,
                                        tracing::trace_state_ptr trace_state = nullptr);
 
     void set_trigger_compaction_hook(std::function<void()> fn);
+
+    future<> await_pending_reads() {
+        return _reads_phaser.advance_and_await();
+    }
 };
 
 } // namespace logstor

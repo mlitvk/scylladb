@@ -1171,7 +1171,7 @@ void database::add_column_family(keyspace& ks, schema_ptr schema, column_family:
         if (!_logstor) {
             on_internal_error(dblog, "Key-value storage is enabled but logstor is not initialized");
         }
-        cf->set_kv_storage(_logstor.get());
+        cf->init_kv_storage(_logstor.get());
         dblog.info("Table {}.{} is using key-value storage", schema->ks_name(), schema->cf_name());
     }
 
