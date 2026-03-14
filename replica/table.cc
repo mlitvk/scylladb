@@ -1073,7 +1073,7 @@ future<> compaction_group::split(compaction::compaction_type_options::split opt,
 
 future<> compaction_group::discard_logstor_segments() {
     auto& sm = get_logstor_segment_manager();
-    co_await sm.discard_segments(*_logstor_segments);
+    co_await sm.discard_segments(*_logstor_segments, get_logstor_index());
 }
 
 future<> compaction_group::flush_separator() {

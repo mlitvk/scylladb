@@ -425,8 +425,8 @@ public:
 
 private:
 
-    bool is_record_alive(const index_key&, log_location);
-    bool update_record_location(const index_key&, log_location old_loc, log_location new_loc);
+    bool is_record_alive(primary_index&, const primary_index_key&, log_location);
+    bool update_record_location(primary_index&, const primary_index_key&, log_location old_loc, log_location new_loc);
 
     void submit(compaction_group&) override;
     future<> stop_ongoing_compactions(compaction_group&) override;
@@ -671,7 +671,7 @@ public:
         return _cfg.segment_size;
     }
 
-    future<> discard_segments(segment_set&);
+    future<> discard_segments(segment_set&, primary_index&);
 
     size_t get_memory_usage() const {
         return _cfg.max_separator_memory;
@@ -1163,15 +1163,15 @@ future<> segment_manager_impl::free_segment(log_segment_id segment_id) {
     co_return;
 }
 
-future<> segment_manager_impl::discard_segments(segment_set& ss) {
+future<> segment_manager_impl::discard_segments(segment_set& ss, primary_index& index) {
     auto holder = _async_gate.hold();
 
     while (!ss._segments.empty()) {
         auto& desc = ss._segments.one_of_largest();
         auto seg_id = desc_to_segment_id(desc);
         logstor_logger.info("Discard segment {}", seg_id);
-        co_await for_each_record(seg_id, [this] (log_location loc, log_record record) {
-            if (_index.erase(record.key, loc)) {
+        co_await for_each_record(seg_id, [this, &index] (log_location loc, log_record record) {
+            if (index.erase(record.key, loc)) {
                 free_record(loc);
             }
             return make_ready_future<>();
@@ -1292,14 +1292,14 @@ future<> segment_manager_impl::for_each_record(const std::vector<log_segment_id>
     }
 }
 
-bool compaction_manager_impl::is_record_alive(const index_key& key, log_location loc) {
-    return _index.get(key)
+bool compaction_manager_impl::is_record_alive(primary_index& index, const primary_index_key& key, log_location loc) {
+    return index.get(key)
         .transform([loc] (const index_entry& e) { return e.location == loc; })
         .value_or(false);
 }
 
-bool compaction_manager_impl::update_record_location(const index_key& key, log_location old_loc, log_location new_loc) {
-    return _index.update_record_location(key, old_loc, new_loc);
+bool compaction_manager_impl::update_record_location(primary_index& index, const primary_index_key& key, log_location old_loc, log_location new_loc) {
+    return index.update_record_location(key, old_loc, new_loc);
 }
 
 void compaction_manager_impl::submit(compaction_group& cg) {
@@ -1449,10 +1449,10 @@ future<> compaction_manager_impl::compact_segments(compaction_group& cg, std::ve
     size_t records_skipped = 0;
 
     co_await _sm.for_each_record(segments,
-            [this, &records_rewritten, &records_skipped, &cb]
+            [this, &cg, &records_rewritten, &records_skipped, &cb]
             (log_location read_location, log_record record) -> future<> {
 
-        if (!is_record_alive(record.key, read_location)) {
+        if (!is_record_alive(cg.get_logstor_index(), record.key, read_location)) {
             records_skipped++;
             _stats.compaction_records_skipped++;
             co_return;
@@ -1467,10 +1467,10 @@ future<> compaction_manager_impl::compact_segments(compaction_group& cg, std::ve
 
         // write the record and then update the index with the new location
         auto write_and_update_index = cb.buf->write(std::move(writer)).then_unpack(
-                [this, key = std::move(key), read_location, &records_rewritten, &records_skipped]
+                [this, &cg, key = std::move(key), read_location, &records_rewritten, &records_skipped]
                 (log_location new_location, seastar::gate::holder op) {
 
-            if (update_record_location(key, read_location, new_location)) {
+            if (update_record_location(cg.get_logstor_index(), key, read_location, new_location)) {
                 _sm.free_record(read_location);
                 records_rewritten++;
             } else {
@@ -1531,6 +1531,7 @@ future<> compaction_manager_impl::write_to_separator(write_buffer& wb, segment_r
         auto key = w.writer.record().key;
         log_location prev_loc = co_await std::move(w.loc);
 
+        auto& index = w.cg->get_logstor_index();
         auto& buf = w.cg->get_separator_buffer(w.writer.size());
 
         // the separator buffer holds a reference to the segment.
@@ -1540,8 +1541,8 @@ future<> compaction_manager_impl::write_to_separator(write_buffer& wb, segment_r
         }
 
         buf.pending_updates.push_back(
-            buf.write(w.writer).then_unpack([this, key = std::move(key), prev_loc] (log_location new_loc, seastar::gate::holder op) {
-                if (update_record_location(key, prev_loc, new_loc)) {
+            buf.write(w.writer).then_unpack([this, &index, key = std::move(key), prev_loc] (log_location new_loc, seastar::gate::holder op) {
+                if (update_record_location(index, key, prev_loc, new_loc)) {
                     _sm.free_record(prev_loc);
                 } else {
                     _sm.free_record(new_loc);
@@ -1678,6 +1679,7 @@ future<> segment_manager_impl::recover_segment(log_segment_id segment_id) {
     }
     desc.seg_gen = *seg_gen_opt;
 
+    /*
     co_await for_each_record(segment_id, [this, &desc] (log_location loc, log_record record) -> future<> {
         logstor_logger.trace("Recovery: read record at {} gen {}", loc, record.generation);
 
@@ -1697,6 +1699,7 @@ future<> segment_manager_impl::recover_segment(log_segment_id segment_id) {
 
         co_return;
     });
+    */
 }
 
 future<std::optional<segment_generation>> segment_manager_impl::recover_segment_generation(log_segment_id segment_id) {
@@ -1796,8 +1799,8 @@ size_t segment_manager::get_segment_size() const noexcept {
     return _impl->get_segment_size();
 }
 
-future<> segment_manager::discard_segments(segment_set& ss) {
-    return _impl->discard_segments(ss);
+future<> segment_manager::discard_segments(segment_set& ss, primary_index& index) {
+    return _impl->discard_segments(ss, index);
 }
 
 size_t segment_manager::get_memory_usage() const {

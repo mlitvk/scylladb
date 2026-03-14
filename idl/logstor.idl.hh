@@ -7,6 +7,7 @@
  */
 
 #include "idl/frozen_schema.idl.hh"
+#include "idl/token.idl.hh"
 #include "mutation/canonical_mutation.hh"
 
 namespace replica {
@@ -16,8 +17,12 @@ struct index_key {
     std::array<uint8_t, replica::logstor::index_key::digest_size> digest;
 };
 
+struct primary_index_key {
+    dht::decorated_key dk;
+};
+
 class log_record {
-    replica::logstor::index_key key;
+    replica::logstor::primary_index_key key;
     replica::logstor::record_generation generation;
     table_id table;
     canonical_mutation mut;

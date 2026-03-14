@@ -55,7 +55,7 @@ struct index_entry {
 };
 
 struct log_record {
-    index_key key;
+    primary_index_key key;
     record_generation generation;
     table_id table;
     canonical_mutation mut;
