@@ -12,7 +12,6 @@
 #include "mutation/canonical_mutation.hh"
 #include "replica/logstor/utils.hh"
 #include "dht/decorated_key.hh"
-#include "utils/hash.hh"
 
 namespace replica::logstor {
 
@@ -29,15 +28,6 @@ struct log_location {
     uint32_t size;
 
     bool operator==(const log_location& other) const noexcept = default;
-};
-
-struct index_key {
-    static constexpr size_t digest_size = 20;
-
-    std::array<uint8_t, digest_size> digest;
-
-    bool operator==(const index_key& other) const noexcept = default;
-    auto operator<=>(const index_key& other) const noexcept = default;
 };
 
 struct primary_index_key {
@@ -82,9 +72,9 @@ struct fmt::formatter<replica::logstor::log_location> : fmt::formatter<string_vi
 };
 
 template <>
-struct fmt::formatter<replica::logstor::index_key> : fmt::formatter<string_view> {
+struct fmt::formatter<replica::logstor::primary_index_key> : fmt::formatter<string_view> {
     template <typename FormatContext>
-    auto format(const replica::logstor::index_key& key, FormatContext& ctx) const {
-        return fmt::format_to(ctx.out(), "{:02x}", fmt::join(key.digest, ""));
+    auto format(const replica::logstor::primary_index_key& key, FormatContext& ctx) const {
+        return fmt::format_to(ctx.out(), "{}", key.dk);
     }
 };

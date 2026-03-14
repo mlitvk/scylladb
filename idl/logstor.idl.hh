@@ -13,10 +13,6 @@
 namespace replica {
 namespace logstor {
 
-struct index_key {
-    std::array<uint8_t, replica::logstor::index_key::digest_size> digest;
-};
-
 struct primary_index_key {
     dht::decorated_key dk;
 };
