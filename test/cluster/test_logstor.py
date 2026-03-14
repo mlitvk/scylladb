@@ -84,6 +84,34 @@ async def test_basic_write_and_read(manager: ManagerClient):
         assert rows[0].v == {'a': 'apple', 'b': 'banana', 'c': 'cherry'}
 
 @pytest.mark.asyncio
+async def test_range_read(manager: ManagerClient):
+    cmdline = ['--logger-log-level', 'logstor=debug']
+    cfg = {'enable_kv_storage': True, 'experimental_features': ['kv-storage']}
+    await manager.servers_add(1, cmdline=cmdline, config=cfg)
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v int) WITH kv_storage = true")
+        for i in range(10):
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, v) VALUES ({i}, {i*10})")
+
+        # test reading all rows
+        rows = await cql.run_async(f"SELECT pk, v, token(pk) AS tok FROM {ks}.test")
+        assert len(rows) == 10
+        assert sorted([row.pk for row in rows]) == list(range(10))
+        for row in rows:
+            assert row.v == row.pk * 10
+
+        # assert the rows are sorted by token
+        tokens = [row.tok for row in rows]
+        assert tokens == sorted(tokens)
+
+        # read rows by a token range
+        rows = await cql.run_async(f"SELECT pk, v, token(pk) AS tok FROM {ks}.test WHERE token(pk) >= {tokens[2]} AND token(pk) < {tokens[5]}")
+        assert len(rows) == 3
+        assert [row.tok for row in rows] == tokens[2:5]
+
+@pytest.mark.asyncio
 async def test_parallel_writes(manager: ManagerClient):
     cmdline = ['--logger-log-level', 'logstor=debug']
     cfg = {'enable_kv_storage': True, 'experimental_features': ['kv-storage']}

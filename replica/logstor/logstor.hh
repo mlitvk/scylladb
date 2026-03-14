@@ -68,10 +68,10 @@ public:
     const compaction_manager& get_compaction_manager() const noexcept;
 
     /// Create a mutation reader for a specific key
-    mutation_reader make_reader_for_key(schema_ptr schema,
+    mutation_reader make_reader(schema_ptr schema,
                                        const primary_index& index,
                                        reader_permit permit,
-                                       const dht::decorated_key& key,
+                                       const dht::partition_range& pr,
                                        const query::partition_slice& slice,
                                        tracing::trace_state_ptr trace_state = nullptr);
 

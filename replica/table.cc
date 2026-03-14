@@ -225,12 +225,7 @@ table::make_logstor_mutation_reader(schema_ptr s,
                                    tracing::trace_state_ptr trace_state,
                                    streamed_mutation::forwarding fwd,
                                    mutation_reader::forwarding fwd_mr) const {
-    if (pr.is_singular() && pr.start()->value().has_key()) {
-        const dht::decorated_key& key = pr.start()->value().as_decorated_key();
-        return _logstor->make_reader_for_key(std::move(s), logstor_index(), std::move(permit), key, slice, std::move(trace_state));
-    } else {
-        throw std::runtime_error("Range queries over key-value storage are not supported");
-    }
+    return _logstor->make_reader(std::move(s), logstor_index(), std::move(permit), pr, slice, std::move(trace_state));
 }
 
 mutation_reader

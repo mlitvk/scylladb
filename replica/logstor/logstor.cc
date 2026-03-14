@@ -147,113 +147,146 @@ const compaction_manager& logstor::get_compaction_manager() const noexcept {
     return _segment_manager.get_compaction_manager();
 }
 
-mutation_reader logstor::make_reader_for_key(schema_ptr schema,
+mutation_reader logstor::make_reader(schema_ptr schema,
                                             const primary_index& index,
                                             reader_permit permit,
-                                            const dht::decorated_key& key,
+                                            const dht::partition_range& pr,
                                             const query::partition_slice& slice,
                                             tracing::trace_state_ptr trace_state) {
 
-    // Create a simple reader that reads the mutation and delegates to the existing infrastructure
-    class single_key_reader : public mutation_reader::impl {
-    private:
+    class logstor_range_reader : public mutation_reader::impl {
         logstor* _logstor;
         const primary_index& _index;
-        dht::decorated_key _key;
+        dht::partition_range _pr;
         query::partition_slice _slice;
         tracing::trace_state_ptr _trace_state;
-        mutation_reader_opt _delegate_reader;
+        std::optional<dht::decorated_key> _last_key; // owns the key, safe across yields
+        mutation_reader_opt _current_partition_reader;
+        dht::ring_position_comparator _cmp;
 
-    public:
-        single_key_reader(schema_ptr schema,
-                         const primary_index& index,
-                         reader_permit permit,
-                         logstor* logstor,
-                         dht::decorated_key key,
-                         query::partition_slice slice,
-                         tracing::trace_state_ptr trace_state)
-            : impl(std::move(schema), std::move(permit))
-            , _logstor(logstor)
-            , _index(index)
-            , _key(std::move(key))
-            , _slice(std::move(slice))
-            , _trace_state(std::move(trace_state)) {
+        // Finds the next iterator to process, safe to call after any co_await
+        primary_index::partitions_type::const_iterator find_next() const {
+            auto it = _last_key
+                ? _index.upper_bound(*_last_key)                        // strictly after last key
+                : position_at_range_start();                            // initial positioning
+            // If start was exclusive and we haven't yet seen a key
+            return it;
         }
 
-        virtual future<> fill_buffer() override {
-            if (_end_of_stream) {
-                co_return;
+        primary_index::partitions_type::const_iterator position_at_range_start() const {
+            if (!_pr.start()) {
+                return _index.begin();
             }
+            auto it = _index.lower_bound(_pr.start()->value());
+            if (!_pr.start()->is_inclusive() && it != _index.end()) {
+                if (_cmp(it->key(), _pr.start()->value()) == 0) {
+                    ++it;
+                }
+            }
+            return it;
+        }
 
-            // Create delegate reader if not already created
-            if (!_delegate_reader) {
-                // Mark as awaiting I/O during disk read
-                auto await_guard = reader_permit::awaits_guard(_permit);
+        bool exceeds_range_end(const primary_index_entry& e) const {
+            if (!_pr.end()) return false;
+            auto c = _cmp(e.key(), _pr.end()->value());
+            return _pr.end()->is_inclusive() ? c > 0 : c >= 0;
+        }
 
-                auto cmut = co_await _logstor->read(*_schema, _index, _key);
+    public:
+        logstor_range_reader(schema_ptr s, const primary_index& idx, reader_permit p,
+                    logstor* ls, dht::partition_range pr,
+                    query::partition_slice slice, tracing::trace_state_ptr ts)
+            : impl(std::move(s), std::move(p))
+            , _logstor(ls), _index(idx), _pr(std::move(pr))
+            , _slice(std::move(slice)), _trace_state(std::move(ts))
+            , _cmp(*_schema)
+        {}
 
-                if (!cmut.has_value()) {
-                    // Key not found - end of stream
-                    _end_of_stream = true;
-                    co_return;
+        virtual future<> fill_buffer() override {
+            while (!is_buffer_full() && !_end_of_stream) {
+                // Drain current partition's reader first
+                if (_current_partition_reader) {
+                    co_await _current_partition_reader->fill_buffer();
+                    _current_partition_reader->move_buffer_content_to(*this);
+                    if (!_current_partition_reader->is_end_of_stream()) {
+                        continue;
+                    }
+                    co_await _current_partition_reader->close();
+                    _current_partition_reader = std::nullopt;
+                    // _last_key was already set when we opened the reader
                 }
 
-                tracing::trace(_trace_state, "Retrieved mutation for key {} from key-value storage", _key);
+                // Find next key in range (safe after co_await since we use _last_key)
+                auto it = find_next();
+                if (it == _index.end() || exceeds_range_end(*it)) {
+                    _end_of_stream = true;
+                    break;
+                }
 
-                _delegate_reader = make_mutation_reader_from_mutations(
-                    _schema,
-                    _permit,
-                    cmut->to_mutation(_schema),
-                    _slice,
-                    streamed_mutation::forwarding::no
+                // Snapshot the key before yielding
+                auto current_key = it->key();
+
+                auto guard = reader_permit::awaits_guard(_permit);
+                auto cmut = co_await _logstor->read(*_schema, _index, current_key);
+
+                _last_key = current_key; // mark as visited even if not found (tombstoned)
+
+                if (!cmut) {
+                    continue; // key was removed between index lookup and read
+                }
+
+                tracing::trace(_trace_state, "logstor_range_reader: fetched key {}", current_key);
+
+                _current_partition_reader = make_mutation_reader_from_mutations(
+                    _schema, _permit, cmut->to_mutation(_schema),
+                    _slice, streamed_mutation::forwarding::no
                 );
             }
-
-            // Delegate to the mutation reader
-            co_await _delegate_reader->fill_buffer();
-            _delegate_reader->move_buffer_content_to(*this);
-            _end_of_stream = _delegate_reader->is_end_of_stream();
         }
 
         virtual future<> next_partition() override {
             clear_buffer_to_next_partition();
-            _end_of_stream = true;
+            if (!is_buffer_empty()) return make_ready_future<>();
+            _end_of_stream = false;
+            if (_current_partition_reader) {
+                auto fut = _current_partition_reader->close();
+                _current_partition_reader = std::nullopt;
+                return fut;
+            }
             return make_ready_future<>();
         }
 
         virtual future<> fast_forward_to(const dht::partition_range& pr) override {
-            // Single key reader doesn't support range forwarding beyond the current key
-            if (!pr.contains(_key, dht::ring_position_comparator(*_schema))) {
-                _end_of_stream = true;
+            clear_buffer();
+            _end_of_stream = false;
+            _pr = pr;
+            _last_key = std::nullopt;      // re-position from new range start
+            if (_current_partition_reader) {
+                auto fut = _current_partition_reader->close();
+                _current_partition_reader = std::nullopt;
+                return fut;
             }
             return make_ready_future<>();
         }
 
         virtual future<> fast_forward_to(position_range pr) override {
-            // Delegate position forwarding to the underlying reader if it exists
-            if (_delegate_reader) {
+            if (_current_partition_reader) {
                 clear_buffer();
-                return _delegate_reader->fast_forward_to(std::move(pr));
+                return _current_partition_reader->fast_forward_to(std::move(pr));
             }
             return make_ready_future<>();
         }
 
         virtual future<> close() noexcept override {
-            if (_delegate_reader) {
-                return _delegate_reader->close();
+            if (_current_partition_reader) {
+                return _current_partition_reader->close();
             }
             return make_ready_future<>();
         }
     };
 
-    return make_mutation_reader<single_key_reader>(
-        schema,
-        index,
-        std::move(permit),
-        this,
-        key,
-        slice,
-        std::move(trace_state)
+    return make_mutation_reader<logstor_range_reader>(
+        std::move(schema), index, std::move(permit), this, pr, slice, std::move(trace_state)
     );
 }
 
