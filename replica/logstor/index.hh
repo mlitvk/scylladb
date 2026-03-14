@@ -63,6 +63,10 @@ public:
         , _schema(std::move(schema))
         {}
 
+    void set_schema(schema_ptr s) {
+        _schema = std::move(s);
+    }
+
     std::optional<index_entry> get(const primary_index_key& key) const {
         auto it = _partitions.find(key.dk, dht::ring_position_comparator(*_schema));
         if (it != _partitions.end()) {

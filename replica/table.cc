@@ -4233,7 +4233,7 @@ void table::mark_ready_for_writes(db::commitlog* cl) {
     _readonly = false;
 }
 
-void table::init_kv_storage(logstor::logstor* ls) {
+void table::init_logstor(logstor::logstor* ls) {
     _logstor = ls;
     _logstor_index = std::make_unique<logstor::primary_index>(_schema);
 }
@@ -4261,6 +4261,9 @@ void table::set_schema(schema_ptr s) {
     _cache.set_schema(s);
     if (_counter_cell_locks) {
         _counter_cell_locks->set_schema(s);
+    }
+    if (_logstor_index) {
+        _logstor_index->set_schema(s);
     }
     _schema = std::move(s);
 

@@ -836,7 +836,7 @@ public:
     // to issue disk operations safely.
     void mark_ready_for_writes(db::commitlog* cl);
 
-    void init_kv_storage(logstor::logstor* ls);
+    void init_logstor(logstor::logstor* ls);
 
     bool uses_kv_storage() const {
         return _logstor != nullptr;
