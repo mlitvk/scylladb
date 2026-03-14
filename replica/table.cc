@@ -4491,7 +4491,7 @@ future<> table::apply(const mutation& m, db::rp_handle&& h, db::timeout_clock::t
     auto holder = cg.async_gate().hold();
 
     if (_logstor) [[unlikely]] {
-        return _logstor->write(cg, m, std::move(holder));
+        return _logstor->write(m, cg, std::move(holder));
     }
 
     return dirty_memory_region_group().run_when_memory_available([this, &m, h = std::move(h), &cg, holder = std::move(holder)] () mutable {
@@ -4510,7 +4510,7 @@ future<> table::apply(const frozen_mutation& m, schema_ptr m_schema, db::rp_hand
     auto holder = cg.async_gate().hold();
 
     if (_logstor) [[unlikely]] {
-        return _logstor->write(cg, m.unfreeze(m_schema), std::move(holder));
+        return _logstor->write(m.unfreeze(m_schema), cg, std::move(holder));
     }
 
     return dirty_memory_region_group().run_when_memory_available([this, &m, m_schema = std::move(m_schema), h = std::move(h), &cg, holder = std::move(holder)]() mutable {

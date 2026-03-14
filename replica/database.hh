@@ -599,6 +599,8 @@ private:
     bool _is_bootstrap_or_replace = false;
     sstables::shared_sstable make_sstable(sstables::sstable_state state);
 
+    logstor::primary_index _logstor_index;
+
 public:
     void on_flush_timer();
     void deregister_metrics();

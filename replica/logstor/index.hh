@@ -7,8 +7,11 @@
  */
 #pragma once
 
+#include "dht/decorated_key.hh"
+#include "dht/ring_position.hh"
 #include "types.hh"
 #include "utils/bptree.hh"
+#include "utils/double-decker.hh"
 #include "utils/phased_barrier.hh"
 
 namespace replica::logstor {
@@ -17,6 +20,41 @@ struct index_key_less {
     bool operator()(const index_key& a, const index_key& b) const noexcept {
         return a < b;
     }
+};
+
+class primary_index_entry {
+    dht::decorated_key _key;
+    index_entry _e;
+    struct {
+        bool _head : 1;
+        bool _tail : 1;
+        bool _train : 1;
+    } _flags{};
+public:
+    bool is_head() const noexcept { return _flags._head; }
+    void set_head(bool v) noexcept { _flags._head = v; }
+    bool is_tail() const noexcept { return _flags._tail; }
+    void set_tail(bool v) noexcept { _flags._tail = v; }
+    bool with_train() const noexcept { return _flags._train; }
+    void set_train(bool v) noexcept { _flags._train = v; }
+
+    friend class primary_index;
+
+    friend dht::ring_position ring_position_view_to_compare(const primary_index_entry& e) { return e._key; }
+};
+
+class primary_index final {
+public:
+    using partitions_type = double_decker<int64_t, primary_index_entry,
+                            dht::raw_token_less_comparator, dht::ring_position_comparator,
+                            16, bplus::key_search::linear>;
+private:
+    partitions_type partitions;
+
+public:
+    primary_index()
+        : partitions(dht::raw_token_less_comparator{})
+        {}
 };
 
 class log_index_bucket {

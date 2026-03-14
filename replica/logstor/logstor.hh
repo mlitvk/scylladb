@@ -59,7 +59,7 @@ public:
 
     static index_key calculate_key(const schema&, const dht::decorated_key&);
 
-    future<> write(compaction_group&, const mutation&, seastar::gate::holder cg_holder);
+    future<> write(const mutation&, compaction_group&, seastar::gate::holder cg_holder);
 
     future<std::optional<log_record>> read(index_key);
 

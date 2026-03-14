@@ -11,6 +11,7 @@
 #include <fmt/format.h>
 #include "mutation/canonical_mutation.hh"
 #include "replica/logstor/utils.hh"
+#include "dht/decorated_key.hh"
 #include "utils/hash.hh"
 
 namespace replica::logstor {
@@ -37,6 +38,10 @@ struct index_key {
 
     bool operator==(const index_key& other) const noexcept = default;
     auto operator<=>(const index_key& other) const noexcept = default;
+};
+
+struct primary_index_key {
+    dht::decorated_key dk;
 };
 
 using record_generation = generation_base<uint16_t>;

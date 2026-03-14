@@ -61,7 +61,7 @@ size_t logstor::get_memory_usage() const {
     return _index.get_memory_usage() + _segment_manager.get_memory_usage();
 }
 
-future<> logstor::write(compaction_group& cg, const mutation& m, seastar::gate::holder cg_holder) {
+future<> logstor::write(const mutation& m, compaction_group& cg, seastar::gate::holder cg_holder) {
     auto key = calculate_key(*m.schema(), m.decorated_key());
     table_id table = m.schema()->id();
 
