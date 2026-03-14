@@ -35,7 +35,6 @@ struct logstor_config {
 
 class logstor {
 
-    log_index _index;
     segment_manager _segment_manager;
     buffered_writer _write_buffer;
 
@@ -51,15 +50,10 @@ public:
     future<> start();
     future<> stop();
 
-    static void init_crypto();
-    static void free_crypto();
-
     void enable_auto_compaction();
     future<> disable_auto_compaction();
 
     size_t get_memory_usage() const;
-
-    static index_key calculate_key(const schema&, const dht::decorated_key&);
 
     future<> write(const mutation&, compaction_group&, seastar::gate::holder cg_holder);
 

@@ -66,7 +66,7 @@ private:
 public:
     static constexpr size_t block_alignment = 4096;
 
-    explicit segment_manager(segment_manager_config config, log_index&);
+    explicit segment_manager(segment_manager_config config);
     ~segment_manager();
 
     segment_manager(const segment_manager&) = delete;

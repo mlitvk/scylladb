@@ -359,7 +359,6 @@ public:
 
 private:
     segment_manager_impl& _sm;
-    log_index& _index;
     compaction_config _cfg;
 
     seastar::gate _async_gate;
@@ -392,9 +391,8 @@ private:
     absl::flat_hash_map<compaction_group*, std::unique_ptr<group_compaction_state>> _groups;
 
 public:
-    compaction_manager_impl(segment_manager_impl& sm, log_index& index, compaction_config cfg)
+    compaction_manager_impl(segment_manager_impl& sm, compaction_config cfg)
         : _sm(sm)
-        , _index(index)
         , _cfg(std::move(cfg))
         , _adjust_shares_timer(default_scheduling_group(), [this] { adjust_shares(); })
     {}
@@ -571,7 +569,6 @@ class segment_manager_impl {
         uint64_t separator_data_bytes_written{0};
     };
 
-    log_index& _index;
     file_manager _file_mgr;
     compaction_manager_impl _compaction_mgr;
 
@@ -612,7 +609,7 @@ class segment_manager_impl {
 public:
     static constexpr size_t block_alignment = segment_manager::block_alignment;
 
-    explicit segment_manager_impl(segment_manager_config, log_index&);
+    explicit segment_manager_impl(segment_manager_config);
 
     segment_manager_impl(const segment_manager_impl&) = delete;
     segment_manager_impl& operator=(const segment_manager_impl&) = delete;
@@ -779,10 +776,9 @@ private:
     friend class compaction_manager_impl;
 };
 
-segment_manager_impl::segment_manager_impl(segment_manager_config config, log_index& index)
-    : _index(index)
-    , _file_mgr(config)
-    , _compaction_mgr(*this, index, compaction_manager_impl::compaction_config{
+segment_manager_impl::segment_manager_impl(segment_manager_config config)
+    : _file_mgr(config)
+    , _compaction_mgr(*this, compaction_manager_impl::compaction_config{
             .compaction_enabled = config.compaction_enabled,
             .max_segments_per_compaction = config.max_segments_per_compaction,
             .compaction_sg = config.compaction_sg,
@@ -1489,7 +1485,7 @@ future<> compaction_manager_impl::compact_segments(compaction_group& cg, std::ve
                        records_rewritten, records_skipped, segments.size(), cb.flush_count);
 
     // wait for read operations that use the old locations
-    co_await _index.await_pending_reads();
+    //co_await index.await_pending_reads();
 
     // Free the compacted segments
     auto& ss = cg.logstor_segments();
@@ -1571,7 +1567,7 @@ future<> compaction_manager_impl::flush_separator_buffer(separator_buffer buf, c
     _sm._available_separator_buffers.push_back(std::move(wb));
 
     // wait for read operations that use the old locations before freeing the old segments
-    co_await _index.await_pending_reads();
+    //co_await index.await_pending_reads();
 
     // the separator buffer is destroyed and frees the segment if it's the last holder
     buf.flushed = true;
@@ -1635,10 +1631,12 @@ future<> segment_manager_impl::do_recovery() {
     // go over the index and mark all segments that have live data as used.
     size_t allocated_segment_count = next_file_id * _segments_per_file;
     utils::dynamic_bitset used_segments(allocated_segment_count);
+    /*
     for (const auto& entry : _index) {
         used_segments.set(entry.location.segment.value);
         co_await coroutine::maybe_yield();
     }
+        */
 
     // put used segments in the histogram, and put the rest in the free list.
     size_t free_segment_count = 0;
@@ -1736,8 +1734,8 @@ future<std::optional<segment_generation>> segment_manager_impl::recover_segment_
 
 // segment_manager wrapper
 
-segment_manager::segment_manager(segment_manager_config config, log_index& index)
-    : _impl(std::make_unique<segment_manager_impl>(std::move(config), index))
+segment_manager::segment_manager(segment_manager_config config)
+    : _impl(std::make_unique<segment_manager_impl>(std::move(config)))
 { }
 
 segment_manager::~segment_manager() = default;

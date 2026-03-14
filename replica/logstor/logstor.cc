@@ -17,20 +17,17 @@
 #include <openssl/ripemd.h>
 #include <openssl/evp.h>
 
-namespace replica {
-namespace logstor {
+namespace replica::logstor {
 
 seastar::logger logstor_logger("logstor");
 
 logstor::logstor(logstor_config config)
-    : _segment_manager(config.segment_manager_cfg, _index)
+    : _segment_manager(config.segment_manager_cfg)
     , _write_buffer(_segment_manager, config.flush_sg) {
 }
 
 future<> logstor::start() {
     logstor_logger.info("Starting logstor");
-
-    init_crypto();
 
     co_await _segment_manager.start();
     co_await _write_buffer.start();
@@ -43,8 +40,6 @@ future<> logstor::stop() {
 
     co_await _write_buffer.stop();
     co_await _segment_manager.stop();
-
-    free_crypto();
 
     logstor_logger.info("logstor stopped");
 }
@@ -266,61 +261,4 @@ void logstor::set_trigger_compaction_hook(std::function<void()> fn) {
     _segment_manager.set_trigger_compaction_hook(std::move(fn));
 }
 
-// Cache RIPEMD-160 algorithm descriptor and context
-namespace {
-thread_local EVP_MD* cached_ripemd160_md = nullptr;
-thread_local EVP_MD_CTX* cached_ripemd160_ctx = nullptr;
-}
-
-void logstor::init_crypto() {
-    cached_ripemd160_md = EVP_MD_fetch(nullptr, "RIPEMD160", nullptr);
-    if (!cached_ripemd160_md) {
-        throw std::runtime_error("Failed to fetch RIPEMD160 algorithm");
-    }
-
-    cached_ripemd160_ctx = EVP_MD_CTX_new();
-    if (!cached_ripemd160_ctx) {
-        throw std::runtime_error("Failed to create RIPEMD160 context");
-    }
-}
-
-void logstor::free_crypto() {
-    if (cached_ripemd160_ctx) {
-        EVP_MD_CTX_free(cached_ripemd160_ctx);
-        cached_ripemd160_ctx = nullptr;
-    }
-    if (cached_ripemd160_md) {
-        EVP_MD_free(cached_ripemd160_md);
-        cached_ripemd160_md = nullptr;
-    }
-}
-
-index_key logstor::calculate_key(const schema& s, const dht::decorated_key& key) {
-    // hash of (ks name, table name, partition key)
-
-    constexpr char separator = ':';
-
-    EVP_MD_CTX* ctx = cached_ripemd160_ctx;
-    EVP_DigestInit_ex(ctx, cached_ripemd160_md, nullptr);
-
-    auto ks_bytes = to_bytes_view(s.ks_name());
-    EVP_DigestUpdate(ctx, ks_bytes.data(), ks_bytes.size());
-    EVP_DigestUpdate(ctx, &separator, 1);
-
-    auto cf_bytes = to_bytes_view(s.cf_name());
-    EVP_DigestUpdate(ctx, cf_bytes.data(), cf_bytes.size());
-    EVP_DigestUpdate(ctx, &separator, 1);
-
-    managed_bytes_view key_view(key.key());
-    for (bytes_view frag : fragment_range(key_view)) {
-        EVP_DigestUpdate(ctx, frag.data(), frag.size());
-    }
-
-    index_key result;
-    EVP_DigestFinal_ex(ctx, result.digest.data(), nullptr);
-
-    return result;
-}
-
-}
 }
