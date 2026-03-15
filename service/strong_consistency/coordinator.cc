@@ -10,6 +10,7 @@
 #include "db/consistency_level_type.hh"
 #include "exceptions/exceptions.hh"
 #include "raft/raft.hh"
+#include "locator/tablets.hh"
 #include "schema/schema.hh"
 #include "replica/database.hh"
 #include "locator/tablet_replication_strategy.hh"
@@ -49,12 +50,36 @@ struct read_timeout : public exceptions::read_timeout_exception {
     {}
 };
 
-static const locator::tablet_replica* find_replica(const locator::tablet_info& tinfo, locator::host_id id) {
-    const auto it = std::ranges::find_if(tinfo.replicas,
+static const locator::tablet_replica* find_replica(const locator::tablet_replica_set& replicas, locator::host_id id) {
+    const auto it = std::ranges::find_if(replicas,
         [&] (const locator::tablet_replica& r) {
             return r.host == id;
         });
-    return it == tinfo.replicas.end() ? nullptr : &*it;
+    return it == replicas.end() ? nullptr : &*it;
+}
+
+static locator::tablet_replica_set get_normal_tablet_replicas(const locator::tablet_info& tinfo, const locator::tablet_transition_info* trinfo) {
+    if (!trinfo) {
+        return tinfo.replicas;
+    }
+    switch (trinfo->writes) {
+        case locator::write_replica_set_selector::previous:
+        case locator::write_replica_set_selector::both:
+            return tinfo.replicas;
+        case locator::write_replica_set_selector::next:
+            return trinfo->next;
+    }
+}
+
+static locator::tablet_replica_set get_redirect_tablet_replicas(const locator::tablet_info& tinfo, const locator::tablet_transition_info* trinfo) {
+    if (!trinfo) {
+        return tinfo.replicas;
+    }
+    auto replicas = tinfo.replicas;
+    if (trinfo->pending_replica) {
+        replicas.push_back(*trinfo->pending_replica);
+    }
+    return replicas;
 }
 
 // Subscribe target to sources and return an array of the corresponding
@@ -90,7 +115,7 @@ struct coordinator::operation_ctx {
     raft_server raft_server;
     locator::tablet_id tablet_id;
     const locator::tablet_raft_info& raft_info;
-    const locator::tablet_info& tablet_info;
+    locator::tablet_replica_set redirect_replicas;
 };
 
 // Select closest replica from a tablet replica set, preferring replicas in same rack
@@ -142,10 +167,13 @@ auto coordinator::create_operation_ctx(const schema& schema, const dht::token& t
     const auto& tablet_map = erm->get_token_metadata().tablets().get_tablet_map(schema.id());
     const auto tablet_id = tablet_map.get_tablet_id(token);
     const auto& tablet_info = tablet_map.get_tablet_info(tablet_id);
+    const auto* trinfo = tablet_map.get_tablet_transition_info(tablet_id);
+    auto normal_replicas = get_normal_tablet_replicas(tablet_info, trinfo);
+    auto redirect_replicas = get_redirect_tablet_replicas(tablet_info, trinfo);
 
-    if (!contains(tablet_info.replicas, this_replica)) {
+    if (!contains(normal_replicas, this_replica)) {
         co_return need_redirect {
-            select_closest_replica(_gossiper, tablet_info.replicas, token,
+            select_closest_replica(_gossiper, normal_replicas, token,
                 erm->get_token_metadata().get_topology())
         };
     }
@@ -161,7 +189,7 @@ auto coordinator::create_operation_ctx(const schema& schema, const dht::token& t
         .raft_server = std::move(raft_server),
         .tablet_id = tablet_id,
         .raft_info = raft_info,
-        .tablet_info = tablet_info
+        .redirect_replicas = std::move(redirect_replicas)
     };
 }
 
@@ -195,12 +223,12 @@ future<value_or_redirect<>> coordinator::mutate(schema_ptr schema,
             auto disposition = op.raft_server.begin_mutate(aoe.abort_source());
             if (const auto* not_a_leader = get_if<raft::not_a_leader>(&disposition)) {
                 const auto leader_host_id = locator::host_id{not_a_leader->leader.uuid()};
-                const auto* target = find_replica(op.tablet_info, leader_host_id);
+                const auto* target = find_replica(op.redirect_replicas, leader_host_id);
                 if (!target) {
                     on_internal_error(logger,
                         ::format("table {}.{}, tablet {}, current leader {} is not a replica, replicas {}",
                             schema->ks_name(), schema->cf_name(), op.tablet_id,
-                            leader_host_id, op.tablet_info.replicas));
+                            leader_host_id, op.redirect_replicas));
                 }
                 co_return need_redirect{*target};
             }
