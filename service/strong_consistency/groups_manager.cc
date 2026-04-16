@@ -326,10 +326,15 @@ future<> groups_manager::leader_info_updater(raft_group_state& state, global_tab
 
 void groups_manager::maybe_update_group_configuration(raft_group_state& state, global_tablet_id tablet, raft::group_id id, const token_metadata& tm) {
     static constexpr auto config_change_timeout = std::chrono::seconds(60);
+    static constexpr auto config_change_read_barrier_timeout = std::chrono::minutes(5);
 
     const auto& tablet_map = tm.tablets().get_tablet_map(tablet.table);
     const auto& tinfo = tablet_map.get_tablet_info(tablet.tablet);
     const auto* trinfo = tablet_map.get_tablet_transition_info(tablet.tablet);
+    const auto this_replica = locator::tablet_replica{
+        .host = tm.get_my_id(),
+        .shard = this_shard_id(),
+    };
 
     if (!trinfo) {
         return;
@@ -337,6 +342,7 @@ void groups_manager::maybe_update_group_configuration(raft_group_state& state, g
 
     std::vector<raft::config_member> to_add;
     std::vector<raft::server_id> to_del;
+    bool do_read_barrier = false;
 
     switch (trinfo->stage) {
         case tablet_transition_stage::allow_write_both_read_old:
@@ -359,6 +365,12 @@ void groups_manager::maybe_update_group_configuration(raft_group_state& state, g
             if (trinfo->pending_replica) {
                 const auto pending_id = to_server_id(trinfo->pending_replica->host);
                 to_add.push_back(raft::config_member{raft::server_address{pending_id, {}}, raft::is_voter::yes});
+
+                // The pending replica executes a read barrier to wait for it catching up before it starts
+                // serving requests in use_new.
+                if (*trinfo->pending_replica == this_replica) {
+                    do_read_barrier = true;
+                }
             }
             break;
         case tablet_transition_stage::use_new:
@@ -393,22 +405,24 @@ void groups_manager::maybe_update_group_configuration(raft_group_state& state, g
             break;
     }
 
-    if (to_add.empty() && to_del.empty()) {
+    if (to_add.empty() && to_del.empty() && !do_read_barrier) {
         return;
     }
 
     logger.debug("maybe_update_group_configuration(): "
-        "starting config change fiber for raft group {} tablet {}: to_add={}, to_del={}",
-        id, tablet, to_add, to_del);
+        "starting config change fiber for raft group {} tablet {}: to_add={}, to_del={}, do_read_barrier={}",
+        id, tablet, to_add, to_del, do_read_barrier);
 
     // Every replica (not just the leader) runs this fiber. The fiber loops until the
     // configuration matches the expected state or the raft server stops:
     //  1. Recheck which changes are still needed against the current raft config.
-    //  2. If nothing remains, exit.
+    //  2. If nothing remains, stop reconciling config.
     //  3. Wait until a leader is known.
     //  4. If this replica is the leader, call modify_config with the pending changes.
     //  5. On transient errors loop back to step 1. On stopped_error/request_aborted exit.
-    state.server_control_op = futurize_invoke([this, &state, id, to_add = std::move(to_add), to_del = std::move(to_del), tablet](this auto) -> future<> {
+    // After the config is reconciled, the pending replica may still need to run a
+    // read barrier before we let the coordinator advance to use_new.
+    state.server_control_op = futurize_invoke([this, &state, id, to_add = std::move(to_add), to_del = std::move(to_del), do_read_barrier, tablet](this auto) -> future<> {
         locator::tablet_metadata_guard guard(_db.find_column_family(tablet.table), tablet);
         auto retry = exponential_backoff_retry(10ms, 10s);
         abort_on_expiry config_change_aoe(lowres_clock::now() + config_change_timeout);
@@ -440,7 +454,7 @@ void groups_manager::maybe_update_group_configuration(raft_group_state& state, g
             if (add.empty() && del.empty()) {
                 logger.debug("maybe_update_group_configuration(): raft group {} tablet {} config change completed, current config: {}",
                     id, tablet, current_config);
-                co_return;
+                break;
             }
 
             logger.debug("maybe_update_group_configuration(): raft group {} tablet {} pending config change: to_add={}, to_del={}, current config: {}",
@@ -487,7 +501,7 @@ void groups_manager::maybe_update_group_configuration(raft_group_state& state, g
             try {
                 logger.debug("maybe_update_group_configuration(): applying config change for group {} tablet {}: to_add={}, to_del={}", id, tablet, add, del);
                 co_await state.server->modify_config(std::move(add), std::move(del), &config_change_aoe.abort_source());
-                co_return;
+                break;
             } catch (const raft::stopped_error&) {
                 co_return;
             } catch (const raft::request_aborted&) {
@@ -500,6 +514,13 @@ void groups_manager::maybe_update_group_configuration(raft_group_state& state, g
 
             // Transient error: retry
             co_await retry.retry();
+        }
+
+        if (do_read_barrier) {
+            abort_on_expiry read_barrier_aoe(lowres_clock::now() + config_change_read_barrier_timeout);
+            co_await state.server->read_barrier(&read_barrier_aoe.abort_source());
+            logger.debug("maybe_update_group_configuration(): pending replica read barrier completed for raft group {} tablet {}",
+                id, tablet);
         }
     }).handle_exception([id, tablet] (std::exception_ptr ep) {
         logger.warn("maybe_update_group_configuration(): action failed for group {} tablet {}: {}",
