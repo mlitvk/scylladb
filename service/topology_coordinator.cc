@@ -1938,11 +1938,19 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
                     fmt::format("tablet draining failed: {}, moving {} to {}, due to {}", gid, replica, trinfo.pending_replica, reason));
             };
 
+            const auto cleanup_stage = tmap.has_raft_info()
+                    ? locator::tablet_transition_stage::raft_group_cleanup
+                    : locator::tablet_transition_stage::cleanup;
+
+            const auto cleanup_target_stage = tmap.has_raft_info()
+                    ? locator::tablet_transition_stage::raft_group_cleanup_target
+                    : locator::tablet_transition_stage::cleanup_target;
+
             switch (trinfo.stage) {
                 case locator::tablet_transition_stage::allow_write_both_read_old:
                     if (action_failed(tablet_state.barriers[trinfo.stage])) {
                         if (check_excluded_replicas()) {
-                            transition_to(locator::tablet_transition_stage::cleanup_target);
+                            transition_to(cleanup_target_stage);
                             break;
                         }
                     }
@@ -1963,7 +1971,7 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
                 case locator::tablet_transition_stage::write_both_read_old:
                     if (action_failed(tablet_state.barriers[trinfo.stage])) {
                         if (check_excluded_replicas()) {
-                            transition_to(locator::tablet_transition_stage::cleanup_target);
+                            transition_to(cleanup_target_stage);
                             break;
                         }
                     }
@@ -1974,15 +1982,15 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
                     }
                     break;
                 case locator::tablet_transition_stage::write_both_read_old_fallback_cleanup:
-                    transition_to_with_barrier(locator::tablet_transition_stage::cleanup_target);
+                    transition_to_with_barrier(cleanup_target_stage);
                     break;
                 case locator::tablet_transition_stage::rebuild_repair: {
                     if (action_failed(tablet_state.rebuild_repair)) {
                         bool fail = utils::get_local_injector().enter("rebuild_repair_stage_fail");
                         if (fail || check_excluded_replicas()) {
-                            rtlogger.debug("Will set tablet {} stage to {}", gid, locator::tablet_transition_stage::cleanup_target);
+                            rtlogger.debug("Will set tablet {} stage to {}", gid, cleanup_target_stage);
                             updates.emplace_back(get_mutation_builder()
-                                    .set_stage(last_token, locator::tablet_transition_stage::cleanup_target)
+                                    .set_stage(last_token, cleanup_target_stage)
                                     .del_session(last_token)
                                     .build());
                             break;
@@ -2057,9 +2065,9 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
                         }
 
                         if (rollback) {
-                            rtlogger.debug("Will set tablet {} stage to {}: {}", gid, locator::tablet_transition_stage::cleanup_target, *rollback);
+                            rtlogger.debug("Will set tablet {} stage to {}: {}", gid, cleanup_target_stage, *rollback);
                             updates.emplace_back(get_mutation_builder()
-                                .set_stage(last_token, locator::tablet_transition_stage::cleanup_target)
+                                .set_stage(last_token, cleanup_target_stage)
                                 .del_session(last_token)
                                 .build());
                             break;
@@ -2122,7 +2130,7 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
                             if (_feature_service.tablets_intermediate_fallback_cleanup) {
                                 transition_to(locator::tablet_transition_stage::write_both_read_old_fallback_cleanup);
                             } else {
-                                transition_to_with_barrier(locator::tablet_transition_stage::cleanup_target);
+                                transition_to_with_barrier(cleanup_target_stage);
                             }
                             break;
                         }
@@ -2131,6 +2139,9 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
                 }
                     break;
                 case locator::tablet_transition_stage::use_new:
+                    transition_to_with_barrier(cleanup_stage);
+                    break;
+                case locator::tablet_transition_stage::raft_group_cleanup:
                     transition_to_with_barrier(locator::tablet_transition_stage::cleanup);
                     break;
                 case locator::tablet_transition_stage::cleanup: {
@@ -2162,6 +2173,9 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
                         transition_to(locator::tablet_transition_stage::end_migration);
                     }
                 }
+                    break;
+                case locator::tablet_transition_stage::raft_group_cleanup_target:
+                    transition_to_with_barrier(locator::tablet_transition_stage::cleanup_target);
                     break;
                 case locator::tablet_transition_stage::cleanup_target:
                     if (do_barrier()) {

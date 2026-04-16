@@ -1016,7 +1016,11 @@ private:
                 return false;
             case tablet_transition_stage::use_new:
                 return false;
+            case tablet_transition_stage::raft_group_cleanup:
+                return false;
             case tablet_transition_stage::cleanup:
+                return false;
+            case tablet_transition_stage::raft_group_cleanup_target:
                 return false;
             case tablet_transition_stage::cleanup_target:
                 return false;
