@@ -20,6 +20,8 @@
 #include <ranges>
 #include <optional>
 #include <vector>
+#include <functional>
+#include <utility>
 
 namespace replica {
 class table;
@@ -183,6 +185,78 @@ private:
     explicit segment_ref(log_segment_id id, std::function<void()> on_last_release, std::function<void()> on_failure)
         : _state(make_lw_shared<state>(id, std::move(on_last_release), std::move(on_failure)))
     {}
+};
+
+class owned_write_buffer {
+    write_buffer* _buf = nullptr;
+    std::function<future<>(write_buffer*)> _release;
+    std::optional<seastar::semaphore_units<>> _pool_units;
+
+    void background_release() noexcept {
+        if (!_buf) {
+            return;
+        }
+        auto* buf = std::exchange(_buf, nullptr);
+        auto units = std::move(_pool_units);
+        if (!_release) {
+            return;
+        }
+        (void)futurize_invoke(_release, buf).finally([units = std::move(units)] {}).handle_exception([] (std::exception_ptr ep) {
+            logstor_logger.error("Failed to release write buffer: {}", ep);
+        });
+    }
+
+public:
+    owned_write_buffer() = default;
+
+    owned_write_buffer(write_buffer* buf, std::function<future<>(write_buffer*)> release,
+            std::optional<seastar::semaphore_units<>> pool_units = std::nullopt)
+        : _buf(buf), _release(std::move(release)), _pool_units(std::move(pool_units)) {}
+
+    ~owned_write_buffer() {
+        background_release();
+    }
+
+    owned_write_buffer(const owned_write_buffer&) = delete;
+    owned_write_buffer& operator=(const owned_write_buffer&) = delete;
+
+    owned_write_buffer(owned_write_buffer&& o) noexcept
+        : _buf(std::exchange(o._buf, nullptr)), _release(std::move(o._release)), _pool_units(std::move(o._pool_units)) {}
+
+    owned_write_buffer& operator=(owned_write_buffer&& o) noexcept {
+        if (this != &o) {
+            background_release();
+            _buf = std::exchange(o._buf, nullptr);
+            _release = std::move(o._release);
+            _pool_units = std::move(o._pool_units);
+        }
+        return *this;
+    }
+
+    future<> release() {
+        if (!_buf) {
+            co_return;
+        }
+        auto* buf = std::exchange(_buf, nullptr);
+        auto units = std::move(_pool_units);
+        co_await _release(buf).finally([units = std::move(units)] {});
+    }
+
+    write_buffer* get() const noexcept {
+        return _buf;
+    }
+
+    write_buffer& operator*() const noexcept {
+        return *_buf;
+    }
+
+    write_buffer* operator->() const noexcept {
+        return _buf;
+    }
+
+    explicit operator bool() const noexcept {
+        return _buf != nullptr;
+    }
 };
 
 struct separator_buffer {

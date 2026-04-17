@@ -408,8 +408,6 @@ private:
     logstor_compaction_controller _shares_controller;
     utils::observer<float> _compaction_static_shares_observer;
 
-    seastar::semaphore _compaction_sem{1};
-
     struct group_compaction_state {
         shared_future<> completion{make_ready_future<>()};
         abort_source as;
@@ -514,7 +512,7 @@ private:
     future<> run_auto_compaction();
     future<> do_compact(logstor_group&, abort_source&);
     future<> do_split_compaction(replica::table&, logstor_group&, mutation_writer::classify_by_token_group, abort_source&);
-    future<> compact_segments(logstor_group&, std::vector<log_segment_id>);
+    future<> compact_segments(logstor_group&, std::vector<log_segment_id>, abort_source&);
     group_compaction_state& get_group_state(logstor_group&);
     group_compaction_state* find_group_state(logstor_group&) noexcept;
 
@@ -532,7 +530,6 @@ future<> compaction_manager_impl::stop() {
     for (auto& [cg, state] : _groups) {
         state->as.request_abort();
     }
-    _compaction_sem.broken();
     co_await _async_gate.close();
     _groups.clear();
 }
@@ -631,6 +628,82 @@ public:
     }
 };
 
+// Fixed-size pool of write_buffer's.
+// The size of the pool is determined at construction and cannot be changed.
+class write_buffer_pool {
+    std::vector<write_buffer> _pool;
+    std::vector<write_buffer*> _available;
+    seastar::semaphore _available_sem{0};
+
+public:
+
+    write_buffer_pool(size_t count, size_t buffer_size, segment_kind kind)
+        : _available_sem(count) {
+        _available.reserve(count);
+        _pool.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            _pool.emplace_back(buffer_size, kind);
+            _available.push_back(&_pool.back());
+        }
+    }
+
+    future<owned_write_buffer> allocate(abort_source& as) {
+        auto units = co_await get_units(_available_sem, 1, as);
+        if (_available.empty()) {
+            throw std::runtime_error("No available write buffer after acquiring semaphore unit");
+        }
+        auto* wb = _available.back();
+        _available.pop_back();
+        co_return owned_write_buffer(wb, [this] (write_buffer* wb) -> future<> {
+            return release(wb);
+        }, std::move(units));
+    }
+
+    future<std::vector<owned_write_buffer>> allocate_many(size_t count, abort_source& as) {
+        if (count > _pool.size()) {
+            throw std::runtime_error(fmt::format("Cannot allocate {} write buffers from pool of size {}", count, _pool.size()));
+        }
+
+        auto units = co_await get_units(_available_sem, count, as);
+        if (_available.size() < count) {
+            throw std::runtime_error(fmt::format("Only {} write buffers available after acquiring {} semaphore units", _available.size(), count));
+        }
+
+        std::vector<owned_write_buffer> buffers;
+        buffers.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            auto* wb = _available.back();
+            _available.pop_back();
+            buffers.emplace_back(wb, [this] (write_buffer* wb) -> future<> {
+                return release(wb);
+            }, units.split(1));
+        }
+        co_return buffers;
+    }
+
+    future<> release(write_buffer* wb) {
+        co_await wb->close();
+        wb->reset();
+        _available.push_back(wb);
+    }
+
+    void break_waiters() {
+        _available_sem.broken();
+    }
+
+    size_t size() const noexcept {
+        return _pool.size();
+    }
+
+    size_t available_buffer_count() const noexcept {
+        return _available.size();
+    }
+
+    size_t used_buffer_count() const noexcept {
+        return _pool.size() - _available.size();
+    }
+};
+
 class segment_manager_impl {
 
     struct stats {
@@ -672,8 +745,9 @@ class segment_manager_impl {
     std::vector<segment_descriptor> _segment_descs;
     seastar::circular_buffer<log_segment_id> _free_segments;
 
-    std::vector<write_buffer> _compaction_buffer_pool;
-    std::vector<write_buffer*> _available_compaction_buffers;
+    static constexpr size_t max_compaction_parallelism = 8;
+
+    write_buffer_pool _compaction_buffer_pool;
 
     utils::phased_barrier _writes_phaser{"logstor_sm_writes"};
 
@@ -967,20 +1041,12 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
     , _max_segments((config.disk_size / config.file_size) * _segments_per_file)
     , _segment_pool(segment_pool_size, config.max_segments_per_compaction)
     , _segment_descs(_max_segments)
+    // Compaction concurrency is limited by buffer availability. Normal compaction
+    // uses one buffer; split compaction allocates two buffers.
+    , _compaction_buffer_pool(std::max(max_compaction_parallelism, 2ul), config.segment_size, segment_kind::full)
     {
 
     _free_segments.reserve(_max_segments);
-
-    // pre-allocate write buffers for compaction
-    // at most a single compaction/split running at a time
-    // and at most two buffers used at a time by split.
-    size_t compaction_buffer_count = 2;
-    _available_compaction_buffers.reserve(compaction_buffer_count);
-    _compaction_buffer_pool.reserve(compaction_buffer_count);
-    for (size_t i = 0; i < compaction_buffer_count; ++i) {
-        _compaction_buffer_pool.emplace_back(config.segment_size, segment_kind::full);
-        _available_compaction_buffers.push_back(&_compaction_buffer_pool.back());
-    }
 
     namespace sm = seastar::metrics;
 
@@ -1581,8 +1647,6 @@ future<std::vector<compaction_manager_impl::compaction_candidate>> compaction_ma
 }
 
 future<> compaction_manager_impl::do_compact(logstor_group& cg, abort_source& as) {
-    auto sem_units = co_await get_units(_compaction_sem, 1, as);
-
     if (as.abort_requested() || !_cfg.compaction_enabled) {
         co_return;
     }
@@ -1595,8 +1659,8 @@ future<> compaction_manager_impl::do_compact(logstor_group& cg, abort_source& as
 
     auto holder = _async_gate.hold();
 
-    co_await with_scheduling_group(_cfg.compaction_sg, [this, &cg, segments_for_compaction = std::move(segments_for_compaction)] mutable {
-        return compact_segments(cg, std::move(segments_for_compaction));
+    co_await with_scheduling_group(_cfg.compaction_sg, [this, &cg, &as, segments_for_compaction = std::move(segments_for_compaction)] mutable {
+        return compact_segments(cg, std::move(segments_for_compaction), as);
     });
 }
 
@@ -1606,7 +1670,7 @@ future<> compaction_manager_impl::do_compact(logstor_group& cg, abort_source& as
 // the buffer is flushed when the next record doesn't fit and on close().
 struct compaction_buffer {
     segment_manager_impl& sm;
-    write_buffer* buf = nullptr;
+    owned_write_buffer buf;
     logstor_group& cg;
     std::vector<future<>> pending_updates;
 
@@ -1616,28 +1680,15 @@ struct compaction_buffer {
         size_t records_skipped{0};
     } stats;
 
-    explicit compaction_buffer(segment_manager_impl& sm, logstor_group& cg)
-        : sm(sm), cg(cg)
-    {
-        if (sm._available_compaction_buffers.empty()) {
-            throw std::runtime_error("No available compaction buffers");
-        }
-        buf = sm._available_compaction_buffers.back();
-        sm._available_compaction_buffers.pop_back();
-    }
+    compaction_buffer(segment_manager_impl& sm, owned_write_buffer buf, logstor_group& cg)
+        : sm(sm)
+        , buf(std::move(buf))
+        , cg(cg)
+    {}
 
     compaction_buffer(compaction_buffer&& o) noexcept
-        : sm(o.sm), buf(std::exchange(o.buf, nullptr)), cg(o.cg)
+        : sm(o.sm), buf(std::move(o.buf)), cg(o.cg)
         , pending_updates(std::move(o.pending_updates)), stats(o.stats) {}
-
-    ~compaction_buffer() {
-        if (buf) {
-            (void)buf->close().then([sm = &this->sm, buf = this->buf] {
-                buf->reset();
-                sm->_available_compaction_buffers.push_back(buf);
-            });
-        }
-    }
 
     future<> flush() {
         if (buf->has_data()) {
@@ -1653,8 +1704,7 @@ struct compaction_buffer {
 
     future<> close() {
         co_await flush();
-        sm._available_compaction_buffers.push_back(buf);
-        buf = nullptr;
+        co_await buf.release();
     }
 
     // Rewrite a single live record into this buffer, updating the index atomically.
@@ -1687,10 +1737,10 @@ struct compaction_buffer {
     }
 };
 
-future<> compaction_manager_impl::compact_segments(logstor_group& cg, std::vector<log_segment_id> segments) {
+future<> compaction_manager_impl::compact_segments(logstor_group& cg, std::vector<log_segment_id> segments, abort_source& as) {
     logstor_logger.trace("Starting compaction of segments {} in compaction group {}", segments, cg.table_id());
 
-    compaction_buffer cb(_sm, cg);
+    compaction_buffer cb(_sm, co_await _sm._compaction_buffer_pool.allocate(as), cg);
 
     auto& index = cg.logstor_index();
 
@@ -1751,8 +1801,6 @@ future<> compaction_manager_impl::submit_split_compaction(replica::table& t, log
 future<> compaction_manager_impl::do_split_compaction(replica::table& t, logstor_group& src, mutation_writer::classify_by_token_group classifier, abort_source& as) {
     static constexpr size_t batch_size = 32;
 
-    auto sem_units = co_await get_units(_compaction_sem, 1, as);
-
     auto& src_segments = src.logstor_segments();
 
     // the src and target groups both share the table index
@@ -1801,7 +1849,11 @@ future<> compaction_manager_impl::do_split_compaction(replica::table& t, logstor
         // (one per target group). Both buffers write back into src; the next outer loop
         // iteration will fast-path the resulting single-group segments to the correct child group.
 
-        std::array<compaction_buffer, 2> bufs{compaction_buffer{_sm, src}, compaction_buffer{_sm, src}};
+        auto split_buffers = co_await _sm._compaction_buffer_pool.allocate_many(2, as);
+        std::array<compaction_buffer, 2> bufs{
+            compaction_buffer(_sm, std::move(split_buffers[0]), src),
+            compaction_buffer(_sm, std::move(split_buffers[1]), src),
+        };
 
         auto nonempty_segments = batch
                 | std::views::filter([this] (log_segment_id seg_id) {
