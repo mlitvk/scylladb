@@ -404,6 +404,61 @@ Invariants:
    on behalf of previous transitions can still run in the cluster, but they can have no side effects. This is ensured
    by the proper use of the topology guard mechanism (see the "Topology guards" section).
 
+## Strongly-consistent tablets
+
+For tablets belonging to a strongly-consistent table, the migration also updates the tablet's raft group membership so that it stays compatible with the replica set used by the current migration stage.
+
+These extra stages and preconditions apply only to strongly-consistent tables.
+
+State transition diagram for strongly-consistent tablet migration stages:
+
+```mermaid
+stateDiagram-v2
+    state if_state <<choice>>
+    [*] --> allow_write_both_read_old
+    allow_write_both_read_old --> write_both_read_old
+    write_both_read_old --> streaming
+    streaming --> write_both_read_new
+    write_both_read_new --> use_new
+    use_new --> raft_group_cleanup
+    raft_group_cleanup --> cleanup
+    cleanup --> end_migration
+    end_migration --> [*]
+    allow_write_both_read_old --> raft_group_cleanup_target: error
+    write_both_read_old --> raft_group_cleanup_target: error
+    streaming --> raft_group_cleanup_target: error
+    write_both_read_new --> if_state: error
+    if_state --> use_new: more new replicas
+    if_state --> raft_group_cleanup_target: more old replicas
+    raft_group_cleanup_target --> cleanup_target
+    cleanup_target --> revert_migration
+    revert_migration --> [*]
+```
+
+For strongly-consistent tables, the following additional preconditions hold:
+
+1. allow_write_both_read_old
+
+2. write_both_read_old
+
+    Precondition: the pending replica is a non-voter member of the tablet's raft group.
+
+3. streaming
+
+4. write_both_read_new
+
+5. use_new
+
+    Precondition: the pending replica is a voter member of the tablet's raft group and has completed a raft read barrier.
+
+6. raft_group_cleanup
+
+    Precondition: The leaving replica is a non-voter member of the tablet's raft group.
+
+7. cleanup
+
+    Precondition: the leaving replica is no longer a member of the tablet's raft group.
+
 # Tablet resize
 
 Each table has its resize metadata stored in group0.
