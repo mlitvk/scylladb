@@ -2596,6 +2596,11 @@ public:
                 continue;
             }
 
+            if (tmap.has_raft_info()) {
+                // tablet resizing is currently not supported for strongly consistent tables.
+                continue;
+            }
+
             // shard presence of a table across the cluster
             size_t shard_count = std::accumulate(tmap.tablets().begin(), tmap.tablets().end(), size_t(0),
                 [] (size_t shard_count, const locator::tablet_info& info) {
@@ -3152,6 +3157,12 @@ public:
 
         if (node_load.shard_count <= 1) {
             lblogger.debug("Node {} is balanced", host);
+            co_return plan;
+        }
+
+        if (_db.features().strongly_consistent_tables) {
+            // intranode migration is currently not supported for strongly consistent tables.
+            // for simplicity let's just disable intranode balancing for now when the feature is enabled.
             co_return plan;
         }
 
