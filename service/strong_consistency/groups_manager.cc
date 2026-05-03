@@ -342,6 +342,7 @@ void groups_manager::maybe_update_group_configuration(raft_group_state& state, g
 
     std::vector<raft::config_member> to_add;
     std::vector<raft::server_id> to_del;
+    bool do_stepdown = false;
     bool do_read_barrier = false;
 
     switch (trinfo->stage) {
@@ -374,6 +375,17 @@ void groups_manager::maybe_update_group_configuration(raft_group_state& state, g
             }
             break;
         case tablet_transition_stage::use_new:
+            // The leaving replica becomes a nonvoter and steps down as leader.
+            if (auto leaving = locator::get_leaving_replica(tinfo, *trinfo)) {
+                if (!locator::contains(trinfo->next, leaving->host)) {
+                    auto leaving_id = to_server_id(leaving->host);
+                    to_add.push_back(raft::config_member{raft::server_address{leaving_id, {}}, raft::is_voter::no});
+
+                    if (*leaving == this_replica) {
+                        do_stepdown = true;
+                    }
+                }
+            }
             break;
         case tablet_transition_stage::raft_group_cleanup:
             // Remove the leaving replica from the raft group.
@@ -422,7 +434,7 @@ void groups_manager::maybe_update_group_configuration(raft_group_state& state, g
     //  5. On transient errors loop back to step 1. On stopped_error/request_aborted exit.
     // After the config is reconciled, the pending replica may still need to run a
     // read barrier before we let the coordinator advance to use_new.
-    state.server_control_op = futurize_invoke([this, &state, id, to_add = std::move(to_add), to_del = std::move(to_del), do_read_barrier, tablet](this auto) -> future<> {
+    state.server_control_op = futurize_invoke([this, &state, id, to_add = std::move(to_add), to_del = std::move(to_del), do_stepdown, do_read_barrier, tablet](this auto) -> future<> {
         locator::tablet_metadata_guard guard(_db.find_column_family(tablet.table), tablet);
         auto retry = exponential_backoff_retry(10ms, 10s);
         abort_on_expiry config_change_aoe(lowres_clock::now() + config_change_timeout);
@@ -521,6 +533,11 @@ void groups_manager::maybe_update_group_configuration(raft_group_state& state, g
             co_await state.server->read_barrier(&read_barrier_aoe.abort_source());
             logger.debug("maybe_update_group_configuration(): pending replica read barrier completed for raft group {} tablet {}",
                 id, tablet);
+        }
+
+        if (do_stepdown && state.server->is_leader()) {
+            const auto stepdown_timeout_ticks = std::chrono::seconds(5) / raft_tick_interval;
+            co_await state.server->stepdown(raft::logical_clock::duration(stepdown_timeout_ticks));
         }
     }).handle_exception([id, tablet] (std::exception_ptr ep) {
         logger.warn("maybe_update_group_configuration(): action failed for group {} tablet {}: {}",
