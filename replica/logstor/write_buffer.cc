@@ -11,6 +11,7 @@
 #include "bytes_fwd.hh"
 #include "logstor.hh"
 #include "replica/logstor/types.hh"
+#include "replica/compaction_group.hh"
 #include <seastar/core/simple-stream.hh>
 #include <seastar/core/timed_out_error.hh>
 #include <seastar/core/with_scheduling_group.hh>
@@ -89,7 +90,7 @@ bool write_buffer::has_data() const noexcept {
     return offset_in_buffer() > header_size();
 }
 
-future<log_location_with_holder> write_buffer::write(log_record_writer writer, compaction_group* cg, seastar::gate::holder cg_holder) {
+future<log_location_with_holder> write_buffer::write(log_record_writer writer, write_target target) {
     const auto content_size = writer.size();
 
     if (!can_fit(content_size)) {
@@ -136,8 +137,7 @@ future<log_location_with_holder> write_buffer::write(log_record_writer writer, c
         _records_copy.push_back(record_in_buffer {
             .writer = std::move(writer),
             .loc = _written.get_shared_future().then(record_location),
-            .cg = cg,
-            .cg_holder = std::move(cg_holder)
+            .target = std::move(target)
         });
     }
 
@@ -291,7 +291,7 @@ future<> buffered_writer::stop() {
     logstor_logger.info("Write buffer stopped");
 }
 
-future<log_location_with_holder> buffered_writer::write(log_record record, db::timeout_clock::time_point timeout, compaction_group* cg, seastar::gate::holder cg_holder) {
+future<log_location_with_holder> buffered_writer::write(log_record record, db::timeout_clock::time_point timeout, write_target target) {
     auto holder = _async_gate.hold();
 
     log_record_writer writer(std::move(record));
@@ -327,7 +327,7 @@ future<log_location_with_holder> buffered_writer::write(log_record record, db::t
         }
     }
 
-    auto fut = head_buf().write(std::move(writer), cg, std::move(cg_holder));
+    auto fut = head_buf().write(std::move(writer), std::move(target));
 
     // Wake the consumer: there is now data at the tail.
     _tail_can_advance.broadcast();

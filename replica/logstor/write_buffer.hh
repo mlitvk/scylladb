@@ -31,6 +31,12 @@ class compaction_group;
 namespace logstor {
 
 class segment_manager;
+class logstor_group;
+
+struct write_target {
+    logstor_group* cg = nullptr;
+    seastar::gate::holder cg_holder;
+};
 
 // Writer for log records that handles serialization and size computation
 class log_record_writer {
@@ -174,8 +180,7 @@ private:
     struct record_in_buffer {
         log_record_writer writer;
         future<log_location> loc;
-        compaction_group* cg;
-        seastar::gate::holder cg_holder;
+        write_target target;
     };
 
     std::vector<record_in_buffer> _records_copy;
@@ -214,11 +219,7 @@ public:
     // Returns a future that will be resolved with the log location once flushed and a gate holder
     // that keeps the write buffer open. The gate should be held for index updates after the write
     // is done.
-    future<log_location_with_holder> write(log_record_writer, compaction_group*, seastar::gate::holder cg_holder);
-
-    future<log_location_with_holder> write(log_record_writer writer) {
-        return write(std::move(writer), nullptr, {});
-    }
+    future<log_location_with_holder> write(log_record_writer, write_target target = {});
 
     static size_t estimate_required_segments(size_t net_data_size, size_t record_count, size_t segment_size);
 
@@ -314,7 +315,7 @@ public:
     future<> start();
     future<> stop();
 
-    future<log_location_with_holder> write(log_record, db::timeout_clock::time_point timeout, compaction_group* cg = nullptr, seastar::gate::holder cg_holder = {});
+    future<log_location_with_holder> write(log_record, db::timeout_clock::time_point timeout, write_target target = {});
 
 private:
     // The flush consumer loop.
