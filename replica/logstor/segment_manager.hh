@@ -47,6 +47,7 @@ struct segment_manager_config {
     size_t segment_size = default_segment_size;
     size_t file_size = default_file_size;
     size_t disk_size;
+    bool format_on_startup = false;
     bool compaction_enabled = true;
     size_t max_segments_per_compaction = 8;
     uint32_t trigger_compaction_threshold_percent = 20;

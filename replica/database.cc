@@ -951,6 +951,7 @@ database::init_logstor() {
             .base_dir = std::filesystem::path(_cfg.logstor_directory()),
             .file_size = _cfg.logstor_file_size_in_mb() * 1024ull * 1024ull,
             .disk_size = _cfg.logstor_disk_size_in_mb() * 1024ull * 1024ull,
+            .format_on_startup = _cfg.logstor_format_on_startup(),
             .trigger_compaction_threshold_percent = _cfg.logstor_compaction_trigger_threshold_percent(),
             .compaction_soft_pressure_threshold_percent = _cfg.logstor_compaction_soft_pressure_threshold_percent(),
             .compaction_sg = _dbcfg.logstor_compaction_scheduling_group,
