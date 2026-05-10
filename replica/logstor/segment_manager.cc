@@ -7,11 +7,14 @@
  */
 #include "replica/logstor/segment_manager.hh"
 #include "replica/compaction_group.hh"
+#include "backlog_controller.hh"
 #include "replica/logstor/index.hh"
 #include "replica/logstor/logstor.hh"
 #include "replica/logstor/types.hh"
 #include "replica/logstor/compaction.hh"
 #include <absl/container/flat_hash_map.h>
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <linux/if_link.h>
 #include <seastar/core/file.hh>
@@ -31,6 +34,7 @@
 #include <seastar/core/circular_buffer.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
+#include <seastar/core/lowres_clock.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/condition-variable.hh>
 #include <string_view>
@@ -396,13 +400,8 @@ private:
         uint64_t separator_segments_freed{0};
     } _stats;
 
-    struct controller {
-        float _compaction_overhead{1.0}; // running average ratio
-
-        void update(size_t segment_write_count, size_t new_segments);
-    };
-    controller _controller;
-    timer<lowres_clock> _adjust_shares_timer;
+    compaction_controller _shares_controller;
+    utils::observer<float> _compaction_static_shares_observer;
 
     seastar::semaphore _separator_flush_sem{0};
     seastar::semaphore _compaction_sem{1};
@@ -424,7 +423,16 @@ public:
     compaction_manager_impl(segment_manager_impl& sm, compaction_config cfg)
         : _sm(sm)
         , _cfg(std::move(cfg))
-        , _adjust_shares_timer(default_scheduling_group(), [this] { adjust_shares(); })
+        , _shares_controller(
+                _cfg.compaction_sg,
+                _cfg.compaction_static_shares.get(),
+                std::nullopt,
+                std::chrono::milliseconds(250),
+                [this] { return current_backlog(); }
+            )
+        , _compaction_static_shares_observer(_cfg.compaction_static_shares.observe([this] (float new_shares) {
+            return _shares_controller.update_static_shares(new_shares);
+        }))
     {}
 
     future<> start();
@@ -435,6 +443,7 @@ public:
     }
 
     const stats& get_stats() const noexcept { return _stats; }
+    float current_backlog() const noexcept;
 
     separator_buffer allocate_separator_buffer() override;
     future<> flush_separator_buffer(separator_buffer buf, logstor_group&) override;
@@ -452,20 +461,9 @@ private:
     future<> do_compact(logstor_group&, abort_source&);
     future<> compact_segments(logstor_group&, std::vector<log_segment_id>);
 
-    void adjust_shares() {
-        if (auto static_shares = _cfg.compaction_static_shares.get(); static_shares != 0) {
-            _cfg.compaction_sg.set_shares(static_shares);
-        } else {
-            auto shares = std::max<float>(1000 * _controller._compaction_overhead, 1000);
-            _cfg.compaction_sg.set_shares(shares);
-        }
-    }
 };
 
 future<> compaction_manager_impl::start() {
-    if (_cfg.compaction_sg != default_scheduling_group()) {
-        _adjust_shares_timer.arm_periodic(std::chrono::milliseconds(50));
-    }
     co_return;
 }
 
@@ -473,7 +471,7 @@ future<> compaction_manager_impl::stop() {
     if (_async_gate.is_closed()) {
         co_return;
     }
-    _adjust_shares_timer.cancel();
+    co_await _shares_controller.shutdown();
     for (auto& [cg, state] : _groups) {
         state->as.request_abort();
     }
@@ -891,6 +889,17 @@ private:
     friend class segment_stream_sink_impl;
 };
 
+float compaction_manager_impl::current_backlog() const noexcept {
+    const auto available_segments = _sm.available_segment_count();
+    const auto soft_pressure_available_segments = static_cast<size_t>(std::ceil(_sm._max_segments * (std::min(_sm._cfg.compaction_soft_pressure_threshold_percent, uint32_t(100)) / 100.0f)));
+    if (available_segments >= soft_pressure_available_segments) {
+        return 0.0f;
+    }
+    return compaction_controller::normalization_factor
+            * float(soft_pressure_available_segments - available_segments)
+            / std::max<size_t>(1, soft_pressure_available_segments);
+}
+
 segment_manager_impl::segment_manager_impl(segment_manager_config config)
     : _file_mgr(config)
     , _compaction_mgr(*this, compaction_manager_impl::compaction_config{
@@ -966,6 +975,8 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
                        sm::description("Counts number of times the separator buffer has been flushed.")),
         sm::make_counter("separator_segments_freed", _compaction_mgr.get_stats().separator_segments_freed,
                        sm::description("Counts number of segments freed by the separator.")),
+        sm::make_gauge("compaction_controller_backlog", [this] { return _compaction_mgr.current_backlog(); },
+                       sm::description("Current normalized backlog used by the logstor compaction shares controller.")),
         sm::make_gauge("separator_buffers_in_use", [this]() { return _separator_buffer_pool.used_buffer_count(); },
                        sm::description("Current number of separator buffers in use.")),
         sm::make_gauge("separator_flow_control_delay", [this]() { return calculate_separator_delay().count(); },
@@ -1666,13 +1677,6 @@ future<> compaction_manager_impl::compact_segments(logstor_group& cg, std::vecto
     _stats.compaction_segments_freed += new_segments;
     _stats.compaction_records_rewritten += cb.stats.records_rewritten;
     _stats.compaction_records_skipped += cb.stats.records_skipped;
-
-    _controller.update(cb.stats.flush_count, new_segments);
-}
-
-void compaction_manager_impl::controller::update(size_t segment_write_count, size_t new_segments) {
-    float new_overhead = static_cast<float>(segment_write_count) / std::max<size_t>(1, new_segments);
-    _compaction_overhead = 0.8 * _compaction_overhead + 0.2 * new_overhead;
 }
 
 future<> compaction_manager_impl::split_compaction(replica::table& t, logstor_group& src, mutation_writer::classify_by_token_group classifier) {
