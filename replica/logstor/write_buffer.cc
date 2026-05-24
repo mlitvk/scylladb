@@ -7,6 +7,7 @@
  */
 #include "write_buffer.hh"
 #include "dht/token.hh"
+#include "seastar/coroutine/maybe_yield.hh"
 #include "segment_manager.hh"
 #include "bytes_fwd.hh"
 #include "logstor.hh"
@@ -295,12 +296,56 @@ buffered_writer::buffered_writer(segment_manager& sm, seastar::scheduling_group 
     }
 }
 
+bool buffered_writer::should_flush_tail() const noexcept {
+    if (!tail_buf().has_data()) {
+        return false;
+    }
+    return true;
+}
+
+bool buffered_writer::maybe_advance_head() noexcept {
+    if (ring_full() || !head_buf().has_data()) {
+        return false;
+    }
+    ++_head;
+    _tail_can_advance.signal();
+    return true;
+}
+
+std::optional<future<log_location_with_holder>> buffered_writer::append_to_head_buffer(log_record_writer& writer, write_target& target) {
+    if (!head_buf().can_fit(writer) && !maybe_advance_head()) {
+        return std::nullopt;
+    }
+
+    bool was_empty = !head_buf().has_data();
+    auto fut = head_buf().write(std::move(writer), std::move(target));
+    if (was_empty) {
+        _tail_can_advance.signal();
+    }
+    return fut;
+}
+
+future<> buffered_writer::drain_queued_writes() {
+    while (!_queued_writes.empty()) {
+        auto& next = _queued_writes.front();
+
+        if (!head_buf().can_fit(next.writer) && !maybe_advance_head()) {
+            break;
+        }
+
+        auto request = std::move(next);
+        _queued_writes.pop_front();
+
+        std::move(append_to_head_buffer(request.writer, request.target).value()).forward_to(std::move(request.pr));
+
+        co_await coroutine::maybe_yield();
+    }
+}
+
 future<> buffered_writer::start() {
     logstor_logger.info("Starting write buffer");
-    _consumer = with_gate(_async_gate, [this] {
-        return with_scheduling_group(_flush_sg, [this] {
-            return consumer_loop();
-        });
+    _consumer = with_scheduling_group(_flush_sg, [this] {
+        return consumer_loop();
     });
     co_return;
 }
@@ -313,8 +358,6 @@ future<> buffered_writer::stop() {
 
     // Wake the consumer so it can observe the closing gate and exit.
     _tail_can_advance.broadcast();
-    // Wake any writer blocked waiting for a free ring slot.
-    _head_can_advance.broadcast();
 
     co_await _async_gate.close();
     co_await std::move(_consumer);
@@ -327,72 +370,71 @@ future<log_location_with_holder> buffered_writer::write(log_record record, db::t
 
     log_record_writer writer(std::move(record));
 
-    auto check_timeout = [timeout] {
-        if (timeout != db::no_timeout && timeout <= db::timeout_clock::now()) {
-            throw timed_out_error{};
-        }
-    };
-
-    check_timeout();
+    if (timeout != db::no_timeout && timeout <= db::timeout_clock::now()) {
+        throw timed_out_error{};
+    }
 
     if (writer.size() > head_buf().max_record_size()) {
         throw std::runtime_error(fmt::format("Write size {} exceeds buffer size {}", writer.size(), head_buf().max_record_size()));
     }
 
-    // Wait until the head buffer can fit this write.
-    while (!head_buf().can_fit(writer)) {
-        // Capture the current head before waiting.  Multiple concurrent writers
-        // can all reach this point; only the first one to proceed actually
-        // advances _head — the rest see _head != current_head and simply
-        // re-check the (already advanced) head buffer.
-        auto current_head = _head;
-        while (ring_full() && !_async_gate.is_closed()) {
-            co_await _head_can_advance.wait();
-            check_timeout();
-        }
-        _async_gate.check();
-        if (_head == current_head) {
-            ++_head;
-            // Wake other writers that are also waiting for a new head buffer.
-            _head_can_advance.broadcast();
+    // fast path - if there are no queued writes and there is space in the current head buffer or the next, advance the
+    // head buffer if needed and write to it.
+    if (_queued_writes.empty()) {
+        if (auto fut = append_to_head_buffer(writer, target)) {
+            co_return co_await std::move(*fut);
         }
     }
 
-    auto fut = head_buf().write(std::move(writer), std::move(target));
+    // either there are queued writes or there is no space in the head buffer and ring is full - queue the write.
 
-    // Wake the consumer: there is now data at the tail.
-    _tail_can_advance.broadcast();
-
+    queued_write request(std::move(writer), std::move(target), timeout);
+    auto fut = request.pr.get_future();
+    _queued_writes.push_back(std::move(request), timeout);
+    _tail_can_advance.signal();
     co_return co_await std::move(fut);
 }
 
 future<> buffered_writer::consumer_loop() {
     while (true) {
-        // Wait for something to flush at the tail.
-        while (!_async_gate.is_closed() && !tail_buf().has_data()) {
+        // wait until we should flush the tail or stop, and meanwhile drain queued writes.
+        while (true) {
+            if (!_queued_writes.empty()) {
+                co_await drain_queued_writes();
+            }
+
+            if (_async_gate.is_closed() || should_flush_tail()) {
+                break;
+            }
+
             co_await _tail_can_advance.wait();
         }
 
-        if (!tail_buf().has_data()) {
-            // Gate is closing and tail is empty — we are done.
+        if (_async_gate.is_closed() && !tail_buf().has_data()) {
             break;
         }
 
-        // If head == tail, the head buffer is still being written to.  Seal it
-        // by advancing the head to give writers a fresh slot.
+        if (!tail_buf().has_data()) {
+            continue;
+        }
+
         if (_head == _tail) {
-            ++_head;
-            // Wake writers that may be waiting for a new head slot.
-            _head_can_advance.broadcast();
+            if (!maybe_advance_head()) {
+                continue;
+            }
         }
 
         co_await _sm.write(tail_buf());
 
         tail_buf().reset();
         ++_tail;
+    }
 
-        // A slot has been freed: wake any writer waiting to advance the head.
-        _head_can_advance.broadcast();
+    while (!_queued_writes.empty()) {
+        auto request = std::move(_queued_writes.front());
+        _queued_writes.pop_front();
+        request.pr.set_exception(std::make_exception_ptr(seastar::gate_closed_exception()));
+        co_await coroutine::maybe_yield();
     }
 }
 
