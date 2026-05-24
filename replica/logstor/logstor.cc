@@ -43,7 +43,7 @@ static api::timestamp_type extract_logstor_record_timestamp(const mutation& m) {
 
 logstor::logstor(logstor_config config, ::cache_tracker& shared_cache_tracker)
     : _segment_manager(config.segment_manager_cfg)
-    , _write_buffer(_segment_manager, config.flush_sg)
+    , _write_buffer(_segment_manager, config.flush_sg, std::chrono::milliseconds(0))
     , _cache_tracker(shared_cache_tracker) {
 
     namespace sm = seastar::metrics;

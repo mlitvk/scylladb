@@ -289,6 +289,7 @@ class buffered_writer {
 
     segment_manager& _sm;
     seastar::scheduling_group _flush_sg;
+    std::chrono::milliseconds _sync_period;
 
     // The ring of buffers, indexed modulo ring_size.
     std::vector<write_buffer> _ring;
@@ -328,6 +329,9 @@ class buffered_writer {
 
     seastar::expiring_fifo<queued_write, on_queued_write_expiry, db::timeout_clock> _queued_writes;
 
+    seastar::timer<db::timeout_clock> _head_flush_timer;
+    bool _head_deadline_expired = false;
+
     seastar::gate _async_gate;
 
     // The single consumer fiber, running for the lifetime of the writer.
@@ -346,9 +350,12 @@ class buffered_writer {
     bool maybe_advance_head() noexcept;
     std::optional<future<log_location_with_holder>> append_to_head_buffer(log_record_writer&, write_target&);
     future<> drain_queued_writes();
+    void arm_head_flush_timer();
+    void cancel_head_flush_timer() noexcept;
+    void on_head_flush_timer() noexcept;
 
 public:
-    explicit buffered_writer(segment_manager& sm, seastar::scheduling_group flush_sg);
+    explicit buffered_writer(segment_manager& sm, seastar::scheduling_group flush_sg, std::chrono::milliseconds sync_period);
 
     buffered_writer(const buffered_writer&) = delete;
     buffered_writer& operator=(const buffered_writer&) = delete;
