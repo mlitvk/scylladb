@@ -60,6 +60,16 @@ static sstring make_collection_literal(unsigned n) {
     return result;
 }
 
+static void execute_insert_for_key(cql_test_env& env, const bytes& key) {
+    env.execute_cql(fmt::format("INSERT INTO cf (\"KEY\", \"C0\", \"C1\", \"C2\", \"C3\", \"C4\") VALUES ("
+        "0x{}, "
+        "0x8f75da6b3dcec90c8a404fb9a5f6b0621e62d39c69ba5758e5f41b78311fbb26cc7a, "
+        "0xa8761a2127160003033a8f4f3d1069b7833ebe24ef56b3beee728c2b686ca516fa51, "
+        "0x583449ce81bfebc2e1a695eb59aad5fcc74d6d7311fc6197b10693e1a161ca2e1c64, "
+        "0x62bcb1dbc0ff953abc703bcb63ea954f437064c0c45366799658bd6b91d0f92908d7, "
+        "0x222fcbe31ffa1e689540e1499b87fa3f9c781065fccd10e4772b4c7039c2efd0fb27);", to_hex(key))).get();
+};
+
 static void execute_update_for_key(cql_test_env& env, const bytes& key, unsigned collection) {
     sstring col_suffix;
     if (collection > 0) {
@@ -104,6 +114,7 @@ struct test_config {
     std::optional<unsigned> initial_tablets;
     unsigned collection = 0;
     db::consistency_level consistency_level;
+    bool logstor = false;
 };
 
 std::ostream& operator<<(std::ostream& os, const test_config::run_mode& m) {
@@ -131,6 +142,8 @@ static void create_partitions(cql_test_env& env, test_config& cfg) {
     for (unsigned sequence = 0; sequence < cfg.partitions; ++sequence) {
         if (cfg.counters) {
             execute_counter_update_for_key(env, make_key(sequence));
+        } else if (cfg.logstor) {
+            execute_insert_for_key(env, make_key(sequence));
         } else {
             execute_update_for_key(env, make_key(sequence), cfg.collection);
         }
@@ -194,6 +207,25 @@ static std::vector<perf_result> test_write(cql_test_env& env, test_config& cfg) 
     return time_parallel([&env, &cfg, id] {
             bytes key = make_random_key(cfg);
             return env.execute_prepared(id, {{cql3::raw_value::make_value(std::move(key))}}, cfg.consistency_level).discard_result();
+        }, cfg.concurrency, cfg.duration_in_seconds, cfg.operations_per_shard, cfg.stop_on_error);
+}
+
+static std::vector<perf_result> test_insert(cql_test_env& env, test_config& cfg) {
+    sstring usings;
+    if (!cfg.timeout.empty()) {
+        usings += "USING TIMEOUT " + cfg.timeout;
+    }
+    sstring query = format("INSERT INTO cf (\"KEY\", \"C0\", \"C1\", \"C2\", \"C3\", \"C4\") "
+            "VALUES (?, "
+            "0x8f75da6b3dcec90c8a404fb9a5f6b0621e62d39c69ba5758e5f41b78311fbb26cc7a, "
+            "0xa8761a2127160003033a8f4f3d1069b7833ebe24ef56b3beee728c2b686ca516fa51, "
+            "0x583449ce81bfebc2e1a695eb59aad5fcc74d6d7311fc6197b10693e1a161ca2e1c64, "
+            "0x62bcb1dbc0ff953abc703bcb63ea954f437064c0c45366799658bd6b91d0f92908d7, "
+            "0x222fcbe31ffa1e689540e1499b87fa3f9c781065fccd10e4772b4c7039c2efd0fb27) {}", usings);
+    auto id = env.prepare(query).get();
+    return time_parallel([&env, &cfg, id] {
+            bytes key = make_random_key(cfg);
+            return env.execute_prepared(id, {{cql3::raw_value::make_value(std::move(key))}}).discard_result();
         }, cfg.concurrency, cfg.duration_in_seconds, cfg.operations_per_shard, cfg.stop_on_error);
 }
 
@@ -261,6 +293,9 @@ static std::vector<perf_result> do_cql_test(cql_test_env& env, test_config& cfg)
         if (cfg.collection > 0) {
             sb.with_column("CC", map_type_impl::get_instance(bytes_type, bytes_type, true));
         }
+        if (cfg.logstor) {
+            sb.set_logstor();
+        }
         return *sb.build();
     }).get();
 
@@ -276,6 +311,8 @@ static std::vector<perf_result> do_cql_test(cql_test_env& env, test_config& cfg)
     case test_config::run_mode::write:
         if (cfg.counters) {
             return test_counter_update(env, cfg);
+        } else if (cfg.logstor) {
+            return test_insert(env, cfg);
         } else {
             return test_write(env, cfg);
         }
@@ -351,6 +388,7 @@ int scylla_simple_query_main(int argc, char** argv) {
         ("stop-on-error", bpo::value<bool>()->default_value(true), "stop after encountering the first error")
         ("timeout", bpo::value<std::string>()->default_value(""), "use timeout")
         ("bypass-cache", "use bypass cache when querying")
+        ("logstor", "use logstor storage engine for the table")
         ("audit", bpo::value<std::string>(), "value for audit config entry")
         ("audit-keyspaces", bpo::value<std::string>(), "value for audit_keyspaces config entry")
         ("audit-tables", bpo::value<std::string>(), "value for audit_tables config entry")
@@ -396,6 +434,9 @@ int scylla_simple_query_main(int argc, char** argv) {
                                                      db::config::config_source::CommandLine);
                 cfg.strongly_consistent_tables = true;
             }
+            if (app.configuration().contains("logstor")) {
+                db_cfg->experimental_features({db::experimental_features_t::feature::LOGSTOR});
+            }
             set_from_cli("audit", app, cfg.db_config->audit);
             set_from_cli("audit-keyspaces", app, cfg.db_config->audit_keyspaces);
             set_from_cli("audit-tables", app, cfg.db_config->audit_tables);
@@ -436,6 +477,7 @@ int scylla_simple_query_main(int argc, char** argv) {
             cfg.timeout = app.configuration()["timeout"].as<std::string>();
             cfg.bypass_cache = app.configuration().contains("bypass-cache");
             cfg.consistency_level = db::consistency_level_from_string(app.configuration()["consistency-level"].as<std::string>());
+            cfg.logstor = app.configuration().contains("logstor");
             audit::audit::start_audit(env.local_db().get_config(), env.get_shared_token_metadata(), env.qp(), env.migration_manager()).handle_exception([&] (auto&& e) {
                 fmt::print("audit start failed: {}", e);
             }).get();
