@@ -45,6 +45,15 @@ logstor::logstor(logstor_config config, ::cache_tracker& shared_cache_tracker)
     : _segment_manager(config.segment_manager_cfg)
     , _write_buffer(_segment_manager, config.flush_sg)
     , _cache_tracker(shared_cache_tracker) {
+
+    namespace sm = seastar::metrics;
+
+    _metrics.add_group("logstor", {
+        sm::make_gauge("queued_write_count", [this] { return _write_buffer.queued_write_count(); },
+                       sm::description("Number of writes currently queued in the write buffer.")),
+        sm::make_counter("write_failures", [this] { return _stats.write_failures; },
+                       sm::description("Number of writes that failed to be persisted.")),
+    });
 }
 
 future<> logstor::do_recovery(replica::database& db) {
@@ -126,8 +135,8 @@ future<> logstor::write(const mutation& m, write_target target, db::timeout_cloc
             // Overwrote an older entry; free it.
             _segment_manager.free_record(prev_entry->location);
         }
-    }).handle_exception([] (std::exception_ptr ep) {
-        logstor_logger.error("Error writing mutation: {}", ep);
+    }).handle_exception([this] (std::exception_ptr ep) {
+        _stats.write_failures++;
         return make_exception_future<>(ep);
     });
 }
