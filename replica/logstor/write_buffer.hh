@@ -306,11 +306,13 @@ class buffered_writer {
         log_record_writer writer;
         write_target target;
         db::timeout_clock::time_point timeout;
+        uint64_t id;
 
-        queued_write(log_record_writer writer, write_target target, db::timeout_clock::time_point timeout)
+        queued_write(log_record_writer writer, write_target target, db::timeout_clock::time_point timeout, uint64_t id)
             : writer(std::move(writer))
             , target(std::move(target))
-            , timeout(timeout) {
+            , timeout(timeout)
+            , id(id) {
         }
 
         void fail_timeout() noexcept {
@@ -319,18 +321,33 @@ class buffered_writer {
     };
 
     struct on_queued_write_expiry {
+        buffered_writer* owner{};
+
         void operator()(queued_write& w) noexcept {
             w.fail_timeout();
+            owner->on_queued_writes_changed();
         }
     };
 
     // Notified when the consumer may need to flush the tail or drain queued writes.
     seastar::condition_variable _tail_can_advance;
 
+    // Notified when queued writes are removed or expired, so flush() can wait
+    // for the pre-flush queue boundary to advance.
+    seastar::condition_variable _queued_writes_changed;
+
     seastar::expiring_fifo<queued_write, on_queued_write_expiry, db::timeout_clock> _queued_writes;
 
     seastar::timer<db::timeout_clock> _head_flush_timer;
     bool _head_deadline_expired = false;
+
+    // Monotonically increasing id assigned to queued writes. flush() snapshots
+    // this counter and waits until all queued writes with lower ids are gone.
+    uint64_t _next_queued_write_id = 0;
+
+    // Signaled by the consumer after each tail advance, so flush() can wait
+    // for specific buffers to be flushed.
+    seastar::condition_variable _tail_advanced;
 
     seastar::gate _async_gate;
 
@@ -353,6 +370,7 @@ class buffered_writer {
     void arm_head_flush_timer();
     void cancel_head_flush_timer() noexcept;
     void on_head_flush_timer() noexcept;
+    void on_queued_writes_changed() noexcept;
 
 public:
     explicit buffered_writer(segment_manager& sm, seastar::scheduling_group flush_sg, std::chrono::milliseconds sync_period);
@@ -362,6 +380,7 @@ public:
 
     future<> start();
     future<> stop();
+    future<> flush();
 
     future<log_location_with_holder> write(log_record, db::timeout_clock::time_point timeout, write_target target = {});
 

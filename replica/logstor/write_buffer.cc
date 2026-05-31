@@ -292,6 +292,7 @@ buffered_writer::buffered_writer(segment_manager& sm, seastar::scheduling_group 
         : _sm(sm)
         , _flush_sg(flush_sg)
         , _sync_period(sync_period)
+        , _queued_writes(on_queued_write_expiry{this})
         , _head_flush_timer([this] { on_head_flush_timer(); }) {
     _ring.reserve(ring_size);
     for (size_t i = 0; i < ring_size; ++i) {
@@ -330,6 +331,10 @@ void buffered_writer::on_head_flush_timer() noexcept {
     _tail_can_advance.signal();
 }
 
+void buffered_writer::on_queued_writes_changed() noexcept {
+    _queued_writes_changed.broadcast();
+}
+
 bool buffered_writer::maybe_advance_head() noexcept {
     if (ring_full() || !head_buf().has_data()) {
         return false;
@@ -355,6 +360,7 @@ std::optional<future<log_location_with_holder>> buffered_writer::append_to_head_
 }
 
 future<> buffered_writer::drain_queued_writes() {
+    bool removed_queued_writes = false;
     while (!_queued_writes.empty()) {
         auto& next = _queued_writes.front();
 
@@ -364,10 +370,15 @@ future<> buffered_writer::drain_queued_writes() {
 
         auto request = std::move(next);
         _queued_writes.pop_front();
+        removed_queued_writes = true;
 
         std::move(append_to_head_buffer(request.writer, request.target).value()).forward_to(std::move(request.pr));
 
         co_await coroutine::maybe_yield();
+    }
+
+    if (removed_queued_writes) {
+        on_queued_writes_changed();
     }
 }
 
@@ -396,6 +407,43 @@ future<> buffered_writer::stop() {
     logstor_logger.info("Write buffer stopped");
 }
 
+future<> buffered_writer::flush() {
+    auto holder = _async_gate.hold();
+
+    // Snapshot the queue insertion boundary. New writes pushed after this point
+    // get higher ids and are not our responsibility.
+    const uint64_t target_next_id = _next_queued_write_id;
+
+    auto preflush_queued_writes_gone = [this, target_next_id] {
+        return _queued_writes.empty() || _queued_writes.front().id >= target_next_id;
+    };
+
+    // Drain or let expire all writes that were queued when flush() was called.
+    while (!preflush_queued_writes_gone()) {
+        co_await drain_queued_writes();
+        if (!preflush_queued_writes_gone()) {
+            co_await _queued_writes_changed.wait(preflush_queued_writes_gone);
+        }
+    }
+
+    // Seal the current head buffer so the consumer will flush it even if it
+    // is not full and the sync period has not yet expired.
+    auto target_head = _head;
+    while (_head == target_head && head_buf().has_data()) {
+        if (maybe_advance_head()) {
+            break;
+        }
+        // Ring is full; wait for tail flush to free a slot.
+        co_await _tail_advanced.wait();
+    }
+
+    // Wait until the consumer has flushed all buffers up to (and including)
+    // the head position captured above.
+    co_await _tail_advanced.when([this, target_tail = _head] {
+        return _tail >= target_tail;
+    });
+}
+
 future<log_location_with_holder> buffered_writer::write(log_record record, db::timeout_clock::time_point timeout, write_target target) {
     auto holder = _async_gate.hold();
 
@@ -419,7 +467,7 @@ future<log_location_with_holder> buffered_writer::write(log_record record, db::t
 
     // either there are queued writes or there is no space in the head buffer and ring is full - queue the write.
 
-    queued_write request(std::move(writer), std::move(target), timeout);
+    queued_write request(std::move(writer), std::move(target), timeout, _next_queued_write_id++);
     auto fut = request.pr.get_future();
     _queued_writes.push_back(std::move(request), timeout);
     _tail_can_advance.signal();
@@ -459,11 +507,13 @@ future<> buffered_writer::consumer_loop() {
 
         tail_buf().reset();
         ++_tail;
+        _tail_advanced.broadcast();
     }
 
     while (!_queued_writes.empty()) {
         auto request = std::move(_queued_writes.front());
         _queued_writes.pop_front();
+        on_queued_writes_changed();
         request.pr.set_exception(std::make_exception_ptr(seastar::gate_closed_exception()));
         co_await coroutine::maybe_yield();
     }
