@@ -2632,6 +2632,14 @@ void table::try_trigger_compaction(compaction_group& cg) noexcept {
     }
 }
 
+future<> table::flush_to_separator() {
+    if (!uses_logstor()) {
+        co_return;
+    }
+
+    co_await _logstor->flush_to_separator();
+}
+
 future<> table::flush_separator(std::optional<logstor::segment_sequence> seq_num) {
     if (!uses_logstor()) {
         co_return;
@@ -3232,6 +3240,7 @@ future<> compaction_group::stop(sstring reason) noexcept {
     co_await _async_gate.close();
     auto flush_future = co_await seastar::coroutine::as_future(flush());
 
+    co_await _t.flush_to_separator();
     co_await flush_separator();
     co_await _flush_gate.close();
     co_await _sstable_add_gate.close();
@@ -4565,6 +4574,7 @@ future<> storage_group::flush() noexcept {
 }
 
 future<> storage_group::flush_separator() noexcept {
+    co_await _main_cg->_t.flush_to_separator();
     for (auto& cg : compaction_groups_immediate()) {
         co_await cg->flush_separator();
     }

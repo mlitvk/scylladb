@@ -1180,6 +1180,7 @@ public:
         return _logstor->get_compaction_manager();
     }
 
+    future<> flush_to_separator();
     future<> flush_separator(std::optional<logstor::segment_sequence> seq_num = std::nullopt);
 
     future<logstor::table_segment_stats> get_logstor_segment_stats() const;
