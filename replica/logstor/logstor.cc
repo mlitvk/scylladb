@@ -239,13 +239,11 @@ mutation_reader logstor::make_reader(schema_ptr schema, const primary_index& ind
         mutation_reader_opt _current_partition_reader;
         dht::ring_position_comparator _cmp;
 
-        // Finds the next iterator to process, safe to call after any co_await
-        primary_index::partitions_type::const_iterator find_next() const {
-            auto it = _last_key
-                ? _index.upper_bound(*_last_key)                        // strictly after last key
-                : position_at_range_start();                            // initial positioning
-            // If start was exclusive and we haven't yet seen a key
-            return it;
+        // Finds the next durable iterator to process, safe to call after any co_await.
+        primary_index::partitions_type::const_iterator find_next_durable() const {
+            return _last_key
+                ? _index.upper_bound(*_last_key)
+                : position_at_range_start();
         }
 
         primary_index::partitions_type::const_iterator position_at_range_start() const {
@@ -265,6 +263,33 @@ mutation_reader logstor::make_reader(schema_ptr schema, const primary_index& ind
             if (!_pr.end()) return false;
             auto c = _cmp(e.key(), _pr.end()->value());
             return _pr.end()->is_inclusive() ? c > 0 : c >= 0;
+        }
+
+        std::optional<dht::decorated_key> find_next_pending() const {
+            auto it = _last_key
+                ? _index.next_pending_in_range(_pr, *_last_key)
+                : _index.first_pending_in_range(_pr);
+            if (it == _index.pending_end()) {
+                return std::nullopt;
+            }
+            return it->first;
+        }
+
+        std::optional<dht::decorated_key> find_next_key() const {
+            std::optional<dht::decorated_key> durable_key;
+            auto durable_it = find_next_durable();
+            if (durable_it != _index.end() && !exceeds_range_end(*durable_it)) {
+                durable_key = durable_it->key();
+            }
+
+            auto pending_key = find_next_pending();
+            if (!durable_key) {
+                return pending_key;
+            }
+            if (!pending_key) {
+                return durable_key;
+            }
+            return _cmp(*pending_key, *durable_key) < 0 ? std::move(pending_key) : std::move(durable_key);
         }
 
     public:
@@ -292,14 +317,14 @@ mutation_reader logstor::make_reader(schema_ptr schema, const primary_index& ind
                 }
 
                 // Find next key in range (safe after co_await since we use _last_key)
-                auto it = find_next();
-                if (it == _index.end() || exceeds_range_end(*it)) {
+                auto next_key = find_next_key();
+                if (!next_key) {
                     _end_of_stream = true;
                     break;
                 }
 
                 // Snapshot the key before yielding
-                auto current_key = it->key();
+                auto current_key = std::move(*next_key);
 
                 auto guard = reader_permit::awaits_guard(_permit);
                 auto mut = co_await _logstor->read(*_schema, _index, current_key, _slice);
