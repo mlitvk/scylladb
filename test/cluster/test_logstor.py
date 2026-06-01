@@ -161,7 +161,7 @@ async def test_parallel_writes(manager: ManagerClient):
             assert rows[0].v == i + 1
 
 async def test_overwrites(manager: ManagerClient):
-    cmdline = ['--logger-log-level', 'logstor=debug']
+    cmdline = ['--logger-log-level', 'logstor=trace']
     cfg = {'experimental_features': ['logstor']}
     await manager.servers_add(1, cmdline=cmdline, config=cfg)
     cql = manager.get_cql()
@@ -814,7 +814,7 @@ async def test_cache(manager: ManagerClient):
     Verify the logstor mutation cache works correctly.
     """
     cmdline = ['--logger-log-level', 'logstor=debug', '--smp=1']
-    cfg = {'experimental_features': ['logstor']}
+    cfg = {'experimental_features': ['logstor'], 'commitlog_sync': 'batch'}
     servers = await manager.servers_add(1, cmdline=cmdline, config=cfg)
     cql = manager.get_cql()
 

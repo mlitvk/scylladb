@@ -12,6 +12,7 @@
 #include <vector>
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/util/memory-data-source.hh>
+#include <seastar/core/coroutine.hh>
 #include <seastar/util/defer.hh>
 
 #include "replica/logstor/logstor.hh"
@@ -25,6 +26,8 @@
 #include "schema/schema_builder.hh"
 #include <seastar/core/simple-stream.hh>
 #include "test/lib/mutation_assertions.hh"
+#include "test/lib/mutation_reader_assertions.hh"
+#include "test/lib/reader_concurrency_semaphore.hh"
 #include "test/lib/tmpdir.hh"
 
 using namespace replica::logstor;
@@ -168,10 +171,18 @@ logstor_config make_test_logstor_config(const std::filesystem::path& base_dir) {
     };
 }
 
+logstor_config make_periodic_test_logstor_config(const std::filesystem::path& base_dir) {
+    auto cfg = make_test_logstor_config(base_dir);
+    cfg.mode = logstor_sync_mode::periodic;
+    cfg.sync_period = std::chrono::hours(1);
+    return cfg;
+}
+
 class test_compaction_group_handle final : public logstor_group {
     ::table_id _table_id;
     primary_index _index;
     compaction_manager& _cm;
+    seastar::gate _write_gate;
 public:
     test_compaction_group_handle(schema_ptr schema, compaction_manager& cm)
         : _table_id(schema->id())
@@ -191,6 +202,14 @@ public:
         return _index;
     }
 
+    seastar::gate::holder hold_write_gate() {
+        return _write_gate.hold();
+    }
+
+    future<> close_write_gate() {
+        return _write_gate.close();
+    }
+
 protected:
     compaction_manager& logstor_compaction_manager() noexcept override {
         return _cm;
@@ -206,9 +225,17 @@ std::set<log_segment_id> snapshot_segment_ids(const utils::chunked_vector<segmen
 }
 
 void write_and_flush_segment(logstor& ls, test_compaction_group_handle& cg, const mutation& m) {
-    ls.write(m, write_target(&cg, {}), db::no_timeout).get();
+    ls.write(m, write_target(&cg, cg.hold_write_gate()), db::no_timeout).get();
     ls.flush_to_separator().get();
     cg.flush_separator().get();
+}
+
+future<> wait_for_pending_cleared(primary_index& index, const dht::decorated_key& key) {
+    return seastar::do_until([&index, &key] {
+        return !index.get_pending(key);
+    }, [] {
+        return seastar::yield();
+    });
 }
 
 }
@@ -924,4 +951,95 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_disabled_group_does_not_compact_on_submit)
     assert_that(*actual_pk0).is_equal_to(pk0_v1);
     assert_that(*actual_pk1).is_equal_to(pk1_v1);
     assert_that(*actual_pk2).is_equal_to(pk2_v0);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_logstor_periodic_range_reader_merges_durable_and_pending) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_periodic_test_logstor_config(dir.path()), cache.shared_tracker);
+    ls.do_recovery_for_test().get();
+    ls.start().get();
+
+    test_compaction_group_handle cg(schema, ls.get_compaction_manager());
+    auto stop_store = seastar::defer([&ls] { ls.stop().get(); });
+
+    auto durable_a = make_kv_mutation(schema, "a", "durable-a", api::timestamp_type(1));
+    auto durable_c = make_kv_mutation(schema, "c", "durable-c", api::timestamp_type(2));
+    auto pending_b = make_kv_mutation(schema, "b", "pending-b", api::timestamp_type(3));
+    auto pending_d = make_kv_mutation(schema, "d", "pending-d", api::timestamp_type(4));
+    tests::reader_concurrency_semaphore_wrapper semaphore;
+
+    write_and_flush_segment(ls, cg, durable_a);
+    write_and_flush_segment(ls, cg, durable_c);
+    wait_for_pending_cleared(cg.logstor_index(), durable_a.decorated_key()).get();
+    wait_for_pending_cleared(cg.logstor_index(), durable_c.decorated_key()).get();
+    ls.write(pending_b, write_target(&cg, cg.hold_write_gate()), db::no_timeout).get();
+    ls.write(pending_d, write_target(&cg, cg.hold_write_gate()), db::no_timeout).get();
+
+    auto reader = ls.make_reader(schema, cg.logstor_index(), semaphore.make_permit(), query::full_partition_range, schema->full_slice());
+
+    assert_that(std::move(reader))
+        .has_monotonic_positions();
+
+    auto actual_a = ls.read(*schema, cg.logstor_index(), durable_a.decorated_key(), schema->full_slice()).get();
+    auto actual_b = ls.read(*schema, cg.logstor_index(), pending_b.decorated_key(), schema->full_slice()).get();
+    auto actual_c = ls.read(*schema, cg.logstor_index(), durable_c.decorated_key(), schema->full_slice()).get();
+    auto actual_d = ls.read(*schema, cg.logstor_index(), pending_d.decorated_key(), schema->full_slice()).get();
+
+    BOOST_REQUIRE(actual_a);
+    BOOST_REQUIRE(actual_b);
+    BOOST_REQUIRE(actual_c);
+    BOOST_REQUIRE(actual_d);
+
+    assert_that(*actual_a).is_equal_to(durable_a);
+    assert_that(*actual_b).is_equal_to(pending_b);
+    assert_that(*actual_c).is_equal_to(durable_c);
+    assert_that(*actual_d).is_equal_to(pending_d);
+
+    auto bounded_range = dht::partition_range::make_singular(pending_b.decorated_key());
+    auto bounded_reader = ls.make_reader(schema, cg.logstor_index(), semaphore.make_permit(), bounded_range, schema->full_slice());
+
+    assert_that(std::move(bounded_reader))
+        .produces(pending_b)
+        .produces_end_of_stream();
+
+    ls.flush_to_separator().get();
+    wait_for_pending_cleared(cg.logstor_index(), pending_b.decorated_key()).get();
+    wait_for_pending_cleared(cg.logstor_index(), pending_d.decorated_key()).get();
+    cg.flush_separator().get();
+    cg.close_write_gate().get();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_logstor_periodic_range_reader_prefers_newer_pending_entry) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_periodic_test_logstor_config(dir.path()), cache.shared_tracker);
+    ls.do_recovery_for_test().get();
+    ls.start().get();
+
+    test_compaction_group_handle cg(schema, ls.get_compaction_manager());
+    auto stop_store = seastar::defer([&ls] { ls.stop().get(); });
+
+    auto durable_old = make_kv_mutation(schema, "same", "durable-old", api::timestamp_type(1));
+    auto pending_new = make_kv_mutation(schema, "same", "pending-new", api::timestamp_type(2));
+    tests::reader_concurrency_semaphore_wrapper semaphore;
+
+    write_and_flush_segment(ls, cg, durable_old);
+    wait_for_pending_cleared(cg.logstor_index(), durable_old.decorated_key()).get();
+    ls.write(pending_new, write_target(&cg, cg.hold_write_gate()), db::no_timeout).get();
+
+    auto reader = ls.make_reader(schema, cg.logstor_index(), semaphore.make_permit(), dht::partition_range::make_singular(pending_new.decorated_key()), schema->full_slice());
+
+    assert_that(std::move(reader))
+        .produces(pending_new)
+        .produces_end_of_stream();
+
+    ls.flush_to_separator().get();
+    wait_for_pending_cleared(cg.logstor_index(), pending_new.decorated_key()).get();
+    cg.flush_separator().get();
+    cg.close_write_gate().get();
 }
