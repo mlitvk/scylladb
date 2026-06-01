@@ -41,6 +41,12 @@ struct index_entry {
     bool operator==(const index_entry& other) const noexcept = default;
 };
 
+struct pending_entry {
+    dht::decorated_key key;
+    api::timestamp_type timestamp;
+    canonical_mutation mutation;
+};
+
 struct log_record_header {
     primary_index_key key;
     api::timestamp_type timestamp;
