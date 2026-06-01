@@ -150,7 +150,17 @@ future<std::optional<mutation>> logstor::read(const schema& s, const primary_ind
 
     auto it = index.find(dk);
     if (it == index.end()) {
-        co_return std::nullopt;
+        auto pending = index.get_pending(dk);
+        if (!pending) {
+            co_return std::nullopt;
+        }
+
+        co_return pending->mutation.to_mutation(s.shared_from_this());
+    }
+
+    auto pending = index.get_pending(dk);
+    if (pending && pending->timestamp >= it->entry().timestamp) {
+        co_return pending->mutation.to_mutation(s.shared_from_this());
     }
 
     // lookup in cache
