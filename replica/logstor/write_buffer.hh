@@ -382,7 +382,7 @@ public:
     future<> stop();
     future<> flush();
 
-    future<log_location_with_holder> write(log_record, db::timeout_clock::time_point timeout, write_target target = {});
+    future<log_location_with_holder> write(log_record_writer, db::timeout_clock::time_point timeout, write_target target = {});
 
     size_t queued_write_count() const noexcept { return _queued_writes.size(); }
 

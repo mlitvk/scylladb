@@ -52,6 +52,7 @@ class logstor {
     segment_manager _segment_manager;
     buffered_writer _write_buffer;
     cache_tracker _cache_tracker;
+    seastar::gate _async_gate;
     seastar::metrics::metric_groups _metrics;
     logstor_sync_mode _mode;
     stats _stats;

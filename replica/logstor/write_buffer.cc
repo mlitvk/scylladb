@@ -444,10 +444,8 @@ future<> buffered_writer::flush() {
     });
 }
 
-future<log_location_with_holder> buffered_writer::write(log_record record, db::timeout_clock::time_point timeout, write_target target) {
+future<log_location_with_holder> buffered_writer::write(log_record_writer writer, db::timeout_clock::time_point timeout, write_target target) {
     auto holder = _async_gate.hold();
-
-    log_record_writer writer(std::move(record));
 
     if (timeout != db::no_timeout && timeout <= db::timeout_clock::now()) {
         throw timed_out_error{};

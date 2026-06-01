@@ -7,6 +7,8 @@
  */
 #include "replica/logstor/logstor.hh"
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/coroutine.hh>
+#include <seastar/coroutine/exception.hh>
 #include <seastar/util/log.hh>
 #include <seastar/core/future.hh>
 #include "query/query-request.hh"
@@ -78,6 +80,7 @@ future<> logstor::stop() {
     logstor_logger.info("Stopping logstor");
 
     co_await _write_buffer.stop();
+    co_await _async_gate.close();
     co_await _segment_manager.stop();
 
     logstor_logger.info("logstor stopped");
@@ -120,8 +123,34 @@ future<> logstor::write(const mutation& m, write_target target, db::timeout_cloc
         .mut = canonical_mutation(m)
     };
 
-    return _write_buffer.write(std::move(record), timeout, std::move(target)).then_unpack([this, index_ptr = &index, ts, key = std::move(key)]
-            (log_location location, seastar::gate::holder op) {
+    log_record_writer writer(std::move(record));
+
+    if (_mode == logstor_sync_mode::periodic) {
+        auto pending = index.insert_pending(key, ts, writer.record().mut);
+        if (!pending) {
+            co_return;
+        }
+
+        auto holder = _async_gate.hold();
+        (void)_write_buffer.write(std::move(writer), timeout, std::move(target))
+            .then_unpack([this, index_ptr = &index, key, pending, ts] (log_location location, seastar::gate::holder op) {
+                auto result = index_ptr->complete_pending_write(key, pending, ts, location);
+
+                if (!result.accepted) {
+                    // A newer durable entry already exists; free the record we just wrote.
+                    _segment_manager.free_record(location);
+                } else if (result.old_durable_location && result.old_durable_location->size != 0) {
+                    // Overwrote an older durable entry; free it.
+                    _segment_manager.free_record(*result.old_durable_location);
+                }
+            }).handle_exception([this, index_ptr = &index, key, pending] (std::exception_ptr ep) {
+                index_ptr->erase_pending_if_current(key, pending);
+                _stats.write_failures++;
+            }).finally([holder = std::move(holder)] {});
+        co_return;
+    }
+
+    co_await _write_buffer.write(std::move(writer), timeout, std::move(target)).then_unpack([this, index_ptr = &index, ts, key = std::move(key)] (log_location location, seastar::gate::holder op) {
         index_entry new_entry {
             .location = location,
             .timestamp = ts,
@@ -188,7 +217,8 @@ future<std::optional<mutation>> logstor::read(const schema& s, const primary_ind
     // across the co_await above.
     if (cache) {
         auto it = index.find(dk);
-        if (it != index.end() && it->entry().location == entry_for_read.location) {
+        auto pending = index.get_pending(dk);
+        if (it != index.end() && it->entry().location == entry_for_read.location && (!pending || pending->timestamp < entry_for_read.timestamp)) {
             cache->populate(*it, m);
         }
     }
