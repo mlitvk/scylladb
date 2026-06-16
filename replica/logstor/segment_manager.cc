@@ -1472,7 +1472,12 @@ future<> compaction_manager_impl::stop_ongoing_compactions(logstor_group& cg) {
     }
     auto& state = *it->second;
     state.as.request_abort();
-    co_await state.completion.get_future();
+    try {
+        co_await state.completion.get_future();
+    } catch (...) {
+        logstor_logger.warn("Stopping ongoing logstor compactions for table {} failed: {}. Ignored",
+                cg.table_id(), std::current_exception());
+    }
 }
 
 future<> compaction_manager_impl::remove(logstor_group& cg) {
@@ -1490,7 +1495,12 @@ future<compaction_reenabler> compaction_manager_impl::disable_compaction(logstor
     ++state.compaction_disabled_counter;
 
     // Wait for any ongoing compaction to finish before disabling
-    co_await state.completion.get_future();
+    try {
+        co_await state.completion.get_future();
+    } catch (...) {
+        logstor_logger.warn("Disabling logstor compaction for table {} failed while waiting for ongoing compaction: {}. Ignored",
+                cg.table_id(), std::current_exception());
+    }
 
     co_return compaction_reenabler([this, &cg] {
         auto it = _groups.find(&cg);
