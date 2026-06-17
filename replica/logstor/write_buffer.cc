@@ -23,6 +23,7 @@
 #include <seastar/core/align.hh>
 #include <seastar/core/aligned_buffer.hh>
 #include "utils/crc.hh"
+#include "utils/error_injection.hh"
 
 namespace replica::logstor {
 
@@ -378,6 +379,7 @@ bool buffered_writer::try_dispatch_next_buffer() {
 future<> buffered_writer::run_dispatched_write(size_t idx) {
     auto& buf = _ring[idx % ring_size];
     try {
+        co_await utils::get_local_injector().inject("logstor_buffered_writer_pause_dispatched_write", utils::wait_for_message(std::chrono::minutes(5)));
         co_await _sm.write(buf);
     } catch (...) {
         _tail_can_advance.signal();

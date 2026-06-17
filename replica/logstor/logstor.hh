@@ -99,6 +99,10 @@ public:
 
     future<> flush_to_separator();
 
+    size_t queued_write_count() const noexcept {
+        return _write_buffer.queued_write_count();
+    }
+
 };
 
 } // namespace logstor

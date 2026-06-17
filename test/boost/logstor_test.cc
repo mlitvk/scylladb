@@ -29,6 +29,8 @@
 #include "test/lib/mutation_reader_assertions.hh"
 #include "test/lib/reader_concurrency_semaphore.hh"
 #include "test/lib/tmpdir.hh"
+#include "test/lib/eventually.hh"
+#include "utils/error_injection.hh"
 
 using namespace replica::logstor;
 
@@ -153,7 +155,7 @@ struct shared_logstor_cache {
 
 logstor_config make_test_logstor_config(const std::filesystem::path& base_dir) {
     constexpr size_t segment_size = 128 * 1024;
-    constexpr size_t file_size = 4 * segment_size;
+    constexpr size_t file_size = 32 * segment_size;
     return logstor_config{
         .segment_manager_cfg = {
             .base_dir = base_dir,
@@ -1043,3 +1045,90 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_periodic_range_reader_prefers_newer_pendin
     cg.flush_separator().get();
     cg.close_write_gate().get();
 }
+
+#ifdef SCYLLA_ENABLE_ERROR_INJECTION
+SEASTAR_THREAD_TEST_CASE(test_logstor_buffered_writer_queues_when_ring_full) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+    constexpr size_t ring_size = 5;
+    constexpr size_t max_writes = ring_size * 8;
+    constexpr size_t max_dispatched_when_ring_full = ring_size - 1;
+
+    shared_logstor_cache cache;
+    auto cfg = make_periodic_test_logstor_config(dir.path());
+    cfg.segment_manager_cfg.max_separator_memory = ring_size * cfg.segment_manager_cfg.segment_size;
+    logstor ls(cfg, cache.shared_tracker);
+    ls.do_recovery_for_test().get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] { ls.stop().get(); });
+
+    test_compaction_group_handle cg(schema, ls.get_compaction_manager());
+
+    auto& errinj = utils::get_local_injector();
+    errinj.enable("logstor_buffered_writer_pause_dispatched_write");
+    auto disable_injection = seastar::defer([&errinj] {
+        if (errinj.is_enabled("logstor_buffered_writer_pause_dispatched_write")) {
+            errinj.disable("logstor_buffered_writer_pause_dispatched_write");
+        }
+    });
+
+    const auto segment_size = ls.get_segment_manager().get_segment_size();
+    std::vector<future<>> writes;
+    writes.reserve(max_writes);
+
+    auto make_large_kv_mutation = [] (schema_ptr schema, sstring pk, api::timestamp_type ts, size_t segment_size) {
+        raw_write_buffer probe(segment_size, segment_kind::mixed);
+        const size_t target_size = probe.max_record_size() / 4;
+
+        sstring value;
+        log_record_writer writer(make_log_record(schema, pk, value, ts));
+        while (writer.size() < target_size) {
+            value += "x";
+            writer = log_record_writer(make_log_record(schema, pk, value, ts));
+        }
+
+        return make_kv_mutation(schema, std::move(pk), std::move(value), ts);
+    };
+
+    for (size_t i = 0; i < max_writes && ls.queued_write_count() == 0; ++i) {
+        auto m = make_large_kv_mutation(schema, format("pk{}", i), api::timestamp_type(i + 1), segment_size);
+        writes.push_back(ls.write(m, write_target(&cg, cg.hold_write_gate()), db::no_timeout).discard_result());
+        if ((i + 1) % 4 == 0) {
+            seastar::yield().get();
+        }
+    }
+
+    if (!eventually_true([&ls] {
+        return ls.queued_write_count() == 1;
+    })) {
+        errinj.disable("logstor_buffered_writer_pause_dispatched_write");
+        BOOST_FAIL("timed out waiting for exactly one queued write");
+    }
+
+    if (!eventually_true([&errinj] {
+        return errinj.waiters("logstor_buffered_writer_pause_dispatched_write") >= max_dispatched_when_ring_full;
+    })) {
+        errinj.disable("logstor_buffered_writer_pause_dispatched_write");
+        BOOST_FAIL("timed out waiting for dispatched writes to pause");
+    }
+
+    errinj.disable("logstor_buffered_writer_pause_dispatched_write");
+
+    for (auto& write : writes) {
+        write.get();
+    }
+
+    ls.flush_to_separator().get();
+    BOOST_REQUIRE_EQUAL(ls.queued_write_count(), 0u);
+
+    cg.flush_separator().get();
+    cg.close_write_gate().get();
+
+    for (size_t i = 0; i < writes.size(); ++i) {
+        auto expected = make_large_kv_mutation(schema, format("pk{}", i), api::timestamp_type(i + 1), segment_size);
+        auto actual = ls.read(*schema, cg.logstor_index(), expected.decorated_key(), schema->full_slice()).get();
+        BOOST_REQUIRE(actual);
+        assert_that(*actual).is_equal_to(expected);
+    }
+}
+#endif
