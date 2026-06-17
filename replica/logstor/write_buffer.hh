@@ -7,6 +7,8 @@
  */
 #pragma once
 
+#include <array>
+
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/temporary_buffer.hh>
@@ -272,16 +274,17 @@ private:
     future<> complete_writes(log_location base_location);
     future<> abort_writes(std::exception_ptr);
 
+    friend class buffered_writer;
     friend class segment_manager_impl;
 };
 
 // Manages a fixed-size circular ring of write_buffers.
 //
-// Writers append to the head buffer.  A single consumer coroutine drains the
-// tail and resumes queued writes in FIFO order once buffer space becomes
-// available. The head advances when the current head buffer is full (can't fit
-// the next write) or when the consumer seals it. Writers wait if the ring is
-// full (all buffers are pending flush).
+// Writers append to the head buffer. A single consumer coroutine dispatches
+// ready buffers for writing in FIFO order and reclaims them once the oldest
+// in-flight write completes. The head advances when the current head buffer is
+// full (can't fit the next write) or when the consumer seals it. Writers wait
+// if the ring is full (all buffers are pending write completion).
 class buffered_writer {
     // Number of buffers in the ring.  Must be >= 2 (one head + at least one
     // that can be in-flight with the consumer).
@@ -296,10 +299,40 @@ class buffered_writer {
 
     // Monotonically increasing indices; the actual slot is idx % ring_size.
     // _head: next slot writers append to.
-    // _tail: next slot the consumer will flush.
-    // Invariant: _head >= _tail && _head - _tail < ring_size.
+    // _dispatch_tail: next slot the consumer will dispatch to segment_manager.
+    // _tail: oldest slot not yet safe to reuse.
+    // Invariant: _head >= _dispatch_tail >= _tail && _head - _tail < ring_size.
     size_t _head{0};
+    size_t _dispatch_tail{0};
     size_t _tail{0};
+
+    struct in_flight_write {
+        std::optional<future<>> completion;
+
+        bool idle() const noexcept {
+            return !completion;
+        }
+
+        bool ready() const noexcept {
+            return completion && completion->available();
+        }
+
+        void start(future<> f) {
+            completion.emplace(std::move(f));
+        }
+
+        future<> take_completion() {
+            auto f = std::move(*completion);
+            completion.reset();
+            return f;
+        }
+
+        void reset() noexcept {
+            completion.reset();
+        }
+    };
+
+    std::array<in_flight_write, ring_size> _in_flight;
 
     struct queued_write {
         seastar::promise<log_location_with_holder> pr;
@@ -329,7 +362,7 @@ class buffered_writer {
         }
     };
 
-    // Notified when the consumer may need to flush the tail or drain queued writes.
+    // Notified when the consumer may be able to dispatch/reclaim buffers or drain queued writes.
     seastar::condition_variable _tail_can_advance;
 
     // Notified when queued writes are removed or expired, so flush() can wait
@@ -356,6 +389,8 @@ class buffered_writer {
 
     write_buffer& head_buf() noexcept { return _ring[_head % ring_size]; }
     write_buffer& tail_buf() noexcept { return _ring[_tail % ring_size]; }
+    in_flight_write& tail_write() noexcept { return _in_flight[_tail % ring_size]; }
+    in_flight_write& dispatch_tail_write() noexcept { return _in_flight[_dispatch_tail % ring_size]; }
     const write_buffer& head_buf() const noexcept { return _ring[_head % ring_size]; }
     const write_buffer& tail_buf() const noexcept { return _ring[_tail % ring_size]; }
 
@@ -363,10 +398,14 @@ class buffered_writer {
     // head further would make the new head slot collide with the tail slot.
     bool ring_full() const noexcept { return _head - _tail == ring_size - 1; }
 
-    bool should_flush_tail() const noexcept;
+    bool has_pending_buffers() const noexcept;
+    bool should_rotate_head_for_flush() const noexcept;
     bool maybe_advance_head() noexcept;
     std::optional<future<log_location_with_holder>> append_to_head_buffer(log_record_writer&, write_target&);
-    future<> drain_queued_writes();
+    bool try_dispatch_next_buffer();
+    future<> run_dispatched_write(size_t idx);
+    future<bool> reclaim_completed_tails();
+    future<bool> drain_queued_writes();
     void arm_head_flush_timer();
     void cancel_head_flush_timer() noexcept;
     void on_head_flush_timer() noexcept;

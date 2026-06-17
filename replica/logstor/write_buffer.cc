@@ -300,14 +300,12 @@ buffered_writer::buffered_writer(segment_manager& sm, seastar::scheduling_group 
     }
 }
 
-bool buffered_writer::should_flush_tail() const noexcept {
-    if (!tail_buf().has_data()) {
-        return false;
-    }
-    if (_head != _tail) {
-        return true;
-    }
-    return _head_deadline_expired;
+bool buffered_writer::has_pending_buffers() const noexcept {
+    return _tail < _head || head_buf().has_data();
+}
+
+bool buffered_writer::should_rotate_head_for_flush() const noexcept {
+    return _dispatch_tail == _head && head_buf().has_data() && (_async_gate.is_closed() || _head_deadline_expired);
 }
 
 void buffered_writer::arm_head_flush_timer() {
@@ -359,7 +357,72 @@ std::optional<future<log_location_with_holder>> buffered_writer::append_to_head_
     return fut;
 }
 
-future<> buffered_writer::drain_queued_writes() {
+bool buffered_writer::try_dispatch_next_buffer() {
+    auto idx = _dispatch_tail;
+    auto& state = dispatch_tail_write();
+    auto& buf = _ring[idx % ring_size];
+
+    if (_dispatch_tail >= _head || !state.idle() || !buf.has_data()) {
+        return false;
+    }
+
+    try {
+        state.start(run_dispatched_write(idx));
+    } catch (...) {
+        state.start(make_exception_future<>(std::current_exception()));
+    }
+    ++_dispatch_tail;
+    return true;
+}
+
+future<> buffered_writer::run_dispatched_write(size_t idx) {
+    auto& buf = _ring[idx % ring_size];
+    try {
+        co_await _sm.write(buf);
+    } catch (...) {
+        _tail_can_advance.signal();
+        throw;
+    }
+
+    _tail_can_advance.signal();
+}
+
+future<bool> buffered_writer::reclaim_completed_tails() {
+    bool reclaimed = false;
+    while (_tail < _dispatch_tail) {
+        auto& state = tail_write();
+        if (!state.ready()) {
+            break;
+        }
+
+        auto completion = state.take_completion();
+        std::exception_ptr ex;
+
+        try {
+            co_await std::move(completion);
+        } catch (...) {
+            ex = std::current_exception();
+        }
+
+        if (ex) {
+            try {
+                co_await tail_buf().abort_writes(std::move(ex));
+            } catch (...) {
+                logstor_logger.warn("Failed to abort buffered writes: {}. Ignoring.", std::current_exception());
+            }
+        }
+
+        tail_buf().reset();
+        state.reset();
+        ++_tail;
+        reclaimed = true;
+        _tail_advanced.broadcast();
+    }
+
+    co_return reclaimed;
+}
+
+future<bool> buffered_writer::drain_queued_writes() {
     bool removed_queued_writes = false;
     while (!_queued_writes.empty()) {
         auto& next = _queued_writes.front();
@@ -371,15 +434,19 @@ future<> buffered_writer::drain_queued_writes() {
         auto request = std::move(next);
         _queued_writes.pop_front();
         removed_queued_writes = true;
-
-        std::move(append_to_head_buffer(request.writer, request.target).value()).forward_to(std::move(request.pr));
-
+        try {
+            std::move(append_to_head_buffer(request.writer, request.target).value()).forward_to(std::move(request.pr));
+        } catch (...) {
+            request.pr.set_exception(std::current_exception());
+        }
         co_await coroutine::maybe_yield();
     }
 
     if (removed_queued_writes) {
         on_queued_writes_changed();
     }
+
+    co_return removed_queued_writes;
 }
 
 future<> buffered_writer::start() {
@@ -403,6 +470,13 @@ future<> buffered_writer::stop() {
 
     co_await _async_gate.close();
     co_await std::move(_consumer);
+
+    for (auto& state : _in_flight) {
+        if (state.completion) {
+            co_await std::move(*state.completion);
+            state.completion.reset();
+        }
+    }
 
     logstor_logger.info("Write buffer stopped");
 }
@@ -474,38 +548,27 @@ future<log_location_with_holder> buffered_writer::write(log_record_writer writer
 
 future<> buffered_writer::consumer_loop() {
     while (true) {
-        // wait until we should flush the tail or stop, and meanwhile drain queued writes.
-        while (true) {
-            if (!_queued_writes.empty()) {
-                co_await drain_queued_writes();
-            }
+        bool progressed = false;
 
-            if (_async_gate.is_closed() || should_flush_tail()) {
-                break;
-            }
+        progressed |= co_await reclaim_completed_tails();
 
-            co_await _tail_can_advance.wait();
+        progressed |= co_await drain_queued_writes();
+
+        if (should_rotate_head_for_flush()) {
+            progressed |= maybe_advance_head();
         }
 
-        if (_async_gate.is_closed() && !tail_buf().has_data()) {
+        while (try_dispatch_next_buffer()) {
+            progressed = true;
+        }
+
+        if (_async_gate.is_closed() && _queued_writes.empty() && !has_pending_buffers()) {
             break;
         }
 
-        if (!tail_buf().has_data()) {
-            continue;
+        if (!progressed) {
+            co_await _tail_can_advance.wait();
         }
-
-        if (_head == _tail) {
-            if (!maybe_advance_head()) {
-                continue;
-            }
-        }
-
-        co_await _sm.write(tail_buf());
-
-        tail_buf().reset();
-        ++_tail;
-        _tail_advanced.broadcast();
     }
 
     while (!_queued_writes.empty()) {
