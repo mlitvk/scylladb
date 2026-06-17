@@ -74,6 +74,7 @@ protected:
 
 class writeable_segment : public segment {
     seastar::gate _write_gate;
+    seastar::semaphore _append_sem{1};
     segment_ref _seg_ref;
     segment_sequence _seq_num;
 
@@ -88,8 +89,7 @@ public:
 
     future<> stop();
 
-    // write a serialized sequence of records.
-    // must not be called concurrently.
+    // Reserve an offset synchronously, then serialize the actual DMA write.
     future<log_location> append(bytes_view data);
 
     bool can_fit(size_t data_size) const noexcept {
@@ -156,8 +156,11 @@ future<log_location> writeable_segment::append(bytes_view data) {
         .size = static_cast<uint32_t>(data_size)
     };
 
-    co_await do_write(loc, data);
     _current_offset += data_size;
+
+    auto units = co_await get_units(_append_sem, 1);
+
+    co_await do_write(loc, data);
     co_return loc;
 }
 
@@ -741,7 +744,6 @@ class segment_manager_impl {
     static constexpr size_t segment_pool_size = 128;
 
     seg_ptr _active_segment;
-    seastar::semaphore _active_segment_write_sem{1};
     segment_pool _segment_pool;
     std::optional<shared_future<>> _switch_segment_fut;
     segment_sequence _next_segment_seq{1};
@@ -1225,8 +1227,6 @@ future<> segment_manager_impl::write(write_buffer& wb) {
     }
 
     {
-        auto sem_units = co_await get_units(_active_segment_write_sem, 1);
-
         while (!_active_segment || !_active_segment->can_fit(sealed_size)) {
             co_await request_segment_switch();
         }
@@ -1249,7 +1249,6 @@ future<> segment_manager_impl::write(write_buffer& wb) {
         bytes_view data(reinterpret_cast<const int8_t*>(wb.data()), wb.serialized_size());
 
         auto loc = co_await seg->append(data);
-        sem_units.return_all();
 
         desc.on_write(wb.net_data_size(), wb.record_count());
 
