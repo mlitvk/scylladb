@@ -879,6 +879,135 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_group_compaction_rewrites_live_records) {
     BOOST_REQUIRE_EQUAL(record_counts.count(api::timestamp_type(2)), 0u); // pk1_v0 - stale
 }
 
+SEASTAR_THREAD_TEST_CASE(test_logstor_group_segments_are_ordered_by_free_space_for_compaction) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    ls.do_recovery_for_test().get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] { ls.stop().get(); });
+
+    test_compaction_group_handle cg(schema, ls.get_compaction_manager());
+    ls.get_compaction_manager().add(cg);
+    auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+
+    struct segment_plan {
+        size_t overwrite_count;
+        std::array<sstring, 2> keys;
+    };
+
+    const std::array<segment_plan, 6> plans{{
+        {0, {"seg0_r0", "seg0_r1"}},
+        {1, {"seg1_r0", "seg1_r1"}},
+        {2, {"seg2_r0", "seg2_r1"}},
+        {0, {"seg3_r0", "seg3_r1"}},
+        {1, {"seg4_r0", "seg4_r1"}},
+        {2, {"seg5_r0", "seg5_r1"}},
+    }};
+
+    const auto segment_size = ls.get_segment_manager().get_segment_size();
+    const auto make_large_kv_mutation = [&] (sstring pk, sstring value_tag, api::timestamp_type ts) {
+        raw_write_buffer probe(segment_size, segment_kind::mixed);
+        const size_t target_size = probe.max_record_size() / 4;
+
+        sstring value = std::move(value_tag);
+        log_record_writer writer(make_log_record(schema, pk, value, ts));
+        while (writer.size() < target_size) {
+            value += "x";
+            writer = log_record_writer(make_log_record(schema, pk, value, ts));
+        }
+
+        return make_kv_mutation(schema, std::move(pk), std::move(value), ts);
+    };
+
+    struct initial_segment_info {
+        log_segment_id segment_id;
+        size_t overwrite_count;
+    };
+    std::vector<initial_segment_info> initial_segments;
+    initial_segments.reserve(plans.size());
+
+    api::timestamp_type ts{1};
+    for (const auto& plan : plans) {
+        std::array<mutation, 2> initial_mutations{
+            make_large_kv_mutation(plan.keys[0], format("initial-{}-{}", plan.keys[0], ts), ts),
+            make_large_kv_mutation(plan.keys[1], format("initial-{}-{}", plan.keys[1], ts + 1), ts + 1),
+        };
+
+        for (auto& m : initial_mutations) {
+            ls.write(m, write_target(&cg, cg.hold_write_gate()), db::no_timeout).get();
+            ++ts;
+        }
+
+        ls.flush_to_separator().get();
+        cg.flush_separator().get();
+
+        std::optional<log_segment_id> segment_id;
+        for (const auto& m : initial_mutations) {
+            auto entry = cg.logstor_index().get(primary_index_key{m.decorated_key()});
+            BOOST_REQUIRE(entry);
+            segment_id = entry->location.segment;
+        }
+
+        BOOST_REQUIRE(segment_id);
+        initial_segments.push_back({*segment_id, plan.overwrite_count});
+    }
+
+    for (const auto& plan : plans) {
+        for (size_t i = 0; i < plan.overwrite_count; ++i) {
+            auto m = make_large_kv_mutation(plan.keys[i], format("overwrite-{}-{}", plan.keys[i], ts), ts);
+            write_and_flush_segment(ls, cg, m);
+            wait_for_pending_cleared(cg.logstor_index(), m.decorated_key()).get();
+            ++ts;
+        }
+    }
+
+    std::map<log_segment_id, size_t> positions;
+    size_t pos = 0;
+    for (const auto& snap : ls.get_segment_manager().make_snapshot(cg).get()) {
+        positions.emplace(snap.segment_id, pos++);
+    }
+
+    std::vector<size_t> low_positions;
+    std::vector<size_t> medium_positions;
+    std::vector<size_t> high_positions;
+
+    for (const auto& info : initial_segments) {
+        auto pos_it = positions.find(info.segment_id);
+        BOOST_REQUIRE(pos_it != positions.end());
+
+        switch (info.overwrite_count) {
+        case 0:
+            low_positions.push_back(pos_it->second);
+            break;
+        case 1:
+            medium_positions.push_back(pos_it->second);
+            break;
+        case 2:
+            high_positions.push_back(pos_it->second);
+            break;
+        default:
+            BOOST_FAIL("unexpected overwrite group");
+        }
+    }
+
+    BOOST_REQUIRE_EQUAL(low_positions.size(), 2u);
+    BOOST_REQUIRE_EQUAL(medium_positions.size(), 2u);
+    BOOST_REQUIRE_EQUAL(high_positions.size(), 2u);
+
+    const auto max_of = [] (const std::vector<size_t>& values) {
+        return *std::max_element(values.begin(), values.end());
+    };
+    const auto min_of = [] (const std::vector<size_t>& values) {
+        return *std::min_element(values.begin(), values.end());
+    };
+
+    BOOST_REQUIRE_LT(max_of(high_positions), min_of(medium_positions));
+    BOOST_REQUIRE_LT(max_of(medium_positions), min_of(low_positions));
+}
+
 SEASTAR_THREAD_TEST_CASE(test_logstor_disabled_group_does_not_compact_on_submit) {
     auto schema = make_kv_schema();
     tmpdir dir;
