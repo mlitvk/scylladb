@@ -475,7 +475,11 @@ future<> buffered_writer::stop() {
 
     for (auto& state : _in_flight) {
         if (state.completion) {
-            co_await std::move(*state.completion);
+            try {
+                co_await std::move(*state.completion);
+            } catch (...) {
+                logstor_logger.warn("Buffered write completion failed during stop: {}. Ignoring.", std::current_exception());
+            }
             state.completion.reset();
         }
     }
@@ -549,36 +553,40 @@ future<log_location_with_holder> buffered_writer::write(log_record_writer writer
 }
 
 future<> buffered_writer::consumer_loop() {
-    while (true) {
-        bool progressed = false;
+    try {
+        while (true) {
+            bool progressed = false;
 
-        progressed |= co_await reclaim_completed_tails();
+            progressed |= co_await reclaim_completed_tails();
 
-        progressed |= co_await drain_queued_writes();
+            progressed |= co_await drain_queued_writes();
 
-        if (should_rotate_head_for_flush()) {
-            progressed |= maybe_advance_head();
+            if (should_rotate_head_for_flush()) {
+                progressed |= maybe_advance_head();
+            }
+
+            while (try_dispatch_next_buffer()) {
+                progressed = true;
+            }
+
+            if (_async_gate.is_closed() && _queued_writes.empty() && !has_pending_buffers()) {
+                break;
+            }
+
+            if (!progressed) {
+                co_await _tail_can_advance.wait();
+            }
         }
 
-        while (try_dispatch_next_buffer()) {
-            progressed = true;
+        while (!_queued_writes.empty()) {
+            auto request = std::move(_queued_writes.front());
+            _queued_writes.pop_front();
+            on_queued_writes_changed();
+            request.pr.set_exception(std::make_exception_ptr(seastar::gate_closed_exception()));
+            co_await coroutine::maybe_yield();
         }
-
-        if (_async_gate.is_closed() && _queued_writes.empty() && !has_pending_buffers()) {
-            break;
-        }
-
-        if (!progressed) {
-            co_await _tail_can_advance.wait();
-        }
-    }
-
-    while (!_queued_writes.empty()) {
-        auto request = std::move(_queued_writes.front());
-        _queued_writes.pop_front();
-        on_queued_writes_changed();
-        request.pr.set_exception(std::make_exception_ptr(seastar::gate_closed_exception()));
-        co_await coroutine::maybe_yield();
+    } catch (...) {
+        on_internal_error(logstor_logger, format("buffered_writer consumer loop aborted unexpectedly: {}", std::current_exception()));
     }
 }
 
