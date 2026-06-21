@@ -1226,6 +1226,8 @@ future<> segment_manager_impl::write(write_buffer& wb) {
         throw std::runtime_error(fmt::format( "Write size {} exceeds segment size {}", sealed_size, _cfg.segment_size));
     }
 
+    co_await utils::get_local_injector().inject("logstor_segment_manager_pause_write", utils::wait_for_message(std::chrono::minutes(5)));
+
     {
         while (!_active_segment || !_active_segment->can_fit(sealed_size)) {
             co_await request_segment_switch();
@@ -1282,6 +1284,8 @@ future<> segment_manager_impl::write_full_segment(write_buffer& wb, logstor_grou
     if (sealed_size > _cfg.segment_size) {
         throw std::runtime_error(fmt::format("Write size {} exceeds segment size {}", sealed_size, _cfg.segment_size));
     }
+
+    co_await utils::get_local_injector().inject("logstor_segment_manager_pause_write", utils::wait_for_message(std::chrono::minutes(5)));
 
     auto seg = co_await get_segment(source);
     auto& desc = get_segment_descriptor(seg->id());

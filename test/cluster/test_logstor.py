@@ -8,6 +8,7 @@ import asyncio
 import random
 import time
 from test.pylib.manager_client import ManagerClient
+from test.pylib.rest_client import inject_error
 from test.cluster.util import new_test_keyspace
 from cassandra.protocol import ConfigurationException
 import pytest
@@ -203,6 +204,57 @@ async def test_parallel_big_writes(manager: ManagerClient):
             rows = await cql.run_async(f"SELECT pk, v FROM {ks}.test WHERE pk = {i}")
             assert rows[0].pk == i
             assert rows[0].v == f"{i}-{large_value}"
+
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
+async def test_queued_writes(manager: ManagerClient):
+    """
+    Pause segment-manager writes in batch sync mode so buffered_writer fills multiple buffers,
+    accumulates queued writes, then drains everything once unpaused.
+    """
+    cmdline = ['--logger-log-level', 'logstor=debug', '--smp=1']
+    cfg = {'experimental_features': ['logstor']}
+    servers = await manager.servers_add(1, cmdline=cmdline, config=cfg)
+    server = servers[0]
+    cql = manager.get_cql()
+    server_log = await manager.server_open_log(server.server_id)
+
+    async with new_test_keyspace(manager, "") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v text) WITH storage_engine = 'logstor'")
+
+        large_value = 'x' * (32 * 1024)
+        num_writes = 16
+        expected = {i: f"{i}-{large_value}" for i in range(num_writes)}
+
+        async with inject_error(manager.api, server.ip_addr, "logstor_segment_manager_pause_write") as handler:
+            log_mark = await server_log.mark()
+            write_tasks = [
+                cql.run_async(f"INSERT INTO {ks}.test (pk, v) VALUES ({pk}, '{value}')")
+                for pk, value in expected.items()
+            ]
+
+            await server_log.wait_for("logstor_segment_manager_pause_write: waiting for message", from_mark=log_mark, timeout=60)
+
+            async def has_queued_writes() -> bool:
+                metrics = await manager.metrics.query(server.ip_addr)
+                return (metrics.get("scylla_logstor_queued_write_count") or 0) > 0
+
+            await wait_for(has_queued_writes, time.time() + 30)
+
+            queued_before_unpause = (await manager.metrics.query(server.ip_addr)).get("scylla_logstor_queued_write_count") or 0
+            assert queued_before_unpause > 0
+
+            for _ in range(num_writes):
+                await handler.message()
+
+            await asyncio.gather(*write_tasks)
+
+        await manager.api.logstor_flush(server.ip_addr)
+
+        for pk, expected_value in expected.items():
+            rows = await cql.run_async(f"SELECT pk, v FROM {ks}.test WHERE pk = {pk}")
+            assert len(rows) == 1
+            assert rows[0].pk == pk
+            assert rows[0].v == expected_value
 
 @pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
 @pytest.mark.parametrize("fail_separator_flush", [False, True], ids=["normal", "fail_separator_flush"])
