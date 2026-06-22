@@ -419,6 +419,8 @@ future<bool> buffered_writer::reclaim_completed_tails() {
         ++_tail;
         reclaimed = true;
         _tail_advanced.broadcast();
+
+        co_await coroutine::maybe_yield();
     }
 
     co_return reclaimed;
@@ -567,6 +569,7 @@ future<> buffered_writer::consumer_loop() {
 
             while (try_dispatch_next_buffer()) {
                 progressed = true;
+                co_await coroutine::maybe_yield();
             }
 
             if (_async_gate.is_closed() && _queued_writes.empty() && !has_pending_buffers()) {
@@ -576,6 +579,8 @@ future<> buffered_writer::consumer_loop() {
             if (!progressed) {
                 co_await _tail_can_advance.wait();
             }
+
+            co_await coroutine::maybe_yield();
         }
 
         while (!_queued_writes.empty()) {
