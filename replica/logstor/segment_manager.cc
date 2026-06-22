@@ -40,6 +40,8 @@
 #include <seastar/core/semaphore.hh>
 #include <seastar/util/memory-data-source.hh>
 #include <seastar/core/condition-variable.hh>
+#include <seastar/coroutine/as_future.hh>
+#include <seastar/coroutine/exception.hh>
 #include <string_view>
 #include "replica/logstor/write_buffer.hh"
 #include "utils/dynamic_bitset.hh"
@@ -1250,7 +1252,13 @@ future<> segment_manager_impl::write(write_buffer& wb) {
         wb.seal(seq_num, std::nullopt, block_alignment);
         bytes_view data(reinterpret_cast<const int8_t*>(wb.data()), wb.serialized_size());
 
-        auto loc = co_await seg->append(data);
+        auto append_result = co_await coroutine::as_future(seg->append(data));
+        if (append_result.failed()) {
+            auto ex = append_result.get_exception();
+            co_await wb.abort_writes(ex);
+            co_await coroutine::return_exception_ptr(std::move(ex));
+        }
+        auto loc = append_result.get();
 
         desc.on_write(wb.net_data_size(), wb.record_count());
 
@@ -1295,7 +1303,13 @@ future<> segment_manager_impl::write_full_segment(write_buffer& wb, logstor_grou
     wb.seal(seg->seq_num(), cg.table_id(), block_alignment);
     bytes_view data(reinterpret_cast<const int8_t*>(wb.data()), wb.serialized_size());
 
-    auto loc = co_await seg->append(data);
+    auto append_result = co_await coroutine::as_future(seg->append(data));
+    if (append_result.failed()) {
+        auto ex = append_result.get_exception();
+        co_await wb.abort_writes(ex);
+        co_await coroutine::return_exception_ptr(std::move(ex));
+    }
+    auto loc = append_result.get();
 
     desc.on_write(wb.net_data_size(), wb.record_count());
 
@@ -1482,9 +1496,12 @@ future<std::optional<segment_header>> segment_manager_impl::read_segment_header(
         .buffer_size = block_alignment,
         .read_ahead = 0,
     });
-    auto result = co_await ::replica::logstor::read_segment_header(in);
+    auto result = co_await coroutine::as_future(::replica::logstor::read_segment_header(in));
     co_await in.close();
-    co_return result;
+    if (result.failed()) {
+        co_return coroutine::exception(result.get_exception());
+    }
+    co_return result.get();
 }
 
 future<> segment_manager_impl::scan_segment(log_segment_id segment_id,
@@ -1495,9 +1512,12 @@ future<> segment_manager_impl::scan_segment(log_segment_id segment_id,
         .buffer_size = std::min<size_t>(_cfg.segment_size, 128 * 1024),
         .read_ahead = 1,
     });
-    co_await ::replica::logstor::scan_segment(in, segment_id, _cfg.segment_size,
-            std::move(header_callback), std::move(on_header), std::move(on_record));
+    auto scan_result = co_await coroutine::as_future(::replica::logstor::scan_segment(in, segment_id, _cfg.segment_size,
+            std::move(header_callback), std::move(on_header), std::move(on_record)));
     co_await in.close();
+    if (scan_result.failed()) {
+        co_await coroutine::return_exception_ptr(scan_result.get_exception());
+    }
 }
 
 future<> compaction_manager_impl::submit_group_compaction(logstor_group& cg, std::function<future<>(group_compaction_state&)> op) {
@@ -2427,7 +2447,7 @@ public:
         co_await _sm.load_segment(_db, _seg->id());
     }
     future<> abort() override {
-        co_return;
+        co_await _seg->stop();
     }
 };
 
