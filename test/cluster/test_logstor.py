@@ -17,6 +17,8 @@ from test.pylib.util import wait_for
 
 logger = logging.getLogger(__name__)
 
+LOGSTOR_PARTITIONER = "com.scylladb.dht.LogstorHashPrefixPartitioner"
+
 async def test_property(manager: ManagerClient):
     cmdline = ['--logger-log-level', 'logstor=debug']
     cfg = {'experimental_features': ['logstor']}
@@ -30,6 +32,11 @@ async def test_property(manager: ManagerClient):
         desc = await cql.run_async(f"DESCRIBE TABLE {ks}.t_enabled")
         logger.info(f"Table t_enabled description:\n{desc}")
         assert "storage_engine = 'logstor'" in desc[0].create_statement
+
+        row = (await cql.run_async(
+            f"SELECT partitioner FROM system_schema.scylla_tables WHERE keyspace_name='{ks}' AND table_name='t_enabled'"
+        ))[0]
+        assert row.partitioner == LOGSTOR_PARTITIONER
 
         desc = await cql.run_async(f"DESCRIBE TABLE {ks}.t_disabled")
         logger.info(f"Table t_disabled description:\n{desc}")
