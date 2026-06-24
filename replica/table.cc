@@ -4830,7 +4830,8 @@ future<> table::discard_logstor_segments() {
         co_return;
     }
 
-    co_await _logstor_index->clear();
+    auto accounting = get_logstor_segment_manager().segment_accounting_updater();
+    co_await _logstor_index->clear(accounting);
 
     co_await parallel_foreach_compaction_group([] (compaction_group& cg) {
         return cg.discard_logstor_segments();
@@ -5793,7 +5794,8 @@ future<> compaction_group::cleanup() {
     _t.rebuild_statistics();
 
     if (_t.uses_logstor()) {
-        co_await _t.logstor_index().erase(p_range);
+        auto accounting = _t.get_logstor_segment_manager().segment_accounting_updater();
+        co_await _t.logstor_index().erase(p_range, accounting);
         co_await discard_logstor_segments();
     }
 
