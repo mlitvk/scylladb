@@ -10,6 +10,7 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/coroutine/exception.hh>
 #include <seastar/util/log.hh>
+#include <seastar/util/defer.hh>
 #include <seastar/core/future.hh>
 #include "query/query-request.hh"
 #include "readers/from_mutations.hh"
@@ -131,10 +132,12 @@ future<> logstor::write(const mutation& m, write_target target, db::timeout_cloc
             co_return;
         }
 
+        auto accounting = _segment_manager.segment_accounting_updater();
+
         auto holder = _async_gate.hold();
         (void)_write_buffer.write(std::move(writer), timeout, std::move(target))
-            .then_unpack([index_ptr = &index, key, generation = *pending, ts] (log_location location, seastar::gate::holder op) mutable {
-                index_ptr->complete_pending_write(key, generation, ts, location);
+            .then_unpack([index_ptr = &index, key, generation = *pending, ts, accounting = std::move(accounting)] (log_location location, seastar::gate::holder op) mutable {
+                index_ptr->complete_pending_write(key, generation, ts, location, &accounting);
             }).handle_exception([this, index_ptr = &index, key, pending] (std::exception_ptr ep) {
                 index_ptr->erase_pending_if_current(key, *pending);
                 _stats.write_failures++;
@@ -142,21 +145,14 @@ future<> logstor::write(const mutation& m, write_target target, db::timeout_cloc
         co_return;
     }
 
-    co_await _write_buffer.write(std::move(writer), timeout, std::move(target)).then_unpack([this, index_ptr = &index, ts, key = std::move(key)] (log_location location, seastar::gate::holder op) {
+    auto accounting = _segment_manager.segment_accounting_updater();
+
+    co_await _write_buffer.write(std::move(writer), timeout, std::move(target)).then_unpack([index_ptr = &index, ts, key = std::move(key), accounting = std::move(accounting)] (log_location location, seastar::gate::holder op) mutable {
         index_entry new_entry {
             .location = location,
             .timestamp = ts,
         };
-
-        auto [inserted, prev_entry] = index_ptr->insert(key, std::move(new_entry));
-
-        if (!inserted) {
-            // A newer entry already exists; free the record we just wrote.
-            _segment_manager.free_record(location);
-        } else if (prev_entry) {
-            // Overwrote an older entry; free it.
-            _segment_manager.free_record(prev_entry->location);
-        }
+        index_ptr->insert(key, std::move(new_entry), &accounting);
     }).handle_exception([this] (std::exception_ptr ep) {
         _stats.write_failures++;
         return make_exception_future<>(ep);

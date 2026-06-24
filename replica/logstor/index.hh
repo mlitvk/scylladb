@@ -106,6 +106,10 @@ public:
     using partitions_type = double_decker<int64_t, primary_index_entry,
                             dht::raw_token_less_comparator, dht::ring_position_comparator,
                             16, bplus::key_search::linear>;
+    struct record_accounting_ops {
+        seastar::noncopyable_function<void(log_location) noexcept> add_record;
+        seastar::noncopyable_function<void(log_location) noexcept> free_record;
+    };
 private:
     struct pending_key_hash {
         size_t operator()(const dht::decorated_key& k) const noexcept {
@@ -176,18 +180,25 @@ private:
         --_key_count;
     }
 
-    auto make_entry_disposer() noexcept {
-        return [this] (primary_index_entry* e) noexcept {
+    auto make_entry_disposer(record_accounting_ops* accounting) noexcept {
+        return [this, accounting] (primary_index_entry* e) noexcept {
             if (_cache_tracker) {
                 _cache_tracker->evict(*e);
+            }
+            if (accounting) {
+                accounting->free_record(e->_e.location);
             }
             on_entry_removed(*e);
         };
     }
 
-    future<> erase_range_gently(partitions_type::iterator begin, const partitions_type::iterator end) {
+    void erase_entry(partitions_type::iterator& it, record_accounting_ops* accounting) noexcept {
+        it.erase_and_dispose(dht::raw_token_less_comparator{}, make_entry_disposer(accounting));
+    }
+
+    future<> erase_range_gently(partitions_type::iterator begin, const partitions_type::iterator end, record_accounting_ops* accounting) {
         static constexpr size_t chunk_size = 1024;
-        auto dispose = make_entry_disposer();
+        auto dispose = make_entry_disposer(accounting);
         while (begin != end) {
             auto chunk_end = begin;
             for (size_t i = 0; i < chunk_size && chunk_end != end; ++i, ++chunk_end);
@@ -259,13 +270,17 @@ public:
         }
     }
 
-    bool update_record_location(const primary_index_key& key, log_location old_location, log_location new_location) {
+    bool update_record_location(const primary_index_key& key, log_location old_location, log_location new_location, record_accounting_ops* accounting) {
         auto it = _partitions.find(key.dk, dht::ring_position_comparator(*_schema));
         if (it != _partitions.end()) {
             if (it->_e.location == old_location) {
                 it->_e.location = new_location;
                 // The cached mutation is still valid (same data, new location on
                 // disk after compaction moved it) — do not evict the cache here.
+                if (accounting) {
+                    accounting->free_record(old_location);
+                    accounting->add_record(new_location);
+                }
                 return true;
             }
         }
@@ -324,7 +339,7 @@ public:
         std::optional<log_location> old_durable_location;
     };
 
-    complete_pending_write_result complete_pending_write(const primary_index_key& key, pending_generation generation, api::timestamp_type ts, log_location new_location) {
+    complete_pending_write_result complete_pending_write(const primary_index_key& key, pending_generation generation, api::timestamp_type ts, log_location new_location, record_accounting_ops* accounting) {
         complete_pending_write_result result;
 
         partitions_type::bound_hint hint;
@@ -335,6 +350,10 @@ public:
                 result.old_durable_location = it->_e.location;
                 it->_e.location = new_location;
                 it->_e.timestamp = ts;
+                if (accounting) {
+                    accounting->free_record(*result.old_durable_location);
+                    accounting->add_record(new_location);
+                }
             }
         } else {
             index_entry new_entry{
@@ -344,6 +363,9 @@ public:
             auto inserted = _partitions.emplace_before(it, key.dk.token().raw(), hint, key.dk, std::move(new_entry));
             on_entry_added(*inserted);
             result.accepted = true;
+            if (accounting) {
+                accounting->add_record(new_location);
+            }
         }
 
         auto pending_it = _pending_entries_by_key.find(key.dk);
@@ -401,7 +423,7 @@ public:
         return it;
     }
 
-    std::pair<bool, std::optional<index_entry>> insert(const primary_index_key& key, index_entry new_entry, entry_cmp_fn cmp = default_entry_cmp) {
+    std::pair<bool, std::optional<index_entry>> insert(const primary_index_key& key, index_entry new_entry, record_accounting_ops* accounting , entry_cmp_fn cmp = default_entry_cmp) {
         partitions_type::bound_hint hint;
         auto i = _partitions.lower_bound(key.dk, dht::ring_position_comparator(*_schema), hint);
         if (hint.match) {
@@ -412,6 +434,10 @@ public:
                 }
                 auto old_entry = i->_e;
                 i->_e = std::move(new_entry);
+                if (accounting) {
+                    accounting->free_record(old_entry.location);
+                    accounting->add_record(i->_e.location);
+                }
                 return {true, std::make_optional(old_entry)};
             } else {
                 return {false, std::make_optional(i->_e)};
@@ -419,24 +445,27 @@ public:
         } else {
             auto it = _partitions.emplace_before(i, key.dk.token().raw(), hint, key.dk, std::move(new_entry));
             on_entry_added(*it);
+            if (accounting) {
+                accounting->add_record(it->_e.location);
+            }
             return {true, std::nullopt};
         }
     }
 
-    bool erase(const primary_index_key& key, log_location loc) {
+    bool erase(const primary_index_key& key, log_location loc, record_accounting_ops* accounting) {
         auto it = _partitions.find(key.dk, dht::ring_position_comparator(*_schema));
         if (it != _partitions.end() && it->_e.location == loc) {
-            it.erase_and_dispose(dht::raw_token_less_comparator{}, make_entry_disposer());
+            erase_entry(it, accounting);
             return true;
         }
         return false;
     }
 
-    future<> erase(const dht::partition_range& pr) {
+    future<> erase(const dht::partition_range& pr, record_accounting_ops* accounting) {
         dht::ring_position_comparator cmp(*_schema);
         auto begin = _partitions.lower_bound(dht::ring_position_view::for_range_start(pr), cmp);
         auto end = _partitions.lower_bound(dht::ring_position_view::for_range_end(pr), cmp);
-        co_await erase_range_gently(begin, end);
+        co_await erase_range_gently(begin, end, accounting);
 
         auto pending_begin = first_pending_in_range(pr);
         if (pending_begin != _pending_entries_by_order.end()) {
@@ -450,8 +479,8 @@ public:
         }
     }
 
-    future<> clear() {
-        co_await erase_range_gently(_partitions.begin(), _partitions.end());
+    future<> clear(record_accounting_ops* accounting) {
+        co_await erase_range_gently(_partitions.begin(), _partitions.end(), accounting);
         _pending_entries_by_key.clear();
         _pending_entries_by_order.clear();
 

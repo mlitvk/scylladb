@@ -63,6 +63,10 @@ struct segment_descriptor : public log_heap_hook<segment_descriptor_hist_options
     }
 
     void on_write(size_t net_data_size, size_t cnt = 1) noexcept {
+        if (net_data_size > free_space || record_count > std::numeric_limits<size_t>::max() - cnt) {
+            on_internal_error(logstor_logger, format("segment_descriptor::on_write overflow: free_space {} size {} count {} + {}",
+                    free_space, net_data_size, record_count, cnt));
+        }
         free_space -= net_data_size;
         record_count += cnt;
     }
@@ -72,6 +76,10 @@ struct segment_descriptor : public log_heap_hook<segment_descriptor_hist_options
     }
 
     void on_free(size_t net_data_size, size_t cnt = 1) noexcept {
+        if (cnt > record_count || net_data_size > std::numeric_limits<size_t>::max() - free_space) {
+            on_internal_error(logstor_logger, format("segment_descriptor::on_free underflow: free_space {} size {} count {} - {}",
+                    free_space, net_data_size, record_count, cnt));
+        }
         free_space += net_data_size;
         record_count -= cnt;
     }

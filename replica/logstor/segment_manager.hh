@@ -20,6 +20,7 @@
 #include <seastar/util/bool_class.hh>
 #include "bytes_fwd.hh"
 #include "mutation_writer/token_group_based_splitting_writer.hh"
+#include "replica/logstor/index.hh"
 #include "replica/logstor/segment_io.hh"
 #include "replica/logstor/write_buffer.hh"
 #include "replica/logstor/compaction.hh"
@@ -125,7 +126,7 @@ public:
 
     future<log_record> read(log_location location);
 
-    void free_record(log_location location);
+    primary_index::record_accounting_ops segment_accounting_updater() noexcept;
 
     compaction_manager& get_compaction_manager() noexcept;
     const compaction_manager& get_compaction_manager() const noexcept;

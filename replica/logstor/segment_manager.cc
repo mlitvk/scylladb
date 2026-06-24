@@ -837,7 +837,15 @@ public:
 
     future<log_record> read(log_location);
 
+    void add_record(log_location);
     void free_record(log_location);
+
+    primary_index::record_accounting_ops segment_accounting_updater() noexcept {
+        return primary_index::record_accounting_ops{
+            .add_record = [this] (log_location loc) noexcept { add_record(loc); },
+            .free_record = [this] (log_location loc) noexcept { free_record(loc); },
+        };
+    }
 
     future<> for_each_record(log_segment_id segment_id,
                             std::function<want_data(log_location, const log_record_header&)> on_header,
@@ -1306,8 +1314,6 @@ future<> segment_manager_impl::write(write_buffer& wb) {
         auto seg_ref = seg->ref();
         auto seq_num = seg->seq_num();
         auto write_op = _writes_phaser.start();
-        auto& desc = get_segment_descriptor(seg->id());
-
         // if we wrote a record to the segment but failed to write it to the separator, the segment should not be freed.
         auto write_to_separator_failed = defer([seg_ref, seq_num, net_data_size = wb.net_data_size(), record_count = wb.record_count()] mutable {
             logstor_logger.warn(
@@ -1329,8 +1335,6 @@ future<> segment_manager_impl::write(write_buffer& wb) {
             co_await coroutine::return_exception_ptr(std::move(ex));
         }
         auto loc = append_result.get();
-
-        desc.on_write(wb.net_data_size(), wb.record_count());
 
         _stats.bytes_written[static_cast<size_t>(source)] += data.size();
         _stats.data_bytes_written[static_cast<size_t>(source)] += wb.net_data_size();
@@ -1366,8 +1370,6 @@ future<> segment_manager_impl::write_full_segment(write_buffer& wb, logstor_grou
     co_await utils::get_local_injector().inject("logstor_segment_manager_pause_write", utils::wait_for_message(std::chrono::minutes(5)));
 
     auto seg = co_await get_segment(source);
-    auto& desc = get_segment_descriptor(seg->id());
-
     logstor_logger.trace("Write full segment {} seq {} from {}", seg->id(), seg->seq_num(), write_source_to_string(source));
 
     wb.seal(seg->seq_num(), cg.table_id(), block_alignment);
@@ -1381,15 +1383,20 @@ future<> segment_manager_impl::write_full_segment(write_buffer& wb, logstor_grou
     }
     auto loc = append_result.get();
 
-    desc.on_write(wb.net_data_size(), wb.record_count());
-
     _stats.bytes_written[static_cast<size_t>(source)] += data.size();
     _stats.data_bytes_written[static_cast<size_t>(source)] += wb.net_data_size();
 
     co_await wb.complete_writes(loc);
     co_await seg->stop();
 
+    // add the segment after all index updates have been completed.
+    auto& desc = get_segment_descriptor(seg->id());
     cg.add_logstor_segment(desc);
+}
+
+void segment_manager_impl::add_record(log_location location) {
+    auto& desc = get_segment_descriptor(location);
+    desc.on_write(location);
 }
 
 void segment_manager_impl::free_record(log_location location) {
@@ -1551,9 +1558,9 @@ future<> segment_manager_impl::discard_segments(segment_set& ss) {
         if (desc.ref_count != 0) {
             on_internal_error(logstor_logger, format("Discarding segment {} with non-zero reference count", seg_id));
         }
-
-        // the index should be cleared before discarding segments, so no data should be reachable
-        desc.reset(_cfg.segment_size);
+        if (desc.net_data_size(_cfg.segment_size) != 0) {
+            on_internal_error(logstor_logger, format("Discarding segment {} that has data", seg_id));
+        }
 
         segments.push_back(seg_id);
     }
@@ -1884,6 +1891,7 @@ struct compaction_buffer {
     future<> rewrite_record(primary_index& index, log_location read_location, log_record record) {
         auto* index_ptr = &index;
         auto key = record.header.key;
+        auto accounting = sm.segment_accounting_updater();
         log_record_writer writer(std::move(record));
 
         if (!buf->can_fit(writer)) {
@@ -1891,15 +1899,12 @@ struct compaction_buffer {
         }
 
         auto write_and_update_index = buf->write(std::move(writer)).then_unpack(
-                [this, index_ptr, key = std::move(key), read_location]
-                (log_location new_location, seastar::gate::holder op) {
-
-            if (index_ptr->update_record_location(key, read_location, new_location)) {
-                sm.free_record(read_location);
+                [this, index_ptr, key = std::move(key), read_location, accounting = std::move(accounting)]
+                (log_location new_location, seastar::gate::holder op) mutable noexcept {
+            if (index_ptr->update_record_location(key, read_location, new_location, &accounting)) {
                 stats.records_rewritten++;
             } else {
                 // another write updated this key
-                sm.free_record(new_location);
                 stats.records_skipped++;
             }
         });
@@ -2096,14 +2101,11 @@ future<> segment_manager_impl::write_to_separator(std::vector<write_buffer::reco
         auto key = w.writer.record().header.key;
         log_location prev_loc = co_await std::move(w.loc);
         auto* index_ptr = &w.target.cg->logstor_index();
+        auto accounting = segment_accounting_updater();
 
         co_await w.target.cg->write_to_separator(std::move(w.writer), seg_ref, segment_seq_num,
-            [this, index_ptr, key = std::move(key), prev_loc] (log_location new_loc, seastar::gate::holder op) {
-                if (index_ptr->update_record_location(key, prev_loc, new_loc)) {
-                    free_record(prev_loc);
-                } else {
-                    free_record(new_loc);
-                }
+            [index_ptr, key = std::move(key), prev_loc, accounting = std::move(accounting)] (log_location new_loc, seastar::gate::holder op) mutable noexcept {
+                index_ptr->update_record_location(key, prev_loc, new_loc, &accounting);
             }
         );
     }
@@ -2113,15 +2115,12 @@ future<> segment_manager_impl::write_to_separator(table& t, log_location prev_lo
     auto key = record.header.key;
     auto& cg = t.get_logstor_group(key.dk.token());
     auto* index_ptr = &cg.logstor_index();
+    auto accounting = segment_accounting_updater();
     log_record_writer writer(std::move(record));
 
     co_await cg.write_to_separator(std::move(writer), std::move(seg_ref), std::nullopt,
-        [this, index_ptr, key = std::move(key), prev_loc] (log_location new_loc, seastar::gate::holder op) {
-            if (index_ptr->update_record_location(key, prev_loc, new_loc)) {
-                free_record(prev_loc);
-            } else {
-                free_record(new_loc);
-            }
+        [index_ptr, key = std::move(key), prev_loc, accounting = std::move(accounting)] (log_location new_loc, seastar::gate::holder op) mutable noexcept {
+            index_ptr->update_record_location(key, prev_loc, new_loc, &accounting);
         }
     );
 }
@@ -2328,7 +2327,7 @@ future<> segment_manager_impl::recover_segment(replica::database& db, log_segmen
             on_header(seg_hdr);
             return make_ready_future<>();
         },
-        [this, &desc, &db, &cmp] (log_location loc, const log_record_header& header) -> want_data {
+        [this, &db, &cmp] (log_location loc, const log_record_header& header) -> want_data {
             logstor_logger.trace("Recovery: read record at {} key {} ts {}", loc, header.key, header.timestamp);
 
             index_entry new_entry {
@@ -2341,13 +2340,8 @@ future<> segment_manager_impl::recover_segment(replica::database& db, log_segmen
                 if (!t.uses_logstor()) {
                     return want_data::no;
                 }
-                auto [inserted, prev_entry] = t.logstor_index().insert(header.key, new_entry, cmp);
-                if (inserted) {
-                    desc.on_write(loc);
-                    if (prev_entry) {
-                        get_segment_descriptor(prev_entry->location).on_free(prev_entry->location);
-                    }
-                }
+                auto accounting = segment_accounting_updater();
+                t.logstor_index().insert(header.key, new_entry, &accounting, cmp);
             } catch (const replica::no_such_column_family&) {
                 // ignore record
             }
@@ -2477,8 +2471,8 @@ future<log_record> segment_manager::read(log_location location) {
     return _impl->read(location);
 }
 
-void segment_manager::free_record(log_location location) {
-    _impl->free_record(location);
+primary_index::record_accounting_ops segment_manager::segment_accounting_updater() noexcept {
+    return _impl->segment_accounting_updater();
 }
 
 compaction_manager& segment_manager::get_compaction_manager() noexcept {
