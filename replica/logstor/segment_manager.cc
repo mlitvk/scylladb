@@ -149,7 +149,7 @@ future<log_location> writeable_segment::append(bytes_view data) {
     auto data_size = data.size();
 
     if (!can_fit(data_size)) {
-        throw std::runtime_error("Entry too large for remaining segment space");
+        on_internal_error(logstor_logger, format("Entry too large for remaining segment space: {} bytes remaining, {} bytes requested", bytes_remaining(), data_size));
     }
 
     log_location loc {
@@ -937,8 +937,18 @@ private:
                     return free_segment(seg_id);
                 }
             },
-            [seg_id] {
-                logstor_logger.warn("Segment {} can't be freed", seg_id);
+            [this, seg_id] (const std::optional<sstring>& reason) {
+                auto& desc = get_segment_descriptor(seg_id);
+                logstor_logger.warn(
+                    "Segment {} can't be freed: reason='{}', net_data_size={}, free_space={}, record_count={}, ref_count={}, owner={}",
+                    seg_id,
+                    reason.value_or("unknown"),
+                    desc.net_data_size(_cfg.segment_size),
+                    desc.free_space,
+                    desc.record_count,
+                    desc.ref_count,
+                    static_cast<const void*>(desc.owner)
+                );
             }
         );
     }
@@ -1254,15 +1264,22 @@ future<> segment_manager_impl::run_separator_fiber() {
             co_return;
         }
 
-        auto write_to_separator_failed = defer([seg_ref = task.seg_ref] mutable {
-            seg_ref.set_flush_failure();
+        auto write_to_separator_failed = defer([seg_ref = task.seg_ref, records = task.records.size(), seq_num = task.seq_num] mutable {
+            logstor_logger.warn(
+                "Marking segment {} flush_failed after separator task failure: records={}, seq_num={}",
+                seg_ref.id(), records, seq_num
+            );
+            seg_ref.set_flush_failure("separator task failed");
         });
 
         try {
             co_await write_to_separator(task.records, std::move(task.seg_ref), task.seq_num);
             write_to_separator_failed.cancel();
         } catch (...) {
-            logstor_logger.warn("Writing to separator failed: {}", std::current_exception());
+            logstor_logger.warn(
+                "Writing to separator failed for segment {}: records={}, seq_num={}, error={}",
+                task.seg_ref.id(), task.records.size(), task.seq_num, std::current_exception()
+            );
         }
     }
 }
@@ -1292,8 +1309,12 @@ future<> segment_manager_impl::write(write_buffer& wb) {
         auto& desc = get_segment_descriptor(seg->id());
 
         // if we wrote a record to the segment but failed to write it to the separator, the segment should not be freed.
-        auto write_to_separator_failed = defer([seg_ref] mutable {
-            seg_ref.set_flush_failure();
+        auto write_to_separator_failed = defer([seg_ref, seq_num, net_data_size = wb.net_data_size(), record_count = wb.record_count()] mutable {
+            logstor_logger.warn(
+                "Marking mixed segment {} flush_failed before handing records to separator: seq_num={}, records={}, net_data_size={}",
+                seg_ref.id(), seq_num, record_count, net_data_size
+            );
+            seg_ref.set_flush_failure("mixed segment write was not handed to separator");
         });
 
         logstor_logger.trace("Write active segment {} seq {}", seg->id(), seq_num);
@@ -1421,7 +1442,14 @@ future<> segment_manager_impl::switch_active_segment() {
     // trigger separator flush for separator buffers that hold old segments
     auto u = std::max<size_t>(1, _max_segments / 100);
     if (_next_segment_seq.value % u == 0 && _next_segment_seq.value > 5*u) {
-        (void)_compaction_mgr.flush_all_separator_buffers(segment_sequence(_next_segment_seq.value - 5*u));
+        auto threshold_seq = segment_sequence(_next_segment_seq.value - 5*u);
+        (void)_compaction_mgr.flush_all_separator_buffers(threshold_seq).handle_exception([threshold_seq] (std::exception_ptr ep) {
+            logstor_logger.warn(
+                "Background separator flush failed during segment switch: threshold_seq={}, error={}",
+                threshold_seq.value,
+                ep
+            );
+        });
     }
 
     logstor_logger.trace("Switched active segment to {} seq {}", _active_segment->id(), _active_segment->seq_num());
@@ -2050,7 +2078,12 @@ future<> compaction_manager_impl::flush_all_separator_buffers(std::optional<segm
 future<separator_buffer> compaction_manager_impl::allocate_separator_buffer() {
     auto buf = _sm._separator_buffer_pool.try_allocate();
     if (!buf) {
-        (void)flush_all_separator_buffers(std::nullopt);
+        (void)flush_all_separator_buffers(std::nullopt).handle_exception([] (std::exception_ptr ep) {
+            logstor_logger.warn(
+                "Background separator flush failed while allocating separator buffer: error={}",
+                ep
+            );
+        });
         buf = co_await _sm._separator_buffer_pool.allocate("separator buffer");
     }
     co_return separator_buffer(std::move(*buf));
@@ -2094,7 +2127,11 @@ future<> segment_manager_impl::write_to_separator(table& t, log_location prev_lo
 }
 
 future<> compaction_manager_impl::flush_separator_buffer(separator_buffer buf, logstor_group& cg) {
-    logstor_logger.trace("Flushing separator buffer with {} bytes", buf.buf->offset_in_buffer());
+    auto min_seq_num_value = buf.min_seq_num ? buf.min_seq_num->value : 0;
+    logstor_logger.trace(
+        "Flushing separator buffer with {} bytes, pending_updates={}, held_segments={}, min_seq_num={}",
+        buf.buf->offset_in_buffer(), buf.pending_updates.size(), buf.held_segments.size(), min_seq_num_value
+    );
 
     utils::get_local_injector().inject("fail_flush_separator_buffer", []() {
         throw std::runtime_error("flush_separator_buffer failed by injection");
@@ -2102,16 +2139,48 @@ future<> compaction_manager_impl::flush_separator_buffer(separator_buffer buf, l
 
     if (buf.buf->has_data()) {
         auto sem_units = co_await get_units(_separator_flush_sem, 1);
-        co_await with_scheduling_group(_cfg.separator_sg, [&] {
-            return _sm.write_full_segment(*buf.buf, cg, write_source::separator);
-        });
+        try {
+            co_await with_scheduling_group(_cfg.separator_sg, [&] {
+                return _sm.write_full_segment(*buf.buf, cg, write_source::separator);
+            });
+        } catch (...) {
+            logstor_logger.warn(
+                "Writing separator buffer to full segment failed: bytes={}, pending_updates={}, held_segments={}, min_seq_num={}, error={}",
+                buf.buf->offset_in_buffer(), buf.pending_updates.size(), buf.held_segments.size(), min_seq_num_value, std::current_exception()
+            );
+            throw;
+        }
         _stats.separator_buffer_flushed++;
     }
-    co_await when_all_succeed(buf.pending_updates.begin(), buf.pending_updates.end());
-    co_await buf.buf.release();
+    try {
+        co_await when_all_succeed(buf.pending_updates.begin(), buf.pending_updates.end());
+    } catch (...) {
+        logstor_logger.warn(
+            "Separator buffer pending updates failed: bytes={}, pending_updates={}, held_segments={}, min_seq_num={}, error={}",
+            buf.buf->offset_in_buffer(), buf.pending_updates.size(), buf.held_segments.size(), min_seq_num_value, std::current_exception()
+        );
+        throw;
+    }
+    try {
+        co_await buf.buf.release();
+    } catch (...) {
+        logstor_logger.warn(
+            "Releasing separator buffer failed: bytes={}, pending_updates={}, held_segments={}, min_seq_num={}, error={}",
+            buf.buf->offset_in_buffer(), buf.pending_updates.size(), buf.held_segments.size(), min_seq_num_value, std::current_exception()
+        );
+        throw;
+    }
 
     // wait for read operations that use the old locations before freeing the old segments
-    co_await cg.logstor_index().await_pending_reads();
+    try {
+        co_await cg.logstor_index().await_pending_reads();
+    } catch (...) {
+        logstor_logger.warn(
+            "Waiting for pending reads before separator segment release failed: held_segments={}, min_seq_num={}, error={}",
+            buf.held_segments.size(), min_seq_num_value, std::current_exception()
+        );
+        throw;
+    }
 
     // the separator buffer is destroyed and frees the segment if it's the last holder
     buf.flushed = true;
@@ -2320,8 +2389,9 @@ future<> segment_manager_impl::add_segment_to_compaction_group(replica::database
 
     if (need_separator) {
         auto seg_ref = make_segment_ref(seg_id);
-        auto write_to_separator_failed = defer([seg_ref] mutable {
-            seg_ref.set_flush_failure();
+        auto write_to_separator_failed = defer([seg_ref, seg_id] mutable {
+            logstor_logger.warn("Marking recovered mixed segment {} flush_failed during separator rewrite", seg_id);
+            seg_ref.set_flush_failure("recovered mixed segment rewrite failed");
         });
         co_await for_each_record(seg_id,
             [&db] (log_location prev_loc, const log_record_header& record_header) -> want_data {
@@ -2522,7 +2592,17 @@ future<> logstor_group::write_to_separator(log_record_writer writer, segment_ref
             auto b = std::move(*_logstor_separator);
             _logstor_separator.reset();
 
-            std::erase_if(_separator_flushes, [] (future<>& f) { return f.available(); });
+            std::erase_if(_separator_flushes, [table_id = table_id()] (future<>& f) {
+                if (!f.available()) {
+                    return false;
+                }
+                try {
+                    f.get();
+                } catch (...) {
+                    logstor_logger.warn("separator flush failed for table {}: {}", table_id, std::current_exception());
+                }
+                return true;
+            });
             _separator_flushes.push_back(cm.flush_separator_buffer(std::move(b), *this));
         }
         _logstor_separator.emplace(co_await cm.allocate_separator_buffer());

@@ -17,7 +17,9 @@
 #include <seastar/coroutine/maybe_yield.hh>
 #include "mutation_writer/token_group_based_splitting_writer.hh"
 #include <functional>
+#include <limits>
 #include <optional>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -153,13 +155,14 @@ class segment_ref {
     struct state {
         log_segment_id id;
         std::function<void()> on_last_release;
-        std::function<void()> on_failure;
+        std::function<void(const std::optional<seastar::sstring>&)> on_failure;
         bool flush_failure{false};
+        std::optional<seastar::sstring> failure_reason;
         ~state() {
             if (!flush_failure) {
                 if (on_last_release) on_last_release();
             } else {
-                if (on_failure) on_failure();
+                if (on_failure) on_failure(failure_reason);
             }
         }
     };
@@ -176,11 +179,19 @@ public:
     log_segment_id id() const noexcept { return _state->id; }
     bool empty() const noexcept { return !_state; }
 
-    void set_flush_failure() noexcept { if (_state) _state->flush_failure = true; }
+    void set_flush_failure(std::string_view reason = {}) noexcept {
+        if (!_state) {
+            return;
+        }
+        _state->flush_failure = true;
+        if (!_state->failure_reason && !reason.empty()) {
+            _state->failure_reason = seastar::sstring(reason);
+        }
+    }
 
 private:
     friend class segment_manager_impl;
-    explicit segment_ref(log_segment_id id, std::function<void()> on_last_release, std::function<void()> on_failure)
+    explicit segment_ref(log_segment_id id, std::function<void()> on_last_release, std::function<void(const std::optional<seastar::sstring>&)> on_failure)
         : _state(make_lw_shared<state>(id, std::move(on_last_release), std::move(on_failure)))
     {}
 };
@@ -270,8 +281,13 @@ struct separator_buffer {
 
     ~separator_buffer() {
         if (!flushed && buf && buf->has_data()) {
+            auto min_seq_num_value = min_seq_num ? min_seq_num->value : 0;
+            logstor_logger.warn(
+                "Destroying unflushed separator buffer: bytes={}, pending_updates={}, held_segments={}, min_seq_num={}",
+                buf->offset_in_buffer(), pending_updates.size(), held_segments.size(), min_seq_num_value
+            );
             for (auto& seg_ref : held_segments) {
-                seg_ref.set_flush_failure();
+                seg_ref.set_flush_failure("separator buffer destroyed before flush completed");
             }
         }
     }
