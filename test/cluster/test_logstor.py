@@ -408,6 +408,76 @@ async def test_recovery_with_segment_reuse(manager: ManagerClient):
             assert len(rows) == 1, f"Key {pk} not found after recovery"
             assert rows[0].v == expected_v, f"Key {pk} value mismatch after recovery"
 
+async def test_live_index_bytes_metric_stays_constant_across_overwrites(manager: ManagerClient):
+    """
+    Verify that scylla_logstor_sm_live_index_bytes reflects the live durable data
+    size after the initial unique-key load and remains unchanged after many
+    fixed-size overwrites that fill the disk multiple times.
+    """
+    disk_size_mb = 4
+    file_size_mb = 1
+    key_count = 800
+    value_size = 2000
+    value_overhead_budget = 500
+    overwrite_rounds = 5
+
+    cmdline = ['--logger-log-level', 'logstor=trace', '--smp=1']
+    cfg = {
+        'logstor_disk_size_in_mb': disk_size_mb,
+        'logstor_file_size_in_mb': file_size_mb,
+        'experimental_features': ['logstor']
+    }
+    servers = await manager.servers_add(1, cmdline=cmdline, config=cfg)
+    server = servers[0]
+    cql = manager.get_cql()
+
+    async def get_live_index_bytes() -> float:
+        metrics = await manager.metrics.query(server.ip_addr)
+        live_index_bytes = metrics.get("scylla_logstor_sm_live_index_bytes")
+        assert live_index_bytes is not None
+        return live_index_bytes
+
+    def make_value(tag: str) -> str:
+        return tag + ('x' * (value_size - len(tag)))
+
+    async with new_test_keyspace(manager, "WITH tablets={'initial':1}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v text) WITH storage_engine = 'logstor'")
+
+        insert = cql.prepare(f"INSERT INTO {ks}.test (pk, v) VALUES (?, ?)")
+
+        initial_value = make_value("initial_")
+        await asyncio.gather(*[cql.run_async(insert, [pk, initial_value]) for pk in range(key_count)])
+
+        await manager.api.logstor_flush(server.ip_addr)
+
+        baseline_live_index_bytes = await get_live_index_bytes()
+        logger.info(f"baseline live_index_bytes={baseline_live_index_bytes}")
+
+        assert baseline_live_index_bytes >= key_count * value_size, (
+            f"expected live_index_bytes to be at least {key_count * value_size}, "
+            f"got {baseline_live_index_bytes}"
+        )
+        # live_index_bytes tracks full durable record bytes, so allow room for
+        # mutation and log record metadata on top of the raw value payload.
+        assert baseline_live_index_bytes <= key_count * (value_size + value_overhead_budget), (
+            f"expected live_index_bytes to be at most {key_count * (value_size + value_overhead_budget)}, "
+            f"got {baseline_live_index_bytes}"
+        )
+
+        for round_no in range(overwrite_rounds):
+            value = make_value(f"round_{round_no}_")
+            await asyncio.gather(*[cql.run_async(insert, [pk, value]) for pk in range(key_count)])
+
+            await manager.api.logstor_flush(server.ip_addr)
+
+            final_live_index_bytes = await get_live_index_bytes()
+            logger.info(f"final live_index_bytes={final_live_index_bytes}")
+
+            assert final_live_index_bytes == baseline_live_index_bytes, (
+                f"expected live_index_bytes to remain {baseline_live_index_bytes} after overwrites, "
+                f"got {final_live_index_bytes}"
+            )
+
 async def test_compaction(manager: ManagerClient):
     """
     Test log compaction by creating dead data and verifying space reclamation.
