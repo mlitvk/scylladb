@@ -276,6 +276,7 @@ private:
 
     friend class buffered_writer;
     friend class segment_manager_impl;
+    friend struct separator_buffer;
 };
 
 // Manages a fixed-size circular ring of write_buffers.

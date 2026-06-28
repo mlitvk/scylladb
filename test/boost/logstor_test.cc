@@ -167,7 +167,6 @@ logstor_config make_test_logstor_config(const std::filesystem::path& base_dir) {
             .compaction_sg = seastar::current_scheduling_group(),
             .compaction_static_shares = utils::updateable_value<float>(0.0f),
             .separator_sg = seastar::current_scheduling_group(),
-            .max_separator_memory = 16 * segment_size,
         },
         .flush_sg = seastar::current_scheduling_group(),
     };
@@ -186,10 +185,12 @@ class test_compaction_group_handle final : public logstor_group {
     compaction_manager& _cm;
     seastar::gate _write_gate;
 public:
-    test_compaction_group_handle(schema_ptr schema, compaction_manager& cm)
-        : _table_id(schema->id())
+    test_compaction_group_handle(schema_ptr schema, compaction_manager& cm, size_t separator_buffer_size)
+        : logstor_group(separator_buffer_size)
+        , _table_id(schema->id())
         , _index(std::move(schema))
         , _cm(cm) {
+        _cm.add(*this);
     }
 
     ::table_id table_id() const noexcept override {
@@ -875,9 +876,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_and_separator_flush) {
     ls.start().get();
     auto stop_store = seastar::defer([&ls] { ls.stop().get(); });
 
-    test_compaction_group_handle cg(schema, ls.get_compaction_manager());
-    ls.get_compaction_manager().add(cg);
-
+    test_compaction_group_handle cg(schema, ls.get_compaction_manager(), ls.get_segment_manager().get_segment_size());
     auto expected = make_kv_mutation(schema, "pk0", "separator-value");
     auto key = expected.decorated_key();
 
@@ -919,8 +918,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_group_compaction_rewrites_live_records) {
     ls.start().get();
     auto stop_store = seastar::defer([&ls] { ls.stop().get(); });
 
-    test_compaction_group_handle cg(schema, ls.get_compaction_manager());
-    ls.get_compaction_manager().add(cg);
+    test_compaction_group_handle cg(schema, ls.get_compaction_manager(), ls.get_segment_manager().get_segment_size());
     auto setup_guard = std::make_optional(ls.get_compaction_manager().disable_compaction(cg).get());
 
     auto pk0_v0 = make_kv_mutation(schema, "pk0", "v0", api::timestamp_type(1));
@@ -1044,8 +1042,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_group_segments_are_ordered_by_free_space_f
     ls.start().get();
     auto stop_store = seastar::defer([&ls] { ls.stop().get(); });
 
-    test_compaction_group_handle cg(schema, ls.get_compaction_manager());
-    ls.get_compaction_manager().add(cg);
+    test_compaction_group_handle cg(schema, ls.get_compaction_manager(), ls.get_segment_manager().get_segment_size());
     auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
 
     struct segment_plan {
@@ -1173,8 +1170,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_disabled_group_does_not_compact_on_submit)
     ls.start().get();
     auto stop_store = seastar::defer([&ls] { ls.stop().get(); });
 
-    test_compaction_group_handle cg(schema, ls.get_compaction_manager());
-    ls.get_compaction_manager().add(cg);
+    test_compaction_group_handle cg(schema, ls.get_compaction_manager(), ls.get_segment_manager().get_segment_size());
     auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
 
     auto pk0_v0 = make_kv_mutation(schema, "pk0", "v0", api::timestamp_type(1));
@@ -1248,7 +1244,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_periodic_range_reader_merges_durable_and_p
     ls.do_recovery_for_test().get();
     ls.start().get();
 
-    test_compaction_group_handle cg(schema, ls.get_compaction_manager());
+    test_compaction_group_handle cg(schema, ls.get_compaction_manager(), ls.get_segment_manager().get_segment_size());
     auto stop_store = seastar::defer([&ls] { ls.stop().get(); });
 
     auto durable_a = make_kv_mutation(schema, "a", "durable-a", api::timestamp_type(1));
@@ -1307,7 +1303,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_periodic_range_reader_prefers_newer_pendin
     ls.do_recovery_for_test().get();
     ls.start().get();
 
-    test_compaction_group_handle cg(schema, ls.get_compaction_manager());
+    test_compaction_group_handle cg(schema, ls.get_compaction_manager(), ls.get_segment_manager().get_segment_size());
     auto stop_store = seastar::defer([&ls] { ls.stop().get(); });
 
     auto durable_old = make_kv_mutation(schema, "same", "durable-old", api::timestamp_type(1));
@@ -1340,13 +1336,12 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_buffered_writer_queues_when_ring_full) {
 
     shared_logstor_cache cache;
     auto cfg = make_periodic_test_logstor_config(dir.path());
-    cfg.segment_manager_cfg.max_separator_memory = ring_size * cfg.segment_manager_cfg.segment_size;
     logstor ls(cfg, cache.shared_tracker);
     ls.do_recovery_for_test().get();
     ls.start().get();
     auto stop_store = seastar::defer([&ls] { ls.stop().get(); });
 
-    test_compaction_group_handle cg(schema, ls.get_compaction_manager());
+    test_compaction_group_handle cg(schema, ls.get_compaction_manager(), ls.get_segment_manager().get_segment_size());
 
     auto& errinj = utils::get_local_injector();
     errinj.enable("logstor_buffered_writer_pause_dispatched_write");

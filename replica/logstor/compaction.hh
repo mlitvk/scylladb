@@ -16,6 +16,8 @@
 #include <seastar/util/noncopyable_function.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 #include "mutation_writer/token_group_based_splitting_writer.hh"
+#include <array>
+#include <ranges>
 #include <functional>
 #include <limits>
 #include <optional>
@@ -277,28 +279,14 @@ public:
 };
 
 struct separator_buffer {
-    owned_write_buffer buf;
+    write_buffer buf;
     utils::chunked_vector<future<>> pending_updates;
     utils::chunked_vector<segment_ref> held_segments;
     std::optional<segment_sequence> min_seq_num;
-    bool flushed{false};
 
-    separator_buffer(owned_write_buffer wb)
-        : buf(std::move(wb))
+    separator_buffer(size_t buffer_size)
+        : buf(buffer_size, segment_kind::full)
     {}
-
-    ~separator_buffer() {
-        if (!flushed && buf && buf->has_data()) {
-            auto min_seq_num_value = min_seq_num ? min_seq_num->value : 0;
-            logstor_logger.warn(
-                "Destroying unflushed separator buffer: bytes={}, pending_updates={}, held_segments={}, min_seq_num={}",
-                buf->offset_in_buffer(), pending_updates.size(), held_segments.size(), min_seq_num_value
-            );
-            for (auto& seg_ref : held_segments) {
-                seg_ref.set_flush_failure("separator buffer destroyed before flush completed");
-            }
-        }
-    }
 
     separator_buffer(const separator_buffer&) = delete;
     separator_buffer& operator=(const separator_buffer&) = delete;
@@ -317,21 +305,30 @@ struct separator_buffer {
         }
 
         pending_updates.push_back(
-            buf->write(std::move(writer)).then_unpack(std::move(after_written))
+            buf.write(std::move(writer)).then_unpack(std::move(after_written))
         );
     }
 
     bool can_fit(const log_record_writer& writer) const noexcept {
-        return buf->can_fit(writer);
+        return buf.can_fit(writer);
     }
 
     bool can_fit(size_t write_size) const noexcept {
-        return buf->can_fit(write_size);
+        return buf.can_fit(write_size);
     }
 
     bool empty() const noexcept {
-        return !buf->has_data();
+        return !buf.has_data();
     }
+
+    void reset() {
+        buf.reset();
+        pending_updates.clear();
+        held_segments.clear();
+        min_seq_num.reset();
+    }
+
+    future<> abort(std::exception_ptr, std::string_view reason);
 };
 
 class compaction_reenabler {
@@ -352,9 +349,7 @@ class compaction_manager {
 public:
     virtual ~compaction_manager() = default;
 
-    virtual future<separator_buffer> allocate_separator_buffer() = 0;
-
-    virtual future<> flush_separator_buffer(separator_buffer, logstor_group&) = 0;
+    virtual future<> flush_separator_buffer(separator_buffer&, logstor_group&) = 0;
 
     virtual future<> flush_all_separator_buffers(std::optional<segment_sequence>) = 0;
 
@@ -376,12 +371,24 @@ public:
 
 class logstor_group {
     segment_set _logstor_segments;
-    std::optional<separator_buffer> _logstor_separator;
-    std::vector<future<>> _separator_flushes;
-    size_t _separator_flushes_in_progress{0};
-    seastar::semaphore _separator_flush_sem{1};
+    std::array<separator_buffer, 2> _separator_buffers;
+    size_t _active_separator_buffer{0};
+    uint64_t _separator_generation{1};
+    shared_future<> _separator_flush{make_ready_future<>()};
+
+    auto& active_separator_buffer(this auto& self) noexcept {
+        return self._separator_buffers[self._active_separator_buffer];
+    }
+
+    auto& inactive_separator_buffer(this auto& self) noexcept {
+        return self._separator_buffers[1 - self._active_separator_buffer];
+    }
+
+    void switch_active_separator_buffer();
 
 protected:
+    explicit logstor_group(size_t separator_buffer_size);
+
     virtual compaction_manager& logstor_compaction_manager() noexcept = 0;
 
 public:
@@ -413,17 +420,18 @@ public:
 
     bool empty() const noexcept {
         return _logstor_segments.empty()
-            && (!_logstor_separator || _logstor_separator->empty())
-            && _separator_flushes.empty()
-            && _separator_flushes_in_progress == 0;
+            && std::ranges::all_of(_separator_buffers, [] (const auto& buf) { return buf.empty(); })
+            && _separator_flush.available();
     }
 
     bool separator_has_data() const noexcept {
-        return _logstor_separator && !_logstor_separator->empty();
+        return std::ranges::any_of(_separator_buffers, [] (const auto& buf) { return !buf.empty(); });
     }
 
     size_t separator_held_segment_count() const noexcept {
-        return _logstor_separator ? _logstor_separator->held_segments.size() : 0;
+        return std::ranges::fold_left(_separator_buffers, size_t(0), [] (size_t count, const auto& buf) {
+            return count + buf.held_segments.size();
+        });
     }
 };
 

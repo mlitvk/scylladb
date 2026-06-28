@@ -981,8 +981,6 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     , logstor_format_on_startup(this, "logstor_format_on_startup", value_status::Used, false,
         "Controls when logstor data files are formatted. When enabled, all logstor files are formatted during node startup, which increases startup time but ensures optimal write performance immediately after startup. "
         "When disabled, logstor files are formatted lazily on first write, which reduces startup time but may cause slightly degraded write performance on first access to each file.")
-    , logstor_separator_max_memory_in_mb(this, "logstor_separator_max_memory_in_mb", value_status::Used, 256,
-        "Maximum memory in megabytes for logstor separator memory buffers.")
     , file_cache_size_in_mb(this, "file_cache_size_in_mb", value_status::Unused, 512,
         "Total memory to use for SSTable-reading buffers.")
     , memtable_flush_queue_size(this, "memtable_flush_queue_size", value_status::Unused, 4,

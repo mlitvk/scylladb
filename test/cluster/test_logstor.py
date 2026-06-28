@@ -1132,35 +1132,29 @@ async def test_cache(manager: ManagerClient):
                 rows = await cql.run_async(f"SELECT pk, v FROM {ks}.test_no_cache WHERE pk = {i}")
                 assert rows[0].v == i * 10, f"unexpected value for pk={i}"
 
-async def test_separator_buffer_pressure(manager: ManagerClient):
+async def test_separator_two_buffer_flush(manager: ManagerClient):
     """
-    Test that the separator buffer pool handles pressure gracefully when many tablets
-    compete for a very small pool.
+    Test that each logstor group flushes its fixed separator buffers without relying
+    on a shared separator buffer pool.
 
-    With logstor_separator_max_memory_in_mb=1 (1 MB / 128 KB = 8 separator buffers)
-    and a table split across 32 tablets (4x the pool size), writes to 200 different
-    keys target all tablets simultaneously. As the separator fiber replays records
-    from the write log into per-tablet compaction groups, it repeatedly exhausts the
-    8-buffer pool: when the pool is empty, allocate_separator_buffer() triggers a flush
-    of an existing buffer (freeing it back to the pool) before the next allocation can
-    proceed. This cycle repeats ~24+ times across the 32 tablets.
+    A table split across 32 tablets writes enough data to fill separator buffers in
+    many groups. Each group owns two separator buffers permanently; when the active
+    buffer fills, the group flushes it and switches to the other buffer.
 
     Verification uses three independent signals:
-    1. No deadlock: logstor_flush completes, proving pool-exhaustion recovery worked.
+    1. No deadlock: logstor_flush completes, proving active/flushing buffer switching worked.
     2. Metrics: scylla_logstor_sm_separator_buffer_flushed increased, confirming that
-       actual disk writes occurred and each one succeeded (the counter only increments
-       after a successful write_full_segment call, never on failure).
+        actual disk writes occurred and each one succeeded (the counter only increments
+        after a successful write_full_segment call, never on failure).
     3. Log scan: absence of "Writing to separator failed" warnings, confirming that
        the separator fiber did not swallow any silent exceptions during replay.
     """
-    # 1 MB / 128 KB per segment = 8 separator buffers; 32 tablets is 4x the pool size.
     num_tablets = 32
     num_keys = 200
 
     cmdline = ['--logger-log-level', 'logstor=trace', '--smp=1']
     cfg = {
         'experimental_features': ['logstor'],
-        'logstor_separator_max_memory_in_mb': 1,
     }
     servers = await manager.servers_add(1, cmdline=cmdline, config=cfg)
     server = servers[0]
@@ -1173,9 +1167,9 @@ async def test_separator_buffer_pressure(manager: ManagerClient):
             " WITH storage_engine = 'logstor'"
         )
 
-        # 4 KB values: 200 keys × 4 KB ≈ 800 KB, filling ~6 segments (128 KB each).
+        # 4 KB values: 200 keys x 4 KB ~= 800 KB, filling ~6 segments (128 KB each).
         # Records from each segment are spread across all 32 tablets by token, so the
-        # separator fiber needs up to 32 buffers while only 8 are available.
+        # separator fiber exercises per-group separator buffers across many groups.
         value = 'x' * 4096
 
         # Snapshot log position and the separator flush counter before writes so we
