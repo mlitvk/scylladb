@@ -42,7 +42,7 @@ struct index_entry {
 };
 
 struct pending_entry {
-    dht::decorated_key key;
+    uint64_t generation;
     api::timestamp_type timestamp;
     canonical_mutation mutation;
 };

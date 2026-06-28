@@ -133,18 +133,10 @@ future<> logstor::write(const mutation& m, write_target target, db::timeout_cloc
 
         auto holder = _async_gate.hold();
         (void)_write_buffer.write(std::move(writer), timeout, std::move(target))
-            .then_unpack([this, index_ptr = &index, key, pending, ts] (log_location location, seastar::gate::holder op) {
-                auto result = index_ptr->complete_pending_write(key, pending, ts, location);
-
-                if (!result.accepted) {
-                    // A newer durable entry already exists; free the record we just wrote.
-                    _segment_manager.free_record(location);
-                } else if (result.old_durable_location && result.old_durable_location->size != 0) {
-                    // Overwrote an older durable entry; free it.
-                    _segment_manager.free_record(*result.old_durable_location);
-                }
+            .then_unpack([index_ptr = &index, key, generation = *pending, ts] (log_location location, seastar::gate::holder op) mutable {
+                index_ptr->complete_pending_write(key, generation, ts, location);
             }).handle_exception([this, index_ptr = &index, key, pending] (std::exception_ptr ep) {
-                index_ptr->erase_pending_if_current(key, pending);
+                index_ptr->erase_pending_if_current(key, *pending);
                 _stats.write_failures++;
             }).finally([holder = std::move(holder)] {});
         co_return;
@@ -178,16 +170,15 @@ future<std::optional<mutation>> logstor::read(const schema& s, const primary_ind
     auto* cache = bypass_cache ? nullptr : index.cache_tracker();
 
     auto it = index.find(dk);
+    auto pending = index.get_pending(dk);
+
     if (it == index.end()) {
-        auto pending = index.get_pending(dk);
         if (!pending) {
             co_return std::nullopt;
         }
-
         co_return pending->mutation.to_mutation(s.shared_from_this());
     }
 
-    auto pending = index.get_pending(dk);
     if (pending && pending->timestamp >= it->entry().timestamp) {
         co_return pending->mutation.to_mutation(s.shared_from_this());
     }
@@ -272,7 +263,7 @@ mutation_reader logstor::make_reader(schema_ptr schema, const primary_index& ind
             if (it == _index.pending_end()) {
                 return std::nullopt;
             }
-            return it->first;
+            return *it;
         }
 
         std::optional<dht::decorated_key> find_next_key() const {

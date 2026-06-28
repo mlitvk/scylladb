@@ -9,7 +9,8 @@
 
 #include "dht/decorated_key.hh"
 #include "dht/ring_position.hh"
-#include <absl/container/btree_map.h>
+#include <absl/container/flat_hash_map.h>
+#include <absl/container/btree_set.h>
 #include <algorithm>
 #include <optional>
 #include <seastar/coroutine/maybe_yield.hh>
@@ -98,7 +99,7 @@ public:
     friend dht::ring_position_view ring_position_view_to_compare(const primary_index_entry& e) { return e._key; }
 };
 
-using pending_entry_ptr = seastar::lw_shared_ptr<pending_entry>;
+using pending_generation = uint64_t;
 
 class primary_index final {
 public:
@@ -106,6 +107,20 @@ public:
                             dht::raw_token_less_comparator, dht::ring_position_comparator,
                             16, bplus::key_search::linear>;
 private:
+    struct pending_key_hash {
+        size_t operator()(const dht::decorated_key& k) const noexcept {
+            return std::hash<dht::decorated_key>()(k);
+        }
+    };
+
+    struct pending_key_equal {
+        const schema_ptr* schema = nullptr;
+
+        bool operator()(const dht::decorated_key& a, const dht::decorated_key& b) const {
+            return a.equal(**schema, b);
+        }
+    };
+
     struct pending_key_less {
         const schema_ptr* schema = nullptr;
         using is_transparent = void;
@@ -123,19 +138,24 @@ private:
         }
     };
 
-    using pending_entries_type = absl::btree_map<dht::decorated_key, pending_entry_ptr, pending_key_less>;
+    using pending_entries_by_key_type = absl::flat_hash_map<dht::decorated_key, pending_entry, pending_key_hash, pending_key_equal>;
+    using pending_entries_by_order_type = absl::btree_set<dht::decorated_key, pending_key_less>;
 
-    static bool is_after_pending_range_end(const dht::partition_range& pr, dht::ring_position_comparator cmp, pending_entries_type::const_iterator it, pending_entries_type::const_iterator end) {
+    static constexpr size_t pending_entries_initial_reserve = 4096;
+
+    static bool is_after_pending_range_end(const dht::partition_range& pr, dht::ring_position_comparator cmp, pending_entries_by_order_type::const_iterator it, pending_entries_by_order_type::const_iterator end) {
         if (it == end || !pr.end()) {
             return false;
         }
-        auto c = cmp(it->first, pr.end()->value());
+        auto c = cmp(*it, pr.end()->value());
         return pr.end()->is_inclusive() ? c > 0 : c >= 0;
     }
 
     partitions_type _partitions;
     schema_ptr _schema;
-    pending_entries_type _pending_entries;
+    pending_entries_by_key_type _pending_entries_by_key;
+    pending_entries_by_order_type _pending_entries_by_order;
+    pending_generation _next_pending_generation = 1;
     size_t _key_count = 0;
     size_t _memory_usage = 0;
 
@@ -180,7 +200,9 @@ public:
     explicit primary_index(schema_ptr schema)
         : _partitions(dht::raw_token_less_comparator{})
         , _schema(std::move(schema))
-        , _pending_entries(pending_key_less{&_schema}) {
+        , _pending_entries_by_key(0, pending_key_hash{}, pending_key_equal{&_schema})
+        , _pending_entries_by_order(pending_key_less{&_schema}) {
+        _pending_entries_by_key.reserve(pending_entries_initial_reserve);
     }
 
     void set_schema(schema_ptr s) {
@@ -220,12 +242,12 @@ public:
         return std::nullopt;
     }
 
-    pending_entry_ptr get_pending(const dht::decorated_key& key) const {
-        auto it = _pending_entries.find(key);
-        if (it != _pending_entries.end()) {
-            return it->second;
+    const pending_entry* get_pending(const dht::decorated_key& key) const {
+        auto it = _pending_entries_by_key.find(key);
+        if (it != _pending_entries_by_key.end()) {
+            return &it->second;
         }
-        return {};
+        return nullptr;
     }
 
     bool is_record_alive(const primary_index_key& key, log_location location) {
@@ -256,39 +278,44 @@ public:
         return a.timestamp <=> b.timestamp;
     }
 
-    pending_entry_ptr insert_pending(const primary_index_key& key, api::timestamp_type ts, canonical_mutation mutation) {
+    std::optional<pending_generation> insert_pending(const primary_index_key& key, api::timestamp_type ts, const canonical_mutation& mutation) {
         auto durable_it = _partitions.find(key.dk, dht::ring_position_comparator(*_schema));
-        auto pending_it = _pending_entries.find(key.dk);
+        auto pending_it = _pending_entries_by_key.find(key.dk);
 
         std::optional<api::timestamp_type> max_ts;
         if (durable_it != _partitions.end()) {
             max_ts = durable_it->_e.timestamp;
         }
-        if (pending_it != _pending_entries.end()) {
-            max_ts = max_ts ? std::max(*max_ts, pending_it->second->timestamp) : pending_it->second->timestamp;
+        if (pending_it != _pending_entries_by_key.end()) {
+            max_ts = max_ts ? std::max(*max_ts, pending_it->second.timestamp) : pending_it->second.timestamp;
         }
 
         if (max_ts && *max_ts > ts) {
-            return {};
+            return std::nullopt;
         }
 
         if (durable_it != _partitions.end() && _cache_tracker) {
             _cache_tracker->evict(*durable_it);
         }
 
-        auto pending = make_lw_shared<pending_entry>(pending_entry{
-            .key = key.dk,
-            .timestamp = ts,
-            .mutation = std::move(mutation),
-        });
+        auto generation = _next_pending_generation++;
 
-        if (pending_it != _pending_entries.end()) {
-            pending_it->second = pending;
+        if (pending_it != _pending_entries_by_key.end()) {
+            pending_it->second = pending_entry{
+                .generation = generation,
+                .timestamp = ts,
+                .mutation = canonical_mutation(mutation),
+            };
         } else {
-            _pending_entries.emplace(key.dk, pending);
+            _pending_entries_by_key.emplace(key.dk, pending_entry{
+                .generation = generation,
+                .timestamp = ts,
+                .mutation = canonical_mutation(mutation),
+            });
+            _pending_entries_by_order.emplace(key.dk);
         }
 
-        return pending;
+        return generation;
     }
 
     struct complete_pending_write_result {
@@ -297,7 +324,7 @@ public:
         std::optional<log_location> old_durable_location;
     };
 
-    complete_pending_write_result complete_pending_write(const primary_index_key& key, const pending_entry_ptr& pending, api::timestamp_type ts, log_location new_location) {
+    complete_pending_write_result complete_pending_write(const primary_index_key& key, pending_generation generation, api::timestamp_type ts, log_location new_location) {
         complete_pending_write_result result;
 
         partitions_type::bound_hint hint;
@@ -319,55 +346,57 @@ public:
             result.accepted = true;
         }
 
-        auto pending_it = _pending_entries.find(key.dk);
-        if (pending_it != _pending_entries.end() && pending_it->second == pending) {
-            _pending_entries.erase(pending_it);
+        auto pending_it = _pending_entries_by_key.find(key.dk);
+        if (pending_it != _pending_entries_by_key.end() && pending_it->second.generation == generation) {
+            _pending_entries_by_key.erase(pending_it);
+            _pending_entries_by_order.erase(key.dk);
             result.pending_cleared = true;
         }
 
         return result;
     }
 
-    bool erase_pending_if_current(const primary_index_key& key, const pending_entry_ptr& pending) {
-        auto it = _pending_entries.find(key.dk);
-        if (it != _pending_entries.end() && it->second == pending) {
-            _pending_entries.erase(it);
+    bool erase_pending_if_current(const primary_index_key& key, pending_generation generation) {
+        auto it = _pending_entries_by_key.find(key.dk);
+        if (it != _pending_entries_by_key.end() && it->second.generation == generation) {
+            _pending_entries_by_key.erase(it);
+            _pending_entries_by_order.erase(key.dk);
             return true;
         }
         return false;
     }
 
-    pending_entries_type::const_iterator pending_end() const {
-        return _pending_entries.end();
+    pending_entries_by_order_type::const_iterator pending_end() const {
+        return _pending_entries_by_order.end();
     }
 
-    pending_entries_type::const_iterator lower_bound_pending(dht::ring_position_view pos) const {
-        return _pending_entries.lower_bound(pos);
+    pending_entries_by_order_type::const_iterator lower_bound_pending(dht::ring_position_view pos) const {
+        return _pending_entries_by_order.lower_bound(pos);
     }
 
-    pending_entries_type::const_iterator upper_bound_pending(const dht::decorated_key& key) const {
-        return _pending_entries.upper_bound(key);
+    pending_entries_by_order_type::const_iterator upper_bound_pending(const dht::decorated_key& key) const {
+        return _pending_entries_by_order.upper_bound(key);
     }
 
-    pending_entries_type::const_iterator first_pending_in_range(const dht::partition_range& pr) const {
+    pending_entries_by_order_type::const_iterator first_pending_in_range(const dht::partition_range& pr) const {
         auto it = pr.start()
-            ? _pending_entries.lower_bound(pr.start()->value())
-            : _pending_entries.begin();
+            ? _pending_entries_by_order.lower_bound(pr.start()->value())
+            : _pending_entries_by_order.begin();
         auto cmp = dht::ring_position_comparator(*_schema);
-        if (pr.start() && !pr.start()->is_inclusive() && it != _pending_entries.end() && cmp(it->first, pr.start()->value()) == 0) {
+        if (pr.start() && !pr.start()->is_inclusive() && it != _pending_entries_by_order.end() && cmp(*it, pr.start()->value()) == 0) {
             ++it;
         }
-        if (is_after_pending_range_end(pr, cmp, it, _pending_entries.end())) {
-            return _pending_entries.end();
+        if (is_after_pending_range_end(pr, cmp, it, _pending_entries_by_order.end())) {
+            return _pending_entries_by_order.end();
         }
         return it;
     }
 
-    pending_entries_type::const_iterator next_pending_in_range(const dht::partition_range& pr, const dht::decorated_key& last_key) const {
-        auto it = _pending_entries.upper_bound(last_key);
+    pending_entries_by_order_type::const_iterator next_pending_in_range(const dht::partition_range& pr, const dht::decorated_key& last_key) const {
+        auto it = _pending_entries_by_order.upper_bound(last_key);
         auto cmp = dht::ring_position_comparator(*_schema);
-        if (is_after_pending_range_end(pr, cmp, it, _pending_entries.end())) {
-            return _pending_entries.end();
+        if (is_after_pending_range_end(pr, cmp, it, _pending_entries_by_order.end())) {
+            return _pending_entries_by_order.end();
         }
         return it;
     }
@@ -410,17 +439,21 @@ public:
         co_await erase_range_gently(begin, end);
 
         auto pending_begin = first_pending_in_range(pr);
-        if (pending_begin != _pending_entries.end()) {
+        if (pending_begin != _pending_entries_by_order.end()) {
             auto pending_end = pr.end()
-                ? _pending_entries.lower_bound(dht::ring_position_view::for_range_end(pr))
-                : _pending_entries.end();
-            _pending_entries.erase(pending_begin, pending_end);
+                ? _pending_entries_by_order.lower_bound(dht::ring_position_view::for_range_end(pr))
+                : _pending_entries_by_order.end();
+            for (auto it = pending_begin; it != pending_end; ++it) {
+                _pending_entries_by_key.erase(*it);
+            }
+            _pending_entries_by_order.erase(pending_begin, pending_end);
         }
     }
 
     future<> clear() {
         co_await erase_range_gently(_partitions.begin(), _partitions.end());
-        _pending_entries.clear();
+        _pending_entries_by_key.clear();
+        _pending_entries_by_order.clear();
 
         if (_key_count != 0 || _memory_usage != 0) {
             on_internal_error(logstor_logger, format("primary_index::clear ended with key_count {} and memory_usage {}", _key_count, _memory_usage));
