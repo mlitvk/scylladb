@@ -969,6 +969,7 @@ database::init_logstor() {
         .flush_sg = _dbcfg.commitlog_scheduling_group,
         .mode = _cfg.commitlog_sync() == "batch" ? logstor::logstor_sync_mode::batch : logstor::logstor_sync_mode::periodic,
         .sync_period = std::chrono::milliseconds(_cfg.commitlog_sync_period_in_ms()),
+        .max_queued_write_bytes = _dbcfg.available_memory * 1 / 100,
     };
     _logstor = std::make_unique<logstor::logstor>(std::move(cfg), _row_cache_tracker);
 

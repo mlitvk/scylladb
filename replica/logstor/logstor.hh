@@ -41,6 +41,7 @@ struct logstor_config {
     seastar::scheduling_group flush_sg;
     logstor_sync_mode mode = logstor_sync_mode::batch;
     std::chrono::milliseconds sync_period{0};
+    size_t max_queued_write_bytes{0};
 };
 
 class logstor {

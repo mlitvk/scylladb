@@ -20,6 +20,7 @@
 #include <seastar/core/simple-stream.hh>
 #include <seastar/core/shared_future.hh>
 
+#include "replica/exceptions.hh"
 #include "replica/logstor/ondisk.hh"
 #include "schema/schema_fwd.hh"
 #include "seastar/core/expiring_fifo.hh"
@@ -341,12 +342,14 @@ class buffered_writer {
         write_target target;
         db::timeout_clock::time_point timeout;
         uint64_t id;
+        size_t write_size;
 
-        queued_write(log_record_writer writer, write_target target, db::timeout_clock::time_point timeout, uint64_t id)
+        queued_write(log_record_writer writer, write_target target, db::timeout_clock::time_point timeout, uint64_t id, size_t write_size)
             : writer(std::move(writer))
             , target(std::move(target))
             , timeout(timeout)
-            , id(id) {
+            , id(id)
+            , write_size(write_size) {
         }
 
         void fail_timeout() noexcept {
@@ -358,6 +361,7 @@ class buffered_writer {
         buffered_writer* owner{};
 
         void operator()(queued_write& w) noexcept {
+            owner->on_queued_write_removed(w);
             w.fail_timeout();
             owner->on_queued_writes_changed();
         }
@@ -371,6 +375,8 @@ class buffered_writer {
     seastar::condition_variable _queued_writes_changed;
 
     seastar::expiring_fifo<queued_write, on_queued_write_expiry, db::timeout_clock> _queued_writes;
+    size_t _queued_write_bytes{0};
+    size_t _max_queued_write_bytes{0};
 
     seastar::timer<db::timeout_clock> _head_flush_timer;
     bool _head_deadline_expired = false;
@@ -407,13 +413,14 @@ class buffered_writer {
     future<> run_dispatched_write(size_t idx);
     future<bool> reclaim_completed_tails();
     future<bool> drain_queued_writes();
+    void on_queued_write_removed(const queued_write&) noexcept;
     void arm_head_flush_timer();
     void cancel_head_flush_timer() noexcept;
     void on_head_flush_timer() noexcept;
     void on_queued_writes_changed() noexcept;
 
 public:
-    explicit buffered_writer(segment_manager& sm, seastar::scheduling_group flush_sg, std::chrono::milliseconds sync_period);
+    explicit buffered_writer(segment_manager& sm, seastar::scheduling_group flush_sg, std::chrono::milliseconds sync_period, size_t max_queued_write_bytes);
 
     buffered_writer(const buffered_writer&) = delete;
     buffered_writer& operator=(const buffered_writer&) = delete;

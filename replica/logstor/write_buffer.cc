@@ -289,11 +289,12 @@ bool ondisk::validate_record_header(const ondisk::record_header& rh) {
 
 // buffered_writer
 
-buffered_writer::buffered_writer(segment_manager& sm, seastar::scheduling_group flush_sg, std::chrono::milliseconds sync_period)
+buffered_writer::buffered_writer(segment_manager& sm, seastar::scheduling_group flush_sg, std::chrono::milliseconds sync_period, size_t max_queued_write_bytes)
         : _sm(sm)
         , _flush_sg(flush_sg)
         , _sync_period(sync_period)
         , _queued_writes(on_queued_write_expiry{this})
+        , _max_queued_write_bytes(max_queued_write_bytes)
         , _head_flush_timer([this] { on_head_flush_timer(); }) {
     _ring.reserve(ring_size);
     for (size_t i = 0; i < ring_size; ++i) {
@@ -332,6 +333,13 @@ void buffered_writer::on_head_flush_timer() noexcept {
 
 void buffered_writer::on_queued_writes_changed() noexcept {
     _queued_writes_changed.broadcast();
+}
+
+void buffered_writer::on_queued_write_removed(const queued_write& w) noexcept {
+    if (w.write_size > _queued_write_bytes) {
+        on_internal_error(logstor_logger, format("buffered_writer queued bytes underflow: removing {}, queued {}", w.write_size, _queued_write_bytes));
+    }
+    _queued_write_bytes -= w.write_size;
 }
 
 bool buffered_writer::maybe_advance_head() noexcept {
@@ -437,6 +445,7 @@ future<bool> buffered_writer::drain_queued_writes() {
 
         auto request = std::move(next);
         _queued_writes.pop_front();
+        on_queued_write_removed(request);
         removed_queued_writes = true;
         try {
             std::move(append_to_head_buffer(request.writer, request.target).value()).forward_to(std::move(request.pr));
@@ -529,12 +538,13 @@ future<> buffered_writer::flush() {
 future<log_location_with_holder> buffered_writer::write(log_record_writer writer, db::timeout_clock::time_point timeout, write_target target) {
     auto holder = _async_gate.hold();
 
-    if (timeout != db::no_timeout && timeout <= db::timeout_clock::now()) {
-        throw timed_out_error{};
+    if (writer.size() > head_buf().max_record_size()) {
+        co_await coroutine::return_exception(std::runtime_error(fmt::format(
+            "Write size {} exceeds max record size {}", writer.size(), head_buf().max_record_size())));
     }
 
-    if (writer.size() > head_buf().max_record_size()) {
-        throw std::runtime_error(fmt::format("Write size {} exceeds buffer size {}", writer.size(), head_buf().max_record_size()));
+    if (_max_queued_write_bytes != 0 && _queued_write_bytes + writer.size() > _max_queued_write_bytes) {
+        co_await coroutine::return_exception(replica::rate_limit_exception());
     }
 
     // fast path - if there are no queued writes and there is space in the current head buffer or the next, advance the
@@ -547,8 +557,10 @@ future<log_location_with_holder> buffered_writer::write(log_record_writer writer
 
     // either there are queued writes or there is no space in the head buffer and ring is full - queue the write.
 
-    queued_write request(std::move(writer), std::move(target), timeout, _next_queued_write_id++);
+    const auto write_size = writer.size();
+    queued_write request(std::move(writer), std::move(target), timeout, _next_queued_write_id++, write_size);
     auto fut = request.pr.get_future();
+    _queued_write_bytes += write_size;
     _queued_writes.push_back(std::move(request), timeout);
     _tail_can_advance.signal();
     co_return co_await std::move(fut);
@@ -586,6 +598,7 @@ future<> buffered_writer::consumer_loop() {
         while (!_queued_writes.empty()) {
             auto request = std::move(_queued_writes.front());
             _queued_writes.pop_front();
+            on_queued_write_removed(request);
             on_queued_writes_changed();
             request.pr.set_exception(std::make_exception_ptr(seastar::gate_closed_exception()));
             co_await coroutine::maybe_yield();

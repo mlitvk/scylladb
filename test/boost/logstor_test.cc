@@ -169,6 +169,7 @@ logstor_config make_test_logstor_config(const std::filesystem::path& base_dir) {
             .separator_sg = seastar::current_scheduling_group(),
         },
         .flush_sg = seastar::current_scheduling_group(),
+        .max_queued_write_bytes = 0,
     };
 }
 
