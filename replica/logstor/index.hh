@@ -293,7 +293,7 @@ public:
         return a.timestamp <=> b.timestamp;
     }
 
-    std::optional<pending_generation> insert_pending(const primary_index_key& key, api::timestamp_type ts, const canonical_mutation& mutation) {
+    std::optional<pending_generation> insert_pending(const primary_index_key& key, api::timestamp_type ts, canonical_mutation mutation) {
         auto durable_it = _partitions.find(key.dk, dht::ring_position_comparator(*_schema));
         auto pending_it = _pending_entries_by_key.find(key.dk);
 
@@ -319,13 +319,13 @@ public:
             pending_it->second = pending_entry{
                 .generation = generation,
                 .timestamp = ts,
-                .mutation = canonical_mutation(mutation),
+                .mutation = std::move(mutation),
             };
         } else {
             _pending_entries_by_key.emplace(key.dk, pending_entry{
                 .generation = generation,
                 .timestamp = ts,
-                .mutation = canonical_mutation(mutation),
+                .mutation = std::move(mutation),
             });
             _pending_entries_by_order.emplace(key.dk);
         }

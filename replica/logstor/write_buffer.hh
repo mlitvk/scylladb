@@ -85,6 +85,10 @@ public:
 
 using log_location_with_holder = std::tuple<log_location, seastar::gate::holder>;
 
+struct buffered_write_result {
+    future<log_location_with_holder> persisted;
+};
+
 // Serializes one in-memory logstor buffer.
 //
 // Callers append log records one by one and then seal the buffer with a target
@@ -337,7 +341,8 @@ class buffered_writer {
     std::array<in_flight_write, ring_size> _in_flight;
 
     struct queued_write {
-        seastar::promise<log_location_with_holder> pr;
+        seastar::promise<buffered_write_result> accepted_pr;
+        seastar::promise<log_location_with_holder> persisted_pr;
         log_record_writer writer;
         write_target target;
         db::timeout_clock::time_point timeout;
@@ -353,7 +358,9 @@ class buffered_writer {
         }
 
         void fail_timeout() noexcept {
-            pr.set_exception(seastar::timed_out_error{});
+            auto ep = std::make_exception_ptr(seastar::timed_out_error{});
+            accepted_pr.set_exception(ep);
+            persisted_pr.set_exception(ep);
         }
     };
 
@@ -414,6 +421,7 @@ class buffered_writer {
     future<bool> reclaim_completed_tails();
     future<bool> drain_queued_writes();
     void on_queued_write_removed(const queued_write&) noexcept;
+    void fail_queued_write(queued_write&, std::exception_ptr) noexcept;
     void arm_head_flush_timer();
     void cancel_head_flush_timer() noexcept;
     void on_head_flush_timer() noexcept;
@@ -429,6 +437,7 @@ public:
     future<> stop();
     future<> flush();
 
+    future<buffered_write_result> write_to_buffer(log_record_writer, db::timeout_clock::time_point timeout, write_target target = {});
     future<log_location_with_holder> write(log_record_writer, db::timeout_clock::time_point timeout, write_target target = {});
 
     size_t queued_write_count() const noexcept { return _queued_writes.size(); }

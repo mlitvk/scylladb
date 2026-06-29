@@ -342,6 +342,11 @@ void buffered_writer::on_queued_write_removed(const queued_write& w) noexcept {
     _queued_write_bytes -= w.write_size;
 }
 
+void buffered_writer::fail_queued_write(queued_write& request, std::exception_ptr ep) noexcept {
+    request.accepted_pr.set_exception(ep);
+    request.persisted_pr.set_exception(std::move(ep));
+}
+
 bool buffered_writer::maybe_advance_head() noexcept {
     if (ring_full() || !head_buf().has_data()) {
         return false;
@@ -358,12 +363,12 @@ std::optional<future<log_location_with_holder>> buffered_writer::append_to_head_
     }
 
     bool was_empty = !head_buf().has_data();
-    auto fut = head_buf().write(std::move(writer), std::move(target));
+    auto persisted = head_buf().write(std::move(writer), std::move(target));
     if (was_empty) {
         arm_head_flush_timer();
         _tail_can_advance.signal();
     }
-    return fut;
+    return persisted;
 }
 
 bool buffered_writer::try_dispatch_next_buffer() {
@@ -448,9 +453,11 @@ future<bool> buffered_writer::drain_queued_writes() {
         on_queued_write_removed(request);
         removed_queued_writes = true;
         try {
-            std::move(append_to_head_buffer(request.writer, request.target).value()).forward_to(std::move(request.pr));
+            auto persisted = append_to_head_buffer(request.writer, request.target).value();
+            request.accepted_pr.set_value(buffered_write_result{request.persisted_pr.get_future()});
+            std::move(persisted).forward_to(std::move(request.persisted_pr));
         } catch (...) {
-            request.pr.set_exception(std::current_exception());
+            fail_queued_write(request, std::current_exception());
         }
         co_await coroutine::maybe_yield();
     }
@@ -535,7 +542,7 @@ future<> buffered_writer::flush() {
     });
 }
 
-future<log_location_with_holder> buffered_writer::write(log_record_writer writer, db::timeout_clock::time_point timeout, write_target target) {
+future<buffered_write_result> buffered_writer::write_to_buffer(log_record_writer writer, db::timeout_clock::time_point timeout, write_target target) {
     auto holder = _async_gate.hold();
 
     if (writer.size() > head_buf().max_record_size()) {
@@ -550,8 +557,8 @@ future<log_location_with_holder> buffered_writer::write(log_record_writer writer
     // fast path - if there are no queued writes and there is space in the current head buffer or the next, advance the
     // head buffer if needed and write to it.
     if (_queued_writes.empty()) {
-        if (auto fut = append_to_head_buffer(writer, target)) {
-            co_return co_await std::move(*fut);
+        if (auto persisted = append_to_head_buffer(writer, target)) {
+            co_return buffered_write_result{std::move(*persisted)};
         }
     }
 
@@ -559,11 +566,16 @@ future<log_location_with_holder> buffered_writer::write(log_record_writer writer
 
     const auto write_size = writer.size();
     queued_write request(std::move(writer), std::move(target), timeout, _next_queued_write_id++, write_size);
-    auto fut = request.pr.get_future();
+    auto accepted = request.accepted_pr.get_future();
     _queued_write_bytes += write_size;
     _queued_writes.push_back(std::move(request), timeout);
     _tail_can_advance.signal();
-    co_return co_await std::move(fut);
+    co_return co_await std::move(accepted);
+}
+
+future<log_location_with_holder> buffered_writer::write(log_record_writer writer, db::timeout_clock::time_point timeout, write_target target) {
+    auto result = co_await write_to_buffer(std::move(writer), timeout, std::move(target));
+    co_return co_await std::move(result.persisted);
 }
 
 future<> buffered_writer::consumer_loop() {
@@ -600,7 +612,7 @@ future<> buffered_writer::consumer_loop() {
             _queued_writes.pop_front();
             on_queued_write_removed(request);
             on_queued_writes_changed();
-            request.pr.set_exception(std::make_exception_ptr(seastar::gate_closed_exception()));
+            fail_queued_write(request, std::make_exception_ptr(seastar::gate_closed_exception()));
             co_await coroutine::maybe_yield();
         }
     } catch (...) {

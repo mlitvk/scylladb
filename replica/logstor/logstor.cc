@@ -112,6 +112,7 @@ future<> logstor::write(const mutation& m, write_target target, db::timeout_cloc
     primary_index_key key(m.decorated_key());
     table_id table = m.schema()->id();
     auto& index = cg.logstor_index();
+    auto accounting = _segment_manager.segment_accounting_updater();
 
     const auto ts = extract_logstor_record_timestamp(m);
 
@@ -127,36 +128,41 @@ future<> logstor::write(const mutation& m, write_target target, db::timeout_cloc
     log_record_writer writer(std::move(record));
 
     if (_mode == logstor_sync_mode::periodic) {
-        auto pending = index.insert_pending(key, ts, writer.record().mut);
+        auto pending_mutation = writer.record().mut;
+        auto result_f = co_await coroutine::as_future(_write_buffer.write_to_buffer(std::move(writer), timeout, std::move(target)));
+        if (result_f.failed()) {
+            ++_stats.write_failures;
+            co_await coroutine::return_exception_ptr(result_f.get_exception());
+        }
+        auto result = result_f.get();
+
+        auto pending = index.insert_pending(key, ts, std::move(pending_mutation));
         if (!pending) {
+            (void)std::move(result.persisted).discard_result().handle_exception([] (std::exception_ptr) {});
             co_return;
         }
 
-        auto accounting = _segment_manager.segment_accounting_updater();
-
         auto holder = _async_gate.hold();
-        (void)_write_buffer.write(std::move(writer), timeout, std::move(target))
+        (void)std::move(result.persisted)
             .then_unpack([index_ptr = &index, key, generation = *pending, ts, accounting = std::move(accounting)] (log_location location, seastar::gate::holder op) mutable {
                 index_ptr->complete_pending_write(key, generation, ts, location, &accounting);
             }).handle_exception([this, index_ptr = &index, key, pending] (std::exception_ptr ep) {
                 index_ptr->erase_pending_if_current(key, *pending);
                 _stats.write_failures++;
             }).finally([holder = std::move(holder)] {});
-        co_return;
-    }
-
-    auto accounting = _segment_manager.segment_accounting_updater();
-
-    co_await _write_buffer.write(std::move(writer), timeout, std::move(target)).then_unpack([index_ptr = &index, ts, key = std::move(key), accounting = std::move(accounting)] (log_location location, seastar::gate::holder op) mutable {
+    } else {
+        auto result_f = co_await coroutine::as_future(_write_buffer.write(std::move(writer), timeout, std::move(target)));
+        if (result_f.failed()) {
+            _stats.write_failures++;
+            co_await coroutine::return_exception_ptr(result_f.get_exception());
+        }
+        auto [location, op] = result_f.get();
         index_entry new_entry {
             .location = location,
             .timestamp = ts,
         };
-        index_ptr->insert(key, std::move(new_entry), &accounting);
-    }).handle_exception([this] (std::exception_ptr ep) {
-        _stats.write_failures++;
-        return make_exception_future<>(ep);
-    });
+        index.insert(key, std::move(new_entry), &accounting);
+    }
 }
 
 future<std::optional<mutation>> logstor::read(const schema& s, const primary_index& index, const dht::decorated_key& dk, const query::partition_slice& slice) {
