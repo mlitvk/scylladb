@@ -257,6 +257,88 @@ async def test_queued_writes(manager: ManagerClient):
             assert rows[0].v == expected_value
 
 @pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
+async def test_write_overloaded_when_buffered_queue_is_full(manager: ManagerClient):
+    """
+    Pause buffered-writer persistence, keep submitting large writes until the queued-write memory limit rejects writes,
+    then unpause and verify the queue drains and new writes succeed.
+    """
+    cmdline = ['--logger-log-level', 'logstor=debug', '--logger-log-level', 'debug_error_injection=debug', '--smp=1']
+    cfg = {'experimental_features': ['logstor']}
+    servers = await manager.servers_add(1, cmdline=cmdline, config=cfg)
+    server = servers[0]
+    cql = manager.get_cql()
+    server_log = await manager.server_open_log(server.server_id)
+
+    def is_overload_error(exc) -> bool:
+        text = str(exc).lower()
+        return "rate limit" in text or "rate_limit" in text or "overload" in text
+
+    async def queued_write_count() -> int:
+        return int((await manager.metrics.query(server.ip_addr)).get("scylla_logstor_queued_write_count") or 0)
+
+    async with new_test_keyspace(manager, "") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v text) WITH storage_engine = 'logstor'")
+        insert = cql.prepare(f"INSERT INTO {ks}.test (pk, v) VALUES (?, ?)")
+        select = cql.prepare(f"SELECT v FROM {ks}.test WHERE pk = ?")
+        value = 'x' * (96 * 1024)
+        final_value = 'ok'
+        injection = "logstor_buffered_writer_pause_dispatched_write"
+        write_tasks = []
+
+        async with inject_error(manager.api, server.ip_addr, injection) as handler:
+            log_mark = await server_log.mark()
+            write_tasks.append(cql.run_async(insert, [0, value]))
+            await server_log.wait_for(f"{injection}: waiting for message", from_mark=log_mark, timeout=60)
+
+            overloaded = False
+            queued_writes_observed = False
+            next_pk = 1
+            max_writes = 1000
+            batch_size = 32
+
+            try:
+                while next_pk < max_writes and not overloaded:
+                    for _ in range(batch_size):
+                        write_tasks.append(cql.run_async(insert, [next_pk, value]))
+                        next_pk += 1
+
+                    done, pending = await asyncio.wait(write_tasks, timeout=1, return_when=asyncio.FIRST_EXCEPTION)
+                    write_tasks = list(pending)
+                    for task in done:
+                        try:
+                            await task
+                        except Exception as exc:  # noqa: BLE001 - driver exception type varies by protocol path
+                            if is_overload_error(exc):
+                                overloaded = True
+                            else:
+                                raise
+
+                    queued_writes_observed = queued_writes_observed or await queued_write_count() > 0
+            finally:
+                # Disable future pauses and release already paused dispatched writes.
+                await manager.api.disable_injection(server.ip_addr, injection)
+                for _ in range(8):
+                    await handler.message()
+
+            assert overloaded, f"Expected logstor write overload after {next_pk} writes"
+            assert queued_writes_observed
+
+        results = await asyncio.gather(*write_tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception) and not is_overload_error(result):
+                raise result
+
+        async def queue_drained() -> bool:
+            return await queued_write_count() == 0
+
+        await wait_for(queue_drained, time.time() + 60)
+
+        await cql.run_async(insert, [max_writes + 1, final_value])
+        rows = await cql.run_async(select, [max_writes + 1])
+        assert len(rows) == 1
+        assert rows[0].v == final_value
+
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
 @pytest.mark.parametrize("fail_separator_flush", [False, True], ids=["normal", "fail_separator_flush"])
 async def test_recovery_basic(manager: ManagerClient, fail_separator_flush: bool):
     """
