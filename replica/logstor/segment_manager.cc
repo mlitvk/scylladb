@@ -1510,7 +1510,7 @@ future<> compaction_manager_impl::submit_group_compaction(logstor_group& cg, std
 
         auto completion = state->completion;
         if (!completion.available()) {
-            co_await completion.get_future();
+            co_await completion.get_future().handle_exception([] (std::exception_ptr) {});
             continue;
         }
 
@@ -1559,12 +1559,7 @@ future<> compaction_manager_impl::stop_ongoing_compactions(logstor_group& cg) {
         co_return;
     }
     state->as.request_abort();
-    try {
-        co_await state->completion.get_future();
-    } catch (...) {
-        logstor_logger.warn("Stopping ongoing logstor compactions for table {} failed: {}. Ignored",
-                cg.table_id(), std::current_exception());
-    }
+    co_await state->completion.get_future().handle_exception([] (std::exception_ptr) {});
 }
 
 future<> compaction_manager_impl::remove(logstor_group& cg) {
@@ -1577,12 +1572,7 @@ future<> compaction_manager_impl::remove(logstor_group& cg) {
     _groups.erase(it);
 
     state->as.request_abort();
-    try {
-        co_await state->completion.get_future();
-    } catch (...) {
-        logstor_logger.warn("Removing logstor compaction state for table {} failed while waiting for ongoing compaction: {}. Ignored",
-                cg.table_id(), std::current_exception());
-    }
+    co_await state->completion.get_future().handle_exception([] (std::exception_ptr) {});
 }
 
 future<compaction_reenabler> compaction_manager_impl::disable_compaction(logstor_group& cg) {
@@ -1591,12 +1581,7 @@ future<compaction_reenabler> compaction_manager_impl::disable_compaction(logstor
     ++state.compaction_disabled_counter;
 
     // Wait for any ongoing compaction to finish before disabling
-    try {
-        co_await state.completion.get_future();
-    } catch (...) {
-        logstor_logger.warn("Disabling logstor compaction for table {} failed while waiting for ongoing compaction: {}. Ignored",
-                cg.table_id(), std::current_exception());
-    }
+    co_await state.completion.get_future().handle_exception([] (std::exception_ptr) {});
 
     co_return compaction_reenabler([this, &cg] {
         auto it = _groups.find(&cg);
