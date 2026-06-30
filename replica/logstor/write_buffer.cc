@@ -207,8 +207,8 @@ future<> write_buffer::close() {
     }
 }
 
-future<log_location_with_holder> write_buffer::write(log_record_writer writer, write_target target) {
-    auto append_result = _raw.append(writer);
+future<log_location_with_holder> write_buffer::write(shared_log_record_writer writer, write_target target) {
+    auto append_result = _raw.append(*writer);
 
     auto record_location = [record_header_offset = append_result.record_header_offset, total_size = append_result.total_size] (log_location base_location) {
         return log_location {
@@ -357,7 +357,7 @@ bool buffered_writer::maybe_advance_head() noexcept {
     return true;
 }
 
-std::optional<future<log_location_with_holder>> buffered_writer::append_to_head_buffer(log_record_writer& writer, write_target& target) {
+std::optional<future<log_location_with_holder>> buffered_writer::append_to_head_buffer(shared_log_record_writer& writer, write_target& target) {
     if (!head_buf().can_fit(writer) && !maybe_advance_head()) {
         return std::nullopt;
     }
@@ -542,15 +542,15 @@ future<> buffered_writer::flush() {
     });
 }
 
-future<buffered_write_result> buffered_writer::write_to_buffer(log_record_writer writer, db::timeout_clock::time_point timeout, write_target target) {
+future<buffered_write_result> buffered_writer::write_to_buffer(shared_log_record_writer writer, db::timeout_clock::time_point timeout, write_target target) {
     auto holder = _async_gate.hold();
 
-    if (writer.size() > head_buf().max_record_size()) {
+    if (writer->size() > head_buf().max_record_size()) {
         co_await coroutine::return_exception(std::runtime_error(fmt::format(
-            "Write size {} exceeds max record size {}", writer.size(), head_buf().max_record_size())));
+            "Write size {} exceeds max record size {}", writer->size(), head_buf().max_record_size())));
     }
 
-    if (_max_queued_write_bytes != 0 && _queued_write_bytes + writer.size() > _max_queued_write_bytes) {
+    if (_max_queued_write_bytes != 0 && _queued_write_bytes + writer->size() > _max_queued_write_bytes) {
         co_await coroutine::return_exception(replica::rate_limit_exception());
     }
 
@@ -564,7 +564,7 @@ future<buffered_write_result> buffered_writer::write_to_buffer(log_record_writer
 
     // either there are queued writes or there is no space in the head buffer and ring is full - queue the write.
 
-    const auto write_size = writer.size();
+    const auto write_size = writer->size();
     queued_write request(std::move(writer), std::move(target), timeout, _next_queued_write_id++, write_size);
     auto accepted = request.accepted_pr.get_future();
     _queued_write_bytes += write_size;
@@ -573,7 +573,7 @@ future<buffered_write_result> buffered_writer::write_to_buffer(log_record_writer
     co_return co_await std::move(accepted);
 }
 
-future<log_location_with_holder> buffered_writer::write(log_record_writer writer, db::timeout_clock::time_point timeout, write_target target) {
+future<log_location_with_holder> buffered_writer::write(shared_log_record_writer writer, db::timeout_clock::time_point timeout, write_target target) {
     auto result = co_await write_to_buffer(std::move(writer), timeout, std::move(target));
     co_return co_await std::move(result.persisted);
 }

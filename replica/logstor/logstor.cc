@@ -125,18 +125,17 @@ future<> logstor::write(const mutation& m, write_target target, db::timeout_cloc
         .mut = canonical_mutation(m)
     };
 
-    log_record_writer writer(std::move(record));
+    auto writer = make_lw_shared<log_record_writer>(std::move(record));
 
     if (_mode == logstor_sync_mode::periodic) {
-        auto pending_mutation = writer.record().mut;
-        auto result_f = co_await coroutine::as_future(_write_buffer.write_to_buffer(std::move(writer), timeout, std::move(target)));
+        auto result_f = co_await coroutine::as_future(_write_buffer.write_to_buffer(writer, timeout, std::move(target)));
         if (result_f.failed()) {
             ++_stats.write_failures;
             co_await coroutine::return_exception_ptr(result_f.get_exception());
         }
         auto result = result_f.get();
 
-        auto pending = index.insert_pending(key, ts, std::move(pending_mutation));
+        auto pending = index.insert_pending(key, ts, std::move(writer));
         if (!pending) {
             (void)std::move(result.persisted).discard_result().handle_exception([] (std::exception_ptr) {});
             co_return;
@@ -178,11 +177,11 @@ future<std::optional<mutation>> logstor::read(const schema& s, const primary_ind
         if (!pending) {
             co_return std::nullopt;
         }
-        co_return pending->mutation.to_mutation(s.shared_from_this());
+        co_return pending->writer->record().mut.to_mutation(s.shared_from_this());
     }
 
     if (pending && pending->timestamp >= it->entry().timestamp) {
-        co_return pending->mutation.to_mutation(s.shared_from_this());
+        co_return pending->writer->record().mut.to_mutation(s.shared_from_this());
     }
 
     // lookup in cache

@@ -17,7 +17,6 @@
 #include <seastar/core/scheduling.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/queue.hh>
-#include <seastar/core/simple-stream.hh>
 #include <seastar/core/shared_future.hh>
 
 #include "replica/exceptions.hh"
@@ -37,50 +36,6 @@ class logstor_group;
 struct write_target {
     logstor_group* cg = nullptr;
     seastar::gate::holder cg_holder;
-};
-
-// Writer for log records that handles serialization and size computation
-class log_record_writer {
-
-    using ostream = seastar::simple_memory_output_stream;
-
-    log_record _record;
-    mutable std::optional<size_t> _header_size;
-    mutable std::optional<size_t> _data_size;
-
-    void compute_sizes() const;
-
-public:
-    explicit log_record_writer(log_record record)
-        : _record(std::move(record))
-    {}
-
-    // Get serialized sizes (computed lazily)
-    size_t header_size() const {
-        if (!_header_size) {
-            compute_sizes();
-        }
-        return *_header_size;
-    }
-
-    size_t data_size() const {
-        if (!_data_size) {
-            compute_sizes();
-        }
-        return *_data_size;
-    }
-
-    // Total serialized content size (header + data)
-    size_t size() const {
-        return header_size() + data_size();
-    }
-
-    // Write the record to an output stream
-    void write(ostream& out) const;
-
-    const log_record& record() const {
-        return _record;
-    }
 };
 
 using log_location_with_holder = std::tuple<log_location, seastar::gate::holder>;
@@ -214,7 +169,7 @@ private:
 class write_buffer {
 public:
     struct record_in_buffer {
-        log_record_writer writer;
+        shared_log_record_writer writer;
         future<log_location> loc;
         write_target target;
     };
@@ -248,6 +203,7 @@ public:
 
     bool can_fit(size_t data_size) const noexcept { return _raw.can_fit(data_size); }
     bool can_fit(const log_record_writer& writer) const noexcept { return _raw.can_fit(writer); }
+    bool can_fit(const shared_log_record_writer& writer) const noexcept { return _raw.can_fit(*writer); }
     bool has_data() const noexcept { return _raw.has_data(); }
 
     size_t max_record_size() const noexcept { return _raw.max_record_size(); }
@@ -266,7 +222,7 @@ public:
     // Returns a future that will be resolved with the log location once flushed and a gate holder
     // that keeps the write buffer open. The gate should be held for index updates after the write
     // is done.
-    future<log_location_with_holder> write(log_record_writer, write_target target = {});
+    future<log_location_with_holder> write(shared_log_record_writer, write_target target = {});
 
 private:
     bool with_record_copy() const noexcept {
@@ -343,13 +299,13 @@ class buffered_writer {
     struct queued_write {
         seastar::promise<buffered_write_result> accepted_pr;
         seastar::promise<log_location_with_holder> persisted_pr;
-        log_record_writer writer;
+        shared_log_record_writer writer;
         write_target target;
         db::timeout_clock::time_point timeout;
         uint64_t id;
         size_t write_size;
 
-        queued_write(log_record_writer writer, write_target target, db::timeout_clock::time_point timeout, uint64_t id, size_t write_size)
+        queued_write(shared_log_record_writer writer, write_target target, db::timeout_clock::time_point timeout, uint64_t id, size_t write_size)
             : writer(std::move(writer))
             , target(std::move(target))
             , timeout(timeout)
@@ -415,7 +371,7 @@ class buffered_writer {
     bool has_pending_buffers() const noexcept;
     bool should_rotate_head_for_flush() const noexcept;
     bool maybe_advance_head() noexcept;
-    std::optional<future<log_location_with_holder>> append_to_head_buffer(log_record_writer&, write_target&);
+    std::optional<future<log_location_with_holder>> append_to_head_buffer(shared_log_record_writer&, write_target&);
     bool try_dispatch_next_buffer();
     future<> run_dispatched_write(size_t idx);
     future<bool> reclaim_completed_tails();
@@ -437,8 +393,8 @@ public:
     future<> stop();
     future<> flush();
 
-    future<buffered_write_result> write_to_buffer(log_record_writer, db::timeout_clock::time_point timeout, write_target target = {});
-    future<log_location_with_holder> write(log_record_writer, db::timeout_clock::time_point timeout, write_target target = {});
+    future<buffered_write_result> write_to_buffer(shared_log_record_writer, db::timeout_clock::time_point timeout, write_target target = {});
+    future<log_location_with_holder> write(shared_log_record_writer, db::timeout_clock::time_point timeout, write_target target = {});
 
     size_t queued_write_count() const noexcept { return _queued_writes.size(); }
 

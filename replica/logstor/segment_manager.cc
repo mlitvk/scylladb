@@ -1891,7 +1891,7 @@ struct compaction_buffer {
         auto* index_ptr = &index;
         auto key = record.header.key;
         auto accounting = sm.segment_accounting_updater();
-        log_record_writer writer(std::move(record));
+        auto writer = make_lw_shared<log_record_writer>(std::move(record));
 
         if (!buf->can_fit(writer)) {
             co_await flush();
@@ -2105,7 +2105,7 @@ future<> segment_manager_impl::write_to_separator(std::vector<write_buffer::reco
 
     co_await seastar::max_concurrent_for_each(groups, separator_group_write_concurrency, [this, seg_ref, segment_seq_num] (separator_group_records& group) -> future<> {
         for (auto* record : group.records) {
-            auto key = record->writer.record().header.key;
+            auto key = record->writer->record().header.key;
             log_location prev_loc = co_await std::move(record->loc);
             auto* index_ptr = &group.cg->logstor_index();
             auto accounting = segment_accounting_updater();
@@ -2124,7 +2124,7 @@ future<> segment_manager_impl::write_to_separator(table& t, log_location prev_lo
     auto& cg = t.get_logstor_group(key.dk.token());
     auto* index_ptr = &cg.logstor_index();
     auto accounting = segment_accounting_updater();
-    log_record_writer writer(std::move(record));
+    auto writer = make_lw_shared<log_record_writer>(std::move(record));
 
     co_await cg.write_to_separator(std::move(writer), std::move(seg_ref), std::nullopt,
         [index_ptr, key = std::move(key), prev_loc, accounting = std::move(accounting)] (log_location new_loc, seastar::gate::holder op) mutable noexcept {
@@ -2606,8 +2606,8 @@ void logstor_group::switch_active_separator_buffer() {
     }));
 }
 
-future<> logstor_group::write_to_separator(log_record_writer writer, segment_ref seg_ref, std::optional<segment_sequence> segment_seq_num, separator_write_completion after_written) {
-    while (!active_separator_buffer().can_fit(writer.size())) {
+future<> logstor_group::write_to_separator(shared_log_record_writer writer, segment_ref seg_ref, std::optional<segment_sequence> segment_seq_num, separator_write_completion after_written) {
+    while (!active_separator_buffer().can_fit(writer->size())) {
         if (!_separator_flush.available()) {
             co_await _separator_flush.get_future().handle_exception([] (std::exception_ptr) {});
             continue;
