@@ -31,15 +31,12 @@ void log_record_writer::compute_sizes() const {
     seastar::measuring_output_stream ms_header;
     ser::serialize(ms_header, _record.header);
     _serialized_header_size = ms_header.size();
-
-    seastar::measuring_output_stream ms_data;
-    ser::serialize(ms_data, _record.mut);
-    _serialized_data_size = ms_data.size();
+    _serialized_data_size = _record.data.serialized_size();
 }
 
 void log_record_writer::write(ostream& out) const {
     ser::serialize(out, _record.header);
-    ser::serialize(out, _record.mut);
+    _record.data.write(out);
 }
 
 // raw_write_buffer

@@ -14,8 +14,8 @@
 #include <seastar/core/simple-stream.hh>
 #include <seastar/core/shared_ptr.hh>
 #include "dht/decorated_key.hh"
-#include "mutation/canonical_mutation.hh"
 #include "mutation/timestamp.hh"
+#include "replica/logstor/mutation_format.hh"
 
 namespace replica::logstor {
 
@@ -53,7 +53,7 @@ struct log_record_header {
 
 struct log_record {
     log_record_header header;
-    canonical_mutation mut;
+    log_record_data data;
 };
 
 struct log_record_bytes_view {

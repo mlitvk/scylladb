@@ -43,6 +43,14 @@ schema_ptr make_kv_schema() {
             .build();
 }
 
+schema_ptr make_kv_schema(table_schema_version version) {
+    return schema_builder(1, "ks", "cf")
+            .with_column("pk", utf8_type, column_kind::partition_key)
+            .with_column("v", utf8_type)
+            .with_version(version)
+            .build();
+}
+
 mutation make_kv_mutation(schema_ptr schema, sstring pk, sstring value, api::timestamp_type ts = api::min_timestamp) {
     auto key = partition_key::from_single_value(*schema, serialized(pk));
     auto dk = dht::decorate_key(*schema, key);
@@ -62,7 +70,9 @@ log_record make_log_record(schema_ptr schema, sstring pk, sstring value, api::ti
             .timestamp = ts,
             .table = schema->id(),
         },
-        .mut = canonical_mutation(m)
+        .data = log_record_data{
+            .mut = logstor_mutation(m),
+        }
     };
 }
 
@@ -269,6 +279,84 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_record_and_header_serializati
     BOOST_REQUIRE_EQUAL(sh.table, schema->id());
     BOOST_REQUIRE_EQUAL(sh.first_token, expected.header.key.dk.token());
     BOOST_REQUIRE_EQUAL(sh.last_token, expected.header.key.dk.token());
+}
+
+SEASTAR_THREAD_TEST_CASE(test_logstor_mutation_reads_across_schema_upgrade) {
+    auto v1 = table_schema_version(utils::UUID(1, 2));
+    auto v2 = table_schema_version(utils::UUID(3, 4));
+
+    auto schema_v1 = make_kv_schema(v1);
+    auto schema_v2 = schema_builder(schema_v1)
+            .without_column("v", api::timestamp_type(7))
+            .with_column("v", utf8_type)
+            .with_version(v2)
+            .build();
+
+    auto expected = make_kv_mutation(schema_v2, "pk0", "value0", api::timestamp_type(11));
+    logstor_mutation stored(make_kv_mutation(schema_v1, "pk0", "value0", api::timestamp_type(11)));
+
+    auto actual = stored.to_mutation(schema_v2);
+
+    assert_that(std::move(actual)).is_equal_to(expected);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_logstor_mutation_round_trips_multi_column_and_upgrades_schema) {
+    auto v1 = table_schema_version(utils::UUID(10, 20));
+    auto v2 = table_schema_version(utils::UUID(30, 40));
+
+    auto schema_v1 = schema_builder(1, "ks", "cf_multi")
+                .with_column("pk", utf8_type, column_kind::partition_key)
+                .with_column("v1", utf8_type)
+                .with_column("v2", utf8_type)
+                .with_column("v3", utf8_type)
+                .with_version(v1)
+                .set_logstor()
+                .build();
+
+    auto make_mutation = [] (schema_ptr schema, sstring pk, api::timestamp_type ts = api::min_timestamp) {
+        auto key = partition_key::from_single_value(*schema, serialized(pk));
+        auto dk = dht::decorate_key(*schema, key);
+        mutation m(schema, dk);
+        auto& row = m.partition().clustered_row(*schema, clustering_key::make_empty());
+        row.apply(row_marker(ts));
+
+        const auto& v1 = *schema->get_column_definition("v1");
+        row.cells().apply(v1, atomic_cell::make_live(*v1.type, ts, serialized("value1")));
+        const auto& v2 = *schema->get_column_definition("v2");
+        row.cells().apply(v2, atomic_cell::make_live(*v2.type, ts, serialized("value2")));
+        const auto& v3 = *schema->get_column_definition("v3");
+        row.cells().apply(v3, atomic_cell::make_live(*v3.type, ts, serialized("value3")));
+        return m;
+    };
+
+    auto original = make_mutation(schema_v1, "pk0", api::timestamp_type(17));
+    logstor_mutation stored(original);
+
+    assert_that(stored.to_mutation(schema_v1)).is_equal_to(original);
+
+    auto schema_v2 = schema_builder(schema_v1)
+            .without_column("v2", api::timestamp_type(7))
+            .with_column("v2", utf8_type)
+            .without_column("v3", api::timestamp_type(8))
+            .with_column("v3", utf8_type)
+            .with_version(v2)
+            .build();
+    auto expected = make_mutation(schema_v2, "pk0", api::timestamp_type(17));
+
+    assert_that(stored.to_mutation(schema_v2)).is_equal_to(expected);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_logstor_mutation_supports_partition_delete_without_row) {
+    auto schema = make_kv_schema();
+    auto key = partition_key::from_single_value(*schema, serialized("pk0"));
+    auto dk = dht::decorate_key(*schema, key);
+    mutation deleted(schema, dk);
+    deleted.partition().apply(tombstone(api::timestamp_type(17), gc_clock::now()));
+
+    logstor_mutation stored(deleted);
+    auto actual = stored.to_mutation(schema);
+
+    assert_that(std::move(actual)).is_equal_to(deleted);
 }
 
 // Checks that a raw write buffer can hold and seal a record whose serialized size is exactly max_record_size().
@@ -527,10 +615,10 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_mixed_buffers_report_readable
     BOOST_REQUIRE_EQUAL(seen_record_headers[3].table, schema->id());
 
     BOOST_REQUIRE_EQUAL(seen_locations.size(), 4u);
-    assert_that(read_record_at_location(segment_copy, seen_locations[0]).mut.to_mutation(schema)).is_equal_to(expected0);
-    assert_that(read_record_at_location(segment_copy, seen_locations[1]).mut.to_mutation(schema)).is_equal_to(expected1);
-    assert_that(read_record_at_location(segment_copy, seen_locations[2]).mut.to_mutation(schema)).is_equal_to(expected2);
-    assert_that(read_record_at_location(segment_copy, seen_locations[3]).mut.to_mutation(schema)).is_equal_to(expected3);
+    assert_that(read_record_at_location(segment_copy, seen_locations[0]).data.mut.to_mutation(schema)).is_equal_to(expected0);
+    assert_that(read_record_at_location(segment_copy, seen_locations[1]).data.mut.to_mutation(schema)).is_equal_to(expected1);
+    assert_that(read_record_at_location(segment_copy, seen_locations[2]).data.mut.to_mutation(schema)).is_equal_to(expected2);
+    assert_that(read_record_at_location(segment_copy, seen_locations[3]).data.mut.to_mutation(schema)).is_equal_to(expected3);
 
     auto maybe_header = read_segment_header_from_bytes(segment_copy);
     BOOST_REQUIRE(maybe_header);
@@ -590,8 +678,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_returns_only_selected_records
     BOOST_REQUIRE_EQUAL(selected_records.size(), 2u);
     BOOST_REQUIRE_EQUAL(selected_records[0].header.timestamp, api::timestamp_type(72));
     BOOST_REQUIRE_EQUAL(selected_records[1].header.timestamp, api::timestamp_type(74));
-    assert_that(selected_records[0].mut.to_mutation(schema)).is_equal_to(expected1);
-    assert_that(selected_records[1].mut.to_mutation(schema)).is_equal_to(expected3);
+    assert_that(selected_records[0].data.mut.to_mutation(schema)).is_equal_to(expected1);
+    assert_that(selected_records[1].data.mut.to_mutation(schema)).is_equal_to(expected3);
 }
 
 // Checks that scan_segment() reads all records from a full buffer with varying serialized sizes.
@@ -639,9 +727,9 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_reads_full_buffer_records_wit
     BOOST_REQUIRE_EQUAL(seen_records[0].header.timestamp, api::timestamp_type(31));
     BOOST_REQUIRE_EQUAL(seen_records[1].header.timestamp, api::timestamp_type(32));
     BOOST_REQUIRE_EQUAL(seen_records[2].header.timestamp, api::timestamp_type(33));
-    assert_that(seen_records[0].mut.to_mutation(schema)).is_equal_to(expected0);
-    assert_that(seen_records[1].mut.to_mutation(schema)).is_equal_to(expected1);
-    assert_that(seen_records[2].mut.to_mutation(schema)).is_equal_to(expected2);
+    assert_that(seen_records[0].data.mut.to_mutation(schema)).is_equal_to(expected0);
+    assert_that(seen_records[1].data.mut.to_mutation(schema)).is_equal_to(expected1);
+    assert_that(seen_records[2].data.mut.to_mutation(schema)).is_equal_to(expected2);
 
     BOOST_REQUIRE(maybe_header);
     BOOST_REQUIRE(maybe_header->kind == segment_kind::full);
@@ -688,7 +776,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_stops_on_mixed_buffer_lower_s
 
     std::vector<segment_header> seen_segment_headers;
     std::vector<log_record_header> seen_record_headers;
-    std::vector<canonical_mutation> seen_mutations;
+    std::vector<logstor_mutation> seen_mutations;
 
     scan_segment(in, log_segment_id{5}, segment_size,
         [&seen_segment_headers] (const segment_header& sh) {
@@ -700,7 +788,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_stops_on_mixed_buffer_lower_s
             return want_data::yes;
         },
         [&seen_mutations] (log_location, log_record rec) {
-            seen_mutations.push_back(std::move(rec.mut));
+            seen_mutations.push_back(std::move(rec.data.mut));
             return make_ready_future<>();
         }).get();
     in.close().get();
@@ -746,7 +834,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_stops_on_corrupted_later_mixe
 
     std::vector<segment_header> seen_segment_headers;
     std::vector<log_record_header> seen_record_headers;
-    std::vector<canonical_mutation> seen_mutations;
+    std::vector<logstor_mutation> seen_mutations;
 
     scan_segment(in, log_segment_id{6}, segment_size,
         [&seen_segment_headers] (const segment_header& sh) {
@@ -758,7 +846,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_stops_on_corrupted_later_mixe
             return want_data::yes;
         },
         [&seen_mutations] (log_location, log_record rec) {
-            seen_mutations.push_back(std::move(rec.mut));
+            seen_mutations.push_back(std::move(rec.data.mut));
             return make_ready_future<>();
         }).get();
     in.close().get();
@@ -822,9 +910,9 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_streamed_segment_rewriter_rewrites_initial
     BOOST_REQUIRE_EQUAL(seen_records[0].header.table, schema->id());
     BOOST_REQUIRE_EQUAL(seen_records[1].header.table, schema->id());
     BOOST_REQUIRE_EQUAL(seen_records[2].header.table, schema->id());
-    assert_that(seen_records[0].mut.to_mutation(schema)).is_equal_to(expected0);
-    assert_that(seen_records[1].mut.to_mutation(schema)).is_equal_to(expected1);
-    assert_that(seen_records[2].mut.to_mutation(schema)).is_equal_to(expected2);
+    assert_that(seen_records[0].data.mut.to_mutation(schema)).is_equal_to(expected0);
+    assert_that(seen_records[1].data.mut.to_mutation(schema)).is_equal_to(expected1);
+    assert_that(seen_records[2].data.mut.to_mutation(schema)).is_equal_to(expected2);
 }
 
 // Checks that the rewriter can wait for a fragmented initial header before rewriting it.

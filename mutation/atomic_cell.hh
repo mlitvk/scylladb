@@ -355,6 +355,9 @@ public:
     }
     operator atomic_cell_view() const { return atomic_cell_view(managed_bytes_view(_data)); }
     atomic_cell(const abstract_type& t, atomic_cell_view other);
+    static atomic_cell from_serialized(managed_bytes data) {
+        return atomic_cell(std::move(data));
+    }
     static atomic_cell make_dead(api::timestamp_type timestamp, gc_clock::time_point deletion_time);
     static atomic_cell make_live(const abstract_type& type, api::timestamp_type timestamp, bytes_view value,
                                  collection_member = collection_member::no);

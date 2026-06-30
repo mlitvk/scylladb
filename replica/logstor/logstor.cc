@@ -149,7 +149,9 @@ future<> logstor::write(const mutation& m, write_target target, db::timeout_cloc
             .timestamp = ts,
             .table = table,
         },
-        .mut = canonical_mutation(m)
+        .data = log_record_data{
+            .mut = logstor_mutation(m),
+        }
     };
 
     auto writer = make_lw_shared<log_record_writer>(std::move(record));
@@ -214,11 +216,11 @@ future<std::optional<mutation>> logstor::read(const schema& s, const primary_ind
         if (!pending) {
             co_return std::nullopt;
         }
-        co_return pending->writer->record().mut.to_mutation(s.shared_from_this());
+        co_return pending->writer->record().data.mut.to_mutation(s.shared_from_this());
     }
 
     if (pending && pending->timestamp >= it->entry().timestamp) {
-        co_return pending->writer->record().mut.to_mutation(s.shared_from_this());
+        co_return pending->writer->record().data.mut.to_mutation(s.shared_from_this());
     }
 
     // lookup in cache
@@ -233,12 +235,11 @@ future<std::optional<mutation>> logstor::read(const schema& s, const primary_ind
     // copy the entry. we want to remember the original entry that we use for the read. the entry may change while we read.
     const index_entry entry_for_read = it->entry();
     auto record = co_await _segment_manager.read(entry_for_read.location);
+    mutation m = record.data.mut.to_mutation(s.shared_from_this());
 
-    if (record.mut.key() != dk.key()) [[unlikely]] {
-        on_internal_error(logstor_logger, format("Key mismatch reading log entry: expected {}, got {}", dk.key(), record.mut.key()));
+    if (m.key() != dk.key()) [[unlikely]] {
+        on_internal_error(logstor_logger, format("Key mismatch reading log entry: expected {}, got {}", dk.key(), m.key()));
     }
-
-    mutation m = record.mut.to_mutation(s.shared_from_this());
 
     // Populate the cache with the freshly deserialized mutation.
     // Skipped when bypass_cache is set.
