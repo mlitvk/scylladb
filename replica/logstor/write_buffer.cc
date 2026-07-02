@@ -81,36 +81,35 @@ bool raw_write_buffer::has_data() const noexcept {
     return offset_in_buffer() > header_size();
 }
 
-raw_write_buffer::append_result raw_write_buffer::append(const log_record_writer& writer) {
-    const auto content_size = writer.size();
-
-    if (!can_fit(content_size)) {
-        throw std::runtime_error(fmt::format("Write size {} exceeds buffer size {}", content_size, _stream.size()));
+template <typename WriteRecordPayload>
+raw_write_buffer::append_result raw_write_buffer::append_record(const log_record_header& header,
+        size_t header_size, size_t data_size, WriteRecordPayload write_payload) {
+    const auto record_size = header_size + data_size;
+    if (!can_fit(record_size)) {
+        throw std::runtime_error(fmt::format("Write size {} exceeds buffer size {}", record_size, _stream.size()));
     }
-    if (content_size == 0) {
+    if (record_size == 0) {
         throw std::runtime_error("Cannot write empty record");
     }
 
     size_t record_header_offset = offset_in_buffer();
     auto rh = ondisk::record_header {
-        .header_size = static_cast<uint32_t>(writer.header_size()),
-        .data_size = static_cast<uint32_t>(writer.data_size())
+        .header_size = static_cast<uint32_t>(header_size),
+        .data_size = static_cast<uint32_t>(data_size)
     };
     ser::serialize(_stream, rh);
 
-    // Write actual data
-    auto data_out = _stream.write_substream(content_size);
-    writer.write(data_out);
+    write_payload(_stream);
 
-    const size_t total_size = ondisk::record_header_size + content_size;
+    const size_t total_size = ondisk::record_header_size + record_size;
 
     _net_data_size += total_size;
     _record_count++;
-    if (!_min_token || writer.record().header.key.dk.token() < *_min_token) {
-        _min_token = writer.record().header.key.dk.token();
+    if (!_min_token || header.key.dk.token() < *_min_token) {
+        _min_token = header.key.dk.token();
     }
-    if (!_max_token || writer.record().header.key.dk.token() > *_max_token) {
-        _max_token = writer.record().header.key.dk.token();
+    if (!_max_token || header.key.dk.token() > *_max_token) {
+        _max_token = header.key.dk.token();
     }
 
     // Add padding to align record
@@ -120,6 +119,20 @@ raw_write_buffer::append_result raw_write_buffer::append(const log_record_writer
         .record_header_offset = record_header_offset,
         .total_size = total_size,
     };
+}
+
+raw_write_buffer::append_result raw_write_buffer::append(const log_record_writer& writer) {
+    return append_record(writer.record().header, writer.header_size(), writer.data_size(), [&writer] (ostream& out) {
+        auto data_out = out.write_substream(writer.size());
+        writer.write(data_out);
+    });
+}
+
+raw_write_buffer::append_result raw_write_buffer::append(const log_record_header& header, log_record_bytes_view record_bytes) {
+    return append_record(header, record_bytes.header.size(), record_bytes.data.size(), [record_bytes] (ostream& out) {
+        out.write(reinterpret_cast<const char*>(record_bytes.header.data()), record_bytes.header.size());
+        out.write(reinterpret_cast<const char*>(record_bytes.data.data()), record_bytes.data.size());
+    });
 }
 
 size_t raw_write_buffer::sealed_size(size_t alignment) const noexcept {
@@ -229,6 +242,28 @@ future<log_location_with_holder> write_buffer::write(shared_log_record_writer wr
     // hold the write buffer until the write is complete, and pass the holder to the
     // caller for follow-up operations that should continue holding the buffer, such
     // as index updates.
+    auto op = _write_gate.hold();
+
+    return _written.get_shared_future().then([record_location, op = std::move(op)] (log_location base_location) mutable {
+        return std::make_tuple(record_location(base_location), std::move(op));
+    });
+}
+
+future<log_location_with_holder> write_buffer::write(const log_record_header& header, log_record_bytes_view record_bytes) {
+    if (with_record_copy()) {
+        throw std::runtime_error("Record byte writes are not supported for mixed write buffers");
+    }
+
+    auto append_result = _raw.append(header, record_bytes);
+
+    auto record_location = [record_header_offset = append_result.record_header_offset, total_size = append_result.total_size] (log_location base_location) {
+        return log_location {
+            .segment = base_location.segment,
+            .offset = static_cast<uint32_t>(base_location.offset + record_header_offset),
+            .size = static_cast<uint32_t>(total_size)
+        };
+    };
+
     auto op = _write_gate.hold();
 
     return _written.get_shared_future().then([record_location, op = std::move(op)] (log_location base_location) mutable {

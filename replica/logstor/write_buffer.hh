@@ -112,6 +112,10 @@ public:
         return can_fit(writer.size());
     }
 
+    bool can_fit(size_t header_size, size_t data_size) const noexcept {
+        return can_fit(header_size + data_size);
+    }
+
     bool has_data() const noexcept;
 
     size_t max_record_size() const noexcept;
@@ -121,6 +125,7 @@ public:
     segment_kind kind() const noexcept { return _segment_kind; }
 
     append_result append(const log_record_writer& writer);
+    append_result append(const log_record_header& header, log_record_bytes_view record_bytes);
     size_t sealed_size(size_t alignment) const noexcept;
 
     static size_t estimate_required_segments(size_t net_data_size, size_t record_count, size_t segment_size);
@@ -151,6 +156,9 @@ private:
 
     // table is set for segment_kind::full
     void write_header(segment_sequence segment_seq, std::optional<table_id> table);
+
+    template <typename WriteRecordPayload>
+    append_result append_record(const log_record_header& header, size_t header_size, size_t data_size, WriteRecordPayload write_payload);
 
     void pad_to_alignment(size_t alignment);
     void finalize(size_t alignment);
@@ -204,6 +212,7 @@ public:
     bool can_fit(size_t data_size) const noexcept { return _raw.can_fit(data_size); }
     bool can_fit(const log_record_writer& writer) const noexcept { return _raw.can_fit(writer); }
     bool can_fit(const shared_log_record_writer& writer) const noexcept { return _raw.can_fit(*writer); }
+    bool can_fit(log_record_bytes_view record_bytes) const noexcept { return _raw.can_fit(record_bytes.header.size(), record_bytes.data.size()); }
     bool has_data() const noexcept { return _raw.has_data(); }
 
     size_t max_record_size() const noexcept { return _raw.max_record_size(); }
@@ -223,6 +232,7 @@ public:
     // that keeps the write buffer open. The gate should be held for index updates after the write
     // is done.
     future<log_location_with_holder> write(shared_log_record_writer, write_target target = {});
+    future<log_location_with_holder> write(const log_record_header&, log_record_bytes_view);
 
 private:
     bool with_record_copy() const noexcept {
