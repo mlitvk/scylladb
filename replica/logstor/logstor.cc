@@ -44,6 +44,30 @@ static api::timestamp_type extract_logstor_record_timestamp(const mutation& m) {
     throw std::runtime_error("logstor mutation has no row marker or partition tombstone timestamp");
 }
 
+static void validate_logstor_mutation(const mutation& m) {
+    const auto& partition = m.partition();
+    if (!partition.static_row().empty()) {
+        throw std::runtime_error("logstor mutation does not support static rows");
+    }
+    if (!partition.row_tombstones().empty()) {
+        throw std::runtime_error("logstor mutation does not support range tombstones");
+    }
+
+    bool found_row = false;
+    for (const auto& row_entry : partition.clustered_rows()) {
+        if (row_entry.dummy()) {
+            continue;
+        }
+        if (found_row) {
+            throw std::runtime_error("logstor mutation supports exactly one clustering row");
+        }
+        if (row_entry.key() != clustering_key::make_empty()) {
+            throw std::runtime_error("logstor mutation supports only empty clustering key rows");
+        }
+        found_row = true;
+    }
+}
+
 logstor::logstor(logstor_config config, ::cache_tracker& shared_cache_tracker)
     : _segment_manager(config.segment_manager_cfg)
     , _write_buffer(_segment_manager, config.flush_sg, config.mode == logstor_sync_mode::periodic ? config.sync_period : std::chrono::milliseconds(0), config.max_queued_write_bytes)
@@ -134,6 +158,8 @@ future<> logstor::write(const mutation& m, write_target target, db::timeout_cloc
     // External admission is controlled here. Once shutdown closes this gate,
     // new writes must not reach the buffer layer at all.
     auto gate_holder = _async_gate.hold();
+
+    validate_logstor_mutation(m);
 
     auto& cg = *target.cg;
     primary_index_key key(m.decorated_key());

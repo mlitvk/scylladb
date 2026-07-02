@@ -274,6 +274,9 @@ std::unique_ptr<prepared_statement> create_table_statement::raw_statement::prepa
         if (storage_engine == "logstor" && !_column_aliases.empty()) {
             throw exceptions::configuration_exception("The 'logstor' storage engine cannot be used with tables that have clustering columns");
         }
+        if (storage_engine == "logstor" && defined_multi_cell_columns) {
+            throw exceptions::configuration_exception("The 'logstor' storage engine cannot be used with tables that have non-frozen collections or UDTs");
+        }
     }
 
     auto& key_aliases = _key_aliases[0];
