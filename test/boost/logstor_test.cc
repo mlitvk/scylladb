@@ -297,6 +297,15 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_accepts_record_at_max_record_
     BOOST_REQUIRE_EQUAL(wb.serialized_size(), ondisk::block_alignment);
 }
 
+SEASTAR_THREAD_TEST_CASE(test_logstor_estimate_required_segments_uses_average_record_size) {
+    constexpr size_t stored_record_size = 9;
+    constexpr size_t record_count = 2;
+    constexpr size_t segment_size = 64;
+
+    BOOST_REQUIRE_EQUAL(raw_write_buffer::estimate_required_segments(stored_record_size, record_count, segment_size, segment_kind::mixed), 1u);
+    BOOST_REQUIRE_EQUAL(raw_write_buffer::estimate_required_segments(stored_record_size, record_count, segment_size, segment_kind::full), 2u);
+}
+
 // Checks that primary_index accounting callbacks track live bytes across inserts, overwrites, relocations, erases, range erases, and clear().
 SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_space_accounting) {
     auto schema = make_kv_schema();

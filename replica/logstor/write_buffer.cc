@@ -275,14 +275,26 @@ std::vector<write_buffer::record_in_buffer> write_buffer::take_separator_records
     return std::move(_records_copy);
 }
 
-size_t raw_write_buffer::estimate_required_segments(size_t stored_record_size, size_t record_count, size_t segment_size) {
-    // Calculate total size needed including headers and alignment padding.
-    size_t total_size = stored_record_size;
+size_t raw_write_buffer::estimate_required_segments(size_t stored_record_size, size_t record_count, size_t segment_size, segment_kind kind) {
+    if (record_count == 0 || stored_record_size == 0) {
+        return 0;
+    }
 
-    // not perfect so let's multiply by some overhead constant
-    total_size = static_cast<size_t>(total_size * 1.1);
+    size_t fixed_overhead = ondisk::buffer_header_size;
+    if (kind == segment_kind::full) {
+        fixed_overhead += ondisk::segment_header_size;
+    }
 
-    return align_up(total_size, segment_size) / segment_size;
+    if (segment_size <= fixed_overhead) {
+        return 1;
+    }
+
+    const auto usable_bytes = segment_size - fixed_overhead;
+    auto records_per_segment = (usable_bytes * record_count) / stored_record_size;
+    if (records_per_segment == 0) {
+        records_per_segment = 1;
+    }
+    return (record_count + records_per_segment - 1) / records_per_segment;
 
 }
 

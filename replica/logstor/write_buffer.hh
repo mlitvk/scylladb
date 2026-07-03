@@ -128,7 +128,7 @@ public:
     append_result append(const log_record_header& header, log_record_bytes_view record_bytes);
     size_t sealed_size(size_t alignment) const noexcept;
 
-    static size_t estimate_required_segments(size_t stored_record_size, size_t record_count, size_t segment_size);
+    static size_t estimate_required_segments(size_t stored_record_size, size_t record_count, size_t segment_size, segment_kind kind);
 
     bool with_segment_header() const noexcept {
         return _segment_kind == segment_kind::full;
