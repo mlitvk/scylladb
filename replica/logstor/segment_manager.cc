@@ -1307,7 +1307,7 @@ future<> segment_manager_impl::write(write_buffer& wb) {
         auto loc = append_result.get();
 
         _stats.bytes_written[static_cast<size_t>(source)] += data.size();
-        _stats.data_bytes_written[static_cast<size_t>(source)] += wb.net_data_size();
+        _stats.data_bytes_written[static_cast<size_t>(source)] += wb.stored_record_size();
 
         // complete all buffered writes with their individual locations and wait
         // for them to be updated in the index.
@@ -1355,7 +1355,7 @@ future<> segment_manager_impl::write_full_segment(write_buffer& wb, logstor_grou
     auto loc = append_result.get();
 
     _stats.bytes_written[static_cast<size_t>(source)] += data.size();
-    _stats.data_bytes_written[static_cast<size_t>(source)] += wb.net_data_size();
+    _stats.data_bytes_written[static_cast<size_t>(source)] += wb.stored_record_size();
 
     co_await wb.complete_writes(loc);
     co_await seg->stop();
@@ -1501,7 +1501,7 @@ void segment_manager_impl::free_segment(log_segment_id segment_id) noexcept {
     logstor_logger.trace("Free segment {}", segment_id);
 
     auto& desc = get_segment_descriptor(segment_id);
-    if (desc.net_data_size(_cfg.segment_size) != 0) {
+    if (desc.stored_record_size(_cfg.segment_size) != 0) {
         on_internal_error(logstor_logger, format("Freeing segment {} that has data", segment_id));
     }
     if (desc.ref_count != 0) {
@@ -1526,7 +1526,7 @@ future<> segment_manager_impl::discard_segments(segment_set& ss) {
         if (desc.ref_count != 0) {
             on_internal_error(logstor_logger, format("Discarding segment {} with non-zero reference count", seg_id));
         }
-        if (desc.net_data_size(_cfg.segment_size) != 0) {
+        if (desc.stored_record_size(_cfg.segment_size) != 0) {
             on_internal_error(logstor_logger, format("Discarding segment {} that has data", seg_id));
         }
 
@@ -1688,7 +1688,7 @@ std::optional<compaction_manager_impl::compaction_candidate> compaction_manager_
     static constexpr double compaction_max_used_fraction_low_pressure = 0.25;
     static constexpr double compaction_max_used_fraction_high_pressure = 0.90;
 
-    size_t accum_net_data_size = 0;
+    size_t accum_stored_record_size = 0;
     size_t accum_record_count = 0;
     std::optional<compaction_candidate_score> best_score;
     size_t best_count = 0;
@@ -1704,7 +1704,7 @@ std::optional<compaction_manager_impl::compaction_candidate> compaction_manager_
             break;
         }
 
-        const auto used_fraction = double(desc.net_data_size(segment_size)) / double(segment_size);
+        const auto used_fraction = double(desc.stored_record_size(segment_size)) / double(segment_size);
         if (used_fraction > max_used_fraction) {
             break;
         }
@@ -1712,21 +1712,21 @@ std::optional<compaction_manager_impl::compaction_candidate> compaction_manager_
         auto seg_id = _sm.desc_to_segment_id(desc);
         candidates.push_back(seg_id);
 
-        accum_net_data_size += desc.net_data_size(segment_size);
+        accum_stored_record_size += desc.stored_record_size(segment_size);
         accum_record_count += desc.record_count;
 
         auto estimated_segments_out = raw_write_buffer::estimate_required_segments(
-                accum_net_data_size, accum_record_count, segment_size);
+                accum_stored_record_size, accum_record_count, segment_size);
 
         compaction_candidate_score score{
             .n_in = candidates.size(),
             .n_out = estimated_segments_out,
-            .estimated_live_bytes = accum_net_data_size,
+            .estimated_live_bytes = accum_stored_record_size,
         };
 
-        logstor_logger.trace("Evaluating compaction candidate {} with net data size {} used_fraction {} accumulated {} estimated n_in {} n_out {} reclaimed {} max_used_fraction {}",
-                           seg_id, desc.net_data_size(segment_size), accum_net_data_size,
-                           used_fraction, score.n_in, score.n_out, score.reclaimed(), max_used_fraction);
+        logstor_logger.trace("Evaluating compaction candidate {} with stored record size {} used_fraction {} accumulated {} estimated n_in {} n_out {} reclaimed {} max_used_fraction {}",
+                           seg_id, desc.stored_record_size(segment_size), accum_stored_record_size,
+                            used_fraction, score.n_in, score.n_out, score.reclaimed(), max_used_fraction);
 
         if (score.reclaimed() == 0) {
             continue;
@@ -1845,7 +1845,7 @@ struct compaction_buffer {
         if (buf->has_data()) {
             stats.flush_count++;
             co_await sm.write_full_segment(*buf, cg, write_source::compaction);
-            logstor_logger.trace("Compaction buffer flushed with {} bytes", buf->net_data_size());
+            logstor_logger.trace("Compaction buffer flushed with {} bytes", buf->stored_record_size());
         }
         co_await when_all_succeed(pending_updates.begin(), pending_updates.end());
         co_await buf->close();
@@ -1895,7 +1895,7 @@ future<> compaction_manager_impl::compact_segments(logstor_group& cg, std::vecto
     auto nonempty_segments = segments
             | std::views::filter([this] (log_segment_id seg_id) {
                 auto& desc = _sm.get_segment_descriptor(seg_id);
-                return desc.net_data_size(_sm.get_segment_size()) > 0;
+                return desc.stored_record_size(_sm.get_segment_size()) > 0;
             });
 
     co_await _sm.for_each_record(nonempty_segments,
@@ -2007,7 +2007,7 @@ future<> compaction_manager_impl::do_split_compaction(replica::table& t, logstor
         auto nonempty_segments = batch
                 | std::views::filter([this] (log_segment_id seg_id) {
                     auto& desc = _sm.get_segment_descriptor(seg_id);
-                    return desc.net_data_size(_sm.get_segment_size()) > 0;
+                    return desc.stored_record_size(_sm.get_segment_size()) > 0;
                 });
 
         co_await _sm.for_each_record(nonempty_segments,

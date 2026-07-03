@@ -251,7 +251,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_record_and_header_serializati
 
     raw_write_buffer wb(32 * 1024, segment_kind::full);
     auto writer = log_record_writer(expected);
-    auto expected_data_size = size_t(ondisk::record_header_size) + writer.size();
+    auto expected_data_size = size_t(ondisk::record_frame_header_size) + writer.serialized_size();
     expected_data_size = ((expected_data_size + ondisk::record_alignment - 1) / ondisk::record_alignment) * ondisk::record_alignment;
     wb.append(std::move(writer));
     wb.seal(segment_sequence{17}, schema->id(), ondisk::block_alignment);

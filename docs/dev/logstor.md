@@ -191,13 +191,13 @@ A serialized form of `write_buffer::segment_header`.
 Each record within the buffer is structured as:
 
 ```
-record_header        (8 bytes)
+record_frame_header  (8 bytes)
 log_record_header    (header_size bytes)
 canonical_mutation   (data_size bytes)
 zero_padding         -- to align to record_alignment (8 bytes)
 ```
 
-**Record Header** (`write_buffer::record_header`):
+**Record Frame Header** (`write_buffer::record_frame_header`):
 
 | Offset | Size | Field         | Description |
 |--------|------|---------------|-------------|
@@ -206,7 +206,7 @@ zero_padding         -- to align to record_alignment (8 bytes)
 
 **Log Record Header** (`log_record_header`):
 
-The `header_size` bytes immediately following the record header are the IDL-serialized form of `log_record_header`, which contains:
+The `header_size` bytes immediately following the record frame header are the IDL-serialized form of `log_record_header`, which contains:
 - `key`: the partition key (`primary_index_key`), including a `decorated_key` with a token and partition key bytes.
 - `timestamp`: the timestamp of the record, used to resolve conflicts by keeping the record with the latest timestamp.
 - `table`: UUID of the table this record belongs to.
@@ -217,6 +217,6 @@ The `data_size` bytes immediately following the log record header are the IDL-se
 
 **Record Location** (`log_location`):
 
-The `log_location` stored in the index for each record points to the start of the `record_header`:
-- `offset`: byte offset from the start of the segment to the `record_header`.
-- `size`: total size including `record_header` + `log_record_header` + `canonical_mutation`
+The `log_location` stored in the index for each record points to the start of the `record_frame_header`:
+- `offset`: byte offset from the start of the segment to the `record_frame_header`.
+- `size`: aligned stored size including `record_frame_header` + `log_record_header` + `canonical_mutation` + padding

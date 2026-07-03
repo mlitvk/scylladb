@@ -30,11 +30,11 @@ namespace replica::logstor {
 void log_record_writer::compute_sizes() const {
     seastar::measuring_output_stream ms_header;
     ser::serialize(ms_header, _record.header);
-    _header_size = ms_header.size();
+    _serialized_header_size = ms_header.size();
 
     seastar::measuring_output_stream ms_data;
     ser::serialize(ms_data, _record.mut);
-    _data_size = ms_data.size();
+    _serialized_data_size = ms_data.size();
 }
 
 void log_record_writer::write(ostream& out) const {
@@ -59,7 +59,7 @@ void raw_write_buffer::reset() {
         _segment_header_stream = _stream.write_substream(ondisk::segment_header_size);
     }
     _buffer_header = {};
-    _net_data_size = 0;
+    _stored_record_size = 0;
     _record_count = 0;
     _min_token = std::nullopt;
     _max_token = std::nullopt;
@@ -67,12 +67,12 @@ void raw_write_buffer::reset() {
 }
 
 size_t raw_write_buffer::max_record_size() const noexcept {
-    return _buffer_size - (header_size() + ondisk::record_header_size);
+    return _buffer_size - (header_size() + ondisk::record_frame_header_size);
 }
 
 bool raw_write_buffer::can_fit(size_t data_size) const noexcept {
     // Calculate total space needed including header, data, and alignment padding
-    auto total_size = ondisk::record_header_size + data_size;
+    auto total_size = ondisk::record_frame_header_size + data_size;
     auto aligned_size = align_up(total_size, ondisk::record_alignment);
     return aligned_size <= _stream.size();
 }
@@ -83,27 +83,27 @@ bool raw_write_buffer::has_data() const noexcept {
 
 template <typename WriteRecordPayload>
 raw_write_buffer::append_result raw_write_buffer::append_record(const log_record_header& header,
-        size_t header_size, size_t data_size, WriteRecordPayload write_payload) {
-    const auto record_size = header_size + data_size;
-    if (!can_fit(record_size)) {
-        throw std::runtime_error(fmt::format("Write size {} exceeds buffer size {}", record_size, _stream.size()));
+        size_t serialized_header_size, size_t serialized_data_size, WriteRecordPayload write_payload) {
+    const auto serialized_record_body_size = serialized_header_size + serialized_data_size;
+    if (!can_fit(serialized_record_body_size)) {
+        throw std::runtime_error(fmt::format("Write size {} exceeds buffer size {}", serialized_record_body_size, _stream.size()));
     }
-    if (record_size == 0) {
+    if (serialized_record_body_size == 0) {
         throw std::runtime_error("Cannot write empty record");
     }
 
     size_t record_header_offset = offset_in_buffer();
-    auto rh = ondisk::record_header {
-        .header_size = static_cast<uint32_t>(header_size),
-        .data_size = static_cast<uint32_t>(data_size)
+    auto rh = ondisk::record_frame_header {
+        .header_size = static_cast<uint32_t>(serialized_header_size),
+        .data_size = static_cast<uint32_t>(serialized_data_size)
     };
     ser::serialize(_stream, rh);
 
     write_payload(_stream);
 
-    const size_t total_size = ondisk::record_header_size + record_size;
+    const size_t stored_size = align_up(ondisk::record_frame_header_size + serialized_record_body_size, ondisk::record_alignment);
 
-    _net_data_size += total_size;
+    _stored_record_size += stored_size;
     _record_count++;
     if (!_min_token || header.key.dk.token() < *_min_token) {
         _min_token = header.key.dk.token();
@@ -117,12 +117,12 @@ raw_write_buffer::append_result raw_write_buffer::append_record(const log_record
 
     return append_result {
         .record_header_offset = record_header_offset,
-        .total_size = total_size,
+        .stored_size = stored_size,
     };
 }
 
 raw_write_buffer::append_result raw_write_buffer::append(const log_record_writer& writer) {
-    return append_record(writer.record().header, writer.header_size(), writer.data_size(), [&writer] (ostream& out) {
+    return append_record(writer.record().header, writer.serialized_header_size(), writer.serialized_data_size(), [&writer] (ostream& out) {
         auto data_out = out.write_substream(writer.size());
         writer.write(data_out);
     });
@@ -223,11 +223,11 @@ future<> write_buffer::close() {
 future<log_location_with_holder> write_buffer::write(shared_log_record_writer writer, write_target target) {
     auto append_result = _raw.append(*writer);
 
-    auto record_location = [record_header_offset = append_result.record_header_offset, total_size = append_result.total_size] (log_location base_location) {
+    auto record_location = [record_header_offset = append_result.record_header_offset, stored_size = append_result.stored_size] (log_location base_location) {
         return log_location {
             .segment = base_location.segment,
             .offset = static_cast<uint32_t>(base_location.offset + record_header_offset),
-            .size = static_cast<uint32_t>(total_size)
+            .size = static_cast<uint32_t>(stored_size)
         };
     };
 
@@ -256,11 +256,11 @@ future<log_location_with_holder> write_buffer::write(const log_record_header& he
 
     auto append_result = _raw.append(header, record_bytes);
 
-    auto record_location = [record_header_offset = append_result.record_header_offset, total_size = append_result.total_size] (log_location base_location) {
+    auto record_location = [record_header_offset = append_result.record_header_offset, stored_size = append_result.stored_size] (log_location base_location) {
         return log_location {
             .segment = base_location.segment,
             .offset = static_cast<uint32_t>(base_location.offset + record_header_offset),
-            .size = static_cast<uint32_t>(total_size)
+            .size = static_cast<uint32_t>(stored_size)
         };
     };
 
@@ -275,10 +275,9 @@ std::vector<write_buffer::record_in_buffer> write_buffer::take_separator_records
     return std::move(_records_copy);
 }
 
-size_t raw_write_buffer::estimate_required_segments(size_t net_data_size, size_t record_count, size_t segment_size) {
+size_t raw_write_buffer::estimate_required_segments(size_t stored_record_size, size_t record_count, size_t segment_size) {
     // Calculate total size needed including headers and alignment padding.
-    // net_data_size includes record headers.
-    size_t total_size = net_data_size;
+    size_t total_size = stored_record_size;
 
     // not perfect so let's multiply by some overhead constant
     total_size = static_cast<size_t>(total_size * 1.1);
@@ -318,7 +317,7 @@ bool ondisk::validate_header(const ondisk::buffer_header& bh) {
     return bh.calculate_crc() == bh.crc;
 }
 
-bool ondisk::validate_record_header(const ondisk::record_header& rh) {
+bool ondisk::validate_record_frame_header(const ondisk::record_frame_header& rh) {
     return rh.header_size != 0;
 }
 

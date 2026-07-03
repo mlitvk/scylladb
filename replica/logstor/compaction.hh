@@ -44,10 +44,10 @@ using separator_write_completion = seastar::noncopyable_function<void(log_locati
 constexpr log_heap_options segment_descriptor_hist_options(4 * 1024, 3, 128 * 1024);
 
 struct segment_descriptor : public log_heap_hook<segment_descriptor_hist_options> {
-    // free_space = segment_size - net_data_size
+    // free_space = segment_size - stored_record_size
     // initially set to segment_size
-    // when writing records, decrease by total net data size
-    // when freeing a record, increase by the record's net data size
+    // when writing records, decrease by total stored record size
+    // when freeing a record, increase by the record's stored record size
     size_t free_space{0};
     size_t record_count{0};
     segment_set* owner{nullptr}; // non-owning, set when added to a segment_set
@@ -58,12 +58,12 @@ struct segment_descriptor : public log_heap_hook<segment_descriptor_hist_options
         record_count = 0;
     }
 
-    size_t net_data_size(size_t segment_size) const noexcept {
+    size_t stored_record_size(size_t segment_size) const noexcept {
         return segment_size - free_space;
     }
 
-    void on_write(size_t net_data_size, size_t cnt = 1) noexcept {
-        free_space -= net_data_size;
+    void on_write(size_t stored_record_size, size_t cnt = 1) noexcept {
+        free_space -= stored_record_size;
         record_count += cnt;
     }
 
@@ -71,8 +71,8 @@ struct segment_descriptor : public log_heap_hook<segment_descriptor_hist_options
         on_write(loc.size);
     }
 
-    void on_free(size_t net_data_size, size_t cnt = 1) noexcept {
-        free_space += net_data_size;
+    void on_free(size_t stored_record_size, size_t cnt = 1) noexcept {
+        free_space += stored_record_size;
         record_count -= cnt;
     }
 

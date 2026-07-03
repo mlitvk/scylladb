@@ -2721,7 +2721,7 @@ future<logstor::table_segment_stats> table::get_logstor_segment_stats() const {
 
         for (const auto& desc : cg_segments._segments) {
             co_await coroutine::maybe_yield();
-            auto data_size = desc.net_data_size(segment_size);
+            auto data_size = desc.stored_record_size(segment_size);
             auto bucket_index = std::min<size_t>(data_size / bucket_size, bucket_count - 1);
             auto& bucket = result.histogram[bucket_index];
             bucket.count++;

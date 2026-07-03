@@ -29,7 +29,7 @@ struct buffer_header {
     uint8_t version;
     uint16_t reserved;
     segment_sequence segment_seq;
-    uint32_t data_size; // size of all records data following the header(s)
+    uint32_t data_size; // size of aligned record bytes following the header(s)
     uint32_t crc;
 
     uint32_t calculate_crc() const;
@@ -56,15 +56,15 @@ static constexpr size_t segment_header_size =
     + 2 * sizeof(int64_t);
 static_assert(segment_header_size % record_alignment == 0, "Segment header size must be aligned by record_alignment");
 
-struct record_header {
+struct record_frame_header {
     uint32_t header_size; // size of the serialized log_record_header
     uint32_t data_size;   // size of the serialized canonical_mutation
 };
 
-static constexpr size_t record_header_size = 2 * sizeof(uint32_t);
+static constexpr size_t record_frame_header_size = 2 * sizeof(uint32_t);
 
 bool validate_header(const buffer_header& bh);
-bool validate_record_header(const record_header& rh);
+bool validate_record_frame_header(const record_frame_header& rh);
 
 } // namespace ondisk
 } // namespace replica::logstor
@@ -136,16 +136,16 @@ struct serializer<replica::logstor::ondisk::segment_header> {
 };
 
 template <>
-struct serializer<replica::logstor::ondisk::record_header> {
+struct serializer<replica::logstor::ondisk::record_frame_header> {
     template <typename Output>
-    static void write(Output& out, const replica::logstor::ondisk::record_header& h) {
+    static void write(Output& out, const replica::logstor::ondisk::record_frame_header& h) {
         serializer<uint32_t>::write(out, h.header_size);
         serializer<uint32_t>::write(out, h.data_size);
     }
 
     template <typename Input>
-    static replica::logstor::ondisk::record_header read(Input& in) {
-        replica::logstor::ondisk::record_header h;
+    static replica::logstor::ondisk::record_frame_header read(Input& in) {
+        replica::logstor::ondisk::record_frame_header h;
         h.header_size = serializer<uint32_t>::read(in);
         h.data_size = serializer<uint32_t>::read(in);
         return h;

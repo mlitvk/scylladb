@@ -67,8 +67,8 @@ class log_record_writer {
     using ostream = seastar::simple_memory_output_stream;
 
     log_record _record;
-    mutable std::optional<size_t> _header_size;
-    mutable std::optional<size_t> _data_size;
+    mutable std::optional<size_t> _serialized_header_size;
+    mutable std::optional<size_t> _serialized_data_size;
 
     void compute_sizes() const;
 
@@ -77,23 +77,27 @@ public:
         : _record(std::move(record))
     {}
 
-    size_t header_size() const {
-        if (!_header_size) {
+    size_t serialized_header_size() const {
+        if (!_serialized_header_size) {
             compute_sizes();
         }
-        return *_header_size;
+        return *_serialized_header_size;
     }
 
-    size_t data_size() const {
-        if (!_data_size) {
+    size_t serialized_data_size() const {
+        if (!_serialized_data_size) {
             compute_sizes();
         }
-        return *_data_size;
+        return *_serialized_data_size;
     }
 
-    size_t size() const {
-        return header_size() + data_size();
+    size_t serialized_size() const {
+        return serialized_header_size() + serialized_data_size();
     }
+
+    size_t header_size() const { return serialized_header_size(); }
+    size_t data_size() const { return serialized_data_size(); }
+    size_t size() const { return serialized_size(); }
 
     void write(ostream& out) const;
 

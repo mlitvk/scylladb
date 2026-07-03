@@ -51,7 +51,7 @@ struct buffered_write_result {
 // layout is:
 //   buffer_header
 //   (segment_header)?                 // for segment_kind::full only
-//   record_header + log_record_header + canonical_mutation
+//   record_frame_header + log_record_header + canonical_mutation
 //   ...
 //   zero padding to the requested final alignment
 //
@@ -66,7 +66,7 @@ public:
 
     struct append_result {
         size_t record_header_offset;
-        size_t total_size;
+        size_t stored_size;
     };
 
 private:
@@ -81,7 +81,7 @@ private:
     ostream _header_stream;
     ostream _segment_header_stream;
 
-    size_t _net_data_size{0};
+    size_t _stored_record_size{0};
     size_t _record_count{0};
     std::optional<dht::token> _min_token;
     std::optional<dht::token> _max_token;
@@ -120,7 +120,7 @@ public:
 
     size_t max_record_size() const noexcept;
 
-    size_t net_data_size() const noexcept { return _net_data_size; }
+    size_t stored_record_size() const noexcept { return _stored_record_size; }
     size_t record_count() const noexcept { return _record_count; }
     segment_kind kind() const noexcept { return _segment_kind; }
 
@@ -128,7 +128,7 @@ public:
     append_result append(const log_record_header& header, log_record_bytes_view record_bytes);
     size_t sealed_size(size_t alignment) const noexcept;
 
-    static size_t estimate_required_segments(size_t net_data_size, size_t record_count, size_t segment_size);
+    static size_t estimate_required_segments(size_t stored_record_size, size_t record_count, size_t segment_size);
 
     bool with_segment_header() const noexcept {
         return _segment_kind == segment_kind::full;
@@ -146,8 +146,8 @@ public:
         return ondisk::validate_header(bh);
     }
 
-    static bool validate_record_header(const ondisk::record_header& rh) {
-        return ondisk::validate_record_header(rh);
+    static bool validate_record_frame_header(const ondisk::record_frame_header& rh) {
+        return ondisk::validate_record_frame_header(rh);
     }
 
     void seal(segment_sequence segment_seq, std::optional<table_id> table, size_t alignment);
@@ -158,7 +158,7 @@ private:
     void write_header(segment_sequence segment_seq, std::optional<table_id> table);
 
     template <typename WriteRecordPayload>
-    append_result append_record(const log_record_header& header, size_t header_size, size_t data_size, WriteRecordPayload write_payload);
+    append_result append_record(const log_record_header& header, size_t serialized_header_size, size_t serialized_data_size, WriteRecordPayload write_payload);
 
     void pad_to_alignment(size_t alignment);
     void finalize(size_t alignment);
@@ -216,7 +216,7 @@ public:
     bool has_data() const noexcept { return _raw.has_data(); }
 
     size_t max_record_size() const noexcept { return _raw.max_record_size(); }
-    size_t net_data_size() const noexcept { return _raw.net_data_size(); }
+    size_t stored_record_size() const noexcept { return _raw.stored_record_size(); }
     size_t record_count() const noexcept { return _raw.record_count(); }
 
     size_t sealed_size(size_t alignment) {

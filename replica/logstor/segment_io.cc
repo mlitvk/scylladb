@@ -68,8 +68,8 @@ future<std::optional<segment_header>> read_segment_header(seastar::input_stream<
 }
 
 log_record deserialize_log_record(simple_memory_input_stream buf_stream) {
-    auto rh_stream = buf_stream.read_substream(ondisk::record_header_size);
-    auto rh = ser::deserialize(rh_stream, std::type_identity<ondisk::record_header>{});
+    auto rh_stream = buf_stream.read_substream(ondisk::record_frame_header_size);
+    auto rh = ser::deserialize(rh_stream, std::type_identity<ondisk::record_frame_header>{});
     auto header_stream = buf_stream.read_substream(rh.header_size);
     auto data_stream = buf_stream.read_substream(rh.data_size);
 
@@ -149,19 +149,22 @@ future<scan_segment_result> scan_segment(seastar::input_stream<char>& in,
         while (current_position < buffer_data_end_position) {
             // Read record header
             const auto record_offset = current_position;
-            auto size_buf = co_await in.read_exactly(ondisk::record_header_size);
-            current_position += ondisk::record_header_size;
-            if (size_buf.size() < ondisk::record_header_size) {
+            auto size_buf = co_await in.read_exactly(ondisk::record_frame_header_size);
+            current_position += ondisk::record_frame_header_size;
+            if (size_buf.size() < ondisk::record_frame_header_size) {
                 break;
             }
-            auto rh = ser::deserialize_from_buffer(size_buf, std::type_identity<ondisk::record_header>{});
-            if (rh.header_size == 0 || rh.header_size + rh.data_size > buffer_data_end_position - current_position) {
+            auto rh = ser::deserialize_from_buffer(size_buf, std::type_identity<ondisk::record_frame_header>{});
+            const auto serialized_record_body_size = rh.header_size + rh.data_size;
+            if (rh.header_size == 0 || serialized_record_body_size > buffer_data_end_position - current_position) {
                 // invalid record size
                 break;
             }
 
-            logstor_logger.trace("Found record of size {} bytes in segment {}",
-                                rh.header_size + rh.data_size, segment_id);
+            const auto stored_record_size = align_up(ondisk::record_frame_header_size + serialized_record_body_size, ondisk::record_alignment);
+
+            logstor_logger.trace("Found record of stored size {} bytes in segment {}",
+                                stored_record_size, segment_id);
 
             // Read the log_record_header bytes
             auto header_buf = co_await in.read_exactly(rh.header_size);
@@ -174,7 +177,7 @@ future<scan_segment_result> scan_segment(seastar::input_stream<char>& in,
             log_location loc {
                 .segment = segment_id,
                 .offset = static_cast<uint32_t>(record_offset),
-                .size = static_cast<uint32_t>(ondisk::record_header_size + rh.header_size + rh.data_size)
+                .size = static_cast<uint32_t>(stored_record_size)
             };
 
             if (on_record_header(loc, record_header) == want_data::yes) {
