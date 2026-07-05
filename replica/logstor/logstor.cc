@@ -82,8 +82,12 @@ future<> logstor::start() {
 future<> logstor::stop() {
     logstor_logger.info("Stopping logstor");
 
-    co_await _write_buffer.stop();
     co_await _async_gate.close();
+    // Close top-level admission first, then drain the accepted writes, then
+    // stop the segment manager. This matches the general shutdown rule used by
+    // the lower layers: stop new requests, let inflight work finish, and only
+    // then tear down the internal machinery.
+    co_await _write_buffer.stop();
     co_await _segment_manager.stop();
 
     logstor_logger.info("logstor stopped");

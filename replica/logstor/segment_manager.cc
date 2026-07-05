@@ -416,6 +416,10 @@ private:
 
     seastar::gate _async_gate;
 
+    bool can_submit_compaction() const noexcept {
+        return !_async_gate.is_closed() && _cfg.compaction_enabled;
+    }
+
     struct stats {
         uint64_t compaction_segments_in{0};
         uint64_t compaction_segments_out{0};
@@ -537,6 +541,9 @@ private:
     future<> do_compact(logstor_group&, abort_source&);
     future<> do_split_compaction(replica::table&, logstor_group&, mutation_writer::classify_by_token_group, abort_source&);
     future<> compact_segments(logstor_group&, std::vector<log_segment_id>, abort_source&);
+    future<> drain_separator_buffers(std::optional<segment_sequence> seq);
+    void request_abort_running_compactions() noexcept;
+    future<> wait_for_running_compactions();
     group_compaction_state& get_group_state(logstor_group&);
     group_compaction_state* find_group_state(logstor_group&) noexcept;
 
@@ -546,15 +553,41 @@ future<> compaction_manager_impl::start() {
     co_return;
 }
 
+void compaction_manager_impl::request_abort_running_compactions() noexcept {
+    for (auto& [cg, state] : _groups) {
+        state->as.request_abort();
+    }
+}
+
+future<> compaction_manager_impl::wait_for_running_compactions() {
+    co_await coroutine::parallel_for_each(_groups, [] (auto& entry) -> future<> {
+        co_await entry.second->completion.get_future().handle_exception([] (std::exception_ptr) {});
+    });
+}
+
 future<> compaction_manager_impl::stop() {
     if (_async_gate.is_closed()) {
         co_return;
     }
-    co_await _shares_controller.shutdown();
-    for (auto& [cg, state] : _groups) {
-        state->as.request_abort();
-    }
+    // Stop new compaction submissions first. Running compactions are drained
+    // separately through their per-group abort sources, which keeps shutdown
+    // cooperative instead of relying on the gate as a blanket lifetime guard.
     co_await _async_gate.close();
+
+    co_await _shares_controller.shutdown();
+    request_abort_running_compactions();
+
+    // Drain separator buffers before waiting for compactions to unwind. This
+    // keeps separator flushes in the same graceful phase as foreground writes,
+    // instead of treating them as arbitrary background tasks.
+    co_await drain_separator_buffers(std::nullopt);
+
+    co_await wait_for_running_compactions();
+
+    if (!_auto_compaction_completion.available()) {
+        co_await _auto_compaction_completion.get_future().handle_exception([] (std::exception_ptr) {});
+    }
+
     _groups.clear();
 }
 
@@ -776,7 +809,7 @@ class segment_manager_impl {
     seastar::gate _async_gate;
     future<> _reserve_replenisher{make_ready_future<>()};
     seastar::condition_variable _segment_freed_cv;
-    seastar::abort_source _abort_source;
+    seastar::gate _separator_task_gate;
 
     std::vector<segment_descriptor> _segment_descs;
     seastar::circular_buffer<log_segment_id> _free_segments;
@@ -1049,7 +1082,9 @@ bool compaction_manager_impl::should_run_auto_compaction() noexcept {
 }
 
 void compaction_manager_impl::schedule_auto_compaction() {
-    if (_async_gate.is_closed() || !_cfg.compaction_enabled) {
+    // Auto-compaction is a background admission point: once shutdown begins we
+    // stop scheduling immediately and let the existing task drain naturally.
+    if (can_submit_compaction() == false) {
         return;
     }
 
@@ -1061,17 +1096,17 @@ void compaction_manager_impl::schedule_auto_compaction() {
         return;
     }
 
-    _auto_compaction_completion = shared_future(with_gate(_async_gate, [this] {
-        return run_auto_compaction().handle_exception([] (std::exception_ptr ep) {
-            logstor_logger.warn("Automatic logstor compaction failed: {}. Ignored", ep);
-        });
+    // The execution itself is background work, so do not keep the compaction
+    // manager gate held for the lifetime of the auto-compaction loop.
+    _auto_compaction_completion = shared_future(run_auto_compaction().handle_exception([] (std::exception_ptr ep) {
+        logstor_logger.warn("Automatic logstor compaction failed: {}. Ignored", ep);
     }));
 }
 
 future<> compaction_manager_impl::run_auto_compaction() {
     static constexpr size_t batch_size = 4;
 
-    while (should_run_auto_compaction()) {
+    while (can_submit_compaction() && should_run_auto_compaction()) {
         auto candidates = co_await find_top_compaction_candidates(batch_size);
         if (candidates.empty()) {
             co_return;
@@ -1212,11 +1247,32 @@ future<> segment_manager_impl::stop() {
     }
     logstor_logger.info("Stopping segment manager");
 
-    _abort_source.request_abort();
+    // Shutdown is intentionally phased.
+    // 1) stop admitting new external requests
+    // 2) let accepted writes finish and drain separator work
+    // 3) only then abort the remaining background maintenance if needed
+    co_await _async_gate.close();
+
+    // Give accepted writes a chance to finish naturally before we escalate to
+    // the background maintenance side of shutdown.
+    co_await _writes_phaser.advance_and_await();
+
+    // The separator fiber owns the final stage of write completion for mixed
+    // segments. It should be allowed to finish the current batch and drain the
+    // queue before we flush separator buffers and request an abort to make it
+    // exit. This preserves the shutdown rule: stop admission, drain accepted
+    // work, then stop background fibers.
+    co_await _separator_task_gate.close();
+
+    // Separator writes are split across two places: the queue/fiber that builds
+    // separator records and the compaction manager buffers that actually flush
+    // them to disk. Once the queue is drained, the remaining separator buffers
+    // can be flushed explicitly as part of graceful shutdown.
+    co_await _compaction_mgr.flush_all_separator_buffers(std::nullopt);
+
+    _separator_task_queue.abort(std::make_exception_ptr(seastar::abort_requested_exception()));
 
     co_await std::move(_separator_fiber).handle_exception([] (std::exception_ptr) {});
-
-    co_await _async_gate.close();
 
     if (_active_segment) {
         co_await _active_segment->stop();
@@ -1239,10 +1295,6 @@ future<> segment_manager_impl::stop() {
 }
 
 future<> segment_manager_impl::run_separator_fiber() {
-    auto abort_sub = _abort_source.subscribe([this] () noexcept {
-        _separator_task_queue.abort(_abort_source.abort_requested_exception_ptr());
-    });
-
     while (true) {
         separator_task task;
         try {
@@ -1250,6 +1302,8 @@ future<> segment_manager_impl::run_separator_fiber() {
         } catch (seastar::abort_requested_exception&) {
             co_return;
         }
+
+        auto task_gate_holder = _separator_task_gate.hold();
 
         auto write_to_separator_failed = defer([seg_ref = task.seg_ref] mutable {
             seg_ref.set_flush_failure();
@@ -1329,8 +1383,6 @@ future<> segment_manager_impl::write(write_buffer& wb) {
 }
 
 future<> segment_manager_impl::write_full_segment(write_buffer& wb, logstor_group& cg, write_source source) {
-    auto holder = _async_gate.hold();
-
     const auto sealed_size = wb.sealed_size(block_alignment);
 
     if (sealed_size > _cfg.segment_size) {
@@ -1408,17 +1460,14 @@ future<> segment_manager_impl::request_segment_switch() {
 }
 
 future<> segment_manager_impl::switch_active_segment() {
-    auto holder = _async_gate.hold();
-
     auto new_seg = co_await get_segment(write_source::normal_write);
 
     auto old_seg = std::exchange(_active_segment, std::move(new_seg));
 
     if (old_seg) {
-        // close old segment in background
-        (void)with_gate(_async_gate, [old_seg] {
-            return old_seg->stop();
-        }).finally([old_seg] {}).handle_exception([] (std::exception_ptr) {});
+        // Close the old segment in the background. This is internal cleanup for
+        // an already-admitted request, so it should not hold the external gate.
+        (void)old_seg->stop().finally([old_seg] {}).handle_exception([] (std::exception_ptr) {});
     }
 
     // trigger separator flush for separator buffers that hold old segments
@@ -1431,7 +1480,7 @@ future<> segment_manager_impl::switch_active_segment() {
 }
 
 future<> segment_manager_impl::replenish_reserve() {
-    while (true) {
+    while (!_async_gate.is_closed()) {
         bool retry = false;
         try {
             auto seg = co_await allocate_segment();
@@ -1449,6 +1498,9 @@ future<> segment_manager_impl::replenish_reserve() {
         }
 
         if (retry) {
+            if (_async_gate.is_closed()) {
+                break;
+            }
             co_await seastar::sleep(std::chrono::seconds(1));
         }
     }
@@ -1472,7 +1524,7 @@ future<seg_ptr> segment_manager_impl::allocate_segment() {
         }
     };
 
-    while (true) {
+    while (!_async_gate.is_closed()) {
         // first, allocate all new segments sequentially
         if (_next_new_segment_id < _max_segments) {
             auto seg_id = log_segment_id(_next_new_segment_id++);
@@ -1493,6 +1545,8 @@ future<seg_ptr> segment_manager_impl::allocate_segment() {
         // for now let's solve it by waiting with a timeout to re-trigger compaction periodically.
         co_await _segment_freed_cv.wait(std::chrono::seconds(5));
     }
+
+    throw seastar::gate_closed_exception();
 }
 
 void segment_manager_impl::free_segment(log_segment_id segment_id) noexcept {
@@ -1576,7 +1630,7 @@ future<scan_segment_result> segment_manager_impl::scan_segment(log_segment_id se
 
 future<> compaction_manager_impl::submit_group_compaction(logstor_group& cg, std::function<future<>(group_compaction_state&)> op) {
     while (true) {
-        if (_async_gate.is_closed() || !_cfg.compaction_enabled) {
+        if (!can_submit_compaction()) {
             co_return;
         }
 
@@ -1592,15 +1646,15 @@ future<> compaction_manager_impl::submit_group_compaction(logstor_group& cg, std
         }
 
         state->as = {};
-        state->completion = shared_future(with_gate(_async_gate,
-            [this, state, op = std::move(op)] () mutable -> future<> {
-                return op(*state).handle_exception([this] (std::exception_ptr ep) {
-                    ++_stats.compaction_failures;
-                    logstor_logger.debug("logstor compaction failed: {}", ep);
-                    return make_exception_future<>(std::move(ep));
-                });
-            }
-        ));
+        // The compaction submission is admitted here, but the execution itself
+        // is owned by the per-group completion future and abort source. That is
+        // what lets shutdown drain running compactions cooperatively instead of
+        // holding the manager gate for the entire body.
+        state->completion = shared_future(op(*state).handle_exception([this] (std::exception_ptr ep) {
+            ++_stats.compaction_failures;
+            logstor_logger.debug("logstor compaction failed: {}", ep);
+            return make_exception_future<>(std::move(ep));
+        }));
 
         co_await state->completion.get_future();
         co_return;
@@ -1615,7 +1669,7 @@ future<> compaction_manager_impl::start_compaction(logstor_group& cg) {
     if (state->running()) {
         return state->completion.get_future();
     }
-    if (state->compaction_disabled_counter > 0) {
+    if (state->compaction_disabled_counter > 0 || !can_submit_compaction()) {
         return make_ready_future<>();
     }
     return submit_group_compaction(cg, [this, &cg] (group_compaction_state& state) {
@@ -1771,6 +1825,10 @@ future<std::vector<compaction_manager_impl::compaction_candidate>> compaction_ma
     for (auto* cg : group_snapshot) {
         co_await coroutine::maybe_yield();
 
+        if (!can_submit_compaction()) {
+            co_return best_candidates;
+        }
+
         auto it = _groups.find(cg);
         if (it == _groups.end()) {
             continue;
@@ -1798,7 +1856,7 @@ future<std::vector<compaction_manager_impl::compaction_candidate>> compaction_ma
 }
 
 future<> compaction_manager_impl::do_compact(logstor_group& cg, abort_source& as) {
-    if (as.abort_requested() || !_cfg.compaction_enabled) {
+    if (as.abort_requested() || !can_submit_compaction()) {
         co_return;
     }
 
@@ -1806,9 +1864,10 @@ future<> compaction_manager_impl::do_compact(logstor_group& cg, abort_source& as
     if (!candidate || candidate->segments.empty()) {
         co_return;
     }
+    if (as.abort_requested() || !can_submit_compaction()) {
+        co_return;
+    }
     auto segments_for_compaction = std::move(candidate->segments);
-
-    auto holder = _async_gate.hold();
 
     co_await with_scheduling_group(_cfg.compaction_sg, [this, &cg, &as, segments_for_compaction = std::move(segments_for_compaction)] mutable {
         return compact_segments(cg, std::move(segments_for_compaction), as);
@@ -1888,6 +1947,12 @@ struct compaction_buffer {
 future<> compaction_manager_impl::compact_segments(logstor_group& cg, std::vector<log_segment_id> segments, abort_source& as) {
     logstor_logger.trace("Starting compaction of segments {} in compaction group {}", segments, cg.table_id());
 
+    // Keep the normal compaction path simple: a single stop check at entry is
+    // enough because this path should finish quickly once admitted.
+    if (as.abort_requested() || !can_submit_compaction()) {
+        co_return;
+    }
+
     compaction_buffer cb(_sm, co_await _sm._compaction_buffer_pool.allocate(as), cg);
 
     auto& index = cg.logstor_index();
@@ -1955,7 +2020,7 @@ future<> compaction_manager_impl::do_split_compaction(replica::table& t, logstor
     // the src and target groups both share the table index
     auto& index = t.logstor_index();
 
-    while (!src_segments._segments.empty() && !as.abort_requested()) {
+    while (!src_segments._segments.empty() && !as.abort_requested() && can_submit_compaction()) {
         // Collect candidate IDs without yielding to avoid iterator invalidation.
         std::vector<log_segment_id> candidates;
         candidates.reserve(batch_size);
@@ -2048,7 +2113,15 @@ future<> compaction_manager_impl::do_split_compaction(replica::table& t, logstor
 }
 
 future<> compaction_manager_impl::flush_all_separator_buffers(std::optional<segment_sequence> seq) {
-    auto holder = _async_gate.hold();
+    co_await drain_separator_buffers(seq);
+}
+
+future<> compaction_manager_impl::drain_separator_buffers(std::optional<segment_sequence> seq) {
+    // Separator flushing is a drain operation, not admission of new work.
+    // We therefore keep it outside the manager gate and let the separator
+    // buffers/index lifetimes provide the safety boundary. The same helper is
+    // used by shutdown and by the active-segment rotation path when we need to
+    // push old separator data forward.
     co_await coroutine::parallel_for_each(_groups, [seq] (auto& entry) {
         return entry.first->flush_separator(seq);
     });
