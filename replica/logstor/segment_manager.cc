@@ -685,81 +685,117 @@ public:
     }
 };
 
-// Fixed-size pool of write_buffer's.
-// The size of the pool is determined at construction and cannot be changed.
-class write_buffer_pool {
-    std::vector<write_buffer> _pool;
-    std::vector<write_buffer*> _available;
-    seastar::semaphore _available_sem{0};
-
-public:
-
-    write_buffer_pool(size_t count, size_t buffer_size, segment_kind kind)
+write_buffer_pool::write_buffer_pool(size_t count, size_t buffer_size, segment_kind kind)
         : _available_sem(count) {
-        _available.reserve(count);
-        _pool.reserve(count);
-        for (size_t i = 0; i < count; ++i) {
-            _pool.emplace_back(buffer_size, kind);
-            _available.push_back(&_pool.back());
-        }
+    _available.reserve(count);
+    _pool.reserve(count);
+    _released.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        _pool.emplace_back(buffer_size, kind);
+        _available.push_back(&_pool.back());
+    }
+}
+
+future<> write_buffer_pool::start() {
+    _release_fiber = run_release_fiber();
+    co_return;
+}
+
+future<owned_write_buffer> write_buffer_pool::allocate(abort_source& as) {
+    auto units = co_await get_units(_available_sem, 1, as);
+    if (_available.empty()) {
+        throw std::runtime_error("No available write buffer after acquiring semaphore unit");
+    }
+    auto* wb = _available.back();
+    _available.pop_back();
+    co_return owned_write_buffer(wb, this, std::move(units));
+}
+
+future<std::vector<owned_write_buffer>> write_buffer_pool::allocate_many(size_t count, abort_source& as) {
+    if (count > _pool.size()) {
+        throw std::runtime_error(fmt::format("Cannot allocate {} write buffers from pool of size {}", count, _pool.size()));
     }
 
-    future<owned_write_buffer> allocate(abort_source& as) {
-        auto units = co_await get_units(_available_sem, 1, as);
-        if (_available.empty()) {
-            throw std::runtime_error("No available write buffer after acquiring semaphore unit");
-        }
+    auto units = co_await get_units(_available_sem, count, as);
+    if (_available.size() < count) {
+        throw std::runtime_error(fmt::format("Only {} write buffers available after acquiring {} semaphore units", _available.size(), count));
+    }
+
+    std::vector<owned_write_buffer> buffers;
+    buffers.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
         auto* wb = _available.back();
         _available.pop_back();
-        co_return owned_write_buffer(wb, [this] (write_buffer* wb) -> future<> {
-            return release(wb);
-        }, std::move(units));
+        buffers.emplace_back(wb, this, units.split(1));
+    }
+    co_return buffers;
+}
+
+void write_buffer_pool::queue_release(write_buffer* wb, std::optional<seastar::semaphore_units<>> pool_units) noexcept {
+    if (_stopping) {
+        release(wb, std::move(pool_units));
+        return;
     }
 
-    future<std::vector<owned_write_buffer>> allocate_many(size_t count, abort_source& as) {
-        if (count > _pool.size()) {
-            throw std::runtime_error(fmt::format("Cannot allocate {} write buffers from pool of size {}", count, _pool.size()));
-        }
+    _released.push_back(release_entry{wb, std::move(pool_units)});
+    _released_cv.signal();
+}
 
-        auto units = co_await get_units(_available_sem, count, as);
-        if (_available.size() < count) {
-            throw std::runtime_error(fmt::format("Only {} write buffers available after acquiring {} semaphore units", _available.size(), count));
-        }
-
-        std::vector<owned_write_buffer> buffers;
-        buffers.reserve(count);
-        for (size_t i = 0; i < count; ++i) {
-            auto* wb = _available.back();
-            _available.pop_back();
-            buffers.emplace_back(wb, [this] (write_buffer* wb) -> future<> {
-                return release(wb);
-            }, units.split(1));
-        }
-        co_return buffers;
-    }
-
-    future<> release(write_buffer* wb) {
-        co_await wb->close();
+void write_buffer_pool::release(write_buffer* wb, std::optional<seastar::semaphore_units<>> pool_units) noexcept {
+    try {
         wb->reset();
         _available.push_back(wb);
+    } catch (...) {
+        logstor_logger.error("Failed to release write buffer: {}", std::current_exception());
+        if (pool_units) {
+            (void)pool_units->release();
+        }
+    }
+    pool_units.reset();
+}
+
+future<std::optional<write_buffer_pool::release_entry>> write_buffer_pool::wait_for_release() {
+    while (_released_head == _released.size()) {
+        if (_stopping) {
+            co_return std::nullopt;
+        }
+        co_await _released_cv.wait([this] {
+            return _stopping || _released_head != _released.size();
+        });
     }
 
-    void break_waiters() {
-        _available_sem.broken();
-    }
+    co_return std::move(_released[_released_head++]);
+}
 
-    size_t size() const noexcept {
-        return _pool.size();
+future<> write_buffer_pool::run_release_fiber() {
+    while (true) {
+        auto entry_result = co_await coroutine::as_future(wait_for_release());
+        if (entry_result.failed()) {
+            logstor_logger.error("Error while waiting for write buffer release: {}", entry_result.get_exception());
+            co_return;
+        }
+        auto entry = entry_result.get();
+        if (!entry) {
+            co_return;
+        }
+        auto close_result = co_await coroutine::as_future(entry->buf->close());
+        if (close_result.failed()) {
+            logstor_logger.error("Error while closing write buffer: {}", close_result.get_exception());
+            if (entry->pool_units) {
+                (void)entry->pool_units->release();
+            }
+            continue;
+        }
+        release(entry->buf, std::move(entry->pool_units));
     }
+}
 
-    size_t available_buffer_count() const noexcept {
-        return _available.size();
-    }
-
-    size_t used_buffer_count() const noexcept {
-        return _pool.size() - _available.size();
-    }
-};
+future<> write_buffer_pool::stop() {
+    _stopping = true;
+    _released_cv.broadcast();
+    co_await std::move(_release_fiber).handle_exception([] (std::exception_ptr) {});
+    _available_sem.broken();
+}
 
 struct separator_task {
     std::vector<write_buffer::record_in_buffer> records;
@@ -1143,7 +1179,6 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
     , _compaction_buffer_pool(std::max(max_compaction_parallelism, 2ul), config.segment_size, segment_kind::full)
     , _separator_task_queue(separator_queue_depth)
     {
-
     _free_segments.reserve(_max_segments);
 
     namespace sm = seastar::metrics;
@@ -1230,6 +1265,7 @@ future<> segment_manager_impl::start() {
         return replenish_reserve();
     });
 
+    co_await _compaction_buffer_pool.start();
     co_await _compaction_mgr.start();
 
     _separator_fiber = with_scheduling_group(_cfg.separator_sg, [this] {
@@ -1288,6 +1324,8 @@ future<> segment_manager_impl::stop() {
     co_await std::move(_reserve_replenisher);
 
     co_await _compaction_mgr.stop();
+
+    co_await _compaction_buffer_pool.stop();
 
     co_await _file_mgr.stop();
 
@@ -1914,7 +1952,7 @@ struct compaction_buffer {
 
     future<> close() {
         co_await flush();
-        co_await buf.release();
+        buf.release();
     }
 
     // Rewrite a single live record into this buffer, updating the index atomically.

@@ -12,6 +12,7 @@
 #include "utils/chunked_vector.hh"
 #include "write_buffer.hh"
 #include "utils/log_heap.hh"
+#include <seastar/core/condition-variable.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/util/noncopyable_function.hh>
 #include <seastar/coroutine/maybe_yield.hh>
@@ -33,6 +34,8 @@ namespace replica::logstor {
 extern seastar::logger logstor_logger;
 
 class primary_index;
+class owned_write_buffer;
+class write_buffer_pool;
 struct segment_descriptor;
 struct segment_set;
 struct separator_buffer;
@@ -187,60 +190,103 @@ private:
     {}
 };
 
+class write_buffer_pool {
+public:
+    struct release_entry {
+        write_buffer* buf;
+        std::optional<seastar::semaphore_units<>> pool_units;
+    };
+
+private:
+    std::vector<write_buffer> _pool;
+    std::vector<write_buffer*> _available;
+    std::vector<release_entry> _released;
+    size_t _released_head{0};
+    seastar::semaphore _available_sem{0};
+    seastar::condition_variable _released_cv;
+    bool _stopping{false};
+    future<> _release_fiber{make_ready_future<>()};
+
+public:
+    write_buffer_pool(size_t count, size_t buffer_size, segment_kind kind);
+
+    future<> start();
+    future<> stop();
+
+    std::optional<owned_write_buffer> try_allocate();
+    future<owned_write_buffer> allocate();
+    future<owned_write_buffer> allocate(abort_source& as);
+    future<std::vector<owned_write_buffer>> allocate_many(size_t count, abort_source& as);
+
+    void queue_release(write_buffer* wb, std::optional<seastar::semaphore_units<>> pool_units) noexcept;
+    void release(write_buffer* wb, std::optional<seastar::semaphore_units<>> pool_units) noexcept;
+
+private:
+    future<std::optional<release_entry>> wait_for_release();
+    future<> run_release_fiber();
+
+    size_t size() const noexcept {
+        return _pool.size();
+    }
+
+    size_t available_buffer_count() const noexcept {
+        return _available.size();
+    }
+
+    size_t used_buffer_count() const noexcept {
+        return _pool.size() - _available.size();
+    }
+};
+
 class owned_write_buffer {
     write_buffer* _buf = nullptr;
-    std::function<future<>(write_buffer*)> _release;
+    write_buffer_pool* _pool = nullptr;
     std::optional<seastar::semaphore_units<>> _pool_units;
 
-    void background_release() noexcept {
+    void release_buffer() noexcept {
         if (!_buf) {
             return;
         }
         auto* buf = std::exchange(_buf, nullptr);
+        auto* pool = std::exchange(_pool, nullptr);
         auto units = std::move(_pool_units);
-        if (!_release) {
+        if (!pool) {
             return;
         }
-        (void)futurize_invoke(_release, buf).finally([units = std::move(units)] {}).handle_exception([] (std::exception_ptr ep) {
-            logstor_logger.error("Failed to release write buffer: {}", ep);
-        });
+        if (buf->is_closed()) {
+            pool->release(buf, std::move(units));
+            return;
+        }
+
+        pool->queue_release(buf, std::move(units));
     }
 
 public:
     owned_write_buffer() = default;
 
-    owned_write_buffer(write_buffer* buf, std::function<future<>(write_buffer*)> release,
+    owned_write_buffer(write_buffer* buf, write_buffer_pool* pool,
             std::optional<seastar::semaphore_units<>> pool_units = std::nullopt)
-        : _buf(buf), _release(std::move(release)), _pool_units(std::move(pool_units)) {}
+        : _buf(buf), _pool(pool), _pool_units(std::move(pool_units)) {}
 
-    ~owned_write_buffer() {
-        background_release();
-    }
+    ~owned_write_buffer() { release_buffer(); }
 
     owned_write_buffer(const owned_write_buffer&) = delete;
     owned_write_buffer& operator=(const owned_write_buffer&) = delete;
 
     owned_write_buffer(owned_write_buffer&& o) noexcept
-        : _buf(std::exchange(o._buf, nullptr)), _release(std::move(o._release)), _pool_units(std::move(o._pool_units)) {}
+        : _buf(std::exchange(o._buf, nullptr)), _pool(std::exchange(o._pool, nullptr)), _pool_units(std::move(o._pool_units)) {}
 
     owned_write_buffer& operator=(owned_write_buffer&& o) noexcept {
         if (this != &o) {
-            background_release();
+            release_buffer();
             _buf = std::exchange(o._buf, nullptr);
-            _release = std::move(o._release);
+            _pool = std::exchange(o._pool, nullptr);
             _pool_units = std::move(o._pool_units);
         }
         return *this;
     }
 
-    future<> release() {
-        if (!_buf) {
-            co_return;
-        }
-        auto* buf = std::exchange(_buf, nullptr);
-        auto units = std::move(_pool_units);
-        co_await _release(buf).finally([units = std::move(units)] {});
-    }
+    void release() noexcept { release_buffer(); }
 
     write_buffer* get() const noexcept {
         return _buf;
