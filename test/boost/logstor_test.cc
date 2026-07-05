@@ -884,8 +884,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_and_separator_flush) {
     logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
     ls.do_recovery_for_test().get();
     ls.start().get();
-    auto stop_store = seastar::defer([&ls] { ls.stop().get(); });
 
+    {
     test_compaction_group_handle cg(schema, ls.get_compaction_manager(), ls.get_segment_manager().get_segment_size());
 
     auto expected = make_kv_mutation(schema, "pk0", "separator-value");
@@ -917,6 +917,9 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_and_separator_flush) {
     auto actual = ls.read(*schema, cg.logstor_index(), key, schema->full_slice()).get();
     BOOST_REQUIRE(actual);
     assert_that(*actual).is_equal_to(expected);
+    }
+
+    ls.stop().get();
 }
 
 SEASTAR_THREAD_TEST_CASE(test_logstor_group_compaction_rewrites_live_records) {
@@ -1350,8 +1353,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_buffered_writer_queues_when_ring_full) {
     logstor ls(cfg, cache.shared_tracker);
     ls.do_recovery_for_test().get();
     ls.start().get();
-    auto stop_store = seastar::defer([&ls] { ls.stop().get(); });
 
+    {
     test_compaction_group_handle cg(schema, ls.get_compaction_manager(), ls.get_segment_manager().get_segment_size());
 
     auto& errinj = utils::get_local_injector();
@@ -1420,5 +1423,50 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_buffered_writer_queues_when_ring_full) {
         BOOST_REQUIRE(actual);
         assert_that(*actual).is_equal_to(expected);
     }
+    }
+
+    ls.stop().get();
+}
+#endif
+
+#ifdef SCYLLA_ENABLE_ERROR_INJECTION
+SEASTAR_THREAD_TEST_CASE(test_logstor_periodic_stop_drains_pending_write_completion) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_periodic_test_logstor_config(dir.path()), cache.shared_tracker);
+    ls.do_recovery_for_test().get();
+    ls.start().get();
+
+    test_compaction_group_handle cg(schema, ls.get_compaction_manager(), ls.get_segment_manager().get_segment_size());
+
+    auto& errinj = utils::get_local_injector();
+    errinj.enable("logstor_buffered_writer_pause_dispatched_write");
+    auto disable_injection = seastar::defer([&errinj] {
+        if (errinj.is_enabled("logstor_buffered_writer_pause_dispatched_write")) {
+            errinj.disable("logstor_buffered_writer_pause_dispatched_write");
+        }
+    });
+
+    const auto expected_ts = api::timestamp_type(7);
+    auto expected = make_kv_mutation(schema, "pk0", "pending-shutdown", expected_ts);
+    auto pending_key = expected.decorated_key();
+    auto key = primary_index_key{pending_key};
+
+    ls.write(expected, write_target(&cg, cg.hold_write_gate()), db::no_timeout).get();
+    BOOST_REQUIRE(cg.logstor_index().get_pending(pending_key));
+
+    auto stop_future = ls.stop();
+    seastar::yield().get();
+    BOOST_REQUIRE(!stop_future.available());
+
+    errinj.disable("logstor_buffered_writer_pause_dispatched_write");
+    stop_future.get();
+
+    auto final_entry = cg.logstor_index().get(key);
+    BOOST_REQUIRE(final_entry);
+    BOOST_REQUIRE_EQUAL(final_entry->timestamp, expected_ts);
+    BOOST_REQUIRE(!cg.logstor_index().get_pending(pending_key));
 }
 #endif

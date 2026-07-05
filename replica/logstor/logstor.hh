@@ -55,6 +55,13 @@ class logstor {
     buffered_writer _write_buffer;
     cache_tracker _cache_tracker;
     seastar::gate _async_gate;
+    bool _stopping{false};
+    // Periodic writes split into two phases: admission into logstor and a
+    // later completion continuation that updates the primary index after the
+    // buffer flush finishes. The top-level gate should only control external
+    // admission; this internal gate keeps the completion tail alive during
+    // shutdown without making it look like a new external request.
+    seastar::gate _pending_write_gate;
     seastar::metrics::metric_groups _metrics;
     logstor_sync_mode _mode;
     stats _stats;

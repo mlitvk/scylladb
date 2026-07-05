@@ -80,14 +80,31 @@ future<> logstor::start() {
 }
 
 future<> logstor::stop() {
+    if (_stopping) {
+        co_return;
+    }
+    _stopping = true;
+
     logstor_logger.info("Stopping logstor");
 
+    // Stop external admission first. After this point new logstor requests
+    // should fail immediately instead of entering lower layers and making
+    // shutdown depend on their lifetime semantics.
     co_await _async_gate.close();
-    // Close top-level admission first, then drain the accepted writes, then
-    // stop the segment manager. This matches the general shutdown rule used by
-    // the lower layers: stop new requests, let inflight work finish, and only
-    // then tear down the internal machinery.
+
+    // Drain the accepted write path before the segment manager disappears.
+    // Periodic writes may still have a pending completion continuation at this
+    // point; that continuation is internal work and is tracked by
+    // `_pending_write_gate` rather than the external admission gate.
     co_await _write_buffer.stop();
+
+    // Wait for all internal completion continuations to finish clearing the
+    // pending index entries. This is the last part of the accepted write path
+    // that can still be running after the buffered writer has stopped.
+    co_await _pending_write_gate.close();
+
+    // Only now is it safe to stop the segment manager and its dependent
+    // background machinery.
     co_await _segment_manager.stop();
 
     logstor_logger.info("logstor stopped");
@@ -114,6 +131,10 @@ const compaction_manager& logstor::get_compaction_manager() const noexcept {
 }
 
 future<> logstor::write(const mutation& m, write_target target, db::timeout_clock::time_point timeout) {
+    // External admission is controlled here. Once shutdown closes this gate,
+    // new writes must not reach the buffer layer at all.
+    auto gate_holder = _async_gate.hold();
+
     auto& cg = *target.cg;
     primary_index_key key(m.decorated_key());
     table_id table = m.schema()->id();
@@ -148,7 +169,10 @@ future<> logstor::write(const mutation& m, write_target target, db::timeout_cloc
         }
         ++_stats.pending_write_count;
 
-        auto holder = _async_gate.hold();
+        // The flush continuation is internal follow-up work for an already
+        // accepted write. It should survive top-level admission shutdown long
+        // enough to update the primary index and clear the pending entry.
+        auto holder = _pending_write_gate.hold();
         (void)std::move(result.persisted)
             .then_unpack([index_ptr = &index, key, generation = *pending, ts, accounting = std::move(accounting)] (log_location location, seastar::gate::holder op) mutable {
                 index_ptr->complete_pending_write(key, generation, ts, location, accounting);
@@ -174,6 +198,10 @@ future<> logstor::write(const mutation& m, write_target target, db::timeout_cloc
 }
 
 future<std::optional<mutation>> logstor::read(const schema& s, const primary_index& index, const dht::decorated_key& dk, const query::partition_slice& slice) {
+    // Reads are external admission too. They should stop at the same boundary
+    // as writes so shutdown does not keep reaching into lower layers.
+    auto gate_holder = _async_gate.hold();
+
     auto op = index.start_read();
 
     const auto bypass_cache = slice.options.contains(query::partition_slice::option::bypass_cache);
@@ -386,6 +414,11 @@ mutation_reader logstor::make_reader(schema_ptr schema, const primary_index& ind
 }
 
 future<> logstor::flush_to_separator() {
+    // Flush is an external request as well. Closing the top-level gate first
+    // keeps shutdown policy centralized and prevents new separator work from
+    // being admitted while the rest of the stack is draining.
+    auto gate_holder = _async_gate.hold();
+
     co_await _write_buffer.flush();
     co_await _segment_manager.await_pending_writes();
 }

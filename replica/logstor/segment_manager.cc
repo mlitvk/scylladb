@@ -1093,6 +1093,13 @@ void compaction_manager_impl::add(logstor_group& cg) {
 }
 
 bool compaction_manager_impl::should_run_auto_compaction() noexcept {
+    // Shutdown should suppress any new auto-compaction scheduling before we
+    // touch the bookkeeping flag. That keeps stop() from racing with a fresh
+    // background loop that would otherwise observe stale state.
+    if (_async_gate.is_closed()) {
+        return false;
+    }
+
     const auto available_segments = _sm.available_segment_count(write_source::normal_write);
     const auto low_watermark = std::min(_sm._cfg.trigger_compaction_threshold_percent, uint32_t(100));
     const auto high_watermark = std::min(low_watermark + 5, uint32_t(100));
@@ -1318,12 +1325,16 @@ future<> segment_manager_impl::stop() {
         co_await _switch_segment_fut->get_future().handle_exception([] (std::exception_ptr) {});
     }
 
+    co_await _compaction_mgr.stop();
+
+    // Compaction shutdown still needs the allocator/file stack alive while it
+    // drains separator buffers and finishes any in-flight compaction writes.
+    // Teardown of the lower layers only happens after the compaction manager
+    // has fully stopped.
     co_await _segment_pool.stop();
 
     _segment_freed_cv.broken();
     co_await std::move(_reserve_replenisher);
-
-    co_await _compaction_mgr.stop();
 
     co_await _compaction_buffer_pool.stop();
 
