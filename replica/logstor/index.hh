@@ -9,7 +9,13 @@
 
 #include "dht/decorated_key.hh"
 #include "dht/ring_position.hh"
+#include <absl/container/flat_hash_map.h>
+#include <absl/container/btree_set.h>
+#include <algorithm>
+#include <optional>
 #include <seastar/coroutine/maybe_yield.hh>
+#include <seastar/core/shared_ptr.hh>
+#include "mutation/mutation_partition.hh"
 #include "types.hh"
 #include "utils/bptree.hh"
 #include "utils/double-decker.hh"
@@ -93,6 +99,8 @@ public:
     friend dht::ring_position_view ring_position_view_to_compare(const primary_index_entry& e) { return e._key; }
 };
 
+using pending_generation = uint64_t;
+
 class primary_index final {
 public:
     using partitions_type = double_decker<int64_t, primary_index_entry,
@@ -103,8 +111,47 @@ public:
         seastar::noncopyable_function<void(log_location) noexcept> free_record = [] (log_location) noexcept {};
     };
 private:
+    struct pending_key_hash {
+        size_t operator()(const dht::decorated_key& k) const noexcept {
+            return std::hash<dht::decorated_key>()(k);
+        }
+    };
+
+    struct pending_key_equal {
+        const schema_ptr* schema = nullptr;
+
+        bool operator()(const dht::decorated_key& a, const dht::decorated_key& b) const {
+            return a.equal(**schema, b);
+        }
+    };
+
+    struct pending_key_less {
+        const schema_ptr* schema = nullptr;
+        using is_transparent = void;
+
+        bool operator()(const dht::decorated_key& a, const dht::decorated_key& b) const {
+            return dht::ring_position_comparator(**schema)(a, b) < 0;
+        }
+
+        bool operator()(const dht::decorated_key& a, dht::ring_position_view b) const {
+            return dht::ring_position_comparator(**schema)(a, b) < 0;
+        }
+
+        bool operator()(dht::ring_position_view a, const dht::decorated_key& b) const {
+            return dht::ring_position_comparator(**schema)(a, b) < 0;
+        }
+    };
+
+    using pending_entries_by_key_type = absl::flat_hash_map<dht::decorated_key, pending_entry, pending_key_hash, pending_key_equal>;
+    using pending_entries_by_order_type = absl::btree_set<dht::decorated_key, pending_key_less>;
+
+    static constexpr size_t pending_entries_initial_reserve = 4096;
+
     partitions_type _partitions;
     schema_ptr _schema;
+    pending_entries_by_key_type _pending_entries_by_key;
+    pending_entries_by_order_type _pending_entries_by_order;
+    pending_generation _next_pending_generation = 1;
     size_t _key_count = 0;
     size_t _memory_usage = 0;
 
@@ -163,7 +210,10 @@ public:
     explicit primary_index(schema_ptr schema)
         : _partitions(dht::raw_token_less_comparator{})
         , _schema(std::move(schema))
-        {}
+        , _pending_entries_by_key(0, pending_key_hash{}, pending_key_equal{&_schema})
+        , _pending_entries_by_order(pending_key_less{&_schema}) {
+        _pending_entries_by_key.reserve(pending_entries_initial_reserve);
+    }
 
     void set_schema(schema_ptr s) {
         _schema = std::move(s);
@@ -202,6 +252,14 @@ public:
         return std::nullopt;
     }
 
+    const pending_entry* get_pending(const dht::decorated_key& key) const {
+        auto it = _pending_entries_by_key.find(key);
+        if (it != _pending_entries_by_key.end()) {
+            return &it->second;
+        }
+        return nullptr;
+    }
+
     bool is_record_alive(const primary_index_key& key, log_location location) {
         auto it = _partitions.find(key.dk, dht::ring_position_comparator(*_schema));
         if (it != _partitions.end()) {
@@ -230,6 +288,155 @@ public:
 
     static std::strong_ordering default_entry_cmp(const index_entry& a, const index_entry& b) noexcept {
         return a.timestamp <=> b.timestamp;
+    }
+
+    std::optional<pending_generation> insert_pending(const primary_index_key& key, api::timestamp_type ts, shared_log_record_writer writer) {
+        auto durable_it = _partitions.find(key.dk, dht::ring_position_comparator(*_schema));
+        auto pending_it = _pending_entries_by_key.find(key.dk);
+
+        std::optional<api::timestamp_type> max_ts;
+        if (durable_it != _partitions.end()) {
+            max_ts = durable_it->_e.timestamp;
+        }
+        if (pending_it != _pending_entries_by_key.end()) {
+            max_ts = max_ts ? std::max(*max_ts, pending_it->second.timestamp) : pending_it->second.timestamp;
+        }
+
+        if (max_ts && *max_ts > ts) {
+            return std::nullopt;
+        }
+
+        if (durable_it != _partitions.end() && _cache_tracker) {
+            _cache_tracker->evict(*durable_it);
+        }
+
+        auto generation = _next_pending_generation++;
+
+        if (pending_it != _pending_entries_by_key.end()) {
+            pending_it->second = pending_entry{
+                .generation = generation,
+                .timestamp = ts,
+                .writer = std::move(writer),
+            };
+        } else {
+            _pending_entries_by_key.emplace(key.dk, pending_entry{
+                .generation = generation,
+                .timestamp = ts,
+                .writer = std::move(writer),
+            });
+            _pending_entries_by_order.emplace(key.dk);
+        }
+
+        return generation;
+    }
+
+    struct complete_pending_write_result {
+        bool accepted = false;
+        bool pending_cleared = false;
+        std::optional<log_location> old_durable_location;
+    };
+
+    complete_pending_write_result complete_pending_write(const primary_index_key& key, pending_generation generation, api::timestamp_type ts, log_location new_location, record_accounting_ops& accounting) {
+        complete_pending_write_result result;
+
+        partitions_type::bound_hint hint;
+        auto it = _partitions.lower_bound(key.dk, dht::ring_position_comparator(*_schema), hint);
+        if (hint.match) {
+            if (ts >= it->_e.timestamp) {
+                result.accepted = true;
+                result.old_durable_location = it->_e.location;
+                it->_e.location = new_location;
+                it->_e.timestamp = ts;
+                accounting.free_record(*result.old_durable_location);
+                accounting.add_record(new_location);
+            }
+        } else {
+            index_entry new_entry{
+                .location = new_location,
+                .timestamp = ts,
+            };
+            auto inserted = _partitions.emplace_before(it, key.dk.token().raw(), hint, key.dk, std::move(new_entry));
+            on_entry_added(*inserted);
+            result.accepted = true;
+            accounting.add_record(new_location);
+        }
+
+        auto pending_it = _pending_entries_by_key.find(key.dk);
+        if (pending_it != _pending_entries_by_key.end() && pending_it->second.generation == generation) {
+            _pending_entries_by_key.erase(pending_it);
+            _pending_entries_by_order.erase(key.dk);
+            result.pending_cleared = true;
+        }
+
+        return result;
+    }
+
+    bool erase_pending(const primary_index_key& key, pending_generation generation) {
+        auto it = _pending_entries_by_key.find(key.dk);
+        if (it != _pending_entries_by_key.end() && it->second.generation == generation) {
+            _pending_entries_by_key.erase(it);
+            _pending_entries_by_order.erase(key.dk);
+            return true;
+        }
+        return false;
+    }
+
+    // Finds the next pending key in `pr` after `after` (or the first if `after` is nullopt).
+    // Returns nullopt when there are no more pending keys in the range.
+    // Safe to call across co_awaits — recomputes iterators from scratch each time.
+    std::optional<dht::decorated_key> next_pending_in_range(const dht::partition_range& pr, std::optional<dht::decorated_key> after) const {
+        auto it = after
+            ? _pending_entries_by_order.upper_bound(*after)
+            : pr.start()
+                ? _pending_entries_by_order.lower_bound(pr.start()->value())
+                : _pending_entries_by_order.begin();
+
+        auto cmp = dht::ring_position_comparator(*_schema);
+
+        if (!after && pr.start() && !pr.start()->is_inclusive() && it != _pending_entries_by_order.end() && cmp(*it, pr.start()->value()) == 0) {
+            ++it;
+        }
+
+        if (it != _pending_entries_by_order.end() && pr.end()) {
+            auto c = cmp(*it, pr.end()->value());
+            if (pr.end()->is_inclusive() ? c > 0 : c >= 0) {
+                return std::nullopt;
+            }
+        }
+
+        if (it == _pending_entries_by_order.end()) {
+            return std::nullopt;
+        }
+        return *it;
+    }
+
+    // Erases all pending entries overlapping `pr`.
+    void erase_pending_in_range(const dht::partition_range& pr) {
+        auto it = pr.start()
+            ? _pending_entries_by_order.lower_bound(pr.start()->value())
+            : _pending_entries_by_order.begin();
+
+        auto cmp = dht::ring_position_comparator(*_schema);
+
+        if (pr.start() && !pr.start()->is_inclusive() && it != _pending_entries_by_order.end() && cmp(*it, pr.start()->value()) == 0) {
+            ++it;
+        }
+
+        if (it != _pending_entries_by_order.end() && pr.end()) {
+            auto c = cmp(*it, pr.end()->value());
+            if (pr.end()->is_inclusive() ? c > 0 : c >= 0) {
+                return;
+            }
+        }
+
+        auto end_it = pr.end()
+            ? _pending_entries_by_order.lower_bound(dht::ring_position_view::for_range_end(pr))
+            : _pending_entries_by_order.end();
+
+        for (auto cur = it; cur != end_it; ++cur) {
+            _pending_entries_by_key.erase(*cur);
+        }
+        _pending_entries_by_order.erase(it, end_it);
     }
 
     std::pair<bool, std::optional<index_entry>> insert(const primary_index_key& key, index_entry new_entry, record_accounting_ops& accounting , entry_cmp_fn cmp = default_entry_cmp) {
@@ -275,6 +482,8 @@ public:
                 [this, &cmp, begin_pos] { return _partitions.lower_bound(begin_pos, cmp); },
                 [this, &cmp, end_pos] { return _partitions.lower_bound(end_pos, cmp); }
             , accounting);
+
+        erase_pending_in_range(pr);
     }
 
     future<> clear(record_accounting_ops& accounting) {
@@ -282,6 +491,9 @@ public:
                 [this] { return _partitions.begin(); },
                 [this] { return _partitions.end(); }
             , accounting);
+
+        _pending_entries_by_key.clear();
+        _pending_entries_by_order.clear();
 
         if (_key_count != 0 || _memory_usage != 0) {
             on_internal_error(logstor_logger, format("primary_index::clear ended with key_count {} and memory_usage {}", _key_count, _memory_usage));

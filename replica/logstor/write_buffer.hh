@@ -7,6 +7,8 @@
  */
 #pragma once
 
+#include <array>
+
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/temporary_buffer.hh>
@@ -15,11 +17,12 @@
 #include <seastar/core/scheduling.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/queue.hh>
-#include <seastar/core/simple-stream.hh>
 #include <seastar/core/shared_future.hh>
 
+#include "replica/exceptions.hh"
 #include "replica/logstor/ondisk.hh"
 #include "schema/schema_fwd.hh"
+#include "seastar/core/expiring_fifo.hh"
 #include "types.hh"
 #include "timeout_config.hh"
 
@@ -35,51 +38,11 @@ struct write_target {
     seastar::gate::holder cg_holder;
 };
 
-// Writer for log records that handles serialization and size computation
-class log_record_writer {
-
-    using ostream = seastar::simple_memory_output_stream;
-
-    log_record _record;
-    mutable std::optional<size_t> _header_size;
-    mutable std::optional<size_t> _data_size;
-
-    void compute_sizes() const;
-
-public:
-    explicit log_record_writer(log_record record)
-        : _record(std::move(record))
-    {}
-
-    // Get serialized sizes (computed lazily)
-    size_t header_size() const {
-        if (!_header_size) {
-            compute_sizes();
-        }
-        return *_header_size;
-    }
-
-    size_t data_size() const {
-        if (!_data_size) {
-            compute_sizes();
-        }
-        return *_data_size;
-    }
-
-    // Total serialized content size (header + data)
-    size_t size() const {
-        return header_size() + data_size();
-    }
-
-    // Write the record to an output stream
-    void write(ostream& out) const;
-
-    const log_record& record() const {
-        return _record;
-    }
-};
-
 using log_location_with_holder = std::tuple<log_location, seastar::gate::holder>;
+
+struct buffered_write_result {
+    future<log_location_with_holder> persisted;
+};
 
 // Serializes one in-memory logstor buffer.
 //
@@ -206,7 +169,7 @@ private:
 class write_buffer {
 public:
     struct record_in_buffer {
-        log_record_writer writer;
+        shared_log_record_writer writer;
         future<log_location> loc;
         write_target target;
     };
@@ -240,6 +203,7 @@ public:
 
     bool can_fit(size_t data_size) const noexcept { return _raw.can_fit(data_size); }
     bool can_fit(const log_record_writer& writer) const noexcept { return _raw.can_fit(writer); }
+    bool can_fit(const shared_log_record_writer& writer) const noexcept { return _raw.can_fit(*writer); }
     bool has_data() const noexcept { return _raw.has_data(); }
 
     size_t max_record_size() const noexcept { return _raw.max_record_size(); }
@@ -258,7 +222,7 @@ public:
     // Returns a future that will be resolved with the log location once flushed and a gate holder
     // that keeps the write buffer open. The gate should be held for index updates after the write
     // is done.
-    future<log_location_with_holder> write(log_record_writer, write_target target = {});
+    future<log_location_with_holder> write(shared_log_record_writer, write_target target = {});
 
 private:
     bool with_record_copy() const noexcept {
@@ -271,16 +235,18 @@ private:
     future<> complete_writes(log_location base_location);
     future<> abort_writes(std::exception_ptr);
 
+    friend class buffered_writer;
     friend class segment_manager_impl;
     friend struct separator_buffer;
 };
 
 // Manages a fixed-size circular ring of write_buffers.
 //
-// Writers append to the head buffer.  A single consumer coroutine drains the
-// tail.  The head advances when the current head buffer is full (can't fit the
-// next write) or when the consumer seals it.  Writers wait if the ring is full
-// (all buffers are pending flush).
+// Writers append to the head buffer. A single consumer coroutine dispatches
+// ready buffers for writing in FIFO order and reclaims them once the oldest
+// in-flight write completes. The head advances when the current head buffer is
+// full (can't fit the next write) or when the consumer seals it. Writers wait
+// if the ring is full (all buffers are pending write completion).
 class buffered_writer {
     // Number of buffers in the ring.  Must be >= 2 (one head + at least one
     // that can be in-flight with the consumer).
@@ -288,46 +254,149 @@ class buffered_writer {
 
     segment_manager& _sm;
     seastar::scheduling_group _flush_sg;
+    std::chrono::milliseconds _sync_period;
 
     // The ring of buffers, indexed modulo ring_size.
     std::vector<write_buffer> _ring;
 
     // Monotonically increasing indices; the actual slot is idx % ring_size.
     // _head: next slot writers append to.
-    // _tail: next slot the consumer will flush.
-    // Invariant: _head >= _tail && _head - _tail < ring_size.
+    // _dispatch_tail: next slot the consumer will dispatch to segment_manager.
+    // _tail: oldest slot not yet safe to reuse.
+    // Invariant: _head >= _dispatch_tail >= _tail && _head - _tail < ring_size.
     size_t _head{0};
+    size_t _dispatch_tail{0};
     size_t _tail{0};
 
-    // Notified when _tail advances (a slot becomes free for the head to move into)
-    // or when the head buffer is switched.
-    seastar::condition_variable _head_can_advance;
+    struct in_flight_write {
+        std::optional<future<>> completion;
 
-    // Notified when data is written to the head buffer (consumer may wake up).
+        bool idle() const noexcept {
+            return !completion;
+        }
+
+        bool ready() const noexcept {
+            return completion && completion->available();
+        }
+
+        void start(future<> f) {
+            completion.emplace(std::move(f));
+        }
+
+        future<> take_completion() {
+            auto f = std::move(*completion);
+            completion.reset();
+            return f;
+        }
+
+        void reset() noexcept {
+            completion.reset();
+        }
+    };
+
+    std::array<in_flight_write, ring_size> _in_flight;
+
+    struct queued_write {
+        seastar::promise<buffered_write_result> accepted_pr;
+        seastar::promise<log_location_with_holder> persisted_pr;
+        shared_log_record_writer writer;
+        write_target target;
+        db::timeout_clock::time_point timeout;
+        uint64_t id;
+        size_t write_size;
+
+        queued_write(shared_log_record_writer writer, write_target target, db::timeout_clock::time_point timeout, uint64_t id, size_t write_size)
+            : writer(std::move(writer))
+            , target(std::move(target))
+            , timeout(timeout)
+            , id(id)
+            , write_size(write_size) {
+        }
+
+        void fail_timeout() noexcept {
+            auto ep = std::make_exception_ptr(seastar::timed_out_error{});
+            accepted_pr.set_exception(ep);
+            persisted_pr.set_exception(ep);
+        }
+    };
+
+    struct on_queued_write_expiry {
+        buffered_writer* owner{};
+
+        void operator()(queued_write& w) noexcept {
+            owner->on_queued_write_removed(w);
+            w.fail_timeout();
+            owner->on_queued_writes_changed();
+        }
+    };
+
+    // Notified when the consumer may be able to dispatch/reclaim buffers or drain queued writes.
     seastar::condition_variable _tail_can_advance;
+
+    // Notified when queued writes are removed or expired, so flush() can wait
+    // for the pre-flush queue boundary to advance.
+    seastar::condition_variable _queued_writes_changed;
+
+    seastar::expiring_fifo<queued_write, on_queued_write_expiry, db::timeout_clock> _queued_writes;
+    size_t _queued_write_bytes{0};
+    size_t _max_queued_write_bytes{0};
+
+    seastar::timer<db::timeout_clock> _head_flush_timer;
+    bool _head_deadline_expired = false;
+
+    // Monotonically increasing id assigned to queued writes. flush() snapshots
+    // this counter and waits until all queued writes with lower ids are gone.
+    uint64_t _next_queued_write_id = 0;
+
+    // Signaled by the consumer after each tail advance, so flush() can wait
+    // for specific buffers to be flushed.
+    seastar::condition_variable _tail_advanced;
 
     seastar::gate _async_gate;
 
-    // The single flush-consumer fiber, running for the lifetime of the writer.
+    // The single consumer fiber, running for the lifetime of the writer.
     future<> _consumer{make_ready_future<>()};
 
     write_buffer& head_buf() noexcept { return _ring[_head % ring_size]; }
     write_buffer& tail_buf() noexcept { return _ring[_tail % ring_size]; }
+    in_flight_write& tail_write() noexcept { return _in_flight[_tail % ring_size]; }
+    in_flight_write& dispatch_tail_write() noexcept { return _in_flight[_dispatch_tail % ring_size]; }
+    const write_buffer& head_buf() const noexcept { return _ring[_head % ring_size]; }
+    const write_buffer& tail_buf() const noexcept { return _ring[_tail % ring_size]; }
 
     // The ring is full when all ring_size slots are occupied. Advancing the
     // head further would make the new head slot collide with the tail slot.
     bool ring_full() const noexcept { return _head - _tail == ring_size - 1; }
 
+    bool has_pending_buffers() const noexcept;
+    bool should_rotate_head_for_flush() const noexcept;
+    bool maybe_advance_head() noexcept;
+    std::optional<future<log_location_with_holder>> append_to_head_buffer(shared_log_record_writer&, write_target&);
+    bool try_dispatch_next_buffer();
+    future<> run_dispatched_write(size_t idx);
+    future<bool> reclaim_completed_tails();
+    future<bool> drain_queued_writes();
+    void on_queued_write_removed(const queued_write&) noexcept;
+    void fail_queued_write(queued_write&, std::exception_ptr) noexcept;
+    void arm_head_flush_timer();
+    void cancel_head_flush_timer() noexcept;
+    void on_head_flush_timer() noexcept;
+    void on_queued_writes_changed() noexcept;
+
 public:
-    explicit buffered_writer(segment_manager& sm, seastar::scheduling_group flush_sg);
+    explicit buffered_writer(segment_manager& sm, seastar::scheduling_group flush_sg, std::chrono::milliseconds sync_period, size_t max_queued_write_bytes);
 
     buffered_writer(const buffered_writer&) = delete;
     buffered_writer& operator=(const buffered_writer&) = delete;
 
     future<> start();
     future<> stop();
+    future<> flush();
 
-    future<log_location_with_holder> write(log_record, db::timeout_clock::time_point timeout, write_target target = {});
+    future<buffered_write_result> write_to_buffer(shared_log_record_writer, db::timeout_clock::time_point timeout, write_target target = {});
+    future<log_location_with_holder> write(shared_log_record_writer, db::timeout_clock::time_point timeout, write_target target = {});
+
+    size_t queued_write_count() const noexcept { return _queued_writes.size(); }
 
 private:
     // The flush consumer loop.

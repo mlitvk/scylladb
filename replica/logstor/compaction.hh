@@ -275,7 +275,7 @@ struct separator_buffer {
     separator_buffer(separator_buffer&&) noexcept = default;
     separator_buffer& operator=(separator_buffer&&) noexcept = default;
 
-    void write(segment_ref seg_ref, std::optional<segment_sequence> segment_seq_num, log_record_writer writer, separator_write_completion after_written) {
+    void write(segment_ref seg_ref, std::optional<segment_sequence> segment_seq_num, shared_log_record_writer writer, separator_write_completion after_written) {
         // The separator buffer holds a reference to the source segment until its updates are durable.
         if (held_segments.empty() || held_segments.back().id() != seg_ref.id()) {
             held_segments.push_back(std::move(seg_ref));
@@ -290,7 +290,7 @@ struct separator_buffer {
         );
     }
 
-    bool can_fit(const log_record_writer& writer) const noexcept {
+    bool can_fit(const shared_log_record_writer& writer) const noexcept {
         return buf.can_fit(writer);
     }
 
@@ -395,7 +395,7 @@ public:
         _logstor_segments.clear();
     }
 
-    future<> write_to_separator(log_record_writer, segment_ref, std::optional<segment_sequence>, separator_write_completion);
+    future<> write_to_separator(shared_log_record_writer, segment_ref, std::optional<segment_sequence>, separator_write_completion);
 
     future<> flush_separator(std::optional<segment_sequence> seq_num = std::nullopt);
 

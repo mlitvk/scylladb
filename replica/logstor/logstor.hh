@@ -10,6 +10,7 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/temporary_buffer.hh>
 #include <optional>
+#include <chrono>
 #include <seastar/core/scheduling.hh>
 #include "db/cache_tracker.hh"
 #include "readers/mutation_reader.hh"
@@ -30,16 +31,33 @@ namespace logstor {
 
 extern seastar::logger logstor_logger;
 
+enum class logstor_sync_mode {
+    periodic,
+    batch,
+};
+
 struct logstor_config {
     segment_manager_config segment_manager_cfg;
     seastar::scheduling_group flush_sg;
+    logstor_sync_mode mode = logstor_sync_mode::batch;
+    std::chrono::milliseconds sync_period{0};
+    size_t max_queued_write_bytes{0};
 };
 
 class logstor {
 
+    struct stats {
+        uint64_t write_failures{0};
+        uint64_t pending_write_count{0};
+    };
+
     segment_manager _segment_manager;
     buffered_writer _write_buffer;
     cache_tracker _cache_tracker;
+    seastar::gate _async_gate;
+    seastar::metrics::metric_groups _metrics;
+    logstor_sync_mode _mode;
+    stats _stats;
 
 public:
 
@@ -82,6 +100,10 @@ public:
                                        tracing::trace_state_ptr trace_state = nullptr);
 
     future<> flush_to_separator();
+
+    size_t queued_write_count() const noexcept {
+        return _write_buffer.queued_write_count();
+    }
 
 };
 

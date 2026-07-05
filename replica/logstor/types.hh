@@ -8,7 +8,11 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
+#include <utility>
 #include <fmt/format.h>
+#include <seastar/core/simple-stream.hh>
+#include <seastar/core/shared_ptr.hh>
 #include "dht/decorated_key.hh"
 #include "mutation/canonical_mutation.hh"
 #include "mutation/timestamp.hh"
@@ -50,6 +54,55 @@ struct log_record_header {
 struct log_record {
     log_record_header header;
     canonical_mutation mut;
+};
+
+// Writer for log records that handles serialization and size computation.
+class log_record_writer {
+
+    using ostream = seastar::simple_memory_output_stream;
+
+    log_record _record;
+    mutable std::optional<size_t> _header_size;
+    mutable std::optional<size_t> _data_size;
+
+    void compute_sizes() const;
+
+public:
+    explicit log_record_writer(log_record record)
+        : _record(std::move(record))
+    {}
+
+    size_t header_size() const {
+        if (!_header_size) {
+            compute_sizes();
+        }
+        return *_header_size;
+    }
+
+    size_t data_size() const {
+        if (!_data_size) {
+            compute_sizes();
+        }
+        return *_data_size;
+    }
+
+    size_t size() const {
+        return header_size() + data_size();
+    }
+
+    void write(ostream& out) const;
+
+    const log_record& record() const {
+        return _record;
+    }
+};
+
+using shared_log_record_writer = lw_shared_ptr<log_record_writer>;
+
+struct pending_entry {
+    uint64_t generation;
+    api::timestamp_type timestamp;
+    shared_log_record_writer writer;
 };
 
 struct segment_sequence {

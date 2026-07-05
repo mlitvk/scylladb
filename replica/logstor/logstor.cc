@@ -7,6 +7,8 @@
  */
 #include "replica/logstor/logstor.hh"
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/coroutine.hh>
+#include <seastar/coroutine/exception.hh>
 #include <seastar/util/log.hh>
 #include <seastar/util/defer.hh>
 #include <seastar/core/future.hh>
@@ -44,8 +46,20 @@ static api::timestamp_type extract_logstor_record_timestamp(const mutation& m) {
 
 logstor::logstor(logstor_config config, ::cache_tracker& shared_cache_tracker)
     : _segment_manager(config.segment_manager_cfg)
-    , _write_buffer(_segment_manager, config.flush_sg)
-    , _cache_tracker(shared_cache_tracker) {
+    , _write_buffer(_segment_manager, config.flush_sg, config.mode == logstor_sync_mode::periodic ? config.sync_period : std::chrono::milliseconds(0), config.max_queued_write_bytes)
+    , _cache_tracker(shared_cache_tracker)
+    , _mode(config.mode) {
+
+    namespace sm = seastar::metrics;
+
+    _metrics.add_group("logstor", {
+        sm::make_gauge("queued_write_count", [this] { return _write_buffer.queued_write_count(); },
+                       sm::description("Number of writes currently queued in the write buffer.")),
+        sm::make_gauge("pending_write_count", [this] { return _stats.pending_write_count; },
+                       sm::description("Number of writes accepted by logstor but not yet completed in the primary index.")),
+        sm::make_counter("write_failures", [this] { return _stats.write_failures; },
+                       sm::description("Number of writes that failed to be persisted.")),
+    });
 }
 
 future<> logstor::do_recovery(replica::database& db) {
@@ -69,6 +83,7 @@ future<> logstor::stop() {
     logstor_logger.info("Stopping logstor");
 
     co_await _write_buffer.stop();
+    co_await _async_gate.close();
     co_await _segment_manager.stop();
 
     logstor_logger.info("logstor stopped");
@@ -112,17 +127,46 @@ future<> logstor::write(const mutation& m, write_target target, db::timeout_cloc
         .mut = canonical_mutation(m)
     };
 
-    return _write_buffer.write(std::move(record), timeout, std::move(target)).then_unpack([index_ptr = &index, ts, key = std::move(key), accounting = std::move(accounting)]
-            (log_location location, seastar::gate::holder op) mutable {
+    auto writer = make_lw_shared<log_record_writer>(std::move(record));
+
+    if (_mode == logstor_sync_mode::periodic) {
+        auto result_f = co_await coroutine::as_future(_write_buffer.write_to_buffer(writer, timeout, std::move(target)));
+        if (result_f.failed()) {
+            ++_stats.write_failures;
+            co_await coroutine::return_exception_ptr(result_f.get_exception());
+        }
+        auto result = result_f.get();
+
+        auto pending = index.insert_pending(key, ts, std::move(writer));
+        if (!pending) {
+            (void)std::move(result.persisted).discard_result().handle_exception([] (std::exception_ptr) {});
+            co_return;
+        }
+        ++_stats.pending_write_count;
+
+        auto holder = _async_gate.hold();
+        (void)std::move(result.persisted)
+            .then_unpack([index_ptr = &index, key, generation = *pending, ts, accounting = std::move(accounting)] (log_location location, seastar::gate::holder op) mutable {
+                index_ptr->complete_pending_write(key, generation, ts, location, accounting);
+            }).handle_exception([this, index_ptr = &index, key, pending] (std::exception_ptr ep) {
+                index_ptr->erase_pending(key, *pending);
+                _stats.write_failures++;
+            }).finally([this, holder = std::move(holder)] {
+                --_stats.pending_write_count;
+            });
+    } else {
+        auto result_f = co_await coroutine::as_future(_write_buffer.write(std::move(writer), timeout, std::move(target)));
+        if (result_f.failed()) {
+            _stats.write_failures++;
+            co_await coroutine::return_exception_ptr(result_f.get_exception());
+        }
+        auto [location, op] = result_f.get();
         index_entry new_entry {
             .location = location,
             .timestamp = ts,
         };
-        index_ptr->insert(key, std::move(new_entry), accounting);
-    }).handle_exception([] (std::exception_ptr ep) {
-        logstor_logger.error("Error writing mutation: {}", ep);
-        return make_exception_future<>(ep);
-    });
+        index.insert(key, std::move(new_entry), accounting);
+    }
 }
 
 future<std::optional<mutation>> logstor::read(const schema& s, const primary_index& index, const dht::decorated_key& dk, const query::partition_slice& slice) {
@@ -132,8 +176,17 @@ future<std::optional<mutation>> logstor::read(const schema& s, const primary_ind
     auto* cache = bypass_cache ? nullptr : index.cache_tracker();
 
     auto it = index.find(dk);
+    auto pending = index.get_pending(dk);
+
     if (it == index.end()) {
-        co_return std::nullopt;
+        if (!pending) {
+            co_return std::nullopt;
+        }
+        co_return pending->writer->record().mut.to_mutation(s.shared_from_this());
+    }
+
+    if (pending && pending->timestamp >= it->entry().timestamp) {
+        co_return pending->writer->record().mut.to_mutation(s.shared_from_this());
     }
 
     // lookup in cache
@@ -161,7 +214,8 @@ future<std::optional<mutation>> logstor::read(const schema& s, const primary_ind
     // across the co_await above.
     if (cache) {
         auto it = index.find(dk);
-        if (it != index.end() && it->entry().location == entry_for_read.location) {
+        auto pending = index.get_pending(dk);
+        if (it != index.end() && it->entry().location == entry_for_read.location && (!pending || pending->timestamp < entry_for_read.timestamp)) {
             cache->populate(*it, m);
         }
     }
@@ -182,13 +236,11 @@ mutation_reader logstor::make_reader(schema_ptr schema, const primary_index& ind
         mutation_reader_opt _current_partition_reader;
         dht::ring_position_comparator _cmp;
 
-        // Finds the next iterator to process, safe to call after any co_await
-        primary_index::partitions_type::const_iterator find_next() const {
-            auto it = _last_key
-                ? _index.upper_bound(*_last_key)                        // strictly after last key
-                : position_at_range_start();                            // initial positioning
-            // If start was exclusive and we haven't yet seen a key
-            return it;
+        // Finds the next durable iterator to process, safe to call after any co_await.
+        primary_index::partitions_type::const_iterator find_next_durable() const {
+            return _last_key
+                ? _index.upper_bound(*_last_key)
+                : position_at_range_start();
         }
 
         primary_index::partitions_type::const_iterator position_at_range_start() const {
@@ -208,6 +260,27 @@ mutation_reader logstor::make_reader(schema_ptr schema, const primary_index& ind
             if (!_pr.end()) return false;
             auto c = _cmp(e.key(), _pr.end()->value());
             return _pr.end()->is_inclusive() ? c > 0 : c >= 0;
+        }
+
+        std::optional<dht::decorated_key> find_next_pending() const {
+            return _index.next_pending_in_range(_pr, _last_key);
+        }
+
+        std::optional<dht::decorated_key> find_next_key() const {
+            std::optional<dht::decorated_key> durable_key;
+            auto durable_it = find_next_durable();
+            if (durable_it != _index.end() && !exceeds_range_end(*durable_it)) {
+                durable_key = durable_it->key();
+            }
+
+            auto pending_key = find_next_pending();
+            if (!durable_key) {
+                return pending_key;
+            }
+            if (!pending_key) {
+                return durable_key;
+            }
+            return _cmp(*pending_key, *durable_key) < 0 ? std::move(pending_key) : std::move(durable_key);
         }
 
     public:
@@ -235,14 +308,14 @@ mutation_reader logstor::make_reader(schema_ptr schema, const primary_index& ind
                 }
 
                 // Find next key in range (safe after co_await since we use _last_key)
-                auto it = find_next();
-                if (it == _index.end() || exceeds_range_end(*it)) {
+                auto next_key = find_next_key();
+                if (!next_key) {
                     _end_of_stream = true;
                     break;
                 }
 
                 // Snapshot the key before yielding
-                auto current_key = it->key();
+                auto current_key = std::move(*next_key);
 
                 auto guard = reader_permit::awaits_guard(_permit);
                 auto mut = co_await _logstor->read(*_schema, _index, current_key, _slice);
@@ -309,6 +382,7 @@ mutation_reader logstor::make_reader(schema_ptr schema, const primary_index& ind
 }
 
 future<> logstor::flush_to_separator() {
+    co_await _write_buffer.flush();
     co_await _segment_manager.await_pending_writes();
 }
 

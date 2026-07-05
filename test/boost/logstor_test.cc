@@ -12,6 +12,7 @@
 #include <vector>
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/util/memory-data-source.hh>
+#include <seastar/core/coroutine.hh>
 #include <seastar/util/defer.hh>
 
 #include "replica/logstor/logstor.hh"
@@ -25,7 +26,11 @@
 #include "schema/schema_builder.hh"
 #include <seastar/core/simple-stream.hh>
 #include "test/lib/mutation_assertions.hh"
+#include "test/lib/mutation_reader_assertions.hh"
+#include "test/lib/reader_concurrency_semaphore.hh"
 #include "test/lib/tmpdir.hh"
+#include "test/lib/eventually.hh"
+#include "utils/error_injection.hh"
 
 using namespace replica::logstor;
 
@@ -164,13 +169,22 @@ logstor_config make_test_logstor_config(const std::filesystem::path& base_dir) {
             .separator_sg = seastar::current_scheduling_group(),
         },
         .flush_sg = seastar::current_scheduling_group(),
+        .max_queued_write_bytes = 0,
     };
+}
+
+logstor_config make_periodic_test_logstor_config(const std::filesystem::path& base_dir) {
+    auto cfg = make_test_logstor_config(base_dir);
+    cfg.mode = logstor_sync_mode::periodic;
+    cfg.sync_period = std::chrono::hours(1);
+    return cfg;
 }
 
 class test_compaction_group_handle final : public logstor_group {
     ::table_id _table_id;
     primary_index _index;
     compaction_manager& _cm;
+    seastar::gate _write_gate;
 public:
     test_compaction_group_handle(schema_ptr schema, compaction_manager& cm, size_t separator_buffer_size)
         : logstor_group(separator_buffer_size)
@@ -192,6 +206,14 @@ public:
         return _index;
     }
 
+    seastar::gate::holder hold_write_gate() {
+        return _write_gate.hold();
+    }
+
+    future<> close_write_gate() {
+        return _write_gate.close();
+    }
+
 protected:
     compaction_manager& logstor_compaction_manager() noexcept override {
         return _cm;
@@ -207,9 +229,17 @@ std::set<log_segment_id> snapshot_segment_ids(const utils::chunked_vector<segmen
 }
 
 void write_and_flush_segment(logstor& ls, test_compaction_group_handle& cg, const mutation& m) {
-    ls.write(m, write_target(&cg, {}), db::no_timeout).get();
+    ls.write(m, write_target(&cg, cg.hold_write_gate()), db::no_timeout).get();
     ls.flush_to_separator().get();
     cg.flush_separator().get();
+}
+
+future<> wait_for_pending_cleared(primary_index& index, const dht::decorated_key& key) {
+    return seastar::do_until([&index, &key] {
+        return !index.get_pending(key);
+    }, [] {
+        return seastar::yield();
+    });
 }
 
 }
@@ -1004,6 +1034,134 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_group_compaction_rewrites_live_records) {
     BOOST_REQUIRE_EQUAL(record_counts.count(api::timestamp_type(2)), 0u); // pk1_v0 - stale
 }
 
+SEASTAR_THREAD_TEST_CASE(test_logstor_group_segments_are_ordered_by_free_space_for_compaction) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    ls.do_recovery_for_test().get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] { ls.stop().get(); });
+
+    test_compaction_group_handle cg(schema, ls.get_compaction_manager(), ls.get_segment_manager().get_segment_size());
+    auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+
+    struct segment_plan {
+        size_t overwrite_count;
+        std::array<sstring, 2> keys;
+    };
+
+    const std::array<segment_plan, 6> plans{{
+        {0, {"seg0_r0", "seg0_r1"}},
+        {1, {"seg1_r0", "seg1_r1"}},
+        {2, {"seg2_r0", "seg2_r1"}},
+        {0, {"seg3_r0", "seg3_r1"}},
+        {1, {"seg4_r0", "seg4_r1"}},
+        {2, {"seg5_r0", "seg5_r1"}},
+    }};
+
+    const auto segment_size = ls.get_segment_manager().get_segment_size();
+    const auto make_large_kv_mutation = [&] (sstring pk, sstring value_tag, api::timestamp_type ts) {
+        raw_write_buffer probe(segment_size, segment_kind::mixed);
+        const size_t target_size = probe.max_record_size() / 4;
+
+        sstring value = std::move(value_tag);
+        log_record_writer writer(make_log_record(schema, pk, value, ts));
+        while (writer.size() < target_size) {
+            value += "x";
+            writer = log_record_writer(make_log_record(schema, pk, value, ts));
+        }
+
+        return make_kv_mutation(schema, std::move(pk), std::move(value), ts);
+    };
+
+    struct initial_segment_info {
+        log_segment_id segment_id;
+        size_t overwrite_count;
+    };
+    std::vector<initial_segment_info> initial_segments;
+    initial_segments.reserve(plans.size());
+
+    api::timestamp_type ts{1};
+    for (const auto& plan : plans) {
+        std::array<mutation, 2> initial_mutations{
+            make_large_kv_mutation(plan.keys[0], format("initial-{}-{}", plan.keys[0], ts), ts),
+            make_large_kv_mutation(plan.keys[1], format("initial-{}-{}", plan.keys[1], ts + 1), ts + 1),
+        };
+
+        for (auto& m : initial_mutations) {
+            ls.write(m, write_target(&cg, cg.hold_write_gate()), db::no_timeout).get();
+            ++ts;
+        }
+
+        ls.flush_to_separator().get();
+        cg.flush_separator().get();
+
+        std::optional<log_segment_id> segment_id;
+        for (const auto& m : initial_mutations) {
+            auto entry = cg.logstor_index().get(primary_index_key{m.decorated_key()});
+            BOOST_REQUIRE(entry);
+            segment_id = entry->location.segment;
+        }
+
+        BOOST_REQUIRE(segment_id);
+        initial_segments.push_back({*segment_id, plan.overwrite_count});
+    }
+
+    for (const auto& plan : plans) {
+        for (size_t i = 0; i < plan.overwrite_count; ++i) {
+            auto m = make_large_kv_mutation(plan.keys[i], format("overwrite-{}-{}", plan.keys[i], ts), ts);
+            write_and_flush_segment(ls, cg, m);
+            wait_for_pending_cleared(cg.logstor_index(), m.decorated_key()).get();
+            ++ts;
+        }
+    }
+
+    std::map<log_segment_id, size_t> positions;
+    size_t pos = 0;
+    for (const auto& snap : ls.get_segment_manager().make_snapshot(cg).get()) {
+        positions.emplace(snap.segment_id, pos++);
+    }
+
+    std::vector<size_t> low_positions;
+    std::vector<size_t> medium_positions;
+    std::vector<size_t> high_positions;
+
+    for (const auto& info : initial_segments) {
+        auto pos_it = positions.find(info.segment_id);
+        BOOST_REQUIRE(pos_it != positions.end());
+
+        switch (info.overwrite_count) {
+        case 0:
+            low_positions.push_back(pos_it->second);
+            break;
+        case 1:
+            medium_positions.push_back(pos_it->second);
+            break;
+        case 2:
+            high_positions.push_back(pos_it->second);
+            break;
+        default:
+            BOOST_FAIL("unexpected overwrite group");
+        }
+    }
+
+    BOOST_REQUIRE_EQUAL(low_positions.size(), 2u);
+    BOOST_REQUIRE_EQUAL(medium_positions.size(), 2u);
+    BOOST_REQUIRE_EQUAL(high_positions.size(), 2u);
+
+    const auto max_of = [] (const std::vector<size_t>& values) {
+        return *std::max_element(values.begin(), values.end());
+    };
+    const auto min_of = [] (const std::vector<size_t>& values) {
+        return *std::min_element(values.begin(), values.end());
+    };
+
+    BOOST_REQUIRE_LT(max_of(high_positions), min_of(medium_positions));
+    BOOST_REQUIRE_LT(max_of(medium_positions), min_of(low_positions));
+}
+
 SEASTAR_THREAD_TEST_CASE(test_logstor_disabled_group_does_not_compact_on_submit) {
     auto schema = make_kv_schema();
     tmpdir dir;
@@ -1078,3 +1236,180 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_disabled_group_does_not_compact_on_submit)
     assert_that(*actual_pk1).is_equal_to(pk1_v1);
     assert_that(*actual_pk2).is_equal_to(pk2_v0);
 }
+
+SEASTAR_THREAD_TEST_CASE(test_logstor_periodic_range_reader_merges_durable_and_pending) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_periodic_test_logstor_config(dir.path()), cache.shared_tracker);
+    ls.do_recovery_for_test().get();
+    ls.start().get();
+
+    test_compaction_group_handle cg(schema, ls.get_compaction_manager(), ls.get_segment_manager().get_segment_size());
+    auto stop_store = seastar::defer([&ls] { ls.stop().get(); });
+
+    auto durable_a = make_kv_mutation(schema, "a", "durable-a", api::timestamp_type(1));
+    auto durable_c = make_kv_mutation(schema, "c", "durable-c", api::timestamp_type(2));
+    auto pending_b = make_kv_mutation(schema, "b", "pending-b", api::timestamp_type(3));
+    auto pending_d = make_kv_mutation(schema, "d", "pending-d", api::timestamp_type(4));
+    tests::reader_concurrency_semaphore_wrapper semaphore;
+
+    write_and_flush_segment(ls, cg, durable_a);
+    write_and_flush_segment(ls, cg, durable_c);
+    wait_for_pending_cleared(cg.logstor_index(), durable_a.decorated_key()).get();
+    wait_for_pending_cleared(cg.logstor_index(), durable_c.decorated_key()).get();
+    ls.write(pending_b, write_target(&cg, cg.hold_write_gate()), db::no_timeout).get();
+    ls.write(pending_d, write_target(&cg, cg.hold_write_gate()), db::no_timeout).get();
+
+    auto reader = ls.make_reader(schema, cg.logstor_index(), semaphore.make_permit(), query::full_partition_range, schema->full_slice());
+
+    assert_that(std::move(reader))
+        .has_monotonic_positions();
+
+    auto actual_a = ls.read(*schema, cg.logstor_index(), durable_a.decorated_key(), schema->full_slice()).get();
+    auto actual_b = ls.read(*schema, cg.logstor_index(), pending_b.decorated_key(), schema->full_slice()).get();
+    auto actual_c = ls.read(*schema, cg.logstor_index(), durable_c.decorated_key(), schema->full_slice()).get();
+    auto actual_d = ls.read(*schema, cg.logstor_index(), pending_d.decorated_key(), schema->full_slice()).get();
+
+    BOOST_REQUIRE(actual_a);
+    BOOST_REQUIRE(actual_b);
+    BOOST_REQUIRE(actual_c);
+    BOOST_REQUIRE(actual_d);
+
+    assert_that(*actual_a).is_equal_to(durable_a);
+    assert_that(*actual_b).is_equal_to(pending_b);
+    assert_that(*actual_c).is_equal_to(durable_c);
+    assert_that(*actual_d).is_equal_to(pending_d);
+
+    auto bounded_range = dht::partition_range::make_singular(pending_b.decorated_key());
+    auto bounded_reader = ls.make_reader(schema, cg.logstor_index(), semaphore.make_permit(), bounded_range, schema->full_slice());
+
+    assert_that(std::move(bounded_reader))
+        .produces(pending_b)
+        .produces_end_of_stream();
+
+    ls.flush_to_separator().get();
+    wait_for_pending_cleared(cg.logstor_index(), pending_b.decorated_key()).get();
+    wait_for_pending_cleared(cg.logstor_index(), pending_d.decorated_key()).get();
+    cg.flush_separator().get();
+    cg.close_write_gate().get();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_logstor_periodic_range_reader_prefers_newer_pending_entry) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_periodic_test_logstor_config(dir.path()), cache.shared_tracker);
+    ls.do_recovery_for_test().get();
+    ls.start().get();
+
+    test_compaction_group_handle cg(schema, ls.get_compaction_manager(), ls.get_segment_manager().get_segment_size());
+    auto stop_store = seastar::defer([&ls] { ls.stop().get(); });
+
+    auto durable_old = make_kv_mutation(schema, "same", "durable-old", api::timestamp_type(1));
+    auto pending_new = make_kv_mutation(schema, "same", "pending-new", api::timestamp_type(2));
+    tests::reader_concurrency_semaphore_wrapper semaphore;
+
+    write_and_flush_segment(ls, cg, durable_old);
+    wait_for_pending_cleared(cg.logstor_index(), durable_old.decorated_key()).get();
+    ls.write(pending_new, write_target(&cg, cg.hold_write_gate()), db::no_timeout).get();
+
+    auto reader = ls.make_reader(schema, cg.logstor_index(), semaphore.make_permit(), dht::partition_range::make_singular(pending_new.decorated_key()), schema->full_slice());
+
+    assert_that(std::move(reader))
+        .produces(pending_new)
+        .produces_end_of_stream();
+
+    ls.flush_to_separator().get();
+    wait_for_pending_cleared(cg.logstor_index(), pending_new.decorated_key()).get();
+    cg.flush_separator().get();
+    cg.close_write_gate().get();
+}
+
+#ifdef SCYLLA_ENABLE_ERROR_INJECTION
+SEASTAR_THREAD_TEST_CASE(test_logstor_buffered_writer_queues_when_ring_full) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+    constexpr size_t ring_size = 5;
+    constexpr size_t max_writes = ring_size * 8;
+    constexpr size_t max_dispatched_when_ring_full = ring_size - 1;
+
+    shared_logstor_cache cache;
+    auto cfg = make_periodic_test_logstor_config(dir.path());
+    logstor ls(cfg, cache.shared_tracker);
+    ls.do_recovery_for_test().get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] { ls.stop().get(); });
+
+    test_compaction_group_handle cg(schema, ls.get_compaction_manager(), ls.get_segment_manager().get_segment_size());
+
+    auto& errinj = utils::get_local_injector();
+    errinj.enable("logstor_buffered_writer_pause_dispatched_write");
+    auto disable_injection = seastar::defer([&errinj] {
+        if (errinj.is_enabled("logstor_buffered_writer_pause_dispatched_write")) {
+            errinj.disable("logstor_buffered_writer_pause_dispatched_write");
+        }
+    });
+
+    const auto segment_size = ls.get_segment_manager().get_segment_size();
+    std::vector<future<>> writes;
+    writes.reserve(max_writes);
+
+    auto make_large_kv_mutation = [] (schema_ptr schema, sstring pk, api::timestamp_type ts, size_t segment_size) {
+        raw_write_buffer probe(segment_size, segment_kind::mixed);
+        const size_t target_size = probe.max_record_size() / 4;
+
+        sstring value;
+        log_record_writer writer(make_log_record(schema, pk, value, ts));
+        while (writer.size() < target_size) {
+            value += "x";
+            writer = log_record_writer(make_log_record(schema, pk, value, ts));
+        }
+
+        return make_kv_mutation(schema, std::move(pk), std::move(value), ts);
+    };
+
+    for (size_t i = 0; i < max_writes && ls.queued_write_count() == 0; ++i) {
+        auto m = make_large_kv_mutation(schema, format("pk{}", i), api::timestamp_type(i + 1), segment_size);
+        writes.push_back(ls.write(m, write_target(&cg, cg.hold_write_gate()), db::no_timeout).discard_result());
+        if ((i + 1) % 4 == 0) {
+            seastar::yield().get();
+        }
+    }
+
+    if (!eventually_true([&ls] {
+        return ls.queued_write_count() == 1;
+    })) {
+        errinj.disable("logstor_buffered_writer_pause_dispatched_write");
+        BOOST_FAIL("timed out waiting for exactly one queued write");
+    }
+
+    if (!eventually_true([&errinj] {
+        return errinj.waiters("logstor_buffered_writer_pause_dispatched_write") >= max_dispatched_when_ring_full;
+    })) {
+        errinj.disable("logstor_buffered_writer_pause_dispatched_write");
+        BOOST_FAIL("timed out waiting for dispatched writes to pause");
+    }
+
+    errinj.disable("logstor_buffered_writer_pause_dispatched_write");
+
+    for (auto& write : writes) {
+        write.get();
+    }
+
+    ls.flush_to_separator().get();
+    BOOST_REQUIRE_EQUAL(ls.queued_write_count(), 0u);
+
+    cg.flush_separator().get();
+    cg.close_write_gate().get();
+
+    for (size_t i = 0; i < writes.size(); ++i) {
+        auto expected = make_large_kv_mutation(schema, format("pk{}", i), api::timestamp_type(i + 1), segment_size);
+        auto actual = ls.read(*schema, cg.logstor_index(), expected.decorated_key(), schema->full_slice()).get();
+        BOOST_REQUIRE(actual);
+        assert_that(*actual).is_equal_to(expected);
+    }
+}
+#endif

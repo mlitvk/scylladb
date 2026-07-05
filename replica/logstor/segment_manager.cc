@@ -75,6 +75,7 @@ protected:
 
 class writeable_segment : public segment {
     seastar::gate _write_gate;
+    seastar::semaphore _append_sem{1};
     segment_ref _seg_ref;
     segment_sequence _seq_num;
 
@@ -89,8 +90,7 @@ public:
 
     future<> stop();
 
-    // write a serialized sequence of records.
-    // must not be called concurrently.
+    // Reserve an offset synchronously, then serialize the actual DMA write.
     future<log_location> append(bytes_view data);
 
     bool can_fit(size_t data_size) const noexcept {
@@ -157,8 +157,11 @@ future<log_location> writeable_segment::append(bytes_view data) {
         .size = static_cast<uint32_t>(data_size)
     };
 
-    co_await do_write(loc, data);
     _current_offset += data_size;
+
+    auto units = co_await get_units(_append_sem, 1);
+
+    co_await do_write(loc, data);
     co_return loc;
 }
 
@@ -749,7 +752,6 @@ class segment_manager_impl {
     static constexpr size_t segment_pool_size = 128;
 
     seg_ptr _active_segment;
-    seastar::semaphore _active_segment_write_sem{1};
     segment_pool _segment_pool;
     std::optional<shared_future<>> _switch_segment_fut;
     segment_sequence _next_segment_seq{1};
@@ -1244,9 +1246,9 @@ future<> segment_manager_impl::write(write_buffer& wb) {
         throw std::runtime_error(fmt::format( "Write size {} exceeds segment size {}", sealed_size, _cfg.segment_size));
     }
 
-    {
-        auto sem_units = co_await get_units(_active_segment_write_sem, 1);
+    co_await utils::get_local_injector().inject("logstor_segment_manager_pause_write", utils::wait_for_message(std::chrono::minutes(5)));
 
+    {
         while (!_active_segment || !_active_segment->can_fit(sealed_size)) {
             co_await request_segment_switch();
         }
@@ -1274,7 +1276,6 @@ future<> segment_manager_impl::write(write_buffer& wb) {
             co_await coroutine::return_exception_ptr(std::move(ex));
         }
         auto loc = append_result.get();
-        sem_units.return_all();
 
         _stats.bytes_written[static_cast<size_t>(source)] += data.size();
         _stats.data_bytes_written[static_cast<size_t>(source)] += wb.net_data_size();
@@ -1306,6 +1307,8 @@ future<> segment_manager_impl::write_full_segment(write_buffer& wb, logstor_grou
     if (sealed_size > _cfg.segment_size) {
         throw std::runtime_error(fmt::format("Write size {} exceeds segment size {}", sealed_size, _cfg.segment_size));
     }
+
+    co_await utils::get_local_injector().inject("logstor_segment_manager_pause_write", utils::wait_for_message(std::chrono::minutes(5)));
 
     auto seg = co_await get_segment(source);
     logstor_logger.trace("Write full segment {} seq {} from {}", seg->id(), seg->seq_num(), write_source_to_string(source));
@@ -1831,7 +1834,7 @@ struct compaction_buffer {
         auto* index_ptr = &index;
         auto key = record.header.key;
         auto accounting = sm.segment_accounting_updater();
-        log_record_writer writer(std::move(record));
+        auto writer = make_lw_shared<log_record_writer>(std::move(record));
 
         if (!buf->can_fit(writer)) {
             co_await flush();
@@ -2045,7 +2048,7 @@ future<> segment_manager_impl::write_to_separator(std::vector<write_buffer::reco
 
     co_await seastar::max_concurrent_for_each(groups, separator_group_write_concurrency, [this, seg_ref, segment_seq_num] (separator_group_records& group) -> future<> {
         for (auto* record : group.records) {
-            auto key = record->writer.record().header.key;
+            auto key = record->writer->record().header.key;
             log_location prev_loc = co_await std::move(record->loc);
             auto* index_ptr = &group.cg->logstor_index();
             auto accounting = segment_accounting_updater();
@@ -2064,7 +2067,7 @@ future<> segment_manager_impl::write_to_separator(table& t, log_location prev_lo
     auto& cg = t.get_logstor_group(key.dk.token());
     auto* index_ptr = &cg.logstor_index();
     auto accounting = segment_accounting_updater();
-    log_record_writer writer(std::move(record));
+    auto writer = make_lw_shared<log_record_writer>(std::move(record));
 
     co_await cg.write_to_separator(std::move(writer), std::move(seg_ref), std::nullopt,
         [index_ptr, key = std::move(key), prev_loc, accounting = std::move(accounting)] (log_location new_loc, seastar::gate::holder op) mutable noexcept {
@@ -2533,8 +2536,8 @@ void logstor_group::switch_active_separator_buffer() {
     _separator_flush = shared_future(logstor_compaction_manager().flush_separator_buffer(buf, *this));
 }
 
-future<> logstor_group::write_to_separator(log_record_writer writer, segment_ref seg_ref, std::optional<segment_sequence> segment_seq_num, separator_write_completion after_written) {
-    while (!active_separator_buffer().can_fit(writer.size())) {
+future<> logstor_group::write_to_separator(shared_log_record_writer writer, segment_ref seg_ref, std::optional<segment_sequence> segment_seq_num, separator_write_completion after_written) {
+    while (!active_separator_buffer().can_fit(writer->size())) {
         if (!_separator_flush.available()) {
             co_await _separator_flush.get_future().handle_exception([] (std::exception_ptr) {});
             continue;
