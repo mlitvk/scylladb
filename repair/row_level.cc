@@ -19,6 +19,8 @@
 #include "sstables/sstables.hh"
 #include "sstables/sstables_manager.hh"
 #include "mutation/mutation_fragment.hh"
+#include "mutation/mutation_fragment_v2.hh"
+#include "mutation/mutation_rebuilder.hh"
 #include "mutation_writer/multishard_writer.hh"
 #include "dht/i_partitioner.hh"
 #include "dht/sharder.hh"
@@ -516,8 +518,33 @@ mutation_fragment_queue make_mutation_fragment_queue(schema_ptr s, reader_permit
 }
 
 class logstor_direct_writer_queue_impl : public mutation_fragment_queue::impl {
+    schema_ptr _schema;
+    std::optional<mutation_rebuilder_v2> _rebuilder;
+
+private:
+    void rebuild(mutation_fragment_v2&& mf) {
+        if (mf.is_partition_start()) {
+            auto ps = std::move(mf).as_partition_start();
+            _rebuilder.emplace(_schema);
+            _rebuilder->consume_new_partition(ps.key());
+            (void)_rebuilder->consume(ps.partition_tombstone());
+            return;
+        }
+
+        if (!_rebuilder) {
+            throw std::runtime_error("Logstor repair writer got non-partition-start fragment without an active rebuilder");
+        }
+
+        (void)_rebuilder->consume(std::move(mf));
+    }
+
 public:
-    virtual future<> push(mutation_fragment_v2) override {
+    explicit logstor_direct_writer_queue_impl(schema_ptr schema)
+        : _schema(std::move(schema)) {
+    }
+
+    virtual future<> push(mutation_fragment_v2 mf) override {
+        rebuild(std::move(mf));
         return make_exception_future<>(std::runtime_error("Logstor repair writer is not implemented"));
     }
 
@@ -525,6 +552,7 @@ public:
     }
 
     virtual void push_end_of_stream() override {
+        _rebuilder.reset();
     }
 };
 
@@ -532,7 +560,7 @@ class logstor_repair_writer_impl : public repair_writer::impl {
     mutation_fragment_queue _mq;
 public:
     explicit logstor_repair_writer_impl(schema_ptr schema, reader_permit permit)
-        : _mq(std::move(schema), std::move(permit), seastar::make_shared<logstor_direct_writer_queue_impl>()) {
+        : _mq(schema, std::move(permit), seastar::make_shared<logstor_direct_writer_queue_impl>(schema)) {
     }
 
     virtual mutation_fragment_queue& queue() override {
