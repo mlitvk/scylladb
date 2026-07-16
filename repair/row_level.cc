@@ -515,6 +515,38 @@ mutation_fragment_queue make_mutation_fragment_queue(schema_ptr s, reader_permit
     return mutation_fragment_queue(std::move(s), std::move(permit), seastar::make_shared<queue_reader_handle_adapter>(std::move(handle)));
 }
 
+class logstor_direct_writer_queue_impl : public mutation_fragment_queue::impl {
+public:
+    virtual future<> push(mutation_fragment_v2) override {
+        return make_exception_future<>(std::runtime_error("Logstor repair writer is not implemented"));
+    }
+
+    virtual void abort(std::exception_ptr) override {
+    }
+
+    virtual void push_end_of_stream() override {
+    }
+};
+
+class logstor_repair_writer_impl : public repair_writer::impl {
+    mutation_fragment_queue _mq;
+public:
+    explicit logstor_repair_writer_impl(schema_ptr schema, reader_permit permit)
+        : _mq(std::move(schema), std::move(permit), seastar::make_shared<logstor_direct_writer_queue_impl>()) {
+    }
+
+    virtual mutation_fragment_queue& queue() override {
+        return _mq;
+    }
+
+    virtual future<> wait_for_writer_done() override {
+        return make_ready_future<>();
+    }
+
+    virtual void create_writer(lw_shared_ptr<repair_writer>) override {
+    }
+};
+
 struct sharder_helper {
     struct tablet_sharder_keepalive {
         std::unique_ptr<dht::auto_refreshing_sharder> sharder_ptr;
@@ -596,9 +628,16 @@ lw_shared_ptr<repair_writer> make_repair_writer(
             db::view::view_builder& view_builder,
             sharded<db::view::view_building_worker>& view_building_worker,
             service::frozen_topology_guard topo_guard) {
-    auto [queue_reader, queue_handle] = make_queue_reader(schema, permit);
-    auto queue = make_mutation_fragment_queue(schema, permit, std::move(queue_handle));
-    auto i = std::make_unique<repair_writer_impl>(schema, repaired_at, permit, db, view_builder, view_building_worker, reason, std::move(queue), std::move(queue_reader), topo_guard);
+    auto& table = db.local().find_column_family(schema->id());
+    std::unique_ptr<repair_writer::impl> i;
+    if (table.uses_logstor()) {
+        i = std::make_unique<logstor_repair_writer_impl>(schema, permit);
+    } else {
+        auto [queue_reader, queue_handle] = make_queue_reader(schema, permit);
+        auto queue = make_mutation_fragment_queue(schema, permit, std::move(queue_handle));
+        i = std::make_unique<repair_writer_impl>(schema, repaired_at, permit, db, view_builder, view_building_worker, reason, std::move(queue), std::move(queue_reader), topo_guard);
+    }
+
     return make_lw_shared<repair_writer>(schema, permit, std::move(i));
 }
 
