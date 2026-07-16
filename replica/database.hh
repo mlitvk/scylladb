@@ -902,6 +902,10 @@ public:
 
     size_t get_logstor_memory_usage() const;
 
+    bool supports_incremental_repair() const {
+        return !uses_logstor();
+    }
+
     // Creates a mutation reader which covers all data sources for this column family.
     // Caller needs to ensure that column_family remains live (FIXME: relax this).
     // Note: for data queries use query() instead.

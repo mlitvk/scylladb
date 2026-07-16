@@ -1196,6 +1196,10 @@ private:
 
     future<> prepare_sstables_for_incremental_repair() {
         auto& table = _db.local().find_column_family(_schema->id());
+        if (!table.supports_incremental_repair()) {
+            on_internal_error(rlogger, format("Incremental repair is not supported for table={}.{}",
+                    table.schema()->ks_name(), table.schema()->cf_name()));
+        }
         table_id tid = table.schema()->id();
         auto erm = table.get_effective_replication_map();
         auto& tmap = erm->get_token_metadata_ptr()->tablets().get_tablet_map(tid);
@@ -3466,12 +3470,13 @@ public:
             auto compaction_time = gc_clock::now();
 
             std::optional<int64_t> repaired_at;
+            auto& table = _shard_task.db.local().find_column_family(_table_id);
             bool enable_incremental_repair = _shard_task.db.local().features().tablet_incremental_repair && _is_tablet &&
                                               _shard_task.sched_info.incremental_mode != locator::tablet_repair_incremental_mode::disabled &&
                                              _shard_task.sched_info.sched_by_scheduler &&
-                                             !_shard_task.sched_info.for_tablet_rebuild;
+                                             !_shard_task.sched_info.for_tablet_rebuild &&
+                                             table.supports_incremental_repair();
             if (enable_incremental_repair) {
-                auto& table = _shard_task.db.local().find_column_family(_table_id);
                 auto erm = table.get_effective_replication_map();
                 auto& tmap = erm->get_token_metadata_ptr()->tablets().get_tablet_map(_table_id);
                 auto last_token = _range.end() ? _range.end()->value() : dht::maximum_token();
@@ -3481,7 +3486,7 @@ public:
             }
 
             repair_meta master(_shard_task.rs,
-                    _shard_task.db.local().find_column_family(_table_id),
+                    table,
                     s,
                     std::move(permit),
                     _range,
