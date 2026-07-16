@@ -566,6 +566,10 @@ private:
                     m.token(), _schema->ks_name(), _schema->cf_name())));
         }
 
+        rlogger.debug("logstor repair writer: applying rebuilt partition table={}.{} token={} shards={} clustered_rows_empty={}",
+                _schema->ks_name(), _schema->cf_name(), m.token(), shards,
+                m.partition().clustered_rows().empty());
+
         return parallel_for_each(shards, [&db = _db, fm = freeze(m), schema = _schema, topo_guard = _topo_guard, timeout = _timeout] (shard_id shard) mutable {
             return db.invoke_on(shard, [fm, schema, topo_guard, timeout] (replica::database& db) mutable -> future<> {
                 service::topology_guard guard(topo_guard);
@@ -575,6 +579,8 @@ private:
                     throw std::runtime_error(format("Logstor repair writer routed to non-logstor table={}.{}",
                             schema->ks_name(), schema->cf_name()));
                 }
+                rlogger.debug("logstor repair writer: applying rebuilt partition on shard={} table={}.{}",
+                        this_shard_id(), schema->ks_name(), schema->cf_name());
                 co_await table.apply(fm, schema, db::rp_handle(), timeout, db::noop_large_data_guardrail::instance());
             });
         });
@@ -583,6 +589,8 @@ private:
     future<> rebuild(mutation_fragment_v2 mf) {
         if (mf.is_partition_start()) {
             auto ps = std::move(mf).as_partition_start();
+            rlogger.debug("logstor repair writer: start partition table={}.{} key={}",
+                    _schema->ks_name(), _schema->cf_name(), ps.key());
             _rebuilder.emplace(_schema);
             _rebuilder->consume_new_partition(ps.key());
             (void)_rebuilder->consume(ps.partition_tombstone());
@@ -600,6 +608,8 @@ private:
             if (!mut) {
                 return make_exception_future<>(std::runtime_error("Logstor repair writer ended a partition without a rebuilt mutation"));
             }
+            rlogger.debug("logstor repair writer: finished rebuilding partition table={}.{} token={}",
+                    _schema->ks_name(), _schema->cf_name(), mut->token());
             return apply_rebuilt_partition(std::move(*mut));
         }
 
@@ -708,6 +718,8 @@ lw_shared_ptr<repair_writer> make_repair_writer(
     auto& table = db.local().find_column_family(schema->id());
     std::unique_ptr<repair_writer::impl> i;
     if (table.uses_logstor()) {
+        rlogger.debug("make_repair_writer: using logstor repair writer for table={}.{}",
+                schema->ks_name(), schema->cf_name());
         i = std::make_unique<logstor_repair_writer_impl>(schema, permit, db, topo_guard);
     } else {
         auto [queue_reader, queue_handle] = make_queue_reader(schema, permit);
@@ -3592,6 +3604,11 @@ public:
                                              _shard_task.sched_info.sched_by_scheduler &&
                                              !_shard_task.sched_info.for_tablet_rebuild &&
                                              table.supports_incremental_repair();
+            if (_is_tablet && !table.supports_incremental_repair() && _shard_task.sched_info.incremental_mode != locator::tablet_repair_incremental_mode::disabled) {
+                rlogger.debug("repair[{}]: disabling tablet incremental repair for table={}.{} requested_mode={}",
+                        _shard_task.global_repair_id.uuid(), table.schema()->ks_name(), table.schema()->cf_name(),
+                        _shard_task.sched_info.incremental_mode);
+            }
             if (enable_incremental_repair) {
                 auto erm = table.get_effective_replication_map();
                 auto& tmap = erm->get_token_metadata_ptr()->tablets().get_tablet_map(_table_id);
@@ -3600,6 +3617,10 @@ public:
                 auto sstables_repaired_at = tinfo.sstables_repaired_at;
                 repaired_at = sstables_repaired_at + 1;
             }
+            rlogger.debug("repair[{}]: row-level repair table={}.{} is_tablet={} uses_logstor={} enable_incremental_repair={} incremental_mode={} for_tablet_rebuild={}",
+                    _shard_task.global_repair_id.uuid(), table.schema()->ks_name(), table.schema()->cf_name(), _is_tablet,
+                    table.uses_logstor(), enable_incremental_repair, _shard_task.sched_info.incremental_mode,
+                    _shard_task.sched_info.for_tablet_rebuild);
 
             repair_meta master(_shard_task.rs,
                     table,
