@@ -631,6 +631,7 @@ public:
 
 class logstor_repair_writer_impl : public repair_writer::impl {
     mutation_fragment_queue _mq;
+    utils::phased_barrier::operation _stream_op;
 
     static mutation_fragment_queue make_queue(schema_ptr schema, reader_permit permit, sharded<replica::database>& db,
             service::frozen_topology_guard topo_guard) {
@@ -641,6 +642,7 @@ class logstor_repair_writer_impl : public repair_writer::impl {
 public:
     logstor_repair_writer_impl(schema_ptr schema, reader_permit permit, sharded<replica::database>& db, service::frozen_topology_guard topo_guard)
         : _mq(make_queue(schema, std::move(permit), db, topo_guard))
+        , _stream_op(db.local().find_column_family(schema->id()).stream_in_progress()) {
     }
 
     virtual mutation_fragment_queue& queue() override {
