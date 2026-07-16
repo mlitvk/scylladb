@@ -10,10 +10,13 @@ import time
 from test.pylib.manager_client import ManagerClient
 from test.cluster.util import new_test_keyspace
 from cassandra.protocol import ConfigurationException
+from cassandra.cluster import ConsistencyLevel
+from cassandra.query import SimpleStatement
 import pytest
 import logging
 from test.pylib.tablets import get_tablet_count, get_tablet_replica
 from test.pylib.util import wait_for
+from test.pylib.util import wait_for_cql_and_get_hosts
 
 logger = logging.getLogger(__name__)
 
