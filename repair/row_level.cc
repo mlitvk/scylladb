@@ -555,6 +555,7 @@ class logstor_direct_writer_queue_impl : public mutation_fragment_queue::impl {
     sharded<replica::database>& _db;
     service::frozen_topology_guard _topo_guard;
     sharder_helper _sharder;
+    db::timeout_clock::time_point _timeout;
     std::optional<mutation_rebuilder_v2> _rebuilder;
 
 private:
@@ -565,8 +566,8 @@ private:
                     m.token(), _schema->ks_name(), _schema->cf_name())));
         }
 
-        return parallel_for_each(shards, [&db = _db, fm = freeze(m), schema = _schema, topo_guard = _topo_guard] (shard_id shard) mutable {
-            return db.invoke_on(shard, [fm, schema, topo_guard] (replica::database& db) mutable -> future<> {
+        return parallel_for_each(shards, [&db = _db, fm = freeze(m), schema = _schema, topo_guard = _topo_guard, timeout = _timeout] (shard_id shard) mutable {
+            return db.invoke_on(shard, [fm, schema, topo_guard, timeout] (replica::database& db) mutable -> future<> {
                 service::topology_guard guard(topo_guard);
                 guard.check();
                 auto& table = db.find_column_family(schema->id());
@@ -574,7 +575,7 @@ private:
                     throw std::runtime_error(format("Logstor repair writer routed to non-logstor table={}.{}",
                             schema->ks_name(), schema->cf_name()));
                 }
-                return make_exception_future<>(std::runtime_error("Logstor repair apply is not implemented"));
+                co_await table.apply(fm, schema, db::rp_handle(), timeout, db::noop_large_data_guardrail::instance());
             });
         });
     }
@@ -607,11 +608,13 @@ private:
     }
 
 public:
-    logstor_direct_writer_queue_impl(schema_ptr schema, sharded<replica::database>& db, service::frozen_topology_guard topo_guard)
+    logstor_direct_writer_queue_impl(schema_ptr schema, sharded<replica::database>& db, service::frozen_topology_guard topo_guard,
+            db::timeout_clock::time_point timeout)
         : _schema(std::move(schema))
         , _db(db)
         , _topo_guard(topo_guard)
-        , _sharder(get_sharder_helper(_db.local().find_column_family(_schema->id()), *_schema, _topo_guard)) {
+        , _sharder(get_sharder_helper(_db.local().find_column_family(_schema->id()), *_schema, _topo_guard))
+        , _timeout(timeout) {
     }
 
     virtual future<> push(mutation_fragment_v2 mf) override {
@@ -628,10 +631,16 @@ public:
 
 class logstor_repair_writer_impl : public repair_writer::impl {
     mutation_fragment_queue _mq;
+
+    static mutation_fragment_queue make_queue(schema_ptr schema, reader_permit permit, sharded<replica::database>& db,
+            service::frozen_topology_guard topo_guard) {
+        auto timeout = permit.timeout();
+        return mutation_fragment_queue(schema, std::move(permit), seastar::shared_ptr<mutation_fragment_queue::impl>(
+                seastar::make_shared<logstor_direct_writer_queue_impl>(schema, db, topo_guard, timeout)));
+    }
 public:
     logstor_repair_writer_impl(schema_ptr schema, reader_permit permit, sharded<replica::database>& db, service::frozen_topology_guard topo_guard)
-        : _mq(schema, std::move(permit), seastar::shared_ptr<mutation_fragment_queue::impl>(
-                seastar::make_shared<logstor_direct_writer_queue_impl>(schema, db, topo_guard))) {
+        : _mq(make_queue(schema, std::move(permit), db, topo_guard))
     }
 
     virtual mutation_fragment_queue& queue() override {
