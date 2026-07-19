@@ -64,7 +64,7 @@ public:
 
     std::unique_ptr<primary_index> make_primary_index(schema_ptr schema, bool cache_enabled);
 
-    future<> write(const mutation&, compaction_group&, seastar::gate::holder cg_holder, db::timeout_clock::time_point timeout);
+    future<> write(mutation, compaction_group&, seastar::gate::holder cg_holder, db::timeout_clock::time_point timeout);
 
     future<std::optional<mutation>> read(schema_ptr schema, const primary_index&, const dht::decorated_key&, const query::partition_slice&);
 

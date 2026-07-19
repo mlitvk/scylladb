@@ -104,14 +104,26 @@ const compaction_manager& logstor::get_compaction_manager() const noexcept {
 std::unique_ptr<primary_index> logstor::make_primary_index(schema_ptr schema, bool cache_enabled) {
     return std::make_unique<primary_index>(schema, cache_enabled ? &_cache_tracker : nullptr);
 }
-
-
-future<> logstor::write(const mutation& m, compaction_group& cg, seastar::gate::holder cg_holder, db::timeout_clock::time_point timeout) {
+future<> logstor::write(mutation m, compaction_group& cg, seastar::gate::holder cg_holder, db::timeout_clock::time_point timeout) {
     primary_index_key key(*m.schema(), m.decorated_key());
     table_id table = m.schema()->id();
     auto& index = cg.get_logstor_index();
 
     const auto ts = extract_logstor_record_timestamp(m);
+
+    if (const auto existing_entry = index.get(key); existing_entry && existing_entry->timestamp == ts) {
+        auto existing = co_await read(m.schema(), index, m.decorated_key(), m.schema()->full_slice());
+        if (existing && extract_logstor_record_timestamp(*existing) == ts) {
+            if (*existing == m) {
+                co_return;
+            }
+
+            m.apply(*existing);
+
+            logstor_logger.debug("Merging same-timestamp write for table={}.{} key={} ts={}",
+                    m.schema()->ks_name(), m.schema()->cf_name(), key, ts);
+        }
+    }
 
     log_record record {
         .header = {
@@ -122,7 +134,7 @@ future<> logstor::write(const mutation& m, compaction_group& cg, seastar::gate::
         .mut = canonical_mutation(m)
     };
 
-    return _write_buffer.write(std::move(record), timeout, &cg, std::move(cg_holder)).then_unpack([this, index_ptr = &index, ts, key = std::move(key)]
+    co_await _write_buffer.write(std::move(record), timeout, &cg, std::move(cg_holder)).then_unpack([this, index_ptr = &index, ts, key = std::move(key)]
             (log_location location, seastar::gate::holder op) {
         index_entry new_entry {
             .location = location,
