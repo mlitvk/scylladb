@@ -517,6 +517,39 @@ mutation_fragment_queue make_mutation_fragment_queue(schema_ptr s, reader_permit
     return mutation_fragment_queue(std::move(s), std::move(permit), seastar::make_shared<queue_reader_handle_adapter>(std::move(handle)));
 }
 
+struct sharder_helper {
+    struct tablet_sharder_keepalive {
+        std::unique_ptr<dht::auto_refreshing_sharder> sharder_ptr;
+        service::topology_guard topo_guard;
+    };
+    using sharder_keepalive = std::variant<tablet_sharder_keepalive, locator::effective_replication_map_ptr>;
+
+    sharder_keepalive keepalive;
+    const dht::sharder& sharder;
+
+    sharder_helper(sharder_keepalive s_keepalive, const dht::sharder& s)
+        : keepalive(std::move(s_keepalive))
+        , sharder(s)
+    {}
+};
+
+sharder_helper get_sharder_helper(replica::table& t, const schema& s, service::frozen_topology_guard frozen_topo_guard) {
+    if (frozen_topo_guard == service::default_session_id) {
+        // The sharder is valid only when the erm is valid. Keep a reference of the erm to keep the sharder valid.
+        auto erm = t.get_effective_replication_map();
+        auto& sharder = erm->get_sharder(s);
+        sharder_helper::sharder_keepalive keepalive = std::move(erm);
+        return sharder_helper{std::move(keepalive), sharder};
+    } else {
+        sharder_helper::tablet_sharder_keepalive keepalive{
+            .sharder_ptr = std::make_unique<dht::auto_refreshing_sharder>(t.shared_from_this()),
+            .topo_guard = frozen_topo_guard
+        };
+        auto& sharder = *keepalive.sharder_ptr;
+        return sharder_helper{std::move(keepalive), sharder};
+    }
+}
+
 class logstor_direct_writer_queue_impl : public mutation_fragment_queue::impl {
     schema_ptr _schema;
     std::optional<mutation_rebuilder_v2> _rebuilder;
@@ -574,39 +607,6 @@ public:
     virtual void create_writer(lw_shared_ptr<repair_writer>) override {
     }
 };
-
-struct sharder_helper {
-    struct tablet_sharder_keepalive {
-        std::unique_ptr<dht::auto_refreshing_sharder> sharder_ptr;
-        service::topology_guard topo_guard;
-    };
-    using sharder_keepalive = std::variant<tablet_sharder_keepalive, locator::effective_replication_map_ptr>;
-
-    sharder_keepalive keepalive;
-    const dht::sharder& sharder;
-
-    sharder_helper(sharder_keepalive s_keepalive, const dht::sharder& s)
-        : keepalive(std::move(s_keepalive))
-        , sharder(s)
-    {}
-};
-
-sharder_helper get_sharder_helper(replica::table& t, const schema& s, service::frozen_topology_guard frozen_topo_guard) {
-    if (frozen_topo_guard == service::default_session_id) {
-        // The sharder is valid only when the erm is valid. Keep a reference of the erm to keep the sharder valid.
-        auto erm = t.get_effective_replication_map();
-        auto& sharder = erm->get_sharder(s);
-        sharder_helper::sharder_keepalive keepalive = std::move(erm);
-        return sharder_helper{std::move(keepalive), sharder};
-    } else {
-        sharder_helper::tablet_sharder_keepalive keepalive{
-            .sharder_ptr = std::make_unique<dht::auto_refreshing_sharder>(t.shared_from_this()),
-            .topo_guard = frozen_topo_guard
-        };
-        auto& sharder = *keepalive.sharder_ptr;
-        return sharder_helper{std::move(keepalive), sharder};
-    }
-}
 
 void repair_writer_impl::create_writer(lw_shared_ptr<repair_writer> w) {
     if (_writer_done) {
