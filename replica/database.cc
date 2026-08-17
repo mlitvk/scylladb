@@ -3040,8 +3040,18 @@ future<> database::flush_logstor_separator(std::optional<logstor::segment_sequen
     });
 }
 
-future<logstor::table_segment_stats> database::get_logstor_table_segment_stats(table_id table) const {
-    return find_column_family(table).get_logstor_segment_stats();
+logstor::table_logstor_stats database::get_logstor_table_stats(table_id table) const {
+    const auto& cf = find_column_family(table);
+    if (!cf.uses_logstor()) {
+        return {};
+    }
+    const auto usage = cf.get_logstor_segment_manager().get_usage();
+    return logstor::table_logstor_stats{
+        .segments = cf.logstor_segment_stats(),
+        .live_record_bytes = cf.logstor_live_record_bytes(),
+        .free_segments = usage.free_segments,
+        .total_segments = usage.total_segments,
+    };
 }
 
 size_t database::get_logstor_memory_usage() const {

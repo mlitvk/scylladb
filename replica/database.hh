@@ -1223,8 +1223,6 @@ public:
 
     future<> flush_separator(std::optional<logstor::segment_sequence> seq_num = std::nullopt);
 
-    future<logstor::table_segment_stats> get_logstor_segment_stats() const;
-
     table_stats& get_stats() const {
         return _stats;
     }
@@ -1234,12 +1232,17 @@ public:
     // computed on the fly, since segments are allocated and freed without the table taking part.
     utils::file_size_stats live_disk_space_used() const;
     utils::file_size_stats total_disk_space_used() const;
-    // Space taken by the logstor segments this table owns. Zero for a table that doesn't use logstor.
-    uint64_t logstor_disk_space_used() const;
+    // Statistics of the logstor segments this table owns on this shard, summed over its compaction
+    // groups. Empty for a table that doesn't use logstor. This is the one walk of the groups that
+    // every logstor segment statistic below is derived from.
+    logstor::segment_stats logstor_segment_stats() const;
     // Number of logstor segments this table owns.
     uint64_t logstor_segment_count() const;
-    // Bytes of the live records of this table, which is less than the space its segments take by
-    // however much room those segments still have.
+    // Space taken by the logstor segments this table owns. Zero for a table that doesn't use logstor.
+    uint64_t logstor_disk_space_used() const;
+    // Bytes of the live records of this table, taken from its index rather than from the segments,
+    // so unlike the statistics above this covers the records that are not in a segment of a group
+    // yet. Less than the space the segments take by however much room they still have.
     uint64_t logstor_live_record_bytes() const;
 
     locator::combined_load_stats table_load_stats() const;
@@ -2155,7 +2158,7 @@ public:
     void trigger_logstor_compaction(bool major);
     static future<> flush_logstor_separator_on_all_shards(sharded<database>& sharded_db);
     future<> flush_logstor_separator(std::optional<logstor::segment_sequence> seq_num = std::nullopt);
-    future<logstor::table_segment_stats> get_logstor_table_segment_stats(table_id table) const;
+    logstor::table_logstor_stats get_logstor_table_stats(table_id table) const;
     size_t get_logstor_memory_usage() const;
     // Space the files logstor has allocated on this shard take on disk. Zero when logstor is unused.
     uint64_t get_logstor_disk_usage() const;

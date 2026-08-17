@@ -1535,53 +1535,84 @@ rest_sstable_info(http_context& ctx, std::unique_ptr<http::request> req) {
         });
 }
 
+static ss::logstor_segment_stats to_json_logstor_segment_stats(const replica::logstor::table_logstor_stats& stats, uint64_t segment_size) {
+    namespace logstor = replica::logstor;
+
+    const auto occupied_bytes = stats.segments.segment_count * segment_size;
+
+    ss::logstor_segment_stats result;
+    result.compaction_groups = stats.segments.group_count;
+    result.segments = stats.segments.segment_count;
+    result.occupied_bytes = occupied_bytes;
+    result.live_bytes = stats.segments.live_bytes;
+    result.reclaimable_bytes = occupied_bytes - stats.segments.live_bytes;
+    result.utilization = occupied_bytes ? double(stats.segments.live_bytes) / occupied_bytes : 0.0;
+    result.live_record_bytes = stats.live_record_bytes;
+
+    for (size_t i = 0; i < logstor::utilization_bucket_count; ++i) {
+        ss::logstor_utilization_bucket bucket;
+        bucket.bucket = i;
+        bucket.lower_bound = double(i) / logstor::utilization_bucket_count;
+        bucket.upper_bound = double(i + 1) / logstor::utilization_bucket_count;
+        bucket.count = stats.segments.utilization[i];
+        result.utilization_histogram.push(std::move(bucket));
+    }
+
+    return result;
+}
+
 static
 future<json::json_return_type>
 rest_logstor_info(http_context& ctx, std::unique_ptr<http::request> req) {
-        auto keyspace = api::req_param<sstring>(*req, "keyspace", {}).value;
-        auto table = api::req_param<sstring>(*req, "table", {}).value;
-        if (table.empty()) {
-            table = api::req_param<sstring>(*req, "cf", {}).value;
-        }
+    auto keyspace = api::req_param<sstring>(*req, "keyspace", {}).value;
+    auto table = api::req_param<sstring>(*req, "table", {}).value;
+    if (table.empty()) {
+        table = api::req_param<sstring>(*req, "cf", {}).value;
+    }
 
-        if (keyspace.empty()) {
-            throw bad_param_exception("The query parameter 'keyspace' is required");
-        }
-        if (table.empty()) {
-            throw bad_param_exception("The query parameter 'table' is required");
-        }
+    if (keyspace.empty()) {
+        throw bad_param_exception("The query parameter 'keyspace' is required");
+    }
+    if (table.empty()) {
+        throw bad_param_exception("The query parameter 'table' is required");
+    }
 
-        keyspace = validate_keyspace(ctx, keyspace);
-        auto tid = validate_table(ctx.db.local(), keyspace, table);
+    keyspace = validate_keyspace(ctx, keyspace);
+    auto tid = validate_table(ctx.db.local(), keyspace, table);
 
-        auto& cf = ctx.db.local().find_column_family(tid);
-        if (!cf.uses_logstor()) {
-            throw bad_param_exception(fmt::format("Table {}.{} does not use logstor", keyspace, table));
-        }
+    const auto& cf = ctx.db.local().find_column_family(tid);
+    if (!cf.uses_logstor()) {
+        throw bad_param_exception(fmt::format("Table {}.{} does not use logstor", keyspace, table));
+    }
+    const auto segment_size = cf.get_logstor_segment_manager().get_segment_size();
 
-        return do_with(replica::logstor::table_segment_stats{}, [keyspace = std::move(keyspace), table = std::move(table), tid, &ctx] (replica::logstor::table_segment_stats& merged_stats) {
-            return ctx.db.map_reduce([&merged_stats](replica::logstor::table_segment_stats&& shard_stats) {
-                merged_stats += shard_stats;
-            }, [tid](const replica::database& db) {
-                return db.get_logstor_table_segment_stats(tid);
-            }).then([&merged_stats, keyspace = std::move(keyspace), table = std::move(table)] {
-                ss::table_logstor_info result;
-                result.keyspace = keyspace;
-                result.table = table;
-                result.compaction_groups = merged_stats.compaction_group_count;
-                result.segments = merged_stats.segment_count;
-                result.live_record_bytes = merged_stats.live_record_bytes;
+    auto per_shard = co_await ctx.db.map([tid] (const replica::database& db) {
+        return db.get_logstor_table_stats(tid);
+    });
 
-                for (const auto& bucket : merged_stats.histogram) {
-                    ss::logstor_hist_bucket hist;
-                    hist.count = bucket.count;
-                    hist.max_data_size = bucket.max_data_size;
-                    result.data_size_histogram.push(std::move(hist));
-                }
+    ss::table_logstor_info result;
+    result.keyspace = std::move(keyspace);
+    result.table = std::move(table);
+    result.segment_size = segment_size;
 
-                return make_ready_future<json::json_return_type>(stream_object(result));
-            });
-        });
+    replica::logstor::table_logstor_stats total;
+    for (unsigned shard = 0; shard < per_shard.size(); ++shard) {
+        const auto& stats = per_shard[shard];
+        total += stats;
+
+        ss::shard_logstor_info shard_info;
+        shard_info.shard = shard;
+        shard_info.stats = to_json_logstor_segment_stats(stats, segment_size);
+        shard_info.free_segments = stats.free_segments;
+        shard_info.total_segments = stats.total_segments;
+        result.shards.push(std::move(shard_info));
+    }
+
+    result.stats = to_json_logstor_segment_stats(total, segment_size);
+    result.free_segments = total.free_segments;
+    result.total_segments = total.total_segments;
+
+    co_return json::json_return_type(stream_object(std::move(result)));
 }
 
 static

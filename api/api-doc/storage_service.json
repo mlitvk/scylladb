@@ -3968,20 +3968,86 @@
             }
         }
       },
-        "logstor_hist_bucket":{
-         "id":"logstor_hist_bucket",
+        "logstor_utilization_bucket":{
+         "id":"logstor_utilization_bucket",
+         "description":"One bucket of the logstor segment utilization histogram. The buckets are equal and cover [0, 1], so bucket i holds the segments whose utilization is in [i/n, (i+1)/n), and the last one also holds the fully utilized segments.",
          "properties":{
             "bucket":{
-               "type":"long"
+               "type":"long",
+               "description":"Index of the bucket, counting from the least utilized segments"
+            },
+            "lower_bound":{
+               "type":"double",
+               "description":"Lowest utilization in this bucket, as a fraction of a segment"
+            },
+            "upper_bound":{
+               "type":"double",
+               "description":"Utilization above this bucket, as a fraction of a segment"
             },
             "count":{
+               "type":"long",
+               "description":"Number of segments whose utilization falls in this bucket"
+            }
+         }
+        },
+        "logstor_segment_stats":{
+         "id":"logstor_segment_stats",
+         "description":"Statistics of the logstor segments owned by a table",
+         "properties":{
+            "compaction_groups":{
+               "type":"long",
+               "description":"Number of compaction groups the statistics are summed over"
+            },
+            "segments":{
+               "type":"long",
+               "description":"Number of segments those groups own"
+            },
+            "occupied_bytes":{
+               "type":"long",
+               "description":"Space those segments take, which is the disk space of the table: segments times the segment size"
+            },
+            "live_bytes":{
+               "type":"long",
+               "description":"Bytes of the live records held by those segments"
+            },
+            "reclaimable_bytes":{
+               "type":"long",
+               "description":"occupied_bytes less live_bytes: the space held by dead records, which compaction can give back"
+            },
+            "utilization":{
+               "type":"double",
+               "description":"live_bytes as a fraction of occupied_bytes, or 0 when no segment is owned"
+            },
+            "live_record_bytes":{
+               "type":"long",
+               "description":"Bytes of the live records of the table, from its index. At least live_bytes, since it also covers the records that are not in a segment of a group yet"
+            },
+            "utilization_histogram":{
+               "type":"array",
+               "items":{
+                  "$ref":"logstor_utilization_bucket"
+               },
+               "description":"Distribution of the owned segments by utilization. Compaction reclaims from the low buckets, so the shape says how much space there is to reclaim and how cheaply."
+            }
+         }
+        },
+        "shard_logstor_info":{
+         "id":"shard_logstor_info",
+         "description":"Logstor information for one table on one shard",
+         "properties":{
+            "shard":{
                "type":"long"
             },
-            "min_data_size":{
-               "type":"long"
+            "stats":{
+               "type":"logstor_segment_stats"
             },
-            "max_data_size":{
-               "type":"long"
+            "free_segments":{
+               "type":"long",
+               "description":"Segments the shard can still allocate for writing, across all tables"
+            },
+            "total_segments":{
+               "type":"long",
+               "description":"Segment slots the shard has, across all tables"
             }
          }
         },
@@ -3995,20 +4061,28 @@
             "table":{
                "type":"string"
             },
-            "compaction_groups":{
-               "type":"long"
+            "segment_size":{
+               "type":"long",
+               "description":"Size of a logstor segment, which the utilization buckets are fractions of"
             },
-            "segments":{
-               "type":"long"
+            "stats":{
+               "type":"logstor_segment_stats",
+               "description":"The statistics of the table on the whole node, summed over the shards"
             },
-            "live_record_bytes":{
-               "type":"long"
+            "free_segments":{
+               "type":"long",
+               "description":"Segments the node can still allocate for writing, across all tables"
             },
-            "data_size_histogram":{
+            "total_segments":{
+               "type":"long",
+               "description":"Segment slots the node has, across all tables"
+            },
+            "shards":{
                "type":"array",
                "items":{
-                  "$ref":"logstor_hist_bucket"
-               }
+                  "$ref":"shard_logstor_info"
+               },
+               "description":"The same statistics per shard, which is where a skew between the shards shows"
             }
          }
         },
