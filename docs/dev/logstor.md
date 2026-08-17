@@ -67,6 +67,33 @@ Only step 4 writes to the disk - all other steps only update in-memory metadata.
 4. It reads the segments, finding all live records, and writing them into a write buffer. When the buffer is full it is flushed into a new segment, and for each recording updating the index location to the new location.
 5. After all live records are rewritten the old segments are freed.
 
+### Space Accounting
+
+Three different quantities describe the space logstor uses, and they are deliberately not the same
+number:
+
+- **Live record bytes** - the bytes of the records the index points at, tracked by the primary index
+  as records are added and freed, so it is per table. `segment_manager` tracks the same sum for the
+  whole shard. This is the live data, and it excludes the space held by dead records.
+- **Segment occupancy** - the segments a compaction group owns, times the segment size. A segment
+  belongs to a group once the separator or compaction has written it, and it is only given back when
+  compaction reclaims it, so occupancy also covers the dead records in those segments. This is what a
+  table reports as its disk space, next to its sstables, in `table::live_disk_space_used()`.
+- **File footprint** - the files logstor has allocated, times the file size. Files are allocated as
+  the disk fills up, up to `logstor_disk_size_in_mb`, and are only retired during recovery, so the
+  footprint is a high water mark and it covers the free segments, which belong to no table. This is
+  the space logstor takes on disk, reported by `segment_manager::get_disk_usage()`, and it is what a
+  node includes in the load it reports.
+
+The three are ordered: live record bytes of a table <= its segment occupancy, and the sum over all
+tables <= the file footprint. The ratio of the first two is the space amplification of the table, and
+the difference between the last two is the space compaction has already reclaimed for reuse.
+
+Metrics: `scylla_column_family_live_disk_space` and `scylla_column_family_logstor_segments` report
+the occupancy of a table, `scylla_column_family_logstor_live_record_bytes` its live data,
+`scylla_logstor_sm_live_record_bytes` the live data of the shard and `scylla_logstor_sm_disk_usage`
+its file footprint.
+
 ## Usage
 
 ### Enabling Logstor
