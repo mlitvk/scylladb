@@ -24,6 +24,19 @@ which contains:
 - ``tablet_sizes``: the disk size in bytes of all the tablets on the given node.
 - ``effective_capacity``: contains the sum of available disk space and all the tablet sizes on the given node.
 
+The size of a tablet is the data it holds rather than the space that data is stored in
+(``compaction_group::live_data_size()``). For sstables the two are the same number, the bytes of the
+sstables the tablet owns. For a table using the logstor storage engine the size is the live records of
+the segments the tablet owns, without the dead records in them that compaction has yet to reclaim: a
+logstor tablet's occupancy is set by the space pressure of the shard rather than by its own data, so
+it neither tracks what the tablet holds nor moves with the tablet. See the space accounting section of
+``docs/dev/logstor.md``.
+
+Note that ``effective_capacity`` does not model the logstor segment pool, which is a fixed per-shard
+area that only logstor can write into and that is allocated up front, so the available disk space a
+node reports does not fall as logstor fills up. Consequently, on a node using logstor the utilization
+is comparable between nodes configured alike, but its absolute value understates how full the pool is.
+
 The balancer will use this information to compute the disk load (disk utilization)
 on every node and shard. It will then migrate tablets from the most to the least
 loaded nodes and shards.

@@ -83,11 +83,28 @@ number:
   the disk fills up, up to `logstor_disk_size_in_mb`, and are only retired during recovery, so the
   footprint is a high water mark and it covers the free segments, which belong to no table. This is
   the space logstor takes on disk, reported by `segment_manager::get_disk_usage()`, and it is what a
-  node includes in the load it reports.
+  node includes in the load it gossips (`database::disk_space_used()`).
 
 The three are ordered: live record bytes of a table <= its segment occupancy, and the sum over all
 tables <= the file footprint. The ratio of the first two is the space amplification of the table, and
 the difference between the last two is the space compaction has already reclaimed for reuse.
+
+The size a node reports for a **tablet**, on the other hand, is the live bytes of the segments the
+tablet's compaction groups own (`compaction_group::live_data_size()`), not their occupancy. The
+occupancy of a tablet is not a property of its data: compaction only reclaims once the shard is short
+of free segments, and it reclaims wherever that is cheapest across all the groups of the shard, so
+how much dead data a tablet is left holding is decided by the space pressure of the disk it sits on
+and by the write history, and at steady state the occupied segments of a shard stay at the free-segment
+target whatever the data is. Live bytes are the part that is intrinsic to the tablet, that a migration
+carries to another node and that a split divides in two, which is what makes them the number to
+equalize across the cluster and to compare against the target tablet size. See
+`docs/dev/size-based-load-balancing.md`.
+
+The same distinction applies wherever a table is sized by the volume of its data rather than by the
+space that data takes: `table::live_data_size()` is the sum over its groups, and it is what the repair
+small-table optimization and the initial tablet count of a keyspace migrated from vnodes are derived
+from. `table::live_disk_space_used()` remains the space on disk: that is what the metrics and the
+nodetool and API disk space of a table report, and what orders the tables of a major compaction.
 
 Metrics: `scylla_column_family_live_disk_space` and `scylla_column_family_logstor_segments` report
 the occupancy of a table, `scylla_column_family_logstor_live_record_bytes` its live data,
