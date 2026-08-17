@@ -55,6 +55,20 @@ struct segment_manager_config {
     seastar::scheduling_group split_compaction_sg;
 };
 
+// What the logstor of one shard is using and what it has to use. Every field is shard wide and
+// covers every table, unlike the statistics of the segments a compaction group owns. Read together
+// through a single accessor, since a caller that wants one of them usually wants the others to
+// compare it against.
+struct segment_manager_usage {
+    // Bytes of the files allocated for segments. This is the space logstor takes on disk, which is
+    // more than the segments the tables own take: it also covers the segments that are free, and
+    // files are never given back during normal operation, only retired on recovery.
+    uint64_t disk_usage{0};
+    // Memory the segment manager holds for its own bookkeeping. The indexes of the tables are not
+    // part of it.
+    size_t memory_usage{0};
+};
+
 struct table_segment_histogram_bucket {
     size_t count;
     size_t max_data_size;
@@ -138,7 +152,7 @@ public:
     // The index must be cleared first, so that no record of the group is reachable.
     future<> discard_segments(logstor_group&);
 
-    size_t get_memory_usage() const;
+    segment_manager_usage get_usage() const noexcept;
 
     future<> await_pending_writes();
 

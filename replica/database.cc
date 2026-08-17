@@ -3061,6 +3061,26 @@ size_t database::get_logstor_memory_usage() const {
     return m;
 }
 
+uint64_t database::get_logstor_disk_usage() const {
+    return _logstor ? _logstor->get_segment_manager().get_usage().disk_usage : 0;
+}
+
+uint64_t database::disk_space_used() const {
+    // The logstor part is the space of the files logstor has allocated rather than the sum of the
+    // segments the tables own, since the segments no table owns are space on disk all the same, and
+    // logstor doesn't give the files back once it has allocated them. The tables therefore only
+    // contribute their sstables here, and the sum of their disk space is smaller than this.
+    int64_t sstable_bytes = 0;
+
+    get_tables_metadata().for_each_table([&sstable_bytes] (table_id, lw_shared_ptr<replica::table> table) {
+        sstable_bytes += table->get_stats().sstables_live_disk_space_used.on_disk;
+    });
+
+    // The sstable statistic is maintained incrementally by the sstable sets, so clamp the sum rather
+    // than let a drift below zero come out of here as a huge unsigned load.
+    return get_logstor_disk_usage() + uint64_t(std::max<int64_t>(0, sstable_bytes));
+}
+
 future<> database::snapshot_table_on_all_shards(sharded<database>& sharded_db, table_id uuid, sstring tag, db::snapshot_options opts, snapshot_callback ssc) {
     if (!opts.skip_flush) {
         co_await flush_table_on_all_shards(sharded_db, uuid);

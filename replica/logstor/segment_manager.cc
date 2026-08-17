@@ -981,8 +981,12 @@ public:
 
     future<> discard_segments(logstor_group&);
 
-    size_t get_memory_usage() const {
+    size_t get_memory_usage() const noexcept {
         return sizeof(_segment_descs);
+    }
+
+    uint64_t get_disk_usage() const noexcept {
+        return _file_mgr.allocated_file_count() * _cfg.file_size;
     }
 
     future<owned_write_buffer> allocate_separator_buffer() {
@@ -1263,7 +1267,7 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
                        sm::description("Counts number of segments allocated.")),
         sm::make_counter("segments_freed", _stats.segments_freed,
                        sm::description("Counts number of segments freed.")),
-        sm::make_gauge("disk_usage", [this] { return _file_mgr.allocated_file_count() * _cfg.file_size; },
+        sm::make_gauge("disk_usage", [this] { return get_disk_usage(); },
                        sm::description("Total disk usage.")),
         sm::make_counter("compaction_bytes_written", _stats.bytes_written[static_cast<size_t>(write_source::compaction)],
                        sm::description("Counts number of bytes written to the disk by compaction.")),
@@ -2736,8 +2740,11 @@ future<> segment_manager::discard_segments(logstor_group& cg) {
     return _impl->discard_segments(cg);
 }
 
-size_t segment_manager::get_memory_usage() const {
-    return _impl->get_memory_usage();
+segment_manager_usage segment_manager::get_usage() const noexcept {
+    return segment_manager_usage{
+        .disk_usage = _impl->get_disk_usage(),
+        .memory_usage = _impl->get_memory_usage(),
+    };
 }
 
 future<> segment_manager::await_pending_writes() {
