@@ -161,9 +161,11 @@ public:
 future<uint64_t> estimate_partitions(seastar::sharded<replica::database>& db, const sstring& keyspace,
         const sstring& cf, const dht::token_range& range);
 
-// Return the total on-disk size (in bytes) of a table summed across all the
-// shards of the local node. Returns 0 if the table does not exist locally.
-future<uint64_t> local_table_on_disk_size(seastar::sharded<replica::database>& db, table_id table);
+// Return the data (in bytes) a table holds, summed across all the shards of the
+// local node. This is the data itself and not the space it is stored in, so for
+// a logstor table it excludes the dead records its segments still hold.
+// Returns 0 if the table does not exist locally.
+future<uint64_t> local_table_data_size(seastar::sharded<replica::database>& db, table_id table);
 
 
 enum class repair_row_level_start_status: uint8_t {

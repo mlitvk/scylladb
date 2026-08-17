@@ -147,17 +147,17 @@ bool should_enable_small_table_optimization_for_rbno(bool enable_small_table_opt
     return small_table_optimization;
 }
 
-// Probe the on-disk size of a user table on the local node and on the given
+// Probe the amount of data a user table holds on the local node and on the given
 // neighbor nodes (the replicas the node operation syncs from), and return the
 // largest size reported by any of them. This is used to decide whether a user
 // table is small enough for the small table optimization: for the join style
 // operations (bootstrap, replace, rebuild) the local node is still (mostly)
 // empty, so the size has to be read from the source replicas; for decommission
 // the data is still local.
-static future<uint64_t> get_max_table_on_disk_size(repair_service& rs, repair_uniq_id id,
+static future<uint64_t> get_max_table_data_size(repair_service& rs, repair_uniq_id id,
         const sstring& keyspace, const sstring& cf, table_id table,
         const std::vector<locator::host_id>& nodes) {
-    uint64_t max_size = co_await local_table_on_disk_size(rs.get_db(), table);
+    uint64_t max_size = co_await local_table_data_size(rs.get_db(), table);
     co_await coroutine::parallel_for_each(nodes, [&] (locator::host_id node) -> future<> {
         try {
             auto size = co_await ser::repair_rpc_verbs::send_repair_get_table_size(&rs.get_messaging(), node, table);
@@ -177,7 +177,7 @@ static future<uint64_t> get_max_table_on_disk_size(repair_service& rs, repair_un
 // Partition the tables of a keyspace into those that should use the small table
 // optimization (small_cfs) and the rest (normal_cfs). All tables of the small
 // system keyspaces are always optimized; user tables are optimized only when
-// their on-disk size (probed on the replicas we sync from) is small enough.
+// the data they hold (probed on the replicas we sync from) is small enough.
 static future<std::pair<std::vector<sstring>, std::vector<sstring>>>
 partition_tables_for_small_table_optimization(repair_service& rs, replica::database& db, repair_uniq_id id,
         const sstring& keyspace, std::vector<sstring> cfs, streaming::stream_reason reason,
@@ -194,9 +194,9 @@ partition_tables_for_small_table_optimization(repair_service& rs, replica::datab
     // regardless of size (the always optimized small system keyspaces). This is
     // a keyspace level decision, so compute it once.
     bool keyspace_always_small = should_enable_small_table_optimization_for_rbno(enable_small_table_optimization, keyspace, reason);
-    // Whether user tables of this keyspace should be auto-detected by their
-    // on-disk size. Only done for the supported reasons and when the whole
-    // cluster supports the size probe RPC verb.
+    // Whether user tables of this keyspace should be auto-detected by the data
+    // they hold. Only done for the supported reasons and when the whole cluster
+    // supports the size probe RPC verb.
     bool auto_detect_by_size = !keyspace_always_small && enable_small_table_optimization &&
             size_probe_supported && small_table_optimization_reason_supported(reason);
 
@@ -210,8 +210,8 @@ partition_tables_for_small_table_optimization(repair_service& rs, replica::datab
     }
 
     // Probe the size of all user tables in parallel and classify each table as
-    // small or normal based on its max on-disk size across the replicas we sync
-    // from. The classification and the push into the result vectors run
+    // small or normal based on the most data any of the replicas we sync from
+    // holds for it. The classification and the push into the result vectors run
     // synchronously (no preemption point between them), so pushing directly from
     // the parallel loop is safe.
     co_await coroutine::parallel_for_each(cfs, [&] (sstring& cf) -> future<> {
@@ -221,7 +221,7 @@ partition_tables_for_small_table_optimization(repair_service& rs, replica::datab
         } catch (replica::no_such_column_family&) {
             co_return;
         }
-        uint64_t size = co_await get_max_table_on_disk_size(rs, id, keyspace, cf, table, neighbor_nodes);
+        uint64_t size = co_await get_max_table_data_size(rs, id, keyspace, cf, table, neighbor_nodes);
         bool small = size <= max_table_size;
         rlogger.info("repair[{}]: small table optimization size check keyspace={}, table={}, size={}, max_table_size={}, small_table_optimization={}",
                 id.uuid(), keyspace, cf, size, max_table_size, small);
@@ -710,11 +710,11 @@ future<uint64_t> estimate_partitions(seastar::sharded<replica::database>& db, co
     );
 }
 
-future<uint64_t> local_table_on_disk_size(seastar::sharded<replica::database>& db, table_id table) {
+future<uint64_t> local_table_data_size(seastar::sharded<replica::database>& db, table_id table) {
     return db.map_reduce0(
         [table] (const replica::database& db) -> uint64_t {
             const auto* cf = find_column_family_if_exists(db, table, false);
-            return cf ? uint64_t(cf->live_disk_space_used().on_disk) : uint64_t(0);
+            return cf ? cf->live_data_size() : uint64_t(0);
         },
         uint64_t(0),
         std::plus<uint64_t>()

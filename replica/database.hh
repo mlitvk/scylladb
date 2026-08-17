@@ -1232,6 +1232,11 @@ public:
     // computed on the fly, since segments are allocated and freed without the table taking part.
     utils::file_size_stats live_disk_space_used() const;
     utils::file_size_stats total_disk_space_used() const;
+    // The data this table holds on this shard, rather than the space that data is stored in. Less
+    // than live_disk_space_used() for a logstor table, which is charged for whole segments no matter
+    // how much of them is still live. Use this where the data volume is what matters, and the disk
+    // space accessors above where the space on disk is. See compaction_group::live_data_size().
+    uint64_t live_data_size() const;
     // Statistics of the logstor segments this table owns on this shard, summed over its compaction
     // groups. Empty for a table that doesn't use logstor. This is the one walk of the groups that
     // every logstor segment statistic below is derived from.

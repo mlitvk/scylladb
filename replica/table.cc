@@ -765,7 +765,7 @@ public:
     locator::combined_load_stats table_load_stats() const override {
         return locator::combined_load_stats{
             .table_ls = locator::table_load_stats{
-                            .size_in_bytes = _single_sg->live_disk_space_used(),
+                            .size_in_bytes = _single_sg->live_data_size(),
                             .split_ready_seq_number = std::numeric_limits<locator::resize_decision::seq_number_t>::min()},
             .tablet_ls = locator::tablet_load_stats{}
         };
@@ -2399,28 +2399,24 @@ size_t compaction_group::live_sstable_count() const noexcept {
     return _main_sstables->size() + _maintenance_sstables->size();
 }
 
-size_t compaction_group::logstor_disk_space_used() const noexcept {
+uint64_t compaction_group::logstor_live_bytes() const noexcept {
     if (!_t.uses_logstor()) {
         return 0;
     }
-    return logstor_segments().segment_count() * _t.get_logstor_segment_manager().get_segment_size();
+    return logstor_segments().live_bytes();
 }
 
-uint64_t compaction_group::live_disk_space_used() const noexcept {
-    return _main_sstables->bytes_on_disk() + _maintenance_sstables->bytes_on_disk() + logstor_disk_space_used();
+uint64_t compaction_group::live_data_size() const noexcept {
+    return _main_sstables->bytes_on_disk() + _maintenance_sstables->bytes_on_disk() + logstor_live_bytes();
 }
 
 sstables::file_size_stats compaction_group::live_sstable_disk_space_used() const noexcept {
     return _main_sstables->get_file_size_stats() + _maintenance_sstables->get_file_size_stats();
 }
 
-uint64_t storage_group::live_disk_space_used() const {
+uint64_t storage_group::live_data_size() const {
     auto cgs = const_cast<storage_group&>(*this).compaction_groups_immediate();
-    return std::ranges::fold_left(cgs | std::views::transform(std::mem_fn(&compaction_group::live_disk_space_used)), uint64_t(0), std::plus{});
-}
-
-uint64_t compaction_group::total_disk_space_used() const noexcept {
-    return live_disk_space_used() + std::ranges::fold_left(_sstables_compacted_but_not_deleted | std::views::transform(std::mem_fn(&sstables::sstable::bytes_on_disk)), uint64_t(0), std::plus{});
+    return std::ranges::fold_left(cgs | std::views::transform(std::mem_fn(&compaction_group::live_data_size)), uint64_t(0), std::plus{});
 }
 
 sstables::file_size_stats compaction_group::total_sstable_disk_space_used() const noexcept {
@@ -2467,6 +2463,14 @@ uint64_t table::logstor_disk_space_used() const {
 
 uint64_t table::logstor_live_record_bytes() const {
     return uses_logstor() ? logstor_index().get_live_record_bytes() : 0;
+}
+
+uint64_t table::live_data_size() const {
+    uint64_t bytes = 0;
+    for_each_compaction_group([&bytes] (const compaction_group& cg) {
+        bytes += cg.live_data_size();
+    });
+    return bytes;
 }
 
 utils::file_size_stats table::live_disk_space_used() const {
@@ -3619,7 +3623,8 @@ locator::combined_load_stats tablet_storage_group_manager::table_load_stats() co
         auto tid = locator::tablet_id(id);
         locator::global_tablet_id gid { _t.schema()->id(), tid };
         locator::tablet_replica me { _my_host_id, this_shard_id() };
-        const uint64_t tablet_size = sg.live_disk_space_used();
+        // The data the tablet holds rather than the space it takes, see compaction_group::live_data_size().
+        const uint64_t tablet_size = sg.live_data_size();
 
         auto transition = _tablet_map->get_tablet_transition_info(tid);
         auto& info = _tablet_map->get_tablet_info(tid);

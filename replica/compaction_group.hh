@@ -279,11 +279,17 @@ public:
     void register_backlog_tracker(compaction::compaction_backlog_tracker new_backlog_tracker);
 
     size_t live_sstable_count() const noexcept;
-    // Disk space used by all the storage of this group, sstables and logstor segments alike.
-    uint64_t live_disk_space_used() const noexcept;
-    uint64_t total_disk_space_used() const noexcept;
-    // Space taken by the logstor segments this group owns. Zero for a table that doesn't use logstor.
-    size_t logstor_disk_space_used() const noexcept;
+    // Bytes of the live records in the logstor segments this group owns, which is less than the
+    // space those segments take, the rest being held by dead records that compaction has yet to
+    // reclaim. Zero for a table that doesn't use logstor.
+    uint64_t logstor_live_bytes() const noexcept;
+    // The data this group holds, rather than the space it takes: sstable bytes on disk plus the
+    // live records of the logstor segments, without the dead records in them. That makes it a
+    // property of the data alone - it does not move with the space amplification of the disk the
+    // group happens to sit on. This is what a tablet reports as its size for load balancing and
+    // resize decisions, and what table::live_data_size() sums for the places that size a table by
+    // its data. For the space the storage of a table takes see table::live_disk_space_used().
+    uint64_t live_data_size() const noexcept;
     // The sstable part alone, which is what table_stats caches. The logstor part is not cached,
     // see table::live_disk_space_used().
     sstables::file_size_stats live_sstable_disk_space_used() const noexcept;
@@ -419,7 +425,8 @@ public:
     // the sstable belongs to the main compaction group.
     compaction_group_ptr& select_compaction_group(dht::token first, dht::token last, const locator::tablet_map&) noexcept;
 
-    uint64_t live_disk_space_used() const;
+    // See compaction_group::live_data_size().
+    uint64_t live_data_size() const;
 
     void for_each_compaction_group(std::function<void(const compaction_group_ptr&)> action) const;
     utils::small_vector<compaction_group_ptr, 3> compaction_groups_immediate();

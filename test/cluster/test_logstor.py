@@ -1122,15 +1122,14 @@ async def test_tablet_split_trigger_by_size(manager: ScyllaClusterManager):
     Test that a logstor table automatically splits tablets when the data size
     exceeds --target-tablet-size-in-bytes.
 
-    The split threshold is set to 300KB (~2 segments at 128KB each).
-    Writing 5 keys with ~100KB values fills 5 segments (~640KB total), which
-    exceeds the threshold and should trigger an automatic split.
-    After the split, all data must remain readable.
+    A tablet splits above twice the target tablet size, so with a target of 200KB the live data of
+    the table has to pass 400KB. Writing 5 keys with ~100KB values leaves ~500KB of live records,
+    which should trigger an automatic split. After the split, all data must remain readable.
     """
     cmdline = [
         '--logger-log-level', 'logstor=debug',
         '--logger-log-level', 'load_balancer=debug',
-        '--target-tablet-size-in-bytes', '300000',
+        '--target-tablet-size-in-bytes', '200000',
         '--smp=1',
     ]
     cfg = {
@@ -1149,8 +1148,8 @@ async def test_tablet_split_trigger_by_size(manager: ScyllaClusterManager):
 
         s0_mark = await s0_log.mark()
 
-        # Write 5 keys with ~100KB values to fill 5 segments (~640KB total).
-        # This exceeds the 300KB target and should trigger a split.
+        # Write 5 keys with ~100KB values, which is ~500KB of live data and
+        # above the 400KB the tablet splits at.
         value = 'x' * (100 * 1024)
         for i in range(5):
             await cql.run_async(f"INSERT INTO {ks}.test (pk, v) VALUES ({i}, '{value}')")
