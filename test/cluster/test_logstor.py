@@ -1167,6 +1167,93 @@ async def test_tablet_split_trigger_by_size(manager: ScyllaClusterManager):
             assert len(rows) == 1, f"Key {i} not found after tablet split"
             assert rows[0].v == value, f"Wrong value for key {i} after tablet split"
 
+async def test_tablet_size_excludes_dead_data(manager: ScyllaClusterManager):
+    """
+    Verify that the size a node reports for a tablet of a logstor table is the data the tablet holds
+    rather than the space its segments take. Overwrites leave dead records behind in those segments
+    until compaction reclaims them, so the two numbers diverge, and the reported size has to follow
+    the live records: it is what the load balancer equalizes across the cluster and what the resize
+    decisions compare against the target tablet size. Here the dead records alone take the segments
+    of the tablet past the size it would split at, and it must not split for them.
+    """
+    key_count = 2
+    value_size = 100 * 1024
+    overwrites = 3
+    # A tablet splits above twice this, which the live data of the table stays below while the
+    # segments holding it, three quarters of them dead after the overwrites, do not.
+    target_tablet_size = 300000
+
+    cmdline = [
+        '--logger-log-level', 'logstor=debug',
+        '--logger-log-level', 'load_balancer=debug',
+        '--target-tablet-size-in-bytes', str(target_tablet_size),
+        '--smp=1',
+    ]
+    cfg = {
+        'tablet_load_stats_refresh_interval_in_seconds': 1,
+        'experimental_features': ['logstor'],
+    }
+    server = await manager.server_add(cmdline=cmdline, config=cfg)
+    cql = manager.get_cql()
+
+    s0_log = await manager.server_open_log(server.server_id)
+
+    async def get_stats(ks: str) -> dict:
+        """The segment statistics of ks.test, after making sure every record it holds is in a segment
+        of a tablet, which is where the size the node reports is read from."""
+        await manager.api.logstor_flush(server.ip_addr)
+        return (await manager.api.get_logstor_info(server.ip_addr, ks, 'test'))['stats']
+
+    async def wait_for_reported_size(ks: str, mark: int, live_bytes: int) -> None:
+        """Waits for a resize decision made with load stats refreshed after `mark`, which reported
+        the table at the size of its live data. Times out if the node reports any other size."""
+        await s0_log.wait_for(rf"\({ks}\.test\) wants \d+ tablets due to avg_tablet_size={live_bytes}\b",
+                              from_mark=mark, timeout=60)
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
+                                         "'replication_factor': 1} AND tablets = {'initial': 1}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v text) WITH storage_engine = 'logstor'")
+
+        insert = cql.prepare(f"INSERT INTO {ks}.test (pk, v) VALUES (?, ?)")
+        value = 'x' * value_size
+
+        s0_mark = await s0_log.mark()
+        await asyncio.gather(*[cql.run_async(insert, [pk, value]) for pk in range(key_count)])
+
+        # nothing has been overwritten yet, so the single tablet is reported at the size of the
+        # records it holds, which is close to the space of its segments
+        stats = await get_stats(ks)
+        logger.info(f"after writes: live_bytes={stats['live_bytes']} occupied_bytes={stats['occupied_bytes']}")
+        await wait_for_reported_size(ks, s0_mark, stats['live_bytes'])
+
+        # Overwriting every key leaves its previous records dead in the segments the tablet owns,
+        # which grow to several times the live data. One key is added along with the overwrites, so
+        # that the size the tablet is reported at has to change for the check below to pass, which is
+        # what makes it a check of a refreshed number rather than of the one from before.
+        s0_mark = await s0_log.mark()
+        for _ in range(overwrites):
+            await asyncio.gather(*[cql.run_async(insert, [pk, value]) for pk in range(key_count)])
+        await cql.run_async(insert, [key_count, value])
+
+        overwritten = await get_stats(ks)
+        logger.info(f"after overwrites: live_bytes={overwritten['live_bytes']} occupied_bytes={overwritten['occupied_bytes']}")
+        assert overwritten['live_bytes'] > stats['live_bytes']
+        assert overwritten['live_bytes'] < 2 * target_tablet_size, (
+            f"expected the live data of the table, {overwritten['live_bytes']} bytes, to stay below "
+            f"the {2 * target_tablet_size} bytes the tablet splits at"
+        )
+        assert overwritten['occupied_bytes'] > 2 * target_tablet_size, (
+            f"expected the segments of the tablet, {overwritten['occupied_bytes']} bytes, to hold "
+            f"enough dead data to pass the {2 * target_tablet_size} bytes it splits at"
+        )
+
+        await wait_for_reported_size(ks, s0_mark, overwritten['live_bytes'])
+
+        # the dead data is not the tablet's to be split, and the decision above was made with it
+        assert await get_tablet_count(manager, server, ks, 'test') == 1, (
+            "expected the tablet not to split for the dead data in its segments"
+        )
+
 async def test_tablet_split_and_merge(manager: ScyllaClusterManager):
     logger.info("Bootstrapping cluster")
     cmdline = [
