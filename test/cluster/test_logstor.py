@@ -739,6 +739,172 @@ async def test_table_disk_space_metrics(manager: ScyllaClusterManager):
             f"expected no disk space for the table after truncating it, got {await get_table_space(ks)}"
         )
 
+async def test_segment_utilization_stats(manager: ScyllaClusterManager):
+    """
+    Verify the segment statistics of a logstor table, as the logstor_info endpoint reports them, as
+    the per-table space metrics report them and as the shard utilization histogram metric exports
+    them: they agree with each other, the histogram accounts for every segment the table owns, and
+    its shape follows the data - overwrites push the mass down into the sparse buckets and compaction
+    brings it back.
+    """
+    key_count = 40
+    value_size = 60 * 1024
+    shards = 2
+
+    cmdline = ['--logger-log-level', 'logstor=debug', f'--smp={shards}']
+    cfg = {
+        'enable_keyspace_column_family_metrics': True,
+        'experimental_features': ['logstor']
+    }
+    servers = await manager.servers_add(1, cmdline=cmdline, config=cfg)
+    server = servers[0]
+    cql = manager.get_cql()
+
+    def check_stats(stats: dict, name: str) -> None:
+        """Checks what has to hold of any segment statistics, wherever they were read from."""
+        histogram = stats['utilization_histogram']
+        assert len(histogram) == 16, f"{name}: unexpected histogram size {len(histogram)}"
+        for i, bucket in enumerate(histogram):
+            assert bucket['bucket'] == i
+            assert bucket['lower_bound'] == pytest.approx(i / len(histogram))
+            assert bucket['upper_bound'] == pytest.approx((i + 1) / len(histogram))
+        # the histogram covers the segments of the table, each of them once
+        counted = sum(bucket['count'] for bucket in histogram)
+        assert counted == stats['segments'], (
+            f"{name}: histogram counts {counted} segments, the table owns {stats['segments']}"
+        )
+        # the space of the segments is either held by live records or waiting to be reclaimed
+        assert stats['occupied_bytes'] == stats['segments'] * segment_size
+        assert stats['live_bytes'] + stats['reclaimable_bytes'] == stats['occupied_bytes']
+        assert stats['utilization'] == pytest.approx(
+            stats['live_bytes'] / stats['occupied_bytes'] if stats['occupied_bytes'] else 0)
+        # the index also points at the records that are not in a segment of a group yet
+        assert stats['live_record_bytes'] >= stats['live_bytes'], (
+            f"{name}: live record bytes {stats['live_record_bytes']} below the "
+            f"{stats['live_bytes']} bytes held by the segments"
+        )
+
+    async def get_info(ks: str) -> dict:
+        """Reads the logstor info of ks.test and checks it against itself: the statistics are
+        consistent on their own, and the node is the sum of its shards."""
+        info = await manager.api.get_logstor_info(server.ip_addr, ks, 'test')
+        assert info['keyspace'] == ks and info['table'] == 'test'
+        assert info['segment_size'] == segment_size
+        check_stats(info['stats'], 'node')
+
+        assert len(info['shards']) == shards
+        for shard, shard_info in enumerate(info['shards']):
+            assert shard_info['shard'] == shard
+            check_stats(shard_info['stats'], f"shard {shard}")
+
+        for field in ['compaction_groups', 'segments', 'live_bytes', 'live_record_bytes']:
+            summed = sum(shard_info['stats'][field] for shard_info in info['shards'])
+            assert summed == info['stats'][field], (
+                f"the shards report {summed} of {field}, the node reports {info['stats'][field]}"
+            )
+        for i in range(len(info['stats']['utilization_histogram'])):
+            summed = sum(shard_info['stats']['utilization_histogram'][i]['count'] for shard_info in info['shards'])
+            assert summed == info['stats']['utilization_histogram'][i]['count']
+
+        # the free segments belong to no table, so they are reported next to the statistics of it
+        assert info['total_segments'] >= info['free_segments'] + info['stats']['segments']
+        return info
+
+    async def check_metrics(ks: str, stats: dict) -> None:
+        """The metrics of the table report the same space the endpoint does, and the shard histogram
+        the same distribution - the table is the only one using logstor, so the two agree."""
+        metrics = await manager.metrics.query(server.ip_addr)
+        labels = {'ks': ks, 'cf': 'test'}
+        assert metrics.get("scylla_column_family_logstor_segments", labels) == stats['segments']
+        assert metrics.get("scylla_column_family_logstor_live_record_bytes", labels) == stats['live_record_bytes']
+        # the two halves of the utilization of the table: what its segments take and what of it is live
+        assert metrics.get("scylla_column_family_logstor_segment_occupied_bytes", labels) == stats['occupied_bytes']
+        assert metrics.get("scylla_column_family_logstor_segment_live_bytes", labels) == stats['live_bytes']
+
+        # the histogram is per shard and aggregated over them, so it covers the segments of the node
+        name = "scylla_logstor_sm_segment_utilization"
+        assert metrics.get(f"{name}_count") == stats['segments']
+        # the metric sums the utilizations of the segments, so the mean is the sum over the count.
+        # The tolerance is for the precision the metric is printed with, not for the value itself.
+        assert metrics.get(f"{name}_sum") == pytest.approx(stats['live_bytes'] / segment_size, rel=1e-4)
+        for bucket in stats['utilization_histogram']:
+            # the buckets of the metric are cumulative, the ones the endpoint reports are not
+            cumulative = sum(b['count'] for b in stats['utilization_histogram'][:bucket['bucket'] + 1])
+            assert metrics.get(f"{name}_bucket", {'le': f"{bucket['upper_bound']:.6f}"}) == cumulative
+
+    def sparse_segments(stats: dict) -> int:
+        """Segments that are less than half utilized, which is what compaction has to reclaim."""
+        return sum(bucket['count'] for bucket in stats['utilization_histogram'][:8])
+
+    async with new_test_keyspace(manager, "WITH tablets={'initial':2}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v text) WITH storage_engine = 'logstor'")
+
+        insert = cql.prepare(f"INSERT INTO {ks}.test (pk, v) VALUES (?, ?)")
+        value = 'x' * value_size
+        await asyncio.gather(*[cql.run_async(insert, [pk, value]) for pk in range(key_count)])
+
+        # a segment joins a group once it is sealed, which is what the separator flush does
+        await manager.api.logstor_flush(server.ip_addr)
+
+        info = await get_info(ks)
+        stats = info['stats']
+        logger.info(f"after writes: {stats['segments']} segments, utilization {stats['utilization']}")
+        assert stats['segments'] > 0, "expected the table to own segments after writing to it"
+        assert stats['compaction_groups'] > 0
+        await check_metrics(ks, stats)
+
+        # nothing has been overwritten, so the segments are as full as the writes left them, bar the
+        # ones the separator flushed partly filled
+        assert stats['utilization'] > 0.7, (
+            f"expected the freshly written segments to be mostly live, got {stats['utilization']}"
+        )
+
+        # overwriting every key kills the records in the old segments without freeing the segments,
+        # so the table owns more of them and the mass of the histogram drops to the sparse end
+        for _ in range(3):
+            await asyncio.gather(*[cql.run_async(insert, [pk, value]) for pk in range(key_count)])
+        await manager.api.logstor_flush(server.ip_addr)
+
+        overwritten = (await get_info(ks))['stats']
+        logger.info(f"after overwrites: {overwritten['segments']} segments, utilization {overwritten['utilization']}")
+        assert overwritten['segments'] > stats['segments']
+        assert overwritten['utilization'] < stats['utilization'], (
+            f"expected the utilization to drop from {stats['utilization']} after overwrites, "
+            f"got {overwritten['utilization']}"
+        )
+        assert sparse_segments(overwritten) > sparse_segments(stats), (
+            "expected the overwrites to leave sparse segments behind"
+        )
+        assert overwritten['live_record_bytes'] == stats['live_record_bytes'], (
+            "expected the overwrites to leave the live data of the table unchanged"
+        )
+        await check_metrics(ks, overwritten)
+
+        # compaction copies the survivors together and frees the sparse segments, which takes the
+        # mass of the histogram back up
+        async def compacted() -> bool:
+            if (await get_info(ks))['stats']['segments'] < overwritten['segments']:
+                return True
+            await manager.api.logstor_compaction(server.ip_addr)
+        await wait_for(compacted, time.time() + 60)
+
+        compacted_stats = (await get_info(ks))['stats']
+        logger.info(f"after compaction: {compacted_stats['segments']} segments, utilization {compacted_stats['utilization']}")
+        assert compacted_stats['utilization'] > overwritten['utilization'], (
+            f"expected the utilization to recover from {overwritten['utilization']} after compaction, "
+            f"got {compacted_stats['utilization']}"
+        )
+        assert sparse_segments(compacted_stats) < sparse_segments(overwritten)
+        assert compacted_stats['live_record_bytes'] == stats['live_record_bytes']
+        await check_metrics(ks, compacted_stats)
+
+        # truncating gives back every segment, and with them everything counted about them
+        await cql.run_async(f"TRUNCATE {ks}.test")
+
+        empty = (await get_info(ks))['stats']
+        assert empty['segments'] == 0 and empty['live_bytes'] == 0 and empty['live_record_bytes'] == 0
+        assert empty['utilization'] == 0
+
 async def test_compaction(manager: ScyllaClusterManager):
     """
     Test log compaction by creating dead data and verifying space reclamation.

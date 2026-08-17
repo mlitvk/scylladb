@@ -553,6 +553,12 @@ class ScyllaRESTAPIClient:
         url = "/storage_service/logstor_flush"
         await self.client.post(url, host=node_ip)
 
+    async def get_logstor_info(self, node_ip: str, keyspace: str, table: str) -> dict:
+        """Get the logstor segment statistics of a table, on the node and per shard"""
+        url = "/storage_service/logstor_info"
+        params = {"keyspace": keyspace, "table": table}
+        return await self.client.get_json(url, host=node_ip, params=params)
+
     async def get_load(self, node_ip: str) -> float:
         """Get the disk space the storage of the node takes, which is the load it reports"""
         return await self.client.get_json("/storage_service/load", host=node_ip)
