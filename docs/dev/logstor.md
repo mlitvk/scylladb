@@ -94,6 +94,51 @@ the occupancy of a table, `scylla_column_family_logstor_live_record_bytes` its l
 `scylla_logstor_sm_live_record_bytes` the live data of the shard and `scylla_logstor_sm_disk_usage`
 its file footprint.
 
+### Segment Utilization
+
+The occupancy of a table says how much space it takes, but not how much of that space compaction can
+give back. That is what the distribution of its segments by **utilization** - the fraction of a
+segment held by live records - answers. A segment joins a compaction group once it is sealed, and
+from there its live bytes only shrink, as the records in it are overwritten or deleted. Compaction
+reclaims from the least utilized segments, since those are the ones whose space it can free while
+copying the least, so mass at the bottom of the distribution is space that is cheap to get back and
+mass at the top is space that is genuinely in use.
+
+Each `segment_set` keeps the distribution of the segments it holds in a histogram of equal buckets
+over `[0, 1]`, together with their live bytes, and maintains both as segments are linked, freed from
+and unlinked (`replica/logstor/segment_stats.hh`). Reading them is therefore O(number of buckets) and
+exact, which is what lets them be exported as a metric: computing them by walking the segments would
+cost a scan per read and would have to yield, and segments moving during those yields would make the
+result approximate.
+
+The statistics are aggregatable: `segment_stats` of a table is the sum over its compaction groups,
+and of a table on a node the sum over the shards. Note that the live bytes in the segments are less
+than the live record bytes of the table, which also cover the records that have not been sealed into
+a segment of a group yet, being still in the active segment or in a separator buffer.
+
+Metrics report the two halves of the question separately. *How much* is per table:
+`scylla_column_family_logstor_segment_live_bytes` over
+`scylla_column_family_logstor_segment_occupied_bytes` is the mean utilization of the segments of a
+table and their difference is what compaction can reclaim from it, and being plain summable gauges
+they aggregate over shards and nodes and can be alerted on. *How cheaply* is the distribution itself,
+`scylla_logstor_sm_segment_utilization`, kept per shard and aggregated over the shards so that a node
+reports one distribution across all of its tables. That is the level the question belongs to: the
+segment pool is shared by the whole shard and compaction reclaims wherever it is cheapest in it. The
+per table distribution is left to the API below rather than exported, since a series per bucket per
+table is cardinality that grows with the number of tables to answer a question that is not asked per
+table.
+
+The histogram is a snapshot of a distribution rather than a count of events, so its buckets fall as
+well as rise. Prometheus has no type for that, so it is exported as an ordinary histogram and a
+dashboard has to read it as it is: `histogram_quantile()` over the raw buckets and a heatmap of them
+are meaningful, and `_sum` over `_count` is the mean utilization, but anything that puts a `rate()`
+in front of the buckets - which is how a latency histogram is read - is not, as every reclaimed
+segment looks to it like a counter reset.
+
+The `/storage_service/logstor_info` API reports the same distribution for a table together with the
+numbers derived from it - the space its segments take, the part of it that is live and the part that
+is reclaimable - both for the node and per shard, which is where a skew between the shards shows.
+
 ## Usage
 
 ### Enabling Logstor
