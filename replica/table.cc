@@ -2294,7 +2294,11 @@ void table::set_metrics() {
                     ms::make_gauge("logstor_live_record_bytes", ms::description("Bytes of the live records of this table in logstor segments"),
                             [this] { return logstor_live_record_bytes(); })(cf)(ks),
                     ms::make_gauge("logstor_segments", ms::description("Number of logstor segments owned by this table"),
-                            [this] { return logstor_segment_count(); })(cf)(ks)
+                            [this] { return logstor_segment_count(); })(cf)(ks),
+                    ms::make_gauge("logstor_segment_live_bytes", ms::description("Bytes of the live records held by the logstor segments of this table. Over the space those segments take it is their mean utilization, and under it is the space compaction can reclaim from them."),
+                            [this] { return logstor_segment_stats().live_bytes; })(cf)(ks),
+                    ms::make_gauge("logstor_segment_occupied_bytes", ms::description("Space the logstor segments of this table take, dead records included. Unlike the disk space of the table it excludes the sstables, so it pairs with the live bytes of the segments."),
+                            [this] { return logstor_disk_space_used(); })(cf)(ks)
             });
         }
 
@@ -2360,7 +2364,11 @@ void table::set_metrics() {
                         ms::make_gauge("logstor_live_record_bytes", ms::description("Bytes of the live records of this table in logstor segments"),
                                 [this] { return logstor_live_record_bytes(); })(cf)(ks)(node_table_metrics).aggregate({seastar::metrics::shard_label}),
                         ms::make_gauge("logstor_segments", ms::description("Number of logstor segments owned by this table"),
-                                [this] { return logstor_segment_count(); })(cf)(ks)(node_table_metrics).aggregate({seastar::metrics::shard_label})
+                                [this] { return logstor_segment_count(); })(cf)(ks)(node_table_metrics).aggregate({seastar::metrics::shard_label}),
+                        ms::make_gauge("logstor_segment_live_bytes", ms::description("Bytes of the live records held by the logstor segments of this table. Over the space those segments take it is their mean utilization, and under it is the space compaction can reclaim from them."),
+                                [this] { return logstor_segment_stats().live_bytes; })(cf)(ks)(node_table_metrics).aggregate({seastar::metrics::shard_label}),
+                        ms::make_gauge("logstor_segment_occupied_bytes", ms::description("Space the logstor segments of this table take, dead records included. Unlike the disk space of the table it excludes the sstables, so it pairs with the live bytes of the segments."),
+                                [this] { return logstor_disk_space_used(); })(cf)(ks)(node_table_metrics).aggregate({seastar::metrics::shard_label})
                 });
             }
             if (uses_tablets()) {

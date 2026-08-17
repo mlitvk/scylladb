@@ -1249,6 +1249,8 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
                        sm::description("Counts number of segments currently in use.")),
         sm::make_gauge("free_segments", [this] { return available_segment_count(); },
                        sm::description("Counts number of free segments currently available.")),
+        sm::make_histogram("segment_utilization", [this] { return to_metrics_histogram(_compaction_mgr.get_segment_stats(), _cfg.segment_size); },
+                       sm::description("Distribution of the segments owned by the compaction groups of this shard by utilization, the fraction of a segment held by live records. A snapshot of the distribution and not a count of events, so the buckets fall as well as rise.")).aggregate({sm::shard_label}),
         sm::make_gauge("live_record_bytes", [this] { return _stats.live_record_bytes; },
                        sm::description("Counts the durable live record bytes currently referenced by the primary index.")),
         sm::make_gauge("live_record_count", [this] { return _stats.live_record_count; },
