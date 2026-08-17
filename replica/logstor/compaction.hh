@@ -8,6 +8,7 @@
 #pragma once
 
 #include "types.hh"
+#include "segment_stats.hh"
 #include "schema/schema_fwd.hh"
 #include "utils/chunked_vector.hh"
 #include "write_buffer.hh"
@@ -247,7 +248,14 @@ struct segment_set {
     // The same segments, in no particular order. Used to iterate efficiently and safely over all segments.
     utils::chunked_vector<segment_descriptor*> _segment_list;
 
-    segment_set() = default;
+    explicit segment_set(uint64_t segment_size) noexcept
+        : _segment_size(segment_size) {
+        // The utilization of every segment is a fraction of this, so a set without a segment size
+        // could not account for anything it holds.
+        if (_segment_size == 0) {
+            on_fatal_internal_error(logstor_logger, "segment_set created with a zero segment size");
+        }
+    }
 
     // Descriptors point back at their set and are linked into its containers, so a set cannot
     // be copied or moved without leaving all of them dangling.
@@ -283,7 +291,12 @@ struct segment_set {
         ++desc.ref_count;
     }
 
-    void update_segment(segment_descriptor& desc) {
+    // Accounts a record that was freed from a segment of this set. `freed_bytes` is the space the
+    // record gave back, which the caller has already added to the free space of the descriptor.
+    void update_segment(segment_descriptor& desc, uint64_t freed_bytes) noexcept {
+        const auto live_bytes = desc.net_data_size(_segment_size);
+        move_between_utilization_buckets(live_bytes + freed_bytes, live_bytes);
+        _live_bytes -= freed_bytes;
         _segments.adjust_up(desc);
     }
 
@@ -305,11 +318,48 @@ struct segment_set {
         return _segment_list.size();
     }
 
+    // Bytes of the live records held by the segments of this set, which is the data the group owns
+    // rather than the space it takes: the rest of the space the segments hold is dead records, which
+    // compaction will reclaim. Maintained as segments are linked, unlinked and freed from, so this
+    // is O(1) and exact.
+    uint64_t live_bytes() const noexcept {
+        return _live_bytes;
+    }
+
     bool empty() const noexcept {
         return _segment_list.empty();
     }
 
+    // Adds what this set holds to `stats`. The statistics are maintained as segments are linked,
+    // unlinked and freed from, so this is O(number of buckets) and exact, unlike a scan of the set,
+    // which would have to yield and could miss segments that move while it does. Accumulating into
+    // the caller's statistics, rather than returning a segment_stats of this set, is what keeps a
+    // caller that aggregates many sets from copying a utilization histogram per set. The group count
+    // is left to the caller, which knows how many groups it is aggregating.
+    void add_stats_to(segment_stats& stats) const noexcept {
+        stats.segment_count += segment_count();
+        stats.live_bytes += live_bytes();
+        for (size_t i = 0; i < utilization_bucket_count; ++i) {
+            stats.utilization[i] += _utilization[i];
+        }
+    }
+
 private:
+    // The size of a segment, needed to turn the free space of a descriptor into a utilization.
+    uint64_t _segment_size;
+    // Live record bytes held by the segments of this set, and their distribution by utilization.
+    uint64_t _live_bytes{0};
+    utilization_histogram _utilization{};
+
+    void move_between_utilization_buckets(uint64_t from_live_bytes, uint64_t to_live_bytes) noexcept {
+        const auto from = utilization_bucket_of(from_live_bytes, _segment_size);
+        const auto to = utilization_bucket_of(to_live_bytes, _segment_size);
+        if (from != to) {
+            --_utilization[from];
+            ++_utilization[to];
+        }
+    }
+
     // Makes room for one more segment, so that the following link() cannot fail. Only useful when
     // nothing can be added to the set in between, since the room is not reserved for a caller.
     void reserve_one() {
@@ -336,6 +386,9 @@ private:
         desc.owner = this;
         desc.index_in_set = _segment_list.size() - 1;
         _segments.push(desc);
+        const auto live_bytes = desc.net_data_size(_segment_size);
+        ++_utilization[utilization_bucket_of(live_bytes, _segment_size)];
+        _live_bytes += live_bytes;
     }
 
     // Validates the invariants of every removal path, and aborts rather than throwing, both
@@ -348,6 +401,9 @@ private:
             on_fatal_internal_error(logstor_logger, "segment is not at its recorded position in its set");
         }
         _segments.erase(desc);
+        const auto live_bytes = desc.net_data_size(_segment_size);
+        --_utilization[utilization_bucket_of(live_bytes, _segment_size)];
+        _live_bytes -= live_bytes;
         // Keep the list compact by moving the last segment into the freed slot.
         auto* last = _segment_list.back();
         _segment_list[desc.index_in_set] = last;
@@ -484,6 +540,9 @@ public:
     virtual void add(logstor_group&) = 0;
     virtual future<> remove(logstor_group&) = 0;
 
+    // Statistics of the segments owned by every group registered on this shard, across all tables.
+    virtual segment_stats get_segment_stats() const noexcept = 0;
+
     virtual void submit(logstor_group&) = 0;
 
     virtual future<> submit_split_compaction(logstor_group& src, mutation_writer::classify_by_token_group, split_target_group) = 0;
@@ -518,7 +577,9 @@ class logstor_group {
     future<> allocate_active_separator_buffer();
 
 protected:
-    logstor_group() = default;
+    explicit logstor_group(uint64_t segment_size) noexcept
+        : _logstor_segments(segment_size) {
+    }
 
     virtual compaction_manager& logstor_compaction_manager() noexcept = 0;
 
@@ -575,6 +636,12 @@ public:
 
     size_t separator_held_segment_count() const noexcept {
         return _active_buffer.held_segments.size() + _flushing_buffer.held_segments.size();
+    }
+
+    // Adds the segments this group owns to `stats`, see segment_set::add_stats_to().
+    void add_stats_to(segment_stats& stats) const noexcept {
+        ++stats.group_count;
+        _logstor_segments.add_stats_to(stats);
     }
 };
 

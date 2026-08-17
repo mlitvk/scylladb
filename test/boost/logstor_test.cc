@@ -348,7 +348,8 @@ class test_compaction_group_handle final : public logstor_group {
     compaction_manager& _cm;
 public:
     test_compaction_group_handle(schema_ptr schema, logstor& ls)
-        : _table_id(schema->id())
+        : logstor_group(ls.get_segment_manager().get_segment_size())
+        , _table_id(schema->id())
         , _owned_index(ls.make_primary_index(schema, false))
         , _index(*_owned_index)
         , _cm(ls.get_compaction_manager()) {
@@ -358,7 +359,8 @@ public:
     // A group of a table that already has an index: the index is per table, and all the groups of
     // a table share it. This is what the groups of a split have.
     test_compaction_group_handle(schema_ptr schema, logstor& ls, primary_index& index)
-        : _table_id(schema->id())
+        : logstor_group(ls.get_segment_manager().get_segment_size())
+        , _table_id(schema->id())
         , _index(index)
         , _cm(ls.get_compaction_manager()) {
         _cm.add(*this);
@@ -2275,6 +2277,86 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_candidate_score_ranks_by_effici
     BOOST_REQUIRE(four_in < all_dead);
 }
 
+// The statistics of a segment set are maintained as segments are linked, freed from and unlinked,
+// rather than computed by walking it, so every one of those paths has to keep them in step with the
+// segments the set actually holds.
+SEASTAR_THREAD_TEST_CASE(test_logstor_segment_set_stats) {
+    constexpr uint64_t segment_size = 128 * 1024;
+    // One record per utilization bucket, so that a segment holding n of them lands in bucket n.
+    constexpr size_t record_size = segment_size / utilization_bucket_count;
+
+    // Descriptors are intrusively linked into the sets, so they must keep their addresses, and every
+    // set must be destroyed before them.
+    std::deque<segment_descriptor> descs;
+    segment_set segments{segment_size};
+
+    auto add_segment = [&] (size_t live_records) -> segment_descriptor& {
+        auto& desc = descs.emplace_back();
+        desc.reset(segment_size);
+        desc.on_write(live_records * record_size, live_records);
+        segments.add_segment(desc);
+        return desc;
+    };
+
+    auto stats_of = [] (const segment_set& set) {
+        segment_stats stats;
+        set.add_stats_to(stats);
+        return stats;
+    };
+
+    auto check_stats = [&] (const segment_set& set, uint64_t expected_segments, uint64_t expected_live_bytes) {
+        const auto stats = stats_of(set);
+        BOOST_REQUIRE_EQUAL(stats.segment_count, expected_segments);
+        BOOST_REQUIRE_EQUAL(stats.live_bytes, expected_live_bytes);
+        // Every segment of the set is counted, and in exactly one bucket.
+        uint64_t counted = 0;
+        for (auto count : stats.utilization) {
+            counted += count;
+        }
+        BOOST_REQUIRE_EQUAL(counted, expected_segments);
+    };
+
+    auto bucket_of = [&] (const segment_set& set, size_t bucket) {
+        return stats_of(set).utilization[bucket];
+    };
+
+    // An empty set has nothing to report.
+    check_stats(segments, 0, 0);
+
+    // A segment is counted in the bucket its utilization falls in, and a fully utilized one in the
+    // last bucket rather than in one past the end of the histogram.
+    auto& sparse = add_segment(1);
+    auto& full = add_segment(utilization_bucket_count);
+    check_stats(segments, 2, (utilization_bucket_count + 1) * record_size);
+    BOOST_REQUIRE_EQUAL(bucket_of(segments, 1), 1);
+    BOOST_REQUIRE_EQUAL(bucket_of(segments, utilization_bucket_count - 1), 1);
+
+    // Freeing records moves a segment down the histogram, and takes off exactly the space they
+    // gave back.
+    constexpr size_t freed_records = utilization_bucket_count / 2;
+    full.on_free(freed_records * record_size, freed_records);
+    segments.update_segment(full, freed_records * record_size);
+    check_stats(segments, 2, (freed_records + 1) * record_size);
+    BOOST_REQUIRE_EQUAL(bucket_of(segments, utilization_bucket_count - 1), 0);
+    BOOST_REQUIRE_EQUAL(bucket_of(segments, freed_records), 1);
+
+    // Merging hands over the segments together with everything counted about them.
+    segment_set other{segment_size};
+    other.merge(segments).get();
+    check_stats(segments, 0, 0);
+    check_stats(other, 2, (freed_records + 1) * record_size);
+    BOOST_REQUIRE_EQUAL(bucket_of(other, 1), 1);
+    BOOST_REQUIRE_EQUAL(bucket_of(other, freed_records), 1);
+
+    // Removing a segment takes it, and its bytes, out of the set.
+    other.remove_segment(sparse);
+    check_stats(other, 1, freed_records * record_size);
+    BOOST_REQUIRE_EQUAL(bucket_of(other, 1), 0);
+
+    other.clear();
+    check_stats(other, 0, 0);
+}
+
 // Checks that compaction candidate selection chooses segments in ascending utilization order,
 // respects the batch cap, and the returned score accurately describes the selected segments.
 SEASTAR_THREAD_TEST_CASE(test_logstor_select_compaction_batch) {
@@ -2291,7 +2373,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_select_compaction_batch) {
     // Descriptors are intrusively linked into the sets, so they must keep their addresses, and every
     // set must be destroyed before them.
     std::deque<segment_descriptor> descs;
-    segment_set segments;
+    segment_set segments{segment_size};
     auto add_segment = [&] (segment_set& set, size_t live_records) {
         auto& desc = descs.emplace_back();
         desc.reset(segment_size);
@@ -2343,14 +2425,14 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_select_compaction_batch) {
 
     // A group whose segments are all nearly full has no batch with a net gain, which is the answer
     // for the whole group and not only for the prefix that happened to be scored.
-    segment_set dense;
+    segment_set dense{segment_size};
     for (size_t i = 0; i < min_segments_per_compaction; ++i) {
         add_segment(dense, dense_records);
     }
     BOOST_REQUIRE(!select_compaction_batch(dense, segment_size, min_segments_per_compaction));
 
     // An empty group has nothing to compact.
-    segment_set empty;
+    segment_set empty{segment_size};
     BOOST_REQUIRE(!select_compaction_batch(empty, segment_size, min_segments_per_compaction));
 }
 

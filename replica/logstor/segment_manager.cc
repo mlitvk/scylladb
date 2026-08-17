@@ -677,6 +677,14 @@ public:
 
     void add(logstor_group&) override;
 
+    segment_stats get_segment_stats() const noexcept override {
+        segment_stats stats;
+        for (const auto* group : _groups | std::views::keys) {
+            group->add_stats_to(stats);
+        }
+        return stats;
+    }
+
     void submit(logstor_group&) override;
     future<> stop_ongoing_compactions(logstor_group&) override;
     future<> remove(logstor_group&) override;
@@ -1016,6 +1024,10 @@ public:
 
     uint64_t available_segment_count(write_source src) const noexcept {
         return static_cast<uint64_t>(_free_segments.size()) + static_cast<uint64_t>(_segment_pool.available_segment_count(src)) + allocatable_new_segment_count();
+    }
+
+    uint64_t get_total_segment_count() const noexcept {
+        return _max_segments.actual;
     }
 
     void set_actual_max_segments(uint64_t actual_max_segments) {
@@ -1535,11 +1547,7 @@ void segment_manager_impl::on_free_record(log_location location) noexcept {
     _stats.live_record_bytes -= location.size;
     _stats.live_record_count--;
     if (desc.owner) {
-        try {
-            desc.owner->update_segment(desc);
-        } catch (...) {
-            logstor_logger.warn("Failed to update segments histogram: {}", std::current_exception());
-        }
+        desc.owner->update_segment(desc, location.size);
     }
     _stats.bytes_freed += location.size;
 }
@@ -2742,6 +2750,8 @@ future<> segment_manager::discard_segments(logstor_group& cg) {
 
 segment_manager_usage segment_manager::get_usage() const noexcept {
     return segment_manager_usage{
+        .free_segments = _impl->available_segment_count(),
+        .total_segments = _impl->get_total_segment_count(),
         .disk_usage = _impl->get_disk_usage(),
         .memory_usage = _impl->get_memory_usage(),
     };

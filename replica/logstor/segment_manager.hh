@@ -60,6 +60,10 @@ struct segment_manager_config {
 // through a single accessor, since a caller that wants one of them usually wants the others to
 // compare it against.
 struct segment_manager_usage {
+    // Segments that can still be allocated for writing, and the number of segment slots the shard
+    // has, unlike the segments a compaction group owns.
+    uint64_t free_segments{0};
+    uint64_t total_segments{0};
     // Bytes of the files allocated for segments. This is the space logstor takes on disk, which is
     // more than the segments the tables own take: it also covers the segments that are free, and
     // files are never given back during normal operation, only retired on recovery.
