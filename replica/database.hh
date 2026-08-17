@@ -1236,6 +1236,11 @@ public:
     utils::file_size_stats total_disk_space_used() const;
     // Space taken by the logstor segments this table owns. Zero for a table that doesn't use logstor.
     uint64_t logstor_disk_space_used() const;
+    // Number of logstor segments this table owns.
+    uint64_t logstor_segment_count() const;
+    // Bytes of the live records of this table, which is less than the space its segments take by
+    // however much room those segments still have.
+    uint64_t logstor_live_record_bytes() const;
 
     locator::combined_load_stats table_load_stats() const;
 
@@ -2152,6 +2157,13 @@ public:
     future<> flush_logstor_separator(std::optional<logstor::segment_sequence> seq_num = std::nullopt);
     future<logstor::table_segment_stats> get_logstor_table_segment_stats(table_id table) const;
     size_t get_logstor_memory_usage() const;
+    // Space the files logstor has allocated on this shard take on disk. Zero when logstor is unused.
+    uint64_t get_logstor_disk_usage() const;
+
+    // Space the storage of this shard takes on disk, which is what a node reports as its load: the
+    // sstables of all its tables plus the files logstor has allocated. It is more than the sum of
+    // the disk space of the tables, which cannot account for logstor space no table owns.
+    uint64_t disk_space_used() const;
 
     static future<db_clock::time_point> get_all_tables_flushed_at(sharded<database>& sharded_db);
 
