@@ -908,6 +908,51 @@ async def test_segment_utilization_stats(manager: ScyllaClusterManager):
         assert empty['segments'] == 0 and empty['live_bytes'] == 0 and empty['live_record_bytes'] == 0
         assert empty['utilization'] == 0
 
+async def test_node_aggregated_table_metrics(manager: ScyllaClusterManager):
+    """
+    Verify the logstor metrics of a table in the default metrics configuration, which aggregates the
+    per-table metrics over the shards of the node instead of reporting them per shard, since
+    enable_keyspace_column_family_metrics is off by default. The two registrations are separate lists,
+    so a metric added to the one the other tests read can be missing from the one a node reports out
+    of the box.
+    """
+    key_count = 10
+    value_size = 60 * 1024
+
+    cmdline = ['--logger-log-level', 'logstor=debug', '--smp=2']
+    cfg = {'experimental_features': ['logstor']}
+    servers = await manager.servers_add(1, cmdline=cmdline, config=cfg)
+    server = servers[0]
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "WITH tablets={'initial':2}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v text) WITH storage_engine = 'logstor'")
+
+        insert = cql.prepare(f"INSERT INTO {ks}.test (pk, v) VALUES (?, ?)")
+        value = 'x' * value_size
+        await asyncio.gather(*[cql.run_async(insert, [pk, value]) for pk in range(key_count)])
+
+        # a segment joins a group once it is sealed, which is what the separator flush does
+        await manager.api.logstor_flush(server.ip_addr)
+
+        metrics = await manager.metrics.query(server.ip_addr)
+        labels = {'ks': ks, 'cf': 'test'}
+
+        def get(name: str) -> float:
+            value = metrics.get(name, labels)
+            assert value is not None, f"{name} is not reported for {ks}.test"
+            return value
+
+        segments = get("scylla_column_family_logstor_segments")
+        assert segments > 0, "expected the table to own segments after writing to it"
+        assert get("scylla_column_family_logstor_live_record_bytes") >= key_count * value_size
+        # the space of those segments, and the part of it that is live
+        assert get("scylla_column_family_logstor_segment_occupied_bytes") == segments * segment_size
+        assert 0 < get("scylla_column_family_logstor_segment_live_bytes") < segments * segment_size
+        # the data the table holds is held by those segments
+        assert 0 < get("scylla_column_family_live_data_size") < segments * segment_size
+        assert get("scylla_column_family_live_disk_space") == segments * segment_size
+
 async def test_compaction(manager: ScyllaClusterManager):
     """
     Test log compaction by creating dead data and verifying space reclamation.
