@@ -6167,17 +6167,30 @@ future<locator::load_stats> storage_service::load_stats_for_tablet_based_tables(
 
     const locator::host_id this_host = _db.local().get_token_metadata().get_my_id();
 
-    // Align to 64 bytes to avoid cache line ping-pong when updating size in map_reduce0() below
-    struct alignas(64) aligned_tablet_size {
-        uint64_t size = 0;
+    // The inputs the effective capacity below is computed from, gathered per shard. Aligned to 64
+    // bytes to avoid cache line ping-pong when the shards update them in map_reduce0() below.
+    struct alignas(64) aligned_shard_capacity {
+        // Sizes of the tablets of the tables that keep their data in sstables. A logstor table is
+        // left out: the size of its tablets is the live records they hold rather than the space
+        // those take, and the space it has is the segment pool, accounted for on its own below.
+        uint64_t sstable_tablet_sizes = 0;
+        // The segment pool of the shard and the part of it that is allocated on disk already.
+        uint64_t logstor_pool_size = 0;
+        uint64_t logstor_disk_usage = 0;
+        bool has_sstable_tablets = false;
+        bool has_logstor_tablets = false;
     };
-    std::vector<aligned_tablet_size> tablet_sizes_per_shard(this_smp_shard_count());
+    std::vector<aligned_shard_capacity> capacity_per_shard(this_smp_shard_count());
 
     // Each node combines a per-table load map from all of its shards and returns it to the coordinator.
     // So if there are 1k nodes, there will be 1k RPCs in total.
-    auto load_stats = co_await _db.map_reduce0([&table_ids, &this_host, &tablet_sizes_per_shard] (replica::database& db) -> future<locator::load_stats> {
+    auto load_stats = co_await _db.map_reduce0([&table_ids, &this_host, &capacity_per_shard] (replica::database& db) -> future<locator::load_stats> {
         locator::load_stats load_stats{};
         auto& tables_metadata = db.get_tables_metadata();
+
+        aligned_shard_capacity& shard_capacity = capacity_per_shard[this_shard_id()];
+        shard_capacity.logstor_pool_size = db.get_logstor_pool_size();
+        shard_capacity.logstor_disk_usage = db.get_logstor_disk_usage();
 
         for (const auto& id : table_ids) {
             auto table = tables_metadata.get_table_if_exists(id);
@@ -6187,7 +6200,13 @@ future<locator::load_stats> storage_service::load_stats_for_tablet_based_tables(
 
             locator::combined_load_stats combined_ls { table->table_load_stats() };
             load_stats.tables.emplace(id, std::move(combined_ls.table_ls));
-            tablet_sizes_per_shard[this_shard_id()].size += load_stats.tablet_stats[this_host].add_tablet_sizes(combined_ls.tablet_ls);
+            const uint64_t tablet_sizes = load_stats.tablet_stats[this_host].add_tablet_sizes(combined_ls.tablet_ls);
+            if (table->uses_logstor()) {
+                shard_capacity.has_logstor_tablets = true;
+            } else {
+                shard_capacity.has_sstable_tablets = true;
+                shard_capacity.sstable_tablet_sizes += tablet_sizes;
+            }
 
             co_await coroutine::maybe_yield();
         }
@@ -6195,24 +6214,54 @@ future<locator::load_stats> storage_service::load_stats_for_tablet_based_tables(
         co_return std::move(load_stats);
     }, locator::load_stats{}, std::plus<locator::load_stats>());
 
-    load_stats.capacity[this_host] = _disk_space_monitor->space().capacity;
-    load_stats.critical_disk_utilization[this_host] = _disk_space_monitor->disk_utilization() > _db.local().get_config().critical_disk_utilization_level();
-
     const std::filesystem::space_info si = _disk_space_monitor->space();
     load_stats.capacity[this_host] = si.capacity;
+    load_stats.critical_disk_utilization[this_host] = _disk_space_monitor->disk_utilization() > _db.local().get_config().critical_disk_utilization_level();
 
     locator::tablet_load_stats& tls = load_stats.tablet_stats[this_host];
     const uint64_t config_capacity = _db.local().get_config().data_file_capacity();
     if (config_capacity != 0) {
         tls.effective_capacity = config_capacity;
     } else if (_db.local().get_config().force_effective_capacity_to_raw_disk_capacity()) {
-        tls.effective_capacity = _disk_space_monitor->space().capacity;
+        tls.effective_capacity = si.capacity;
     } else {
-        uint64_t sum_tablet_sizes = 0;
-        for (const auto& ts : tablet_sizes_per_shard) {
-            sum_tablet_sizes += ts.size;
+        aligned_shard_capacity node_capacity{};
+        for (const auto& shard_capacity : capacity_per_shard) {
+            node_capacity.sstable_tablet_sizes += shard_capacity.sstable_tablet_sizes;
+            node_capacity.logstor_pool_size += shard_capacity.logstor_pool_size;
+            node_capacity.logstor_disk_usage += shard_capacity.logstor_disk_usage;
+            node_capacity.has_sstable_tablets |= shard_capacity.has_sstable_tablets;
+            node_capacity.has_logstor_tablets |= shard_capacity.has_logstor_tablets;
         }
-        tls.effective_capacity = si.available + sum_tablet_sizes;
+
+        // A tablet stores its data either in sstables or, for a logstor table, in the segments of
+        // the pool of its shard, and the two cannot be traded for one another: the pool is an area
+        // logstor allocates for itself and that sstables cannot write into. So the capacity is the
+        // sum over the storage engines that have tablets to hold on this node:
+        //
+        // - sstables can grow into the free space of the file system, less the part of the pool
+        //   logstor has yet to allocate, which is free space but is spoken for, plus the space the
+        //   tablets already take.
+        // - logstor tablets can grow into the pool, all of it, allocated already or not. The free
+        //   space of the file system is not capacity for them, so a node whose tablets all use
+        //   logstor is not credited with it.
+        //
+        // The pool is counted whole rather than discounted by the space its dead records hold, so
+        // the utilization of a node using logstor is the fraction of its pool that is live data.
+        // That understates how full the pool is by the space amplification of the workload, which
+        // is near enough equal across nodes running the same workload to leave the comparison
+        // between them, which is what the balancer acts on, intact. See the space accounting
+        // section of docs/dev/logstor.md.
+        const uint64_t unallocated_pool = node_capacity.logstor_pool_size - std::min(node_capacity.logstor_pool_size, node_capacity.logstor_disk_usage);
+        const uint64_t available = si.available - std::min<uint64_t>(si.available, unallocated_pool);
+
+        tls.effective_capacity = 0;
+        if (node_capacity.has_logstor_tablets) {
+            tls.effective_capacity += node_capacity.logstor_pool_size;
+        }
+        if (node_capacity.has_sstable_tablets || !node_capacity.has_logstor_tablets) {
+            tls.effective_capacity += available + node_capacity.sstable_tablet_sizes;
+        }
     }
 
     co_return std::move(load_stats);

@@ -1302,6 +1302,73 @@ async def test_tablet_size_excludes_dead_data(manager: ScyllaClusterManager):
             "expected the tablet not to split for the dead data in its segments"
         )
 
+async def test_effective_capacity_is_the_segment_pool(manager: ScyllaClusterManager):
+    """
+    Verify the capacity a node using logstor reports for load balancing is its segment pool rather
+    than the free space of the file system. Logstor allocates the pool for itself and nothing else
+    can write into it, so the free space does not fall as the pool fills up, and what is left of it
+    outside the pool is not room a logstor tablet can grow into: a capacity read from the free space
+    would neither follow the data nor be comparable between nodes whose pools are sized differently.
+    A node that also has an sstable backed tablet table is credited with the free space on top of the
+    pool, since that table can grow into it.
+    """
+    disk_size_mb = 64
+    file_size_mb = 8
+    pool_size = disk_size_mb * 1024 * 1024
+    key_count = 50
+    value_size = 2000
+
+    cmdline = ['--logger-log-level', 'logstor=info', '--smp=1']
+    cfg = {
+        'logstor_disk_size_in_mb': disk_size_mb,
+        'logstor_file_size_in_mb': file_size_mb,
+        'tablet_load_stats_refresh_interval_in_seconds': 1,
+        # the suite forces the capacity to the raw disk capacity, which is what this test is about
+        'force_effective_capacity_to_raw_disk_capacity': False,
+        'experimental_features': ['logstor'],
+    }
+    server = await manager.server_add(cmdline=cmdline, config=cfg)
+    host_id = await manager.get_host_id(server.server_id)
+    cql = manager.get_cql()
+
+    async def wait_for_load(pred, label: str):
+        """Waits for the load statistics of the node to satisfy `pred` and returns them."""
+        async def reported():
+            row = cql.execute(f"SELECT effective_capacity, storage_load FROM system.load_per_node "
+                              f"WHERE node = {host_id}").one()
+            return row if row and row.effective_capacity is not None and pred(row) else None
+        return await wait_for(reported, time.time() + 60, label=label)
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', "
+                                         "'replication_factor': 1} AND tablets = {'initial': 1}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v text) WITH storage_engine = 'logstor'")
+
+        # every tablet of the node is a logstor tablet, so the pool is all the capacity there is
+        await wait_for_load(lambda r: r.effective_capacity == pool_size,
+                            "effective capacity to be the segment pool")
+
+        insert = cql.prepare(f"INSERT INTO {ks}.test (pk, v) VALUES (?, ?)")
+        value = 'x' * value_size
+        await asyncio.gather(*[cql.run_async(insert, [pk, value]) for pk in range(key_count)])
+        await manager.api.logstor_flush(server.ip_addr)
+
+        # Waiting for the load of the node to reach the data written makes this a check of a
+        # refreshed capacity: it is still the pool, and did not grow with the data the way one read
+        # off the free space of the file system, which a logstor table does not consume, would.
+        load = await wait_for_load(lambda r: r.storage_load and r.storage_load >= key_count * value_size,
+                                   "the load of the node to reach the data written")
+        assert load.effective_capacity == pool_size, (
+            f"expected the capacity to stay the {pool_size} bytes of the segment pool once the node "
+            f"holds {load.storage_load} bytes, got {load.effective_capacity}"
+        )
+
+        # an sstable backed tablet table can grow into the free space, which is then capacity too
+        await cql.run_async(f"CREATE TABLE {ks}.sst (pk int PRIMARY KEY, v text)")
+        load = await wait_for_load(lambda r: r.effective_capacity > pool_size,
+                                   "effective capacity to cover the free disk space")
+        logger.info(f"effective capacity with an sstable table: {load.effective_capacity}, pool {pool_size}")
+
+
 async def test_tablet_split_and_merge(manager: ScyllaClusterManager):
     logger.info("Bootstrapping cluster")
     cmdline = [
