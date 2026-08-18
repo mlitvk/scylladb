@@ -108,8 +108,9 @@ nodetool and API disk space of a table report, and what orders the tables of a m
 
 Metrics: `scylla_column_family_live_disk_space` and `scylla_column_family_logstor_segments` report
 the occupancy of a table, `scylla_column_family_logstor_live_record_bytes` its live data,
-`scylla_logstor_sm_live_record_bytes` the live data of the shard and `scylla_logstor_sm_disk_usage`
-its file footprint.
+`scylla_column_family_live_data_size` the data it holds as a tablet reports it - the live bytes of the
+segments its groups own, next to the bytes of its sstables - `scylla_logstor_sm_live_record_bytes` the
+live data of the shard and `scylla_logstor_sm_disk_usage` its file footprint.
 
 ### Segment Utilization
 

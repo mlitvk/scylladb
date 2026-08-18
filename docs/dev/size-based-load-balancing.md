@@ -32,6 +32,10 @@ logstor tablet's occupancy is set by the space pressure of the shard rather than
 it neither tracks what the tablet holds nor moves with the tablet. See the space accounting section of
 ``docs/dev/logstor.md``.
 
+The ``scylla_column_family_live_data_size`` metric reports the same quantity summed over the tablets of
+a table on a node, which is what a node contributes to ``tablet_sizes``, so a balancing decision that
+looks wrong can be checked against the sizes it was made with.
+
 Note that ``effective_capacity`` does not model the logstor segment pool, which is a fixed per-shard
 area that only logstor can write into and that is allocated up front, so the available disk space a
 node reports does not fall as logstor fills up. Consequently, on a node using logstor the utilization
