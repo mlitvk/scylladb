@@ -22,7 +22,8 @@ this struct relevant for the load balancer is stored in its member tablet_stats,
 which contains:
 
 - ``tablet_sizes``: the disk size in bytes of all the tablets on the given node.
-- ``effective_capacity``: contains the sum of available disk space and all the tablet sizes on the given node.
+- ``effective_capacity``: the space in bytes the tablets of the given node can grow into, including
+  the space they already take.
 
 The size of a tablet is the data it holds rather than the space that data is stored in
 (``compaction_group::live_data_size()``). For sstables the two are the same number, the bytes of the
@@ -36,10 +37,24 @@ The ``scylla_column_family_live_data_size`` metric reports the same quantity sum
 a table on a node, which is what a node contributes to ``tablet_sizes``, so a balancing decision that
 looks wrong can be checked against the sizes it was made with.
 
-Note that ``effective_capacity`` does not model the logstor segment pool, which is a fixed per-shard
-area that only logstor can write into and that is allocated up front, so the available disk space a
-node reports does not fall as logstor fills up. Consequently, on a node using logstor the utilization
-is comparable between nodes configured alike, but its absolute value understates how full the pool is.
+``effective_capacity`` is computed per storage engine, because a tablet keeps its data either in
+sstables or, for a logstor table, in the segments of the pool of its shard, and the two cannot be
+traded for one another: the pool is an area logstor allocates for itself and that sstables cannot
+write into. It is the sum over the engines that have tablets to hold on the node:
+
+- sstables can grow into the available disk space, less the part of the pool logstor has yet to
+  allocate, plus the sizes of the tablets already there. For a node with no logstor this is the
+  available disk space plus the tablet sizes, as it has always been.
+- logstor tablets can grow into the segment pool, all of it, allocated already or not. The available
+  disk space is not capacity for them, so a node whose tablets all use logstor is not credited with
+  it.
+
+Note that the pool is counted whole rather than discounted by the space its dead records hold, so on
+a node using logstor the utilization is the fraction of the pool that is live data. That is
+comparable between nodes running the same workload, which is what the balancer acts on, but its
+absolute value understates how full the pool is by the space amplification of the workload. A node
+that is running out of segments therefore cannot be recognized from its utilization. See the space
+accounting section of ``docs/dev/logstor.md``.
 
 The balancer will use this information to compute the disk load (disk utilization)
 on every node and shard. It will then migrate tablets from the most to the least

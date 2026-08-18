@@ -100,6 +100,25 @@ carries to another node and that a split divides in two, which is what makes the
 equalize across the cluster and to compare against the target tablet size. See
 `docs/dev/size-based-load-balancing.md`.
 
+The **capacity** those tablet sizes are divided by is the segment pool: the segments the shard is
+configured to hold times the segment size, summed over the shards
+(`segment_manager::get_segment_pool_size()`). It is the pool rather than the free space of the file
+system because logstor allocates the pool for itself, up front with `logstor_format_on_startup`, and
+nothing else can write into it: the free space a node reports therefore does not fall as logstor
+fills up, and what is left of it outside the pool is not room a logstor tablet can grow into. A node
+that also has sstable backed tablet tables is credited with that free space as well, less the part of
+the pool logstor has yet to allocate, which is free space but is spoken for. This is computed in
+`storage_service::load_stats_for_tablet_based_tables()`.
+
+The pool is counted whole rather than discounted by the space its dead records hold, so the
+utilization of a node using logstor is the fraction of its pool that is live data. That understates
+how full the pool is by the space amplification of the workload - a pool entirely full of segments
+reports the mean utilization of those segments, not 1 - but the amplification is near enough equal
+across nodes running the same workload that the comparison between them, which is what the balancer
+acts on, survives it. What does not survive it is the absolute value, so a node running out of
+segments cannot be recognized from its utilization; the free segment counts are the number that says
+that.
+
 The same distinction applies wherever a table is sized by the volume of its data rather than by the
 space that data takes: `table::live_data_size()` is the sum over its groups, and it is what the repair
 small-table optimization and the initial tablet count of a keyspace migrated from vnodes are derived
