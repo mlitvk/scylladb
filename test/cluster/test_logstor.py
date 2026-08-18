@@ -820,6 +820,9 @@ async def test_segment_utilization_stats(manager: ScyllaClusterManager):
         # the two halves of the utilization of the table: what its segments take and what of it is live
         assert metrics.get("scylla_column_family_logstor_segment_occupied_bytes", labels) == stats['occupied_bytes']
         assert metrics.get("scylla_column_family_logstor_segment_live_bytes", labels) == stats['live_bytes']
+        # the data the table holds, which is what a tablet reports as its size. The table has no
+        # sstables, so it is the live bytes of the segments its groups own and nothing else.
+        assert metrics.get("scylla_column_family_live_data_size", labels) == stats['live_bytes']
 
         # the histogram is per shard and aggregated over them, so it covers the segments of the node
         name = "scylla_logstor_sm_segment_utilization"

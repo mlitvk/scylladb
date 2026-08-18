@@ -2280,6 +2280,7 @@ void table::set_metrics() {
                 ms::make_counter("memtable_row_tombstone_reads", _stats.memtable_row_tombstone_reads, ms::description("Number of row tombstones read from memtables"))(cf)(ks),
                 ms::make_gauge("pending_tasks", ms::description("Estimated number of tasks pending for this column family"), _stats.pending_flushes)(cf)(ks),
                 ms::make_gauge("live_disk_space", ms::description("Live disk space used"), [this] { return live_disk_space_used().on_disk; })(cf)(ks),
+                ms::make_gauge("live_data_size", ms::description("Bytes of the data this table holds, as opposed to the space its storage takes for it. This is the size tablet load balancing equalizes across the cluster and that resize decisions compare against the target tablet size."), [this] { return live_data_size(); })(cf)(ks),
                 ms::make_gauge("total_disk_space", ms::description("Total disk space used"), [this] { return total_disk_space_used().on_disk; })(cf)(ks),
                 ms::make_gauge("total_disk_space_before_compression", ms::description("Hypothetical total disk space used if data files weren't compressed"), [this] { return total_disk_space_used().before_compression; })(cf)(ks),
                 ms::make_gauge("live_sstable", ms::description("Live sstable count"), _stats.live_sstable_count)(cf)(ks),
@@ -2356,6 +2357,7 @@ void table::set_metrics() {
                 ms::make_gauge("total_disk_space_before_compression", ms::description("Hypothetical total disk space used if data files weren't compressed"), [this] { return total_disk_space_used().before_compression; })(cf)(ks)(node_table_metrics).aggregate({seastar::metrics::shard_label}).set_skip_when_empty(),
                 ms::make_gauge("live_sstable", ms::description("Live sstable count"), _stats.live_sstable_count)(cf)(ks)(node_table_metrics).aggregate({seastar::metrics::shard_label}),
                 ms::make_gauge("live_disk_space", ms::description("Live disk space used"), [this] { return live_disk_space_used().on_disk; })(cf)(ks)(node_table_metrics).aggregate({seastar::metrics::shard_label}),
+                ms::make_gauge("live_data_size", ms::description("Bytes of the data this table holds, as opposed to the space its storage takes for it. This is the size tablet load balancing equalizes across the cluster and that resize decisions compare against the target tablet size."), [this] { return live_data_size(); })(cf)(ks)(node_table_metrics).aggregate({seastar::metrics::shard_label}),
                 ms::make_histogram("read_latency", ms::description("Read latency histogram"), [this] {return to_metrics_histogram(_stats.reads.histogram());})(cf)(ks)(node_table_metrics).aggregate({seastar::metrics::shard_label}).set_skip_when_empty(),
                 ms::make_histogram("write_latency", ms::description("Write latency histogram"), [this] {return to_metrics_histogram(_stats.writes.histogram());})(cf)(ks)(node_table_metrics).aggregate({seastar::metrics::shard_label}).set_skip_when_empty()
             });
