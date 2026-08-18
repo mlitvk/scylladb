@@ -1725,8 +1725,8 @@ table::clone_tablet_storage(locator::tablet_id tid, bool leave_unsealed) {
 }
 
 void table::update_stats_for_new_sstable(const sstables::shared_sstable& sst) noexcept {
-    _stats.live_disk_space_used += sst->get_file_size_stats();
-    _stats.total_disk_space_used += sst->get_file_size_stats();
+    _stats.sstables_live_disk_space_used += sst->get_file_size_stats();
+    _stats.sstables_total_disk_space_used += sst->get_file_size_stats();
     _stats.live_sstable_count++;
 }
 
@@ -2402,13 +2402,13 @@ sstables::file_size_stats compaction_group::total_sstable_disk_space_used() cons
 }
 
 void table::rebuild_statistics() {
-    _stats.live_disk_space_used = {};
+    _stats.sstables_live_disk_space_used = {};
     _stats.live_sstable_count = 0;
-    _stats.total_disk_space_used = {};
+    _stats.sstables_total_disk_space_used = {};
 
     for_each_compaction_group([this] (const compaction_group& cg) {
-        _stats.live_disk_space_used += cg.live_sstable_disk_space_used();
-        _stats.total_disk_space_used += cg.total_sstable_disk_space_used();
+        _stats.sstables_live_disk_space_used += cg.live_sstable_disk_space_used();
+        _stats.sstables_total_disk_space_used += cg.total_sstable_disk_space_used();
         _stats.live_sstable_count += cg.live_sstable_count();
     });
 }
@@ -2426,12 +2426,12 @@ uint64_t table::logstor_disk_space_used() const {
 
 sstables::file_size_stats table::live_disk_space_used() const {
     const int64_t logstor_size = logstor_disk_space_used();
-    return _stats.live_disk_space_used + sstables::file_size_stats{logstor_size, logstor_size};
+    return _stats.sstables_live_disk_space_used + sstables::file_size_stats{logstor_size, logstor_size};
 }
 
 sstables::file_size_stats table::total_disk_space_used() const {
     const int64_t logstor_size = logstor_disk_space_used();
-    return _stats.total_disk_space_used + sstables::file_size_stats{logstor_size, logstor_size};
+    return _stats.sstables_total_disk_space_used + sstables::file_size_stats{logstor_size, logstor_size};
 }
 
 void table::rebuild_large_data_index() {

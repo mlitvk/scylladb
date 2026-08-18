@@ -408,8 +408,8 @@ struct table_stats {
     int64_t pending_flushes = 0;
     /** Disk space used by the sstables of this table. Use table::live_disk_space_used() and
      * table::total_disk_space_used() for all the storage of the table, logstor segments included. */
-    sstables::file_size_stats live_disk_space_used;
-    sstables::file_size_stats total_disk_space_used;
+    sstables::file_size_stats sstables_live_disk_space_used;
+    sstables::file_size_stats sstables_total_disk_space_used;
     int64_t live_sstable_count = 0;
     /** Estimated number of compactions pending for this column family */
     int64_t pending_compactions = 0;
