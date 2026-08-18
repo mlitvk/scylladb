@@ -2167,6 +2167,9 @@ public:
     size_t get_logstor_memory_usage() const;
     // Space the files logstor has allocated on this shard take on disk. Zero when logstor is unused.
     uint64_t get_logstor_disk_usage() const;
+    // Space of the segment pool of this shard, which is what the logstor tables can grow into,
+    // allocated already or not. Zero when logstor is unused.
+    uint64_t get_logstor_pool_size() const;
 
     // Space the storage of this shard takes on disk, which is what a node reports as its load: the
     // sstables of all its tables plus the files logstor has allocated. It is more than the sum of

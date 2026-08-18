@@ -64,6 +64,11 @@ struct segment_manager_usage {
     // has, unlike the segments a compaction group owns.
     uint64_t free_segments{0};
     uint64_t total_segments{0};
+    // Bytes of the segment pool the shard is configured to hold, which is the space its tables can
+    // grow into. Unlike total_segments, which counts the slots that are there right now, this
+    // ignores the segments recovery found beyond the configured limit: those are retired as they are
+    // freed and cannot be allocated again, so they are not room to grow into.
+    uint64_t segment_pool_size{0};
     // Bytes of the files allocated for segments. This is the space logstor takes on disk, which is
     // more than the segments the tables own take: it also covers the segments that are free, and
     // files are never given back during normal operation, only retired on recovery.

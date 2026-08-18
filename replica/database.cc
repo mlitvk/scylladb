@@ -3075,6 +3075,10 @@ uint64_t database::get_logstor_disk_usage() const {
     return _logstor ? _logstor->get_segment_manager().get_usage().disk_usage : 0;
 }
 
+uint64_t database::get_logstor_pool_size() const {
+    return _logstor ? _logstor->get_segment_manager().get_usage().segment_pool_size : 0;
+}
+
 uint64_t database::disk_space_used() const {
     // The logstor part is the space of the files logstor has allocated rather than the sum of the
     // segments the tables own, since the segments no table owns are space on disk all the same, and

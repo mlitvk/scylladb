@@ -997,6 +997,10 @@ public:
         return _file_mgr.allocated_file_count() * _cfg.file_size;
     }
 
+    uint64_t get_segment_pool_size() const noexcept {
+        return _max_segments.configured * _cfg.segment_size;
+    }
+
     future<owned_write_buffer> allocate_separator_buffer() {
         return _separator_buffer_pool.allocate(_separator_buffer_abort);
     }
@@ -2754,6 +2758,7 @@ segment_manager_usage segment_manager::get_usage() const noexcept {
     return segment_manager_usage{
         .free_segments = _impl->available_segment_count(),
         .total_segments = _impl->get_total_segment_count(),
+        .segment_pool_size = _impl->get_segment_pool_size(),
         .disk_usage = _impl->get_disk_usage(),
         .memory_usage = _impl->get_memory_usage(),
     };
