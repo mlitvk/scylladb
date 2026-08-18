@@ -78,6 +78,7 @@
 #include "replica/tables_metadata_lock.hh"
 #include "service/topology_guard.hh"
 #include "utils/disk_space_monitor.hh"
+#include "utils/file_size_stats.hh"
 #include "db/large_data_handler.hh"
 
 class cell_locker;
@@ -1231,8 +1232,8 @@ public:
     // Disk space used by the storage of this table on this shard. The sstable part is taken from
     // the statistics, which are maintained as sstables come and go, whereas the logstor part is
     // computed on the fly, since segments are allocated and freed without the table taking part.
-    sstables::file_size_stats live_disk_space_used() const;
-    sstables::file_size_stats total_disk_space_used() const;
+    utils::file_size_stats live_disk_space_used() const;
+    utils::file_size_stats total_disk_space_used() const;
     // Space taken by the logstor segments this table owns. Zero for a table that doesn't use logstor.
     uint64_t logstor_disk_space_used() const;
 

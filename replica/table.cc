@@ -2424,14 +2424,14 @@ uint64_t table::logstor_disk_space_used() const {
     return bytes;
 }
 
-sstables::file_size_stats table::live_disk_space_used() const {
+utils::file_size_stats table::live_disk_space_used() const {
     const int64_t logstor_size = logstor_disk_space_used();
-    return _stats.sstables_live_disk_space_used + sstables::file_size_stats{logstor_size, logstor_size};
+    return _stats.sstables_live_disk_space_used + utils::file_size_stats{logstor_size, logstor_size};
 }
 
-sstables::file_size_stats table::total_disk_space_used() const {
+utils::file_size_stats table::total_disk_space_used() const {
     const int64_t logstor_size = logstor_disk_space_used();
-    return _stats.sstables_total_disk_space_used + sstables::file_size_stats{logstor_size, logstor_size};
+    return _stats.sstables_total_disk_space_used + utils::file_size_stats{logstor_size, logstor_size};
 }
 
 void table::rebuild_large_data_index() {
