@@ -3440,6 +3440,12 @@ compaction_group::~compaction_group() {
         on_fatal_internal_error(tlogger, format("Compaction group of id {} that belongs to {}.{} was not disabled.",
                                                 _group_id, _t.schema()->ks_name(), _t.schema()->cf_name()));
     }
+    // The same for the logstor side: the logstor compaction manager keeps a pointer to the group's
+    // logstor state, which stop() is what takes out of it.
+    if (_logstor_state && get_logstor_compaction_manager().contains(*_logstor_state)) {
+        on_fatal_internal_error(tlogger, format("Logstor state of compaction group of id {} that belongs to {}.{} was not removed.",
+                                                _group_id, _t.schema()->ks_name(), _t.schema()->cf_name()));
+    }
 }
 
 future<> compaction_group::stop(sstring reason) noexcept {

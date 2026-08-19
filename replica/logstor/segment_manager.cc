@@ -677,6 +677,10 @@ public:
 
     void add(logstor_group&) override;
 
+    bool contains(logstor_group& cg) const noexcept override {
+        return _groups.contains(&cg);
+    }
+
     segment_stats get_segment_stats() const noexcept override {
         segment_stats stats;
         for (const auto* group : _groups | std::views::keys) {

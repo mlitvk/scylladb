@@ -540,6 +540,10 @@ public:
     virtual void add(logstor_group&) = 0;
     virtual future<> remove(logstor_group&) = 0;
 
+    // Whether the group is registered here, and therefore whether this manager still holds a pointer
+    // to it. Lets an owner of a group check that it was removed before the group is destroyed.
+    virtual bool contains(logstor_group&) const noexcept = 0;
+
     // Statistics of the segments owned by every group registered on this shard, across all tables.
     virtual segment_stats get_segment_stats() const noexcept = 0;
 
