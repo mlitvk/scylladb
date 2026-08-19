@@ -1399,6 +1399,76 @@ async def test_tablet_migration(manager: ScyllaClusterManager):
             assert len(rows) == 1, f"Expected 1 row for key {i} after tablet migration, but got {len(rows)}"
             assert rows[0].v == f"{i}_{value}", f"Expected value '{i}_{value}' for key {i} after tablet migration, but got {rows[0].v}"
 
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
+async def test_tablet_migration_in_split_mode(manager: ScyllaClusterManager):
+    """
+    Migrate a tablet of a logstor table while its storage group is in split mode, which is the state
+    a resize decision leaves the group in until the split itself runs. The segments written before
+    the decision are all still owned by the main compaction group at that point, so the snapshot
+    streamed to the target has to cover it next to the split ready groups. It didn't, and the tablet
+    arrived at the target with none of its data.
+    """
+    cmdline = ['--logger-log-level', 'logstor=trace', '--logger-log-level', 'stream_blob=trace', '--smp=1']
+    cfg = {
+        'tablet_load_stats_refresh_interval_in_seconds': 1,
+        'experimental_features': ['logstor'],
+    }
+    servers = await manager.servers_add(2, cmdline=cmdline, config=cfg,
+                                        property_file={"dc": "dc1", "rack": "rack1"})
+    cql, _ = await manager.get_ready_cql(servers)
+    host_ids = [await manager.get_host_id(s.server_id) for s in servers]
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'initial': 1}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v text) WITH storage_engine = 'logstor'")
+
+        nrows = 20
+        value = 'x' * (30 * 1024)
+        for i in range(nrows):
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, v) VALUES ({i}, '{i}_{value}')")
+
+        # Seal the records into segments, which the main compaction group owns, and which the split
+        # mode below leaves there.
+        for s in servers:
+            await manager.api.logstor_flush(s.ip_addr)
+
+        tablet_token = 0
+        src_host, src_shard = await get_tablet_replica(manager, servers[0], ks, 'test', tablet_token)
+        src_idx = host_ids.index(src_host)
+
+        # Hold the split right after split mode was set on the storage groups, so that the tablet
+        # migrates with its data still in the main group. Only the node that owns the tablet gets
+        # there: a node with no storage group for the table reports itself split ready and never
+        # splits anything.
+        await manager.api.enable_injection(servers[src_idx].ip_addr, 'split_storage_groups_wait', one_shot=False)
+
+        src_log = await manager.server_open_log(servers[src_idx].server_id)
+        src_mark = await src_log.mark()
+        # The resize decision comes from the load balancer, so balancing is left enabled for it.
+        await cql.run_async(f"ALTER TABLE {ks}.test WITH tablets={{'min_tablet_count': 2}}")
+        await src_log.wait_for('split_storage_groups_wait: waiting for message', from_mark=src_mark, timeout=120)
+
+        # The split is held, so the tablet count is still the pre-split one.
+        assert await get_tablet_count(manager, servers[0], ks, 'test') == 1
+
+        # Keep the balancer from racing with the migration below.
+        await manager.disable_tablet_balancing()
+
+        # The tablet is still where it was when the split was held, so its replica is the node whose
+        # storage group is in split mode.
+        assert (src_host, src_shard) == await get_tablet_replica(manager, servers[0], ks, 'test', tablet_token)
+        dst_host = host_ids[1 - src_idx]
+        await manager.api.move_tablet(servers[0].ip_addr, ks, "test", src_host, src_shard,
+                                      dst_host, 0, tablet_token)
+
+        for i in range(nrows):
+            rows = await cql.run_async(f"SELECT pk, v FROM {ks}.test WHERE pk = {i}")
+            assert len(rows) == 1, f"Expected 1 row for key {i} after tablet migration, but got {len(rows)}"
+            assert rows[0].v == f"{i}_{value}", f"Expected value '{i}_{value}' for key {i} after tablet migration, but got {rows[0].v}"
+
+        # Let the split proceed, so that the keyspace can be dropped.
+        await manager.api.message_injection(servers[src_idx].ip_addr, 'split_storage_groups_wait')
+        await manager.api.disable_injection(servers[src_idx].ip_addr, 'split_storage_groups_wait')
+
 async def test_tablet_intranode_migration(manager: ScyllaClusterManager):
     """
     Test tablet intranode migration
