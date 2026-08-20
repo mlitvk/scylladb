@@ -1193,7 +1193,7 @@ const logstor::logstor_group& compaction_group::as_logstor_group() const noexcep
 }
 
 compaction_group_logstor_state::compaction_group_logstor_state(compaction_group& cg) noexcept
-    : logstor_group(cg.get_logstor_segment_manager().get_segment_size())
+    : logstor_group(cg.get_logstor_segment_manager().get_segment_size(), &cg.get_logstor_segment_stats_node())
     , _cg(&cg) {
 }
 
@@ -2437,45 +2437,21 @@ void table::rebuild_statistics() {
     });
 }
 
-logstor::segment_totals table::logstor_segment_totals() const {
-    logstor::segment_totals totals;
-    if (!uses_logstor()) {
-        return totals;
-    }
-
-    // Every group maintains its own statistics as segments are linked, unlinked and freed from, so
-    // this only sums them up and doesn't have to yield or walk the segments themselves.
-    for_each_compaction_group([&totals] (const compaction_group& cg) {
-        cg.as_logstor_group().add_totals_to(totals);
-    });
-
-    return totals;
+const logstor::segment_stats& table::logstor_segment_stats() const noexcept {
+    // The groups of the table account into this as their segments change, so a table that doesn't use
+    // logstor, and has no group accounting into it, reports what it was created with - nothing.
+    return _logstor_segment_stats.stats();
 }
 
-logstor::segment_stats table::logstor_segment_stats() const {
-    logstor::segment_stats stats;
-    if (!uses_logstor()) {
-        return stats;
-    }
-
-    // Aggregates a utilization histogram per group on top of what the totals above cost, so this is
-    // for the consumers that report the distribution rather than for the counters below.
-    for_each_compaction_group([&stats] (const compaction_group& cg) {
-        cg.as_logstor_group().add_stats_to(stats);
-    });
-
-    return stats;
+uint64_t table::logstor_segment_count() const noexcept {
+    return logstor_segment_stats().segment_count;
 }
 
-uint64_t table::logstor_segment_count() const {
-    return logstor_segment_totals().segment_count;
+uint64_t table::logstor_segment_live_bytes() const noexcept {
+    return logstor_segment_stats().live_bytes;
 }
 
-uint64_t table::logstor_segment_live_bytes() const {
-    return logstor_segment_totals().live_bytes;
-}
-
-uint64_t table::logstor_disk_space_used() const {
+uint64_t table::logstor_disk_space_used() const noexcept {
     if (!uses_logstor()) {
         return 0;
     }
@@ -3554,6 +3530,7 @@ table::table(schema_ptr schema, config config, lw_shared_ptr<const storage_optio
     , _compaction_strategy(make_compaction_strategy(_schema->compaction_strategy(), _schema->compaction_strategy_options()))
     , _logstor(logstor)
     , _logstor_index(_schema->logstor_enabled() ? _logstor->make_primary_index(_schema, cache_enabled()) : nullptr)
+    , _logstor_segment_stats(_logstor ? &_logstor->get_compaction_manager().shard_segment_stats() : nullptr)
     , _sg_manager(make_storage_group_manager())
     , _sstables(make_compound_sstable_set())
     , _sstable_deletion_gate(format("[table {}.{}] sstable_deletion_gate", _schema->ks_name(), _schema->cf_name()))
@@ -5589,6 +5566,10 @@ const logstor::compaction_manager& compaction_group::get_logstor_compaction_mana
 
 logstor::primary_index& compaction_group::get_logstor_index() noexcept {
     return _t.logstor_index();
+}
+
+logstor::segment_stats_node& compaction_group::get_logstor_segment_stats_node() noexcept {
+    return _t.logstor_segment_stats_node();
 }
 
 compaction::compaction_group_view& compaction_group::as_view_for_static_sharding() const {

@@ -75,7 +75,9 @@ class test_logstor_group final : public replica::logstor::logstor_group {
     replica::logstor::compaction_manager& _cm;
 public:
     test_logstor_group(schema_ptr schema, replica::logstor::logstor& ls, bool cache_enabled = false)
-        : logstor_group(ls.get_segment_manager().get_segment_size())
+        // Accounts its segments straight into the shard level of the statistics rollup: a test group
+        // stands on its own, with no table level between it and the shard.
+        : logstor_group(ls.get_segment_manager().get_segment_size(), &ls.get_compaction_manager().shard_segment_stats())
         , _table_id(schema->id())
         , _owned_index(ls.make_primary_index(schema, cache_enabled))
         , _index(*_owned_index)
@@ -86,7 +88,9 @@ public:
     // A group of a table that already has an index: the index is per table, and all the groups of
     // a table share it. This is what the groups of a split have.
     test_logstor_group(schema_ptr schema, replica::logstor::logstor& ls, replica::logstor::primary_index& index)
-        : logstor_group(ls.get_segment_manager().get_segment_size())
+        // Accounts its segments straight into the shard level of the statistics rollup: a test group
+        // stands on its own, with no table level between it and the shard.
+        : logstor_group(ls.get_segment_manager().get_segment_size(), &ls.get_compaction_manager().shard_segment_stats())
         , _table_id(schema->id())
         , _index(index)
         , _cm(ls.get_compaction_manager()) {

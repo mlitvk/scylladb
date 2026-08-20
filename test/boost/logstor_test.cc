@@ -2222,22 +2222,16 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_set_stats) {
         return desc;
     };
 
-    auto stats_of = [] (const segment_set& set) {
-        segment_stats stats;
-        set.add_stats_to(stats);
-        return stats;
-    };
-
     auto check_stats = [&] (const segment_set& set, uint64_t expected_segments, uint64_t expected_live_bytes) {
-        const auto stats = stats_of(set);
+        const auto& stats = set.stats();
         BOOST_REQUIRE_EQUAL(stats.segment_count, expected_segments);
         BOOST_REQUIRE_EQUAL(stats.live_bytes, expected_live_bytes);
-        // The totals are read on their own by whoever has no use for the distribution, so they have
-        // to say the same as the statistics that carry it.
-        segment_totals totals;
-        set.add_totals_to(totals);
-        BOOST_REQUIRE_EQUAL(totals.segment_count, stats.segment_count);
-        BOOST_REQUIRE_EQUAL(totals.live_bytes, stats.live_bytes);
+        // The maintained statistics have to say what the segments themselves do, whatever the path
+        // that got the set here.
+        const auto recomputed = set.recompute_stats_for_test();
+        BOOST_REQUIRE_EQUAL(recomputed.segment_count, stats.segment_count);
+        BOOST_REQUIRE_EQUAL(recomputed.live_bytes, stats.live_bytes);
+        BOOST_REQUIRE(recomputed.utilization == stats.utilization);
         // Every segment of the set is counted, and in exactly one bucket.
         uint64_t counted = 0;
         for (auto count : stats.utilization) {
@@ -2247,7 +2241,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_set_stats) {
     };
 
     auto bucket_of = [&] (const segment_set& set, size_t bucket) {
-        return stats_of(set).utilization[bucket];
+        return set.stats().utilization[bucket];
     };
 
     // An empty set has nothing to report.
@@ -2285,6 +2279,83 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_set_stats) {
 
     other.clear();
     check_stats(other, 0, 0);
+}
+
+// A level of the segment statistics rollup holds the statistics of the levels below it, which every
+// path that changes a set of segments has to keep true, since nothing sums the sets on read.
+SEASTAR_THREAD_TEST_CASE(test_logstor_segment_stats_rollup) {
+    constexpr uint64_t segment_size = 128 * 1024;
+    // One record per utilization bucket, so that a segment holding n of them lands in bucket n.
+    constexpr size_t record_size = segment_size / utilization_bucket_count;
+
+    // Descriptors are intrusively linked into the sets, so they must keep their addresses, and every
+    // set must be destroyed before them.
+    std::deque<segment_descriptor> descs;
+    // A shard and one table on it, the levels above the groups of that table.
+    segment_stats_node shard;
+    segment_stats_node table{&shard};
+
+    auto add_segment = [&] (segment_set& set, size_t live_records) -> segment_descriptor& {
+        auto& desc = descs.emplace_back();
+        desc.reset(segment_size);
+        desc.on_write(live_records * record_size, live_records);
+        set.add_segment(desc);
+        return desc;
+    };
+
+    auto check_levels = [&] (std::initializer_list<std::reference_wrapper<const segment_set>> sets) {
+        segment_stats expected;
+        for (const auto& set : sets) {
+            expected += set.get().stats();
+        }
+        for (const auto* level : {&table, &shard}) {
+            // The table is the sum of its groups, and the shard the sum of its tables, of which this
+            // one is the only one.
+            BOOST_REQUIRE_EQUAL(level->stats().group_count, expected.group_count);
+            BOOST_REQUIRE_EQUAL(level->stats().segment_count, expected.segment_count);
+            BOOST_REQUIRE_EQUAL(level->stats().live_bytes, expected.live_bytes);
+            BOOST_REQUIRE(level->stats().utilization == expected.utilization);
+        }
+    };
+
+    // A level that only aggregates holds nothing of its own, before a group is created under it.
+    check_levels({});
+
+    {
+        segment_set first{segment_size, &table};
+        segment_set second{segment_size, &table};
+
+        // A set of segments counts as one group at every level above it, before it holds a segment.
+        check_levels({first, second});
+        BOOST_REQUIRE_EQUAL(table.stats().group_count, 2u);
+
+        // Linking a segment reaches every level above the set it was linked into.
+        auto& sparse = add_segment(first, 1);
+        add_segment(second, utilization_bucket_count);
+        check_levels({first, second});
+        BOOST_REQUIRE_EQUAL(table.stats().live_bytes, (utilization_bucket_count + 1) * record_size);
+
+        // So does freeing the records of one.
+        sparse.on_free(record_size);
+        first.update_segment(sparse, record_size);
+        check_levels({first, second});
+        BOOST_REQUIRE_EQUAL(table.stats().live_bytes, utilization_bucket_count * record_size);
+
+        // Segments moving between the groups of a table leave the statistics of the table where they
+        // were: what one group loses the other gains.
+        const auto before_merge = table.stats();
+        second.merge(first).get();
+        check_levels({first, second});
+        BOOST_REQUIRE_EQUAL(table.stats().segment_count, before_merge.segment_count);
+        BOOST_REQUIRE_EQUAL(table.stats().live_bytes, before_merge.live_bytes);
+        BOOST_REQUIRE(table.stats().utilization == before_merge.utilization);
+
+        second.remove_segment(sparse);
+        check_levels({first, second});
+    }
+
+    // A group takes what it still held away with it, the segment `second` was left holding included.
+    check_levels({});
 }
 
 // Checks that compaction candidate selection chooses segments in ascending utilization order,

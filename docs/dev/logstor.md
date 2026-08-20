@@ -143,20 +143,24 @@ mass at the top is space that is genuinely in use.
 
 Each `segment_set` keeps the distribution of the segments it holds in a histogram of equal buckets
 over `[0, 1]`, together with their live bytes, and maintains both as segments are linked, freed from
-and unlinked (`replica/logstor/segment_stats.hh`). Reading them is therefore O(number of buckets) and
-exact, which is what lets them be exported as a metric: computing them by walking the segments would
-cost a scan per read and would have to yield, and segments moving during those yields would make the
-result approximate.
+and unlinked (`replica/logstor/segment_stats.hh`). Reading them is therefore O(1) and exact, which is
+what lets them be exported as a metric: computing them by walking the segments would cost a scan per
+read and would have to yield, and segments moving during those yields would make the result
+approximate.
 
-The statistics are aggregatable: those of a table are the sum over its compaction groups, and those of
-a table on a node the sum over the shards. Summing a group is not equally cheap on both halves, so
-they are separate types: `segment_totals` is the group, segment and live byte counts, which costs
-three additions per group, and `segment_stats` adds the distribution, which costs a pass over the
-buckets per group. `table::logstor_segment_totals()` is what the segment counters of a table are
-derived from, several times per metrics scrape; the distribution is aggregated only where it is
-reported, by the shard metric and by the API below. Note that the live bytes in the segments are less
-than the live record bytes of the table, which also cover the records that have not been sealed into
-a segment of a group yet, being still in the active segment or in a separator buffer.
+The statistics are aggregatable, and they are aggregated as they change rather than on read. A
+`segment_set` sits at the bottom of a **rollup**: a chain of `segment_stats_node`s that runs from the
+set, through the table the group belongs to, up to the shard, and a segment linked, unlinked or freed
+from is accounted into every level of it. Reading what a table or a whole shard holds is therefore a
+field read as well. Summing the groups on read instead would cost a walk that grows with the number of
+tablets the shard carries, and the metrics of a table read these several times per scrape, from a
+callback that cannot yield.
+
+A level counts the groups below it, so the group count of a table is the number of its compaction
+groups whether or not they are registered with the compaction manager or are being migrated away: the
+segments of a group take the space they take either way. Note that the live bytes in the segments are
+less than the live record bytes of the table, which also cover the records that have not been sealed
+into a segment of a group yet, being still in the active segment or in a separator buffer.
 
 Metrics report the two halves of the question separately. *How much* is per table:
 `scylla_column_family_logstor_segment_live_bytes` over

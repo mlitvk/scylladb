@@ -518,6 +518,11 @@ private:
     compaction::compaction_strategy _compaction_strategy;
     logstor::logstor* _logstor = nullptr;
     std::unique_ptr<logstor::primary_index> _logstor_index;
+    // The table level of the segment statistics rollup: the statistics of the segments the compaction
+    // groups of this table own, kept up to date as those change rather than summed over the groups on
+    // read. Declared ahead of the storage groups, so that it outlives the sets of segments accounting
+    // into it, and parented to the shard level, which logstor owns and which outlives the table.
+    logstor::segment_stats_node _logstor_segment_stats;
     // The storage_group_manager manages either a single storage_group for vnodes or per-tablet storage_group for tablets.
     // It contains and manages both the compaction_groups list and the storage_groups vector.
     std::unique_ptr<storage_group_manager> _sg_manager;
@@ -1227,9 +1232,10 @@ public:
         return _stats;
     }
 
-    // Disk space used by the storage of this table on this shard. The sstable part is taken from
-    // the statistics, which are maintained as sstables come and go, whereas the logstor part is
-    // computed on the fly, since segments are allocated and freed without the table taking part.
+    // Disk space used by the storage of this table on this shard. Both parts are taken from
+    // statistics that are maintained as the storage changes: the sstable part as sstables come and
+    // go, the logstor part as the segments of its compaction groups are linked, unlinked and freed
+    // from.
     utils::file_size_stats live_disk_space_used() const;
     utils::file_size_stats total_disk_space_used() const;
     // The data this table holds on this shard, rather than the space that data is stored in. Less
@@ -1237,20 +1243,22 @@ public:
     // how much of them is still live. Use this where the data volume is what matters, and the disk
     // space accessors above where the space on disk is. See compaction_group::live_data_size().
     uint64_t live_data_size() const;
-    // Totals of the logstor segments this table owns on this shard, summed over its compaction
-    // groups. Empty for a table that doesn't use logstor. This is the walk of the groups that every
-    // logstor segment counter below is derived from, and it leaves their utilization histograms
-    // alone: aggregating those costs a pass over the buckets per group and no counter needs them.
-    logstor::segment_totals logstor_segment_totals() const;
-    // The same with the distribution of those segments by utilization, which costs more to aggregate.
-    // Only for a consumer that needs the distribution.
-    logstor::segment_stats logstor_segment_stats() const;
+    // Statistics of the logstor segments this table owns on this shard, its compaction groups summed
+    // up. Empty for a table that doesn't use logstor. Kept up to date as segments are linked, unlinked
+    // and freed from, so reading these is a field read: see logstor::segment_stats_node for why the
+    // groups are not walked and summed here instead.
+    const logstor::segment_stats& logstor_segment_stats() const noexcept;
     // Number of logstor segments this table owns.
-    uint64_t logstor_segment_count() const;
+    uint64_t logstor_segment_count() const noexcept;
     // Bytes of the live records held by the logstor segments this table owns.
-    uint64_t logstor_segment_live_bytes() const;
+    uint64_t logstor_segment_live_bytes() const noexcept;
     // Space taken by the logstor segments this table owns. Zero for a table that doesn't use logstor.
-    uint64_t logstor_disk_space_used() const;
+    uint64_t logstor_disk_space_used() const noexcept;
+    // The table level of the segment statistics rollup, which the segments of its compaction groups
+    // are accounted into.
+    logstor::segment_stats_node& logstor_segment_stats_node() noexcept {
+        return _logstor_segment_stats;
+    }
     // Bytes of the live records of this table, taken from its index rather than from the segments,
     // so unlike the statistics above this covers the records that are not in a segment of a group
     // yet. Less than the space the segments take by however much room they still have.

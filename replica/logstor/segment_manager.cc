@@ -631,6 +631,12 @@ private:
     using group_compaction_state_map = absl::flat_hash_map<logstor_group*, std::unique_ptr<group_compaction_state>>;
     group_compaction_state_map _groups;
 
+    // The top of the segment statistics rollup of this shard: the tables account into it, so it holds
+    // the statistics of the segments owned by every group of every table on the shard, registered here
+    // or not. It outlives the tables, and therefore the groups accounting into it, since logstor is
+    // created before them and destroyed after them.
+    segment_stats_node _segment_stats;
+
     shared_future<> _auto_compaction_completion{make_ready_future<>()};
     // Sized for the static maximum; a run holds back the difference between it and the current
     // limit for its duration, see run_auto_compaction().
@@ -678,12 +684,8 @@ public:
         return _groups.contains(&cg);
     }
 
-    segment_stats get_segment_stats() const noexcept override {
-        segment_stats stats;
-        for (const auto* group : _groups | std::views::keys) {
-            group->add_stats_to(stats);
-        }
-        return stats;
+    segment_stats_node& shard_segment_stats() noexcept override {
+        return _segment_stats;
     }
 
     void submit(logstor_group&) override;
@@ -1257,7 +1259,7 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
                        sm::description("Counts number of segments currently in use.")),
         sm::make_gauge("free_segments", [this] { return available_segment_count(); },
                        sm::description("Counts number of free segments currently available.")),
-        sm::make_histogram("segment_utilization", [this] { return to_metrics_histogram(_compaction_mgr.get_segment_stats(), _cfg.segment_size); },
+        sm::make_histogram("segment_utilization", [this] { return to_metrics_histogram(_compaction_mgr.shard_segment_stats().stats(), _cfg.segment_size); },
                        sm::description("Distribution of the segments owned by the compaction groups of this shard by utilization, the fraction of a segment held by live records. A snapshot of the distribution and not a count of events, so the buckets fall as well as rise.")).aggregate({sm::shard_label}),
         sm::make_gauge("live_record_bytes", [this] { return _stats.live_record_bytes; },
                        sm::description("Counts the durable live record bytes currently referenced by the primary index.")),

@@ -258,8 +258,13 @@ struct segment_set {
     // The same segments, in no particular order. Used to iterate efficiently and safely over all segments.
     utils::chunked_vector<segment_descriptor*> _segment_list;
 
-    explicit segment_set(uint64_t segment_size) noexcept
-        : _segment_size(segment_size) {
+    // `parent` is the level of the segment statistics rollup this set accounts into, the table of the
+    // group owning it, or nothing for a set that stands on its own and is only asked about itself.
+    explicit segment_set(uint64_t segment_size, segment_stats_node* parent = nullptr) noexcept
+        : _segment_size(segment_size)
+        // The segments of a set all belong to one compaction group, so the set is what counts as a
+        // group wherever its statistics are summed.
+        , _stats(parent, 1) {
         // The utilization of every segment is a fraction of this, so a set without a segment size
         // could not account for anything it holds.
         if (_segment_size == 0) {
@@ -305,8 +310,9 @@ struct segment_set {
     // record gave back, which the caller has already added to the free space of the descriptor.
     void update_segment(segment_descriptor& desc, uint64_t freed_bytes) noexcept {
         const auto live_bytes = desc.net_data_size(_segment_size);
-        move_between_utilization_buckets(live_bytes + freed_bytes, live_bytes);
-        _live_bytes -= freed_bytes;
+        _stats.free_from_segment(freed_bytes,
+                utilization_bucket_of(live_bytes + freed_bytes, _segment_size),
+                utilization_bucket_of(live_bytes, _segment_size));
         _segments.adjust_up(desc);
     }
 
@@ -330,52 +336,42 @@ struct segment_set {
 
     // Bytes of the live records held by the segments of this set, which is the data the group owns
     // rather than the space it takes: the rest of the space the segments hold is dead records, which
-    // compaction will reclaim. Maintained as segments are linked, unlinked and freed from, so this
-    // is O(1) and exact.
+    // compaction will reclaim.
     uint64_t live_bytes() const noexcept {
-        return _live_bytes;
+        return stats().live_bytes;
     }
 
     bool empty() const noexcept {
         return _segment_list.empty();
     }
 
-    // Adds the totals of what this set holds to `totals`. Both are maintained as segments are
-    // linked, unlinked and freed from, so this is O(1) and exact, unlike a scan of the set, which
-    // would have to yield and could miss segments that move while it does. The group count is left
-    // to the caller, which knows how many groups it is aggregating.
-    void add_totals_to(segment_totals& totals) const noexcept {
-        totals.segment_count += segment_count();
-        totals.live_bytes += live_bytes();
+    // What this set holds, its distribution by utilization included, and one group - itself. Kept up
+    // to date as segments are linked, unlinked and freed from, so reading it is O(1) and exact, unlike
+    // a scan of the set, which would have to yield and could miss segments that move while it does.
+    // The same change is accounted into the levels above this set, see segment_stats_node.
+    const segment_stats& stats() const noexcept {
+        return _stats.stats();
     }
 
-    // Adds what this set holds, its distribution by utilization included, to `stats`. Maintained
-    // and therefore exact like the totals above, but O(number of buckets) rather than O(1): a caller
-    // that has no use for the distribution should add only the totals. Accumulating into the caller's
-    // statistics, rather than returning a segment_stats of this set, is what keeps a caller that
-    // aggregates many sets from copying a utilization histogram per set.
-    void add_stats_to(segment_stats& stats) const noexcept {
-        add_totals_to(stats);
-        for (size_t i = 0; i < utilization_bucket_count; ++i) {
-            stats.utilization[i] += _utilization[i];
+    // Recomputes the statistics from the segments themselves, for a test to check the maintained ones
+    // against. Every path that changes the set has to leave the two equal.
+    segment_stats recompute_stats_for_test() const noexcept {
+        segment_stats stats;
+        stats.group_count = 1;
+        for (const auto* desc : _segment_list) {
+            const auto live_bytes = desc->net_data_size(_segment_size);
+            ++stats.segment_count;
+            stats.live_bytes += live_bytes;
+            ++stats.utilization[utilization_bucket_of(live_bytes, _segment_size)];
         }
+        return stats;
     }
 
 private:
     // The size of a segment, needed to turn the free space of a descriptor into a utilization.
     uint64_t _segment_size;
-    // Live record bytes held by the segments of this set, and their distribution by utilization.
-    uint64_t _live_bytes{0};
-    utilization_histogram _utilization{};
-
-    void move_between_utilization_buckets(uint64_t from_live_bytes, uint64_t to_live_bytes) noexcept {
-        const auto from = utilization_bucket_of(from_live_bytes, _segment_size);
-        const auto to = utilization_bucket_of(to_live_bytes, _segment_size);
-        if (from != to) {
-            --_utilization[from];
-            ++_utilization[to];
-        }
-    }
+    // What this set holds, and the levels above it that the same is accounted into.
+    segment_stats_node _stats;
 
     // Makes room for one more segment, so that the following link() cannot fail. Only useful when
     // nothing can be added to the set in between, since the room is not reserved for a caller.
@@ -404,8 +400,7 @@ private:
         desc.index_in_set = _segment_list.size() - 1;
         _segments.push(desc);
         const auto live_bytes = desc.net_data_size(_segment_size);
-        ++_utilization[utilization_bucket_of(live_bytes, _segment_size)];
-        _live_bytes += live_bytes;
+        _stats.add_segment(live_bytes, utilization_bucket_of(live_bytes, _segment_size));
     }
 
     // Validates the invariants of every removal path, and aborts rather than throwing, both
@@ -419,8 +414,7 @@ private:
         }
         _segments.erase(desc);
         const auto live_bytes = desc.net_data_size(_segment_size);
-        --_utilization[utilization_bucket_of(live_bytes, _segment_size)];
-        _live_bytes -= live_bytes;
+        _stats.remove_segment(live_bytes, utilization_bucket_of(live_bytes, _segment_size));
         // Keep the list compact by moving the last segment into the freed slot.
         auto* last = _segment_list.back();
         _segment_list[desc.index_in_set] = last;
@@ -561,8 +555,9 @@ public:
     // to it. Lets an owner of a group check that it was removed before the group is destroyed.
     virtual bool contains(logstor_group&) const noexcept = 0;
 
-    // Statistics of the segments owned by every group registered on this shard, across all tables.
-    virtual segment_stats get_segment_stats() const noexcept = 0;
+    // The shard level of the segment statistics rollup, which the tables of this shard account into.
+    // Its statistics are those of the segments owned by the groups of every table on the shard.
+    virtual segment_stats_node& shard_segment_stats() noexcept = 0;
 
     virtual void submit(logstor_group&) = 0;
 
@@ -598,8 +593,10 @@ class logstor_group {
     future<> allocate_active_separator_buffer();
 
 protected:
-    explicit logstor_group(uint64_t segment_size) noexcept
-        : _logstor_segments(segment_size) {
+    // `table_stats` is the level of the segment statistics rollup of the table this group belongs to,
+    // which the segments of the group are accounted into.
+    explicit logstor_group(uint64_t segment_size, segment_stats_node* table_stats) noexcept
+        : _logstor_segments(segment_size, table_stats) {
     }
 
     virtual compaction_manager& logstor_compaction_manager() noexcept = 0;
@@ -612,6 +609,9 @@ public:
     virtual primary_index& logstor_index() noexcept = 0;
     virtual const primary_index& logstor_index() const noexcept = 0;
 
+    // The statistics of the segments this group owns are read through the set, see
+    // segment_set::stats(). They are already included in those of the table this group belongs to,
+    // which is where a caller that wants a whole table reads them rather than summing its groups.
     segment_set& logstor_segments() noexcept {
         return _logstor_segments;
     }
@@ -659,18 +659,6 @@ public:
         return _active_buffer.held_segments.size() + _flushing_buffer.held_segments.size();
     }
 
-    // Adds the totals of the segments this group owns to `totals`, see segment_set::add_totals_to().
-    void add_totals_to(segment_totals& totals) const noexcept {
-        ++totals.group_count;
-        _logstor_segments.add_totals_to(totals);
-    }
-
-    // Adds the segments this group owns to `stats`, their distribution by utilization included, see
-    // segment_set::add_stats_to().
-    void add_stats_to(segment_stats& stats) const noexcept {
-        ++stats.group_count;
-        _logstor_segments.add_stats_to(stats);
-    }
 };
 
 } // namespace replica::logstor

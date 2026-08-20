@@ -35,15 +35,11 @@ inline size_t utilization_bucket_of(uint64_t live_bytes, uint64_t segment_size) 
     return std::min<size_t>(live_bytes * utilization_bucket_count / segment_size, utilization_bucket_count - 1);
 }
 
-// Totals over the segments owned by a set of compaction groups: how many there are and how much of
-// what they hold is live. Every field is a sum over the groups, so the totals of a table are the sum
-// over its groups, those of a shard the sum over its tables, and those of a table on a node the sum
-// over the shards.
-//
-// These are separate from the distribution below because they are what the counters of a table are
-// derived from, several times per metrics scrape, and summing them over a group costs three
-// additions, whereas summing a distribution costs a pass over its buckets.
-struct segment_totals {
+// Statistics of the segments owned by a set of compaction groups: how many there are, how much of
+// what they hold is live, and how they are distributed by utilization. Every field is a sum over the
+// groups, so the statistics of a table are the sum over its groups, those of a shard the sum over its
+// tables, and those of a table on a node the sum over the shards.
+struct segment_stats {
     uint64_t group_count{0};
     uint64_t segment_count{0};
     // Bytes of the live records held by those segments. The rest of the space the segments take is
@@ -51,27 +47,106 @@ struct segment_totals {
     // most the live record bytes of the table, which also cover the records that are not in a
     // segment of a group yet, being still in the active segment or in a separator buffer.
     uint64_t live_bytes{0};
-
-    segment_totals& operator+=(const segment_totals& other) noexcept {
-        group_count += other.group_count;
-        segment_count += other.segment_count;
-        live_bytes += other.live_bytes;
-        return *this;
-    }
-};
-
-// The totals of a set of compaction groups together with the distribution of their segments by
-// utilization. Aggregate this only for a consumer that needs the distribution; one that only needs
-// how much space there is and how much of it is live sums the totals alone.
-struct segment_stats : segment_totals {
     utilization_histogram utilization{};
 
     segment_stats& operator+=(const segment_stats& other) noexcept {
-        segment_totals::operator+=(other);
+        group_count += other.group_count;
+        segment_count += other.segment_count;
+        live_bytes += other.live_bytes;
         for (size_t i = 0; i < utilization_bucket_count; ++i) {
             utilization[i] += other.utilization[i];
         }
         return *this;
+    }
+
+    // Takes back out what a component contributed to this sum. Only defined for a component that was
+    // summed into it, which is what makes the subtraction exact.
+    segment_stats& operator-=(const segment_stats& other) noexcept {
+        group_count -= other.group_count;
+        segment_count -= other.segment_count;
+        live_bytes -= other.live_bytes;
+        for (size_t i = 0; i < utilization_bucket_count; ++i) {
+            utilization[i] -= other.utilization[i];
+        }
+        return *this;
+    }
+};
+
+// A level of the segment statistics rollup: it holds the statistics of everything below it and points
+// at the level above, so that a change accounted here reaches every level that includes it.
+//
+// The chain runs from the set of segments a compaction group owns, through the table the group
+// belongs to, up to the shard, which makes reading the statistics of a table or of a shard a field
+// read rather than a walk of the compaction groups summing what each one holds. That walk is what the
+// metrics of a table would otherwise do several times per scrape, growing with the number of tablets
+// on the shard, and a metric is read from a callback that cannot yield. Keeping the statistics up to
+// date is the cheaper side of the trade: a level is three additions, and the levels are counted on the
+// fingers of one hand.
+//
+// A level is only ever changed through the set of segments at the bottom of it, which is what keeps
+// the levels in step: there is one place where a segment being linked, unlinked or freed from is
+// accounted, and the sums above follow from it.
+class segment_stats_node {
+    segment_stats _stats;
+    segment_stats_node* _parent;
+
+public:
+    // `groups` is what this level contributes to the group count of the levels above it: one for the
+    // level of a compaction group, none for a level that aggregates groups.
+    explicit segment_stats_node(segment_stats_node* parent = nullptr, uint64_t groups = 0) noexcept
+        : _parent(parent) {
+        _stats.group_count = groups;
+        for (auto* node = _parent; node; node = node->_parent) {
+            node->_stats.group_count += groups;
+        }
+    }
+
+    // Whatever is still accounted here goes with this level, so a set of segments destroyed while it
+    // still holds some doesn't leave them counted by its table.
+    ~segment_stats_node() {
+        for (auto* node = _parent; node; node = node->_parent) {
+            node->_stats -= _stats;
+        }
+    }
+
+    // A level holds the sum of the levels below it and they point back at it, so it can be neither
+    // copied nor moved.
+    segment_stats_node(const segment_stats_node&) = delete;
+    segment_stats_node& operator=(const segment_stats_node&) = delete;
+    segment_stats_node(segment_stats_node&&) = delete;
+    segment_stats_node& operator=(segment_stats_node&&) = delete;
+
+    const segment_stats& stats() const noexcept {
+        return _stats;
+    }
+
+    void add_segment(uint64_t live_bytes, size_t bucket) noexcept {
+        for (auto* node = this; node; node = node->_parent) {
+            ++node->_stats.segment_count;
+            node->_stats.live_bytes += live_bytes;
+            ++node->_stats.utilization[bucket];
+        }
+    }
+
+    void remove_segment(uint64_t live_bytes, size_t bucket) noexcept {
+        for (auto* node = this; node; node = node->_parent) {
+            --node->_stats.segment_count;
+            node->_stats.live_bytes -= live_bytes;
+            --node->_stats.utilization[bucket];
+        }
+    }
+
+    // Accounts the records freed from a segment that stays where it is, which takes it down the
+    // histogram if the space they gave back took it into a lower bucket.
+    void free_from_segment(uint64_t freed_bytes, size_t from_bucket, size_t to_bucket) noexcept {
+        const bool moved = from_bucket != to_bucket;
+        for (auto* node = this; node; node = node->_parent) {
+            node->_stats.live_bytes -= freed_bytes;
+            if (moved) {
+                --node->_stats.utilization[from_bucket];
+                ++node->_stats.utilization[to_bucket];
+            }
+        }
     }
 };
 

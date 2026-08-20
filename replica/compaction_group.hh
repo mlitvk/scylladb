@@ -339,6 +339,8 @@ public:
 
     logstor::primary_index& get_logstor_index() noexcept;
 
+    logstor::segment_stats_node& get_logstor_segment_stats_node() noexcept;
+
     logstor::logstor_group& as_logstor_group() noexcept;
     const logstor::logstor_group& as_logstor_group() const noexcept;
 
