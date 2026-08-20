@@ -233,6 +233,15 @@ SELECT * FROM keyspace.table_name;
 DELETE FROM keyspace.table_name WHERE pk = 1;
 ```
 
+## Measuring Performance
+
+Two tests measure the cost of an operation, at two levels. `scylla perf-simple-query --logstor` runs
+the whole read and write path of a single node against a logstor table, and it is the same test that
+measures an sstable backed table, so the two can be compared by dropping the flag.
+`test/perf/perf_logstor` drives a logstor directly and measures the steps of a read and of a write
+one at a time. Which one answers which question, how to run either so that two runs can be compared,
+and how to read what they report is in [logstor_perf.md](logstor_perf.md).
+
 ## On-Disk Format
 
 ### Files
