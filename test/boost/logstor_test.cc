@@ -2232,6 +2232,12 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_set_stats) {
         const auto stats = stats_of(set);
         BOOST_REQUIRE_EQUAL(stats.segment_count, expected_segments);
         BOOST_REQUIRE_EQUAL(stats.live_bytes, expected_live_bytes);
+        // The totals are read on their own by whoever has no use for the distribution, so they have
+        // to say the same as the statistics that carry it.
+        segment_totals totals;
+        set.add_totals_to(totals);
+        BOOST_REQUIRE_EQUAL(totals.segment_count, stats.segment_count);
+        BOOST_REQUIRE_EQUAL(totals.live_bytes, stats.live_bytes);
         // Every segment of the set is counted, and in exactly one bucket.
         uint64_t counted = 0;
         for (auto count : stats.utilization) {

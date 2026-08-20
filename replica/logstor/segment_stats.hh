@@ -35,10 +35,15 @@ inline size_t utilization_bucket_of(uint64_t live_bytes, uint64_t segment_size) 
     return std::min<size_t>(live_bytes * utilization_bucket_count / segment_size, utilization_bucket_count - 1);
 }
 
-// Statistics of the segments owned by a set of compaction groups. Every field is a sum over the
-// groups, so the statistics of a table are the sum over its groups, those of a shard the sum over
-// its tables, and those of a table on a node the sum over the shards.
-struct segment_stats {
+// Totals over the segments owned by a set of compaction groups: how many there are and how much of
+// what they hold is live. Every field is a sum over the groups, so the totals of a table are the sum
+// over its groups, those of a shard the sum over its tables, and those of a table on a node the sum
+// over the shards.
+//
+// These are separate from the distribution below because they are what the counters of a table are
+// derived from, several times per metrics scrape, and summing them over a group costs three
+// additions, whereas summing a distribution costs a pass over its buckets.
+struct segment_totals {
     uint64_t group_count{0};
     uint64_t segment_count{0};
     // Bytes of the live records held by those segments. The rest of the space the segments take is
@@ -46,12 +51,23 @@ struct segment_stats {
     // most the live record bytes of the table, which also cover the records that are not in a
     // segment of a group yet, being still in the active segment or in a separator buffer.
     uint64_t live_bytes{0};
-    utilization_histogram utilization{};
 
-    segment_stats& operator+=(const segment_stats& other) noexcept {
+    segment_totals& operator+=(const segment_totals& other) noexcept {
         group_count += other.group_count;
         segment_count += other.segment_count;
         live_bytes += other.live_bytes;
+        return *this;
+    }
+};
+
+// The totals of a set of compaction groups together with the distribution of their segments by
+// utilization. Aggregate this only for a consumer that needs the distribution; one that only needs
+// how much space there is and how much of it is live sums the totals alone.
+struct segment_stats : segment_totals {
+    utilization_histogram utilization{};
+
+    segment_stats& operator+=(const segment_stats& other) noexcept {
+        segment_totals::operator+=(other);
         for (size_t i = 0; i < utilization_bucket_count; ++i) {
             utilization[i] += other.utilization[i];
         }

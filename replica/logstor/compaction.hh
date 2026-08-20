@@ -340,15 +340,22 @@ struct segment_set {
         return _segment_list.empty();
     }
 
-    // Adds what this set holds to `stats`. The statistics are maintained as segments are linked,
-    // unlinked and freed from, so this is O(number of buckets) and exact, unlike a scan of the set,
-    // which would have to yield and could miss segments that move while it does. Accumulating into
-    // the caller's statistics, rather than returning a segment_stats of this set, is what keeps a
-    // caller that aggregates many sets from copying a utilization histogram per set. The group count
-    // is left to the caller, which knows how many groups it is aggregating.
+    // Adds the totals of what this set holds to `totals`. Both are maintained as segments are
+    // linked, unlinked and freed from, so this is O(1) and exact, unlike a scan of the set, which
+    // would have to yield and could miss segments that move while it does. The group count is left
+    // to the caller, which knows how many groups it is aggregating.
+    void add_totals_to(segment_totals& totals) const noexcept {
+        totals.segment_count += segment_count();
+        totals.live_bytes += live_bytes();
+    }
+
+    // Adds what this set holds, its distribution by utilization included, to `stats`. Maintained
+    // and therefore exact like the totals above, but O(number of buckets) rather than O(1): a caller
+    // that has no use for the distribution should add only the totals. Accumulating into the caller's
+    // statistics, rather than returning a segment_stats of this set, is what keeps a caller that
+    // aggregates many sets from copying a utilization histogram per set.
     void add_stats_to(segment_stats& stats) const noexcept {
-        stats.segment_count += segment_count();
-        stats.live_bytes += live_bytes();
+        add_totals_to(stats);
         for (size_t i = 0; i < utilization_bucket_count; ++i) {
             stats.utilization[i] += _utilization[i];
         }
@@ -652,7 +659,14 @@ public:
         return _active_buffer.held_segments.size() + _flushing_buffer.held_segments.size();
     }
 
-    // Adds the segments this group owns to `stats`, see segment_set::add_stats_to().
+    // Adds the totals of the segments this group owns to `totals`, see segment_set::add_totals_to().
+    void add_totals_to(segment_totals& totals) const noexcept {
+        ++totals.group_count;
+        _logstor_segments.add_totals_to(totals);
+    }
+
+    // Adds the segments this group owns to `stats`, their distribution by utilization included, see
+    // segment_set::add_stats_to().
     void add_stats_to(segment_stats& stats) const noexcept {
         ++stats.group_count;
         _logstor_segments.add_stats_to(stats);
