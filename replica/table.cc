@@ -2297,7 +2297,7 @@ void table::set_metrics() {
                     ms::make_gauge("logstor_segments", ms::description("Number of logstor segments owned by this table"),
                             [this] { return logstor_segment_count(); })(cf)(ks),
                     ms::make_gauge("logstor_segment_live_bytes", ms::description("Bytes of the live records held by the logstor segments of this table. Over the space those segments take it is their mean utilization, and under it is the space compaction can reclaim from them."),
-                            [this] { return logstor_segment_stats().live_bytes; })(cf)(ks),
+                            [this] { return logstor_segment_live_bytes(); })(cf)(ks),
                     ms::make_gauge("logstor_segment_occupied_bytes", ms::description("Space the logstor segments of this table take, dead records included. Unlike the disk space of the table it excludes the sstables, so it pairs with the live bytes of the segments."),
                             [this] { return logstor_disk_space_used(); })(cf)(ks)
             });
@@ -2368,7 +2368,7 @@ void table::set_metrics() {
                         ms::make_gauge("logstor_segments", ms::description("Number of logstor segments owned by this table"),
                                 [this] { return logstor_segment_count(); })(cf)(ks)(node_table_metrics).aggregate({seastar::metrics::shard_label}),
                         ms::make_gauge("logstor_segment_live_bytes", ms::description("Bytes of the live records held by the logstor segments of this table. Over the space those segments take it is their mean utilization, and under it is the space compaction can reclaim from them."),
-                                [this] { return logstor_segment_stats().live_bytes; })(cf)(ks)(node_table_metrics).aggregate({seastar::metrics::shard_label}),
+                                [this] { return logstor_segment_live_bytes(); })(cf)(ks)(node_table_metrics).aggregate({seastar::metrics::shard_label}),
                         ms::make_gauge("logstor_segment_occupied_bytes", ms::description("Space the logstor segments of this table take, dead records included. Unlike the disk space of the table it excludes the sstables, so it pairs with the live bytes of the segments."),
                                 [this] { return logstor_disk_space_used(); })(cf)(ks)(node_table_metrics).aggregate({seastar::metrics::shard_label})
                 });
@@ -2437,14 +2437,29 @@ void table::rebuild_statistics() {
     });
 }
 
+logstor::segment_totals table::logstor_segment_totals() const {
+    logstor::segment_totals totals;
+    if (!uses_logstor()) {
+        return totals;
+    }
+
+    // Every group maintains its own statistics as segments are linked, unlinked and freed from, so
+    // this only sums them up and doesn't have to yield or walk the segments themselves.
+    for_each_compaction_group([&totals] (const compaction_group& cg) {
+        cg.as_logstor_group().add_totals_to(totals);
+    });
+
+    return totals;
+}
+
 logstor::segment_stats table::logstor_segment_stats() const {
     logstor::segment_stats stats;
     if (!uses_logstor()) {
         return stats;
     }
 
-    // Every group maintains its own statistics as segments are linked, unlinked and freed from, so
-    // this only sums them up and doesn't have to yield or walk the segments themselves.
+    // Aggregates a utilization histogram per group on top of what the totals above cost, so this is
+    // for the consumers that report the distribution rather than for the counters below.
     for_each_compaction_group([&stats] (const compaction_group& cg) {
         cg.as_logstor_group().add_stats_to(stats);
     });
@@ -2453,7 +2468,11 @@ logstor::segment_stats table::logstor_segment_stats() const {
 }
 
 uint64_t table::logstor_segment_count() const {
-    return logstor_segment_stats().segment_count;
+    return logstor_segment_totals().segment_count;
+}
+
+uint64_t table::logstor_segment_live_bytes() const {
+    return logstor_segment_totals().live_bytes;
 }
 
 uint64_t table::logstor_disk_space_used() const {

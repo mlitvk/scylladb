@@ -1237,12 +1237,18 @@ public:
     // how much of them is still live. Use this where the data volume is what matters, and the disk
     // space accessors above where the space on disk is. See compaction_group::live_data_size().
     uint64_t live_data_size() const;
-    // Statistics of the logstor segments this table owns on this shard, summed over its compaction
-    // groups. Empty for a table that doesn't use logstor. This is the one walk of the groups that
-    // every logstor segment statistic below is derived from.
+    // Totals of the logstor segments this table owns on this shard, summed over its compaction
+    // groups. Empty for a table that doesn't use logstor. This is the walk of the groups that every
+    // logstor segment counter below is derived from, and it leaves their utilization histograms
+    // alone: aggregating those costs a pass over the buckets per group and no counter needs them.
+    logstor::segment_totals logstor_segment_totals() const;
+    // The same with the distribution of those segments by utilization, which costs more to aggregate.
+    // Only for a consumer that needs the distribution.
     logstor::segment_stats logstor_segment_stats() const;
     // Number of logstor segments this table owns.
     uint64_t logstor_segment_count() const;
+    // Bytes of the live records held by the logstor segments this table owns.
+    uint64_t logstor_segment_live_bytes() const;
     // Space taken by the logstor segments this table owns. Zero for a table that doesn't use logstor.
     uint64_t logstor_disk_space_used() const;
     // Bytes of the live records of this table, taken from its index rather than from the segments,
