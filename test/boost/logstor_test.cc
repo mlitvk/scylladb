@@ -1867,7 +1867,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_write_io_error_signals_disk_error)
     ls.start().get();
     auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
 
-    test_compaction_group_handle cg(schema, ls);
+    test_logstor_group cg(schema, ls);
 
     unsigned signalled = 0;
     boost::signals2::scoped_connection conn = logstor_error.connect([&signalled] { ++signalled; });
