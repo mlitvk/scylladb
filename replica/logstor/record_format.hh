@@ -7,11 +7,18 @@
  */
 #pragma once
 
+#include <memory>
+#include <optional>
+#include <vector>
+
 #include <seastar/core/simple-stream.hh>
 
 #include "bytes_fwd.hh"
 #include "mutation/timestamp.hh"
+#include "schema/schema_fwd.hh"
+#include "types/types.hh"
 
+class column_definition;
 class mutation_partition;
 class schema;
 
@@ -103,6 +110,64 @@ inline constexpr uint8_t has_value_length = 0x40;
 
 } // namespace cell_flags
 
+// Maps the columns of a record written under one schema version onto the columns of the
+// schema it is read under. Building one parses the record's schema description, a type parse
+// per column, so it is built once per pair of schema versions rather than once per record -
+// which is what column_translation_cache is for.
+//
+// A column the schema no longer has, or one whose type can no longer hold the values the
+// record holds for it, is dropped from the decoded partition rather than reported. That is
+// what a logstor read does today, through canonical_mutation and
+// converting_mutation_partition_applier, and the format keeps it. Note that this is more
+// lenient than the sstable reader, which refuses such a record.
+class column_translation {
+public:
+    struct column {
+        // The type the record was written with. It, and not the schema's type, is what the
+        // record is decoded with: the two can differ by a value-compatible ALTER TYPE, and
+        // it is the record that says how many bytes its values take.
+        data_type type;
+        std::optional<uint32_t> value_length;
+        // Null when the schema being read has no column of that name, or has one the
+        // record's values do not fit. Either way the cell is parsed and dropped.
+        const column_definition* def = nullptr;
+    };
+
+private:
+    // Holds the schema the column definitions belong to.
+    schema_ptr _schema;
+    table_schema_version _record_version;
+    std::vector<column> _columns;
+
+public:
+    // description is the schema description of a record written under record_version.
+    column_translation(const schema& s, table_schema_version record_version, bytes_view description);
+
+    table_schema_version record_version() const noexcept { return _record_version; }
+    const std::vector<column>& columns() const noexcept { return _columns; }
+};
+
+// The translations a table needs, cached. Held per table, and passed to every read: a read
+// of a record written under the schema version it is read under does not touch it.
+class column_translation_cache {
+    // A table's records span more schema versions than this only while several ALTERs are
+    // in flight, and a translation is cheap to rebuild, so the cache is simply emptied
+    // rather than grown or ordered by use.
+    static constexpr size_t max_entries = 8;
+
+    // The schema version the entries translate to. A schema change makes all of them stale.
+    table_schema_version _schema_version;
+    // unique_ptr so that a translation handed out stays put when the cache grows.
+    std::vector<std::unique_ptr<const column_translation>> _translations;
+
+public:
+    // The translation of a record written under record_version to the schema s. Parses the
+    // record's schema description only for a pair of versions not seen yet.
+    const column_translation& get(const schema& s, table_schema_version record_version, bytes_view description);
+
+    size_t size() const noexcept { return _translations.size(); }
+};
+
 // The size the partition takes encoded. Walks the partition without allocating or
 // copying, so that the record can be written straight into the write buffer.
 size_t measure_row_value(const schema& s, const mutation_partition& p, api::timestamp_type base_ts);
@@ -112,7 +177,9 @@ void write_row_value(seastar::simple_memory_output_stream& out, const schema& s,
         api::timestamp_type base_ts);
 
 // Decodes an encoded partition into p, which must be empty. The cells are read straight
-// out of value, so it does not have to outlive the call.
-void read_row_value_into(mutation_partition& p, const schema& s, bytes_view value, api::timestamp_type base_ts);
+// out of value, so it does not have to outlive the call. translations is consulted only for
+// a record written under a schema version other than the one it is read under.
+void read_row_value_into(mutation_partition& p, const schema& s, bytes_view value, api::timestamp_type base_ts,
+        column_translation_cache& translations);
 
 } // namespace replica::logstor

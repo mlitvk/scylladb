@@ -32,8 +32,9 @@ namespace {
 
 // A logstor table: a partition key and regular columns, no clustering and hence no static
 // columns.
-schema_ptr make_logstor_schema(std::vector<std::pair<sstring, data_type>> columns, size_t pk_components = 1) {
-    schema_builder builder(1, "ks", "cf");
+schema_ptr make_logstor_schema(std::vector<std::pair<sstring, data_type>> columns, size_t pk_components = 1,
+        std::optional<table_id> id = std::nullopt) {
+    schema_builder builder(1, "ks", "cf", id);
     for (size_t i = 0; i < pk_components; ++i) {
         builder.with_column(to_bytes(fmt::format("pk{}", i)), bytes_type, column_kind::partition_key);
     }
@@ -94,9 +95,10 @@ bytes encode(const mutation& m, api::timestamp_type base_ts) {
     return encoded;
 }
 
-mutation decode(schema_ptr s, const dht::decorated_key& dk, bytes_view encoded, api::timestamp_type base_ts) {
+mutation decode(schema_ptr s, const dht::decorated_key& dk, bytes_view encoded, api::timestamp_type base_ts,
+        column_translation_cache& translations) {
     mutation_partition p(*s);
-    read_row_value_into(p, *s, encoded, base_ts);
+    read_row_value_into(p, *s, encoded, base_ts, translations);
     return mutation(s, dk, std::move(p));
 }
 
@@ -105,14 +107,40 @@ mutation decode(schema_ptr s, const dht::decorated_key& dk, bytes_view encoded, 
 // unrelated one, so that the deltas are exercised as well.
 size_t check_round_trip(const mutation& m) {
     size_t encoded_size = 0;
+    column_translation_cache translations;
     for (auto base_ts : {base_timestamp_of(m), api::timestamp_type(0)}) {
         auto encoded = encode(m, base_ts);
-        assert_that(decode(m.schema(), m.decorated_key(), encoded, base_ts)).is_equal_to(m);
+        assert_that(decode(m.schema(), m.decorated_key(), encoded, base_ts, translations)).is_equal_to(m);
         if (base_ts == base_timestamp_of(m)) {
             encoded_size = encoded.size();
         }
     }
+    // A record read under the schema version it was written with needs no translation.
+    BOOST_REQUIRE_EQUAL(translations.size(), 0);
     return encoded_size;
+}
+
+// Reads the record of a mutation written under one schema under another, and requires the
+// result to be the one a logstor read produces today: canonical_mutation, the form logstor
+// stores, is the reference for what ALTER TABLE does to a record written before it.
+mutation check_read_under(const mutation& m, schema_ptr target) {
+    const auto base_ts = base_timestamp_of(m);
+    const auto encoded = encode(m, base_ts);
+
+    column_translation_cache translations;
+    auto decoded = decode(target, m.decorated_key(), encoded, base_ts, translations);
+    BOOST_REQUIRE_EQUAL(translations.size(), 1);
+
+    assert_that(decoded).is_equal_to(canonical_mutation(m).to_mutation(target));
+    return decoded;
+}
+
+size_t cell_count(const mutation& m) {
+    size_t count = 0;
+    for (const auto& e : m.partition().clustered_rows()) {
+        count += e.row().cells().size();
+    }
+    return count;
 }
 
 } // anonymous namespace
@@ -394,7 +422,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_format_extreme_timestamps) {
     }
 }
 
-SEASTAR_THREAD_TEST_CASE(test_logstor_record_format_rejects_a_foreign_schema_version) {
+SEASTAR_THREAD_TEST_CASE(test_logstor_record_format_reads_under_the_schema_version_it_was_written_with) {
     auto s = make_blob_column_schema(2);
     auto m = make_logstor_mutation(s);
     const auto ts = api::timestamp_type(1700000000000000);
@@ -406,8 +434,16 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_format_rejects_a_foreign_schema_ver
     auto other = schema_builder(s).with_column(to_bytes("added"), bytes_type).build();
     BOOST_REQUIRE_NE(other->version(), s->version());
 
-    mutation_partition p(*other);
-    BOOST_REQUIRE_THROW(read_row_value_into(p, *other, encoded, ts), std::runtime_error);
+    // Reading it under the schema it was written with must not consult the cache, and
+    // reading it under another one must.
+    column_translation_cache translations;
+    mutation_partition same(*s);
+    read_row_value_into(same, *s, encoded, ts, translations);
+    BOOST_REQUIRE_EQUAL(translations.size(), 0);
+
+    mutation_partition evolved(*other);
+    read_row_value_into(evolved, *other, encoded, ts, translations);
+    BOOST_REQUIRE_EQUAL(translations.size(), 1);
 }
 
 SEASTAR_THREAD_TEST_CASE(test_logstor_record_format_rejects_a_partition_it_cannot_hold) {
@@ -445,6 +481,178 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_format_rejects_a_partition_it_canno
                 tombstone(ts, gc_clock::now()));  // a strict prefix of the two-column key
         BOOST_REQUIRE_THROW(measure_row_value(*s, m.partition(), ts), std::runtime_error);
     }
+}
+
+SEASTAR_THREAD_TEST_CASE(test_logstor_record_format_read_after_add_column) {
+    auto s = make_blob_column_schema(3);
+    auto m = make_logstor_mutation(s);
+    const auto ts = api::timestamp_type(1700000000000000);
+
+    row_of(m).apply(row_marker(ts));
+    for (size_t i = 0; i < 3; ++i) {
+        set_blob_cell(m, fmt::format("column{:02}", i), to_bytes("v"), ts);
+    }
+
+    // A column added between the write and the read shifts the ids of the columns after it,
+    // since a schema orders its regular columns by name.
+    auto target = schema_builder(s).with_column(to_bytes("column01a"), bytes_type).build();
+    auto decoded = check_read_under(m, target);
+    BOOST_REQUIRE_EQUAL(cell_count(decoded), 3);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_logstor_record_format_read_after_drop_column) {
+    auto s = make_blob_column_schema(3);
+    auto m = make_logstor_mutation(s);
+    const auto ts = api::timestamp_type(1700000000000000);
+
+    row_of(m).apply(row_marker(ts));
+    for (size_t i = 0; i < 3; ++i) {
+        set_blob_cell(m, fmt::format("column{:02}", i), to_bytes("v"), ts);
+    }
+
+    // What the record holds for the dropped column is parsed - it is what advances the read
+    // past it - and left out of the partition.
+    auto target = schema_builder(s).remove_column(to_bytes("column01")).build();
+    auto decoded = check_read_under(m, target);
+    BOOST_REQUIRE_EQUAL(cell_count(decoded), 2);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_logstor_record_format_read_after_drop_and_add_column) {
+    auto s = make_blob_column_schema(2);
+    auto m = make_logstor_mutation(s);
+    const auto ts = api::timestamp_type(1700000000000000);
+
+    row_of(m).apply(row_marker(ts));
+    set_blob_cell(m, "column00", to_bytes("v0"), ts);
+    set_blob_cell(m, "column01", to_bytes("v1"), ts);
+
+    // A column dropped and added again keeps the timestamp of the drop, and a cell written
+    // before it is not part of the column any more.
+    {
+        auto target = schema_builder(s).remove_column(to_bytes("column00"), ts + 10)
+                .with_column(to_bytes("column00"), bytes_type).build();
+        auto decoded = check_read_under(m, target);
+        BOOST_REQUIRE_EQUAL(cell_count(decoded), 1);
+    }
+    // Dropped before the record was written, so the cell is newer than the drop and stays.
+    {
+        auto target = schema_builder(s).remove_column(to_bytes("column00"), ts - 10)
+                .with_column(to_bytes("column00"), bytes_type).build();
+        auto decoded = check_read_under(m, target);
+        BOOST_REQUIRE_EQUAL(cell_count(decoded), 2);
+    }
+}
+
+SEASTAR_THREAD_TEST_CASE(test_logstor_record_format_read_after_altered_column_type) {
+    // The two schemas are the same table, before and after an ALTER TYPE.
+    const auto id = table_id(utils::make_random_uuid());
+    auto s = make_logstor_schema({{"i", int32_type}, {"t", utf8_type}}, 1, id);
+    auto m = make_logstor_mutation(s);
+    const auto ts = api::timestamp_type(1700000000000000);
+
+    row_of(m).apply(row_marker(ts));
+    set_cell(m, "i", atomic_cell::make_live(*int32_type, ts, int32_type->decompose(int32_t(42))));
+    set_cell(m, "t", atomic_cell::make_live(*utf8_type, ts, utf8_type->decompose(sstring("v"))));
+
+    // A blob holds the value of any type, so the cell survives. The column was fixed-width
+    // when the record was written, so the record carries no size for its value and the read
+    // has to take it from the type the record was written with, not from the schema's.
+    {
+        auto target = make_logstor_schema({{"i", bytes_type}, {"t", utf8_type}}, 1, id);
+        auto decoded = check_read_under(m, target);
+        BOOST_REQUIRE_EQUAL(cell_count(decoded), 2);
+        const auto& cdef = *target->get_column_definition(to_bytes("i"));
+        const auto* cell = row_of(decoded).cells().find_cell(cdef.id);
+        BOOST_REQUIRE(cell);
+        BOOST_REQUIRE_EQUAL(cell->as_atomic_cell(cdef).value().size_bytes(), 4);
+    }
+    // A text column cannot hold what the record holds for it, so that cell is left out.
+    {
+        auto target = make_logstor_schema({{"i", utf8_type}, {"t", utf8_type}}, 1, id);
+        auto decoded = check_read_under(m, target);
+        BOOST_REQUIRE_EQUAL(cell_count(decoded), 1);
+    }
+}
+
+SEASTAR_THREAD_TEST_CASE(test_logstor_record_format_read_a_collection_after_drop_and_add_column) {
+    auto live_map = map_type_impl::get_instance(utf8_type, utf8_type, true);
+    auto s = make_logstor_schema({{"m", live_map}, {"v", bytes_type}});
+    const auto ts = api::timestamp_type(1700000000000000);
+
+    auto m = make_logstor_mutation(s);
+    row_of(m).apply(row_marker(ts));
+    set_blob_cell(m, "v", to_bytes("v"), ts);
+    {
+        collection_mutation_writer writer({});
+        const auto old_key = utf8_type->decompose(sstring("a"));
+        const auto new_key = utf8_type->decompose(sstring("b"));
+        const auto old_cell = atomic_cell::make_live(*utf8_type, ts, utf8_type->decompose(sstring("old")),
+                atomic_cell::collection_member::yes);
+        const auto new_cell = atomic_cell::make_live(*utf8_type, ts + 100, utf8_type->decompose(sstring("new")),
+                atomic_cell::collection_member::yes);
+        writer.push_back(bytes_view(old_key), atomic_cell_view(old_cell));
+        writer.push_back(bytes_view(new_key), atomic_cell_view(new_cell));
+        row_of(m).cells().apply(*s->get_column_definition(to_bytes("m")), std::move(writer).finish());
+    }
+
+    // The record stores a collection verbatim, but a column dropped and added again means
+    // the elements written before the drop are no longer part of it, so a read under the new
+    // schema version has to rebuild the collection without them.
+    {
+        auto target = schema_builder(s).remove_column(to_bytes("m"), ts + 50)
+                .with_column(to_bytes("m"), live_map).build();
+        auto decoded = check_read_under(m, target);
+        const auto& cdef = *target->get_column_definition(to_bytes("m"));
+        const auto* cell = row_of(decoded).cells().find_cell(cdef.id);
+        BOOST_REQUIRE(cell);
+        BOOST_REQUIRE_EQUAL(cell->as_collection_mutation().size(), 1);
+    }
+    // Every element is older than the drop, so nothing of the collection is left and the
+    // cell itself goes.
+    {
+        auto target = schema_builder(s).remove_column(to_bytes("m"), ts + 1000)
+                .with_column(to_bytes("m"), live_map).build();
+        auto decoded = check_read_under(m, target);
+        BOOST_REQUIRE_EQUAL(cell_count(decoded), 1);
+    }
+}
+
+SEASTAR_THREAD_TEST_CASE(test_logstor_record_format_column_translation_cache) {
+    auto s = make_blob_column_schema(2);
+    const auto ts = api::timestamp_type(1700000000000000);
+
+    auto m = make_logstor_mutation(s);
+    row_of(m).apply(row_marker(ts));
+    set_blob_cell(m, "column00", to_bytes("v"), ts);
+    const auto encoded = encode(m, ts);
+
+    auto added_one = schema_builder(s).with_column(to_bytes("a"), bytes_type).build();
+    auto added_two = schema_builder(added_one).with_column(to_bytes("b"), bytes_type).build();
+
+    auto m_added_one = make_logstor_mutation(added_one);
+    row_of(m_added_one).apply(row_marker(ts));
+    set_blob_cell(m_added_one, "column00", to_bytes("v"), ts);
+    const auto encoded_added_one = encode(m_added_one, ts);
+
+    column_translation_cache translations;
+    const auto read_under = [&translations] (schema_ptr target, bytes_view record) {
+        mutation_partition p(*target);
+        read_row_value_into(p, *target, record, api::timestamp_type(1700000000000000), translations);
+    };
+
+    // One entry per pair of schema versions, however many records go through it.
+    for (int i = 0; i < 3; ++i) {
+        read_under(added_two, encoded);
+    }
+    BOOST_REQUIRE_EQUAL(translations.size(), 1);
+
+    // A second version of the records written, a second entry.
+    read_under(added_two, encoded_added_one);
+    BOOST_REQUIRE_EQUAL(translations.size(), 2);
+
+    // Reading under another schema version makes every entry stale.
+    read_under(added_one, encoded);
+    BOOST_REQUIRE_EQUAL(translations.size(), 1);
 }
 
 SEASTAR_THREAD_TEST_CASE(test_logstor_record_format_round_trips_random_mutations) {
@@ -488,6 +696,12 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_format_round_trips_random_mutations
             }
 
             check_round_trip(m);
+
+            // And the same record read under a later schema version, over whatever types the
+            // schema was generated with.
+            check_read_under(m, schema_builder(m.schema())
+                    .with_column(to_bytes("added_column"), bytes_type)
+                    .build());
         }
     }
 }

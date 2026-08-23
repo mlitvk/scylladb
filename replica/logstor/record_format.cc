@@ -10,6 +10,7 @@
 #include <seastar/core/byteorder.hh>
 
 #include "bytes.hh"
+#include "db/marshal/type_parser.hh"
 #include "keys/keys.hh"
 #include "mutation/atomic_cell.hh"
 #include "mutation/collection_mutation.hh"
@@ -278,7 +279,7 @@ public:
         p._all = true;
         return p;
     }
-    static column_presence read(value_reader& r, column_count_type n_columns) {
+    static column_presence read(value_reader& r, size_t n_columns) {
         column_presence p;
         if (n_columns <= 64) {
             p._small = r.uvint();
@@ -288,7 +289,7 @@ public:
         return p;
     }
 
-    bool contains(column_id id) const noexcept {
+    bool contains(size_t id) const noexcept {
         if (_all) {
             return true;
         }
@@ -298,6 +299,137 @@ public:
         return static_cast<uint8_t>(_large[id / 8]) & (uint8_t(1) << (id % 8));
     }
 };
+
+// A column that was dropped and added again keeps the timestamp of the drop, and whatever a
+// record holds for it from before that is not part of the column any more. Mirrors what
+// converting_mutation_partition_applier does with such a cell.
+std::optional<collection_mutation> without_dropped_elements(collection_mutation_view cell, api::timestamp_type dropped_at) {
+    const auto tomb = cell.tomb();
+    collection_mutation_writer kept(tomb.timestamp > dropped_at ? tomb : tombstone{});
+    for (const auto& [key, element] : cell) {
+        if (element.timestamp() > dropped_at) {
+            kept.push_back(key, element);
+        }
+    }
+    if (kept.empty()) {
+        return std::nullopt;
+    }
+    return std::move(kept).finish();
+}
+
+// Where one cell of a record goes in the schema it is read under.
+struct target_column {
+    // Null when the schema has no column for it. The cell is parsed anyway: the parse is
+    // what advances the reader past it.
+    const column_definition* def;
+    // The type the record was written with, which is what says how long a value of a
+    // fixed-width type is. The same as the schema's type unless the record was written
+    // under another schema version.
+    const abstract_type* type;
+    std::optional<uint32_t> value_length;
+    // Cells at or below it are not part of the column any more.
+    api::timestamp_type dropped_at;
+    // Set when the record was written under another schema version. Then a position can
+    // land on any column id, so the cells do not arrive in column id order, and the cells
+    // of a column dropped and added again have to be filtered.
+    bool translated;
+};
+
+// Reads one cell and adds it to the row, or drops it if the schema has no column for it.
+void read_cell_into(row& cells, value_reader& r, const target_column& target, api::timestamp_type base_ts,
+        int64_t dt_base, const row_marker& marker) {
+    const auto flags = r.u8();
+
+    auto add = [&cells, &target] (atomic_cell_or_collection cell) {
+        if (target.translated) {
+            cells.apply(*target.def, std::move(cell));
+        } else {
+            cells.append_cell(target.def->id, std::move(cell));
+        }
+    };
+
+    if (flags & cell_flags::is_collection) {
+        if (!target.type->is_multi_cell()) {
+            throw std::runtime_error(fmt::format("logstor record holds a collection for the atomic type {}",
+                    target.type->name()));
+        }
+        const auto data = r.read(r.uvint());
+        if (!target.def) {
+            return;
+        }
+        const collection_mutation_view cell{managed_bytes_view(data)};
+        if (target.dropped_at != api::missing_timestamp) {
+            if (auto kept = without_dropped_elements(cell, target.dropped_at)) {
+                add(std::move(*kept));
+            }
+            return;
+        }
+        if (target.translated && cell.empty()) {
+            // A read under another schema version rebuilds a collection cell, and one that
+            // holds nothing does not survive that. Keep it that way.
+            return;
+        }
+        add(collection_mutation(managed_bytes(data)));
+        return;
+    }
+
+    if (target.type->is_multi_cell()) {
+        throw std::runtime_error(fmt::format("logstor record holds an atomic cell for the collection type {}",
+                target.type->name()));
+    }
+
+    const auto timestamp = flags & cell_flags::use_base_timestamp
+            ? base_ts
+            : value_of_delta(r.svint(), base_ts);
+    // A cell of a column dropped and added again, or one of a column the schema does not
+    // have at all, is parsed and then left out.
+    const bool keep = target.def && timestamp > target.dropped_at;
+
+    if (flags & cell_flags::is_deleted) {
+        const auto deletion_time = deletion_time_from_delta(r.svint(), dt_base);
+        if (keep) {
+            add(atomic_cell::make_dead(timestamp, deletion_time));
+        }
+        return;
+    }
+
+    std::optional<gc_clock::duration> ttl;
+    std::optional<gc_clock::time_point> expiry;
+    if (flags & cell_flags::is_expiring) {
+        if (flags & cell_flags::use_marker_ttl) {
+            if (!marker.is_live() || !marker.is_expiring()) {
+                throw std::runtime_error("logstor record cell takes its ttl from a row marker that has none");
+            }
+            ttl = marker.ttl();
+            expiry = marker.expiry();
+        } else {
+            ttl = gc_clock::duration(static_cast<gc_clock::rep>(r.uvint()));
+            expiry = deletion_time_from_delta(r.svint(), dt_base);
+        }
+    }
+
+    bytes_view value;
+    if (!(flags & cell_flags::has_empty_value)) {
+        if (flags & cell_flags::has_value_length) {
+            value = r.read(r.uvint());
+        } else {
+            if (!target.value_length) {
+                throw std::runtime_error(fmt::format("logstor record holds a cell of no length for the "
+                        "variable-length type {}", target.type->name()));
+            }
+            value = r.read(*target.value_length);
+        }
+    }
+
+    if (!keep) {
+        return;
+    }
+    // The value is stored under the schema's type, which the record's values fit by the
+    // time the translation hands the column over.
+    add(expiry
+            ? atomic_cell::make_live(*target.def->type, timestamp, value, *expiry, *ttl)
+            : atomic_cell::make_live(*target.def->type, timestamp, value));
+}
 
 template <typename Sink>
 void encode_cell(Sink& sink, const column_definition& cdef, const atomic_cell_or_collection& cell,
@@ -449,6 +581,66 @@ void encode_row_value(Sink& sink, const schema& s, const mutation_partition& p, 
 
 } // anonymous namespace
 
+column_translation::column_translation(const schema& s, table_schema_version record_version, bytes_view description)
+        : _schema(s.shared_from_this())
+        , _record_version(record_version) {
+    value_reader r(description);
+
+    const auto type_count = r.uvint();
+    utils::small_vector<data_type, 8> types;
+    types.reserve(type_count);
+    for (uint64_t i = 0; i < type_count; ++i) {
+        const auto name = r.read(r.uvint());
+        types.push_back(db::marshal::type_parser::parse(to_string_view(name)));
+    }
+
+    const auto column_count = r.uvint();
+    _columns.reserve(column_count);
+    for (uint64_t i = 0; i < column_count; ++i) {
+        const auto name = r.read(r.uvint());
+        const auto type_index = r.uvint();
+        if (type_index >= types.size()) {
+            throw std::runtime_error(fmt::format("logstor record column {} refers to type {} of {}",
+                    i, type_index, types.size()));
+        }
+        const auto& type = types[type_index];
+
+        const auto* def = s.get_column_definition(bytes(name));
+        if (def && !(is_compatible(def->kind, column_kind::regular_column) && def->type->is_value_compatible_with(*type))) {
+            // The column is no longer one the record's values fit, so what the record holds
+            // for it is dropped, exactly as a read through canonical_mutation drops it.
+            def = nullptr;
+        }
+        _columns.push_back(column{
+            .type = type,
+            .value_length = type->value_length_if_fixed(),
+            .def = def,
+        });
+    }
+
+    if (r.size()) {
+        throw std::runtime_error(fmt::format("logstor record schema description has {} trailing bytes", r.size()));
+    }
+}
+
+const column_translation& column_translation_cache::get(const schema& s, table_schema_version record_version,
+        bytes_view description) {
+    if (_schema_version != s.version()) {
+        _translations.clear();
+        _schema_version = s.version();
+    }
+    for (const auto& translation : _translations) {
+        if (translation->record_version() == record_version) {
+            return *translation;
+        }
+    }
+    if (_translations.size() >= max_entries) {
+        _translations.clear();
+    }
+    _translations.push_back(std::make_unique<const column_translation>(s, record_version, description));
+    return *_translations.back();
+}
+
 size_t measure_row_value(const schema& s, const mutation_partition& p, api::timestamp_type base_ts) {
     measuring_sink sink;
     encode_row_value(sink, s, p, base_ts);
@@ -461,7 +653,8 @@ void write_row_value(seastar::simple_memory_output_stream& out, const schema& s,
     encode_row_value(sink, s, p, base_ts);
 }
 
-void read_row_value_into(mutation_partition& p, const schema& s, bytes_view value, api::timestamp_type base_ts) {
+void read_row_value_into(mutation_partition& p, const schema& s, bytes_view value, api::timestamp_type base_ts,
+        column_translation_cache& translations) {
     value_reader r(value);
 
     const auto flags = r.u8();
@@ -472,14 +665,14 @@ void read_row_value_into(mutation_partition& p, const schema& s, bytes_view valu
     const auto version_msb = static_cast<int64_t>(r.u64());
     const auto version_lsb = static_cast<int64_t>(r.u64());
     const auto version = table_schema_version(utils::UUID(version_msb, version_lsb));
-    const auto description_size = r.uvint();
-    if (version != s.version()) {
-        throw std::runtime_error(fmt::format("logstor record was written under schema version {}, read under {}",
-                version, s.version()));
+    // Under the same schema version the description says nothing the schema does not, and
+    // position i in the encoding is column id i, so it is stepped over unparsed.
+    const auto description = r.read(r.uvint());
+
+    const column_translation* translation = nullptr;
+    if (version != s.version()) [[unlikely]] {
+        translation = &translations.get(s, version, description);
     }
-    // Same schema version: position i in the encoding is column id i, so the description
-    // is skipped without being parsed.
-    r.skip(description_size);
 
     const auto dt_base = deletion_time_base(base_ts);
     auto read_tombstone = [&r, base_ts, dt_base] {
@@ -487,11 +680,17 @@ void read_row_value_into(mutation_partition& p, const schema& s, bytes_view valu
         const auto deletion_time = deletion_time_from_delta(r.svint(), dt_base);
         return tombstone(timestamp, deletion_time);
     };
+    auto check_fully_read = [&r] {
+        if (r.size()) {
+            throw std::runtime_error(fmt::format("logstor record value has {} trailing bytes", r.size()));
+        }
+    };
 
     if (flags & row_value_flags::has_partition_tombstone) {
         p.apply(read_tombstone());
     }
     if (!(flags & row_value_flags::has_row)) {
+        check_fully_read();
         return;
     }
 
@@ -529,80 +728,44 @@ void read_row_value_into(mutation_partition& p, const schema& s, bytes_view valu
         dr.apply(row_tombstone(deleted_at, shadowable_deleted_at));
     }
 
-    const auto n_columns = s.regular_columns_count();
+    // The cells are the record's columns, which are the schema's only as long as the two
+    // schema versions are the same one.
+    const auto column_count = translation ? translation->columns().size() : s.regular_columns_count();
     const auto presence = flags & row_value_flags::has_column_bitmap
-            ? column_presence::read(r, n_columns)
+            ? column_presence::read(r, column_count)
             : column_presence::all();
 
     auto& cells = dr.cells();
-    for (column_id id = 0; id < n_columns; ++id) {
-        if (!presence.contains(id)) {
+    for (size_t position = 0; position < column_count; ++position) {
+        if (!presence.contains(position)) {
             continue;
         }
-        const auto& cdef = s.regular_column_at(id);
-        const auto cell_flags_byte = r.u8();
-
-        if (cell_flags_byte & cell_flags::is_collection) {
-            if (!cdef.is_multi_cell()) {
-                throw std::runtime_error(fmt::format("logstor record holds a collection for the atomic column {}",
-                        cdef.name_as_text()));
-            }
-            const auto data = r.read(r.uvint());
-            cells.append_cell(id, collection_mutation(managed_bytes(data)));
-            continue;
+        target_column target;
+        if (translation) {
+            const auto& column = translation->columns()[position];
+            target = target_column{
+                .def = column.def,
+                .type = column.type.get(),
+                .value_length = column.value_length,
+                .dropped_at = column.def ? column.def->dropped_at() : api::missing_timestamp,
+                .translated = true,
+            };
+        } else {
+            const auto& cdef = s.regular_column_at(position);
+            target = target_column{
+                .def = &cdef,
+                .type = cdef.type.get(),
+                .value_length = cdef.type->value_length_if_fixed(),
+                // A column dropped and added again gets a new schema version, so a record
+                // of this one holds nothing from before the drop.
+                .dropped_at = api::missing_timestamp,
+                .translated = false,
+            };
         }
-        if (cdef.is_multi_cell()) {
-            throw std::runtime_error(fmt::format("logstor record holds an atomic cell for the collection column {}",
-                    cdef.name_as_text()));
-        }
-
-        const auto timestamp = cell_flags_byte & cell_flags::use_base_timestamp
-                ? base_ts
-                : value_of_delta(r.svint(), base_ts);
-
-        if (cell_flags_byte & cell_flags::is_deleted) {
-            const auto deletion_time = deletion_time_from_delta(r.svint(), dt_base);
-            cells.append_cell(id, atomic_cell::make_dead(timestamp, deletion_time));
-            continue;
-        }
-
-        std::optional<gc_clock::duration> ttl;
-        std::optional<gc_clock::time_point> expiry;
-        if (cell_flags_byte & cell_flags::is_expiring) {
-            if (cell_flags_byte & cell_flags::use_marker_ttl) {
-                if (!marker.is_live() || !marker.is_expiring()) {
-                    throw std::runtime_error("logstor record cell takes its ttl from a row marker that has none");
-                }
-                ttl = marker.ttl();
-                expiry = marker.expiry();
-            } else {
-                ttl = gc_clock::duration(static_cast<gc_clock::rep>(r.uvint()));
-                expiry = deletion_time_from_delta(r.svint(), dt_base);
-            }
-        }
-
-        bytes_view value_bytes;
-        if (!(cell_flags_byte & cell_flags::has_empty_value)) {
-            if (cell_flags_byte & cell_flags::has_value_length) {
-                value_bytes = r.read(r.uvint());
-            } else {
-                const auto fixed_size = cdef.type->value_length_if_fixed();
-                if (!fixed_size) {
-                    throw std::runtime_error(fmt::format("logstor record holds a cell of no length for the "
-                            "variable-length column {}", cdef.name_as_text()));
-                }
-                value_bytes = r.read(*fixed_size);
-            }
-        }
-
-        cells.append_cell(id, expiry
-                ? atomic_cell::make_live(*cdef.type, timestamp, value_bytes, *expiry, *ttl)
-                : atomic_cell::make_live(*cdef.type, timestamp, value_bytes));
+        read_cell_into(cells, r, target, base_ts, dt_base, marker);
     }
 
-    if (r.size()) {
-        throw std::runtime_error(fmt::format("logstor record value has {} trailing bytes", r.size()));
-    }
+    check_fully_read();
 }
 
 } // namespace replica::logstor
