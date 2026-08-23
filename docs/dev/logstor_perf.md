@@ -107,7 +107,7 @@ TMPDIR=/nvme taskset -c 2 build/release/test/perf/perf_logstor --smp 1 \
 |---|---|
 | `index-lookup` | look one key up in the primary index |
 | `index-insert` | point the index of one key at a record, which is what a write does once its record is in a segment. Includes the lookup |
-| `deserialize` | deserialize one record from a buffer, which parses its header and copies out the bytes of its value |
+| `deserialize` | deserialize one record from a buffer, which parses its header and copies out the bytes of its value. Not a step of a point read any more - it takes the fields it needs from the header at their offsets and decodes the value out of the buffer it read - and kept to measure what that saves |
 | `decode` | decode the value of one record into the mutation a read returns |
 | `build-mutation` | build the mutation one write is given. Not a step of a write: a node is handed it by the layer above logstor, and only the `write` test builds one per operation, so this is what has to come off `write` before its steps add up |
 | `encode` | encode one mutation into the value the record of a write carries |
@@ -121,7 +121,7 @@ TMPDIR=/nvme taskset -c 2 build/release/test/perf/perf_logstor --smp 1 \
 | `cache-populate` | evict the cached partition of one entry and admit one in its place |
 | `raw-read` | one DMA read of the size of a record, straight to the data file, with no logstor in it |
 | `read-cached` | a whole read the cache serves |
-| `read-disk` | a whole read that goes to a segment: index lookup, DMA read, deserialization, decoding |
+| `read-disk` | a whole read that goes to a segment: index lookup, DMA read, decoding of the value |
 | `segment-read` | the read of the record from its segment, without the index lookup and without decoding the value |
 | `write` | a whole write, up to and including the flush of the buffer its record went into |
 
@@ -162,7 +162,7 @@ partition that is already in memory rather than deserializing one:
 ```
 read-disk      ~  segment-read + decode + index-lookup
 read-cached    ~  cache-lookup + index-lookup
-segment-read   ~  raw-read + deserialize + what the segment manager puts between them
+segment-read   ~  raw-read + what the segment manager puts between them
 serialize      ~  encode + record-sizes + append
 write          ~  build-mutation + serialize + (index-insert - index-lookup)
                   + the writer machinery and the separator

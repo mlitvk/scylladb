@@ -273,15 +273,15 @@ public:
         return do_read(_slice_bypassing_cache);
     }
 
-    // The read of the record from its segment and its deserialization, without the index lookup and
-    // without materializing the mutation the read returns.
+    // The read of the record from its segment, without the index lookup and without decoding the
+    // value into the mutation the read returns.
     future<> do_segment_read() {
         const auto& key = random_key();
         auto entry = index().get(primary_index_key{key});
         if (!entry) [[unlikely]] {
             on_internal_error(logstor_logger, "key of the dataset is missing from the index");
         }
-        co_await _logstor->get_segment_manager().read(entry->location);
+        co_await _logstor->get_segment_manager().read_record_bytes(entry->location);
     }
 
     // One DMA read of the size of a record, issued straight to the data file: what a read of a

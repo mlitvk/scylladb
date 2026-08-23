@@ -80,6 +80,23 @@ log_record deserialize_log_record(simple_memory_input_stream buf_stream) {
     };
 }
 
+log_record_bytes_view view_log_record(bytes_view record) {
+    auto rh_stream = simple_memory_input_stream(reinterpret_cast<const char*>(record.data()), record.size())
+            .read_substream(ondisk::record_header_size);
+    auto rh = ser::deserialize(rh_stream, std::type_identity<ondisk::record_header>{});
+
+    if (rh.header_size < ondisk::log_record_header_fixed_size
+            || ondisk::record_header_size + rh.header_size + rh.data_size > record.size()) [[unlikely]] {
+        throw std::runtime_error(fmt::format("Truncated log record: a header of {} and a value of {} bytes"
+                " in a record of {}", rh.header_size, rh.data_size, record.size()));
+    }
+
+    return log_record_bytes_view {
+        .header = record.substr(ondisk::record_header_size, rh.header_size),
+        .data = record.substr(ondisk::record_header_size + rh.header_size, rh.data_size),
+    };
+}
+
 future<log_record> read_log_record(seastar::input_stream<char>& in, log_location loc) {
     auto buf = co_await in.read_exactly(loc.size);
     if (buf.size() < loc.size) {

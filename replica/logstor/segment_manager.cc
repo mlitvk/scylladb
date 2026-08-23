@@ -948,7 +948,7 @@ public:
     future<> write(write_buffer&);
     future<> write_full_segment(write_buffer&, logstor_group&, write_source);
 
-    future<log_record> read(log_location);
+    future<temporary_buffer<char>> read_record_bytes(log_location);
 
     void on_add_record(log_location) noexcept;
     void on_free_record(log_location) noexcept;
@@ -1565,7 +1565,7 @@ void segment_manager_impl::on_free_record(log_location location) noexcept {
     _stats.bytes_freed += location.size;
 }
 
-future<log_record> segment_manager_impl::read(log_location location) {
+future<temporary_buffer<char>> segment_manager_impl::read_record_bytes(log_location location) {
     auto holder = _async_gate.hold();
 
     if (location.offset + location.size > _cfg.segment_size) [[unlikely]] {
@@ -1584,7 +1584,7 @@ future<log_record> segment_manager_impl::read(log_location location) {
 
     auto buf = co_await file.dma_read_exactly<char>(file_offset + location.offset, location.size);
     _stats.bytes_read += location.size;
-    co_return deserialize_log_record(simple_memory_input_stream(buf.begin(), buf.size()));
+    co_return std::move(buf);
 }
 
 future<> segment_manager_impl::request_segment_switch() {
@@ -2757,8 +2757,8 @@ future<> segment_manager::write(write_buffer& wb) {
     return _impl->write(wb);
 }
 
-future<log_record> segment_manager::read(log_location location) {
-    return _impl->read(location);
+future<temporary_buffer<char>> segment_manager::read_record_bytes(log_location location) {
+    return _impl->read_record_bytes(location);
 }
 
 compaction_manager& segment_manager::get_compaction_manager() noexcept {

@@ -424,6 +424,38 @@ mutation make_kv_mutation_of_record_size(schema_ptr schema, const sstring& pk, s
 
 }
 
+// Checks what a point read does with the buffer it reads from a segment: the record is split
+// in two without parsing either half, the fields it needs are taken out of the header at
+// their offsets, and the value is decoded straight out of the buffer.
+SEASTAR_THREAD_TEST_CASE(test_logstor_view_log_record) {
+    auto schema = make_kv_schema();
+    const auto ts = api::timestamp_type(4711);
+    auto expected = make_kv_mutation(schema, "pk0", "v0", ts);
+
+    raw_write_buffer wb(32 * 1024, segment_kind::mixed);
+    auto appended = wb.append(log_record_writer(make_log_record(expected, ts)));
+    wb.seal(segment_sequence{3}, std::nullopt, ondisk::block_alignment);
+
+    auto serialized = make_serialized_buffer_copy(wb);
+    const auto record_bytes = bytes_view(reinterpret_cast<const int8_t*>(serialized.get()) + appended.record_header_offset,
+            appended.total_size);
+    const auto record = view_log_record(record_bytes);
+
+    BOOST_REQUIRE_EQUAL(ondisk::log_record_header_timestamp(record.header), ts);
+    const auto key = linearized(managed_bytes_view(expected.decorated_key().key().representation()));
+    BOOST_REQUIRE(ondisk::log_record_header_key(record.header) == bytes_view(key));
+
+    column_translation_cache translations;
+    mutation m(schema, expected.decorated_key());
+    read_row_value_into(m.partition(), *schema, record.data,
+            ondisk::log_record_header_timestamp(record.header), translations);
+    assert_that(m).is_equal_to(expected);
+
+    // A record whose sizes do not fit what was read is refused rather than read past.
+    BOOST_REQUIRE_THROW(view_log_record(record_bytes.substr(0, record_bytes.size() - 1)), std::runtime_error);
+    BOOST_REQUIRE_THROW(view_log_record(record_bytes.substr(0, ondisk::record_header_size)), std::runtime_error);
+}
+
 // Checks the compact log_record_header encoding: what it takes, that it round trips, and
 // that the fields a point read reads without deserializing it are where it expects them.
 SEASTAR_THREAD_TEST_CASE(test_logstor_log_record_header_serialization) {

@@ -55,6 +55,11 @@ future<std::optional<segment_header>> read_segment_header(seastar::input_stream<
 log_record deserialize_log_record(simple_memory_input_stream);
 future<log_record> read_log_record(seastar::input_stream<char>& in, log_location loc);
 
+// The two halves of a record as they sit in a buffer read from a segment, neither of them
+// parsed. This is what a point read works on: it takes the fields it needs out of the header
+// at their offsets and decodes the value straight out of the buffer.
+log_record_bytes_view view_log_record(bytes_view record);
+
 future<> scan_segment(seastar::input_stream<char>& in,
         log_segment_id segment_id,
         size_t segment_size,

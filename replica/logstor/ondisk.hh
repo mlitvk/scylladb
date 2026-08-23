@@ -10,6 +10,8 @@
 
 #include <limits>
 
+#include <seastar/core/byteorder.hh>
+
 #include "idl/uuid.dist.hh"
 #include "idl/uuid.dist.impl.hh"
 #include "dht/token.hh"
@@ -85,6 +87,19 @@ static constexpr size_t max_partition_key_size = std::numeric_limits<uint16_t>::
 // The size a log_record_header takes serialized.
 inline size_t log_record_header_size(const log_record_header& h) noexcept {
     return log_record_header_fixed_size + h.key.dk.key().representation().size();
+}
+
+// The fields of a serialized log_record_header a point read needs, taken at their offsets
+// instead of by deserializing the header, which would allocate for a key the read already
+// has. header must hold at least log_record_header_fixed_size bytes.
+inline api::timestamp_type log_record_header_timestamp(bytes_view header) noexcept {
+    return seastar::read_le<int64_t>(reinterpret_cast<const char*>(header.data()) + log_record_header_timestamp_offset);
+}
+
+inline bytes_view log_record_header_key(bytes_view header) noexcept {
+    const auto size = seastar::read_le<uint16_t>(
+            reinterpret_cast<const char*>(header.data()) + log_record_header_key_size_offset);
+    return header.substr(log_record_header_key_offset, size);
 }
 
 bool validate_header(const buffer_header& bh);

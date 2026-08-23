@@ -51,9 +51,13 @@ Only step 4 writes to the disk - all other steps only update in-memory metadata.
 
 **Read Path:**
 1. Application requests data for a partition key
-2. Index lookup returns record location
-3. Segment manager reads record from disk
-4. Record is deserialized into a mutation and returned
+2. Cache lookup, which serves the read when the partition is cached
+3. Index lookup returns record location
+4. Segment manager reads the bytes of the record from disk
+5. The key of the record is compared against the key of the read, and the value of the record
+   is decoded into the mutation the read returns. Neither the header of the record nor its
+   value is copied out of the buffer that was read: the read takes the two fields it needs
+   from the header at their offsets and decodes the value in place
 
 **Separator:**
 1. When a record is written to the active segment, it is also written to its compaction group's separator buffer. The separator buffer holds a reference to the original segment.

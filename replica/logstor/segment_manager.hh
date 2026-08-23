@@ -16,6 +16,7 @@
 #include <seastar/core/gate.hh>
 #include <seastar/core/queue.hh>
 #include <seastar/core/shared_ptr.hh>
+#include <seastar/core/temporary_buffer.hh>
 #include <seastar/util/bool_class.hh>
 #include "bytes_fwd.hh"
 #include "mutation_writer/token_group_based_splitting_writer.hh"
@@ -117,7 +118,10 @@ public:
 
     future<> write(write_buffer& wb);
 
-    future<log_record> read(log_location location);
+    // The bytes of one record, as they are on disk: the read of a record does not parse its
+    // header, which holds a key the read already has, and decodes its value straight out of
+    // this buffer rather than copying it.
+    future<temporary_buffer<char>> read_record_bytes(log_location location);
 
     void on_add_record(log_location location) noexcept override;
     void on_free_record(log_location location) noexcept override;

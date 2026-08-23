@@ -14,6 +14,7 @@
 #include "readers/from_mutations.hh"
 #include "keys/keys.hh"
 #include "replica/logstor/record_format.hh"
+#include "replica/logstor/segment_io.hh"
 #include "replica/logstor/segment_manager.hh"
 #include "replica/logstor/types.hh"
 #include "utils/managed_bytes.hh"
@@ -191,16 +192,22 @@ future<std::optional<mutation>> logstor::read(const schema& s, const primary_ind
     // Cache miss (or bypass): read from disk using the entry we already have.
     // copy the entry. we want to remember the original entry that we use for the read. the entry may change while we read.
     const index_entry entry_for_read = it->entry();
-    auto record = co_await _segment_manager.read(entry_for_read.location);
+    auto buf = co_await _segment_manager.read_record_bytes(entry_for_read.location);
+    const auto record = view_log_record(bytes_view(reinterpret_cast<const int8_t*>(buf.get()), buf.size()));
 
-    const auto& record_key = record.header.key.dk.key();
-    if (record_key.representation() != dk.key().representation()) [[unlikely]] {
-        on_internal_error(logstor_logger, format("Key mismatch reading log entry: expected {}, got {}", dk.key(), record_key));
+    // The header holds the key of the record, which is the key of this read, so it is compared
+    // rather than deserialized: both sides are the compound blob the key already is.
+    const auto record_key = ondisk::log_record_header_key(record.header);
+    if (managed_bytes_view(record_key) != managed_bytes_view(dk.key().representation())) [[unlikely]] {
+        on_internal_error(logstor_logger, format("Key mismatch reading log entry: expected {}, got {}",
+                dk.key(), partition_key::from_bytes(record_key)));
     }
 
-    // The record's own timestamp is the base its value's timestamps are deltas from.
+    // The timestamp of the record is the base its value's timestamps are deltas from, and it is
+    // the only other field of the header a read needs.
     mutation m(s.shared_from_this(), dk);
-    read_row_value_into(m.partition(), s, record.value.view(), record.header.timestamp, index.translations());
+    read_row_value_into(m.partition(), s, record.data, ondisk::log_record_header_timestamp(record.header),
+            index.translations());
 
     // Populate the cache with the freshly deserialized mutation.
     // Skipped when bypass_cache is set.
