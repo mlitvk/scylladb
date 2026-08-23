@@ -221,7 +221,9 @@ logstor.
   turn of that loop rather than per operation, so it is charged to an operation in proportion to how
   few operations each turn served. Over a concurrency sweep the two separate cleanly:
   `instructions/op = work + cost_of_a_poll * polls/op` fits to within half a percent, and for
-  `segment-read` it gives 7150 instructions of work and about 1900 per poll. At a concurrency of one
+  `segment-read` it gives 7150 instructions of work and about 1900 per poll. That fit was taken
+  before the record format, which took `segment-read` to 5625; the poll cost per turn is a property
+  of the reactor and still holds. At a concurrency of one
   that poll term is 3 polls per operation and most of what the test appears to cost; by 100 it is
   0.03 polls per operation and nothing at all. `polls/op` well under 0.1 means the number being read
   is the operation.
@@ -234,6 +236,13 @@ logstor.
 
 - **Prefer a fixed amount of work** with `--operations-per-shard` when comparing two builds, and
   several iterations of `--duration` when looking at the spread.
+
+- **On a machine whose disk is shared, take the IO tests more than once and keep the clean ones.**
+  The same binary and configuration returned 190k operations per second at `polls/op` 0.03 on one
+  run of `read-disk` and 47k at 1.5 on the next, which puts about 1800 instructions per poll onto
+  the number. When comparing two builds, run them alternately at each row shape rather than one
+  side after the other, so that neither side owns a disk condition, and quote the median of the
+  iterations whose `polls/op` was under 0.1. Two to three runs per cell is what that takes here.
 
 - **Take the noise floor from separate processes, not from one.** The `mad` a run reports is the
   spread between its own iterations, which is the smaller of the two. Running the same configuration
