@@ -9,8 +9,8 @@
 
 #include <cstdint>
 #include <fmt/format.h>
+#include "bytes.hh"
 #include "dht/decorated_key.hh"
-#include "mutation/canonical_mutation.hh"
 #include "mutation/timestamp.hh"
 
 namespace replica::logstor {
@@ -47,9 +47,19 @@ struct log_record_header {
     table_id table;
 };
 
+// The value of a record: the partition it holds, encoded in the logstor record format
+// (replica/logstor/record_format.hh). Everything but a read of the partition treats it as
+// bytes - compaction, the separator and segment streaming copy it as it is.
+struct row_value {
+    bytes data;
+
+    bytes_view view() const noexcept { return data; }
+    size_t size() const noexcept { return data.size(); }
+};
+
 struct log_record {
     log_record_header header;
-    canonical_mutation mut;
+    row_value value;
 };
 
 struct log_record_bytes_view {

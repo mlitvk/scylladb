@@ -43,6 +43,7 @@
 #include "mutation/mutation.hh"
 #include "partition_slice_builder.hh"
 #include "replica/logstor/index.hh"
+#include "replica/logstor/record_format.hh"
 #include "replica/logstor/logstor.hh"
 #include "replica/logstor/segment_io.hh"
 #include "replica/logstor/segment_manager.hh"
@@ -74,6 +75,8 @@ enum class test_kind {
     materialize,
     build_mutation,
     freeze,
+    encode,
+    decode,
     record_header,
     record_sizes,
     append,
@@ -94,6 +97,8 @@ const std::vector<std::pair<std::string_view, test_kind>> test_kinds = {
     {"materialize", test_kind::materialize},
     {"build-mutation", test_kind::build_mutation},
     {"freeze", test_kind::freeze},
+    {"encode", test_kind::encode},
+    {"decode", test_kind::decode},
     {"record-header", test_kind::record_header},
     {"record-sizes", test_kind::record_sizes},
     {"append", test_kind::append},
@@ -174,6 +179,10 @@ class logstor_bench {
     // the tests that measure a single step.
     std::unique_ptr<raw_write_buffer> _serialization_buffer;
     temporary_buffer<char> _serialized_record;
+    // The two forms of the value of a record: the one logstor stores, and the canonical_mutation
+    // it stored before the record format, kept so that the cost of the two can be compared in
+    // one run.
+    bytes _row_value;
     canonical_mutation _canonical_mutation;
     std::optional<mutation> _mutation;
     // A record whose sizes have already been computed, for the append test, which is about what the
@@ -315,14 +324,14 @@ public:
         }
     }
 
-    // What a write pays before its record reaches a buffer of the writer: the mutation is frozen
-    // into a canonical_mutation and the record is serialized into the buffer.
+    // What a write pays before its record reaches a buffer of the writer: the mutation is encoded
+    // into the value of the record and the record is serialized into the buffer.
     void do_serialize(unsigned count) {
         for (unsigned i = 0; i < count; ++i) {
             _serialization_buffer->reset();
             _serialization_buffer->append(log_record_writer(log_record{
                 .header = make_record_header(_mutation->decorated_key()),
-                .mut = canonical_mutation(*_mutation),
+                .value = row_value{encode_value(*_mutation)},
             }));
         }
     }
@@ -337,8 +346,16 @@ public:
         }
     }
 
-    // The first half of what do_serialize() measures: the mutation is frozen into the
-    // canonical_mutation that the record of a write carries.
+    // The first half of what do_serialize() measures: the mutation is encoded into the value the
+    // record of a write carries.
+    void do_encode(unsigned count) {
+        for (unsigned i = 0; i < count; ++i) {
+            _sink += encode_value(*_mutation).size();
+        }
+    }
+
+    // What that cost before the record format: the mutation frozen into a canonical_mutation.
+    // Not a step of a write any more, kept to measure the two against each other.
     void do_freeze(unsigned count) {
         for (unsigned i = 0; i < count; ++i) {
             auto frozen = canonical_mutation(*_mutation);
@@ -355,17 +372,15 @@ public:
         }
     }
 
-    // What log_record_writer::compute_sizes() does: the size of the header is arithmetic on its
-    // key, and the value is serialized once into a stream that only counts the bytes, so that the
-    // writer knows how much room to ask the buffer for. Measured over the header building of
-    // do_record_header(), since the size of a header can only be measured on a header, and against
-    // a key that changes per operation, so that the measuring cannot be hoisted out of the loop.
+    // What log_record_writer::compute_sizes() does: the sizes of the header and of the value are
+    // both arithmetic, so that the writer knows how much room to ask the buffer for. Measured over
+    // the header building of do_record_header(), since the size of a header can only be measured on
+    // a header, and against a key that changes per operation, so that the measuring cannot be
+    // hoisted out of the loop.
     void do_record_sizes(unsigned count) {
         for (unsigned i = 0; i < count; ++i) {
             auto header = make_record_header(random_key());
-            seastar::measuring_output_stream data_size;
-            ser::serialize(data_size, _canonical_mutation);
-            _sink += header.timestamp + ondisk::log_record_header_size(header) + data_size.size();
+            _sink += header.timestamp + ondisk::log_record_header_size(header) + _row_value.size();
         }
     }
 
@@ -414,16 +429,28 @@ public:
         }
     }
 
-    // What a read pays once the record is in memory: the record is deserialized, which copies the
-    // bytes of its canonical_mutation out of the buffer read from the segment.
+    // What a read pays once the record is in memory: the record is deserialized, which parses its
+    // header and copies the bytes of its value out of the buffer read from the segment.
     void do_deserialize(unsigned count) {
         for (unsigned i = 0; i < count; ++i) {
             deserialize_log_record(simple_memory_input_stream(_serialized_record.begin(), _serialized_record.size()));
         }
     }
 
-    // And what it pays after that: the canonical_mutation is turned into the mutation the read
+    // And what it pays after that: the value of the record is decoded into the mutation the read
     // returns.
+    void do_decode(unsigned count) {
+        column_translation_cache translations;
+        const auto ts = record_timestamp(*_mutation);
+        for (unsigned i = 0; i < count; ++i) {
+            mutation m(_schema, _mutation->decorated_key());
+            read_row_value_into(m.partition(), *_schema, _row_value, ts, translations);
+            _sink += m.partition().row_count();
+        }
+    }
+
+    // What that cost before the record format: the canonical_mutation turned into a mutation. Not
+    // a step of a read any more, kept to measure the two against each other.
     void do_materialize(unsigned count) {
         for (unsigned i = 0; i < count; ++i) {
             _canonical_mutation.to_mutation(_schema);
@@ -447,6 +474,13 @@ public:
     size_t record_size() const noexcept { return _serialized_record.size(); }
     size_t payload_size() const noexcept { return size_t(_cfg.columns) * _cfg.value_size; }
 
+    // What the same record took before the record format, when its value was a
+    // canonical_mutation. The header is the same one either way.
+    size_t canonical_mutation_record_size() const noexcept {
+        return record_size() - _row_value.size() + _canonical_mutation.representation().size()
+                + sizeof(uint32_t); // the size prefix of the value as a blob
+    }
+
 private:
     primary_index& index() noexcept {
         return _group->logstor_index();
@@ -462,6 +496,20 @@ private:
             .timestamp = api::new_timestamp(),
             .table = _schema->id(),
         };
+    }
+
+    // The timestamp a write gives the record of a mutation: that of its row marker, which is
+    // also the base the timestamps in the value are deltas from.
+    static api::timestamp_type record_timestamp(const mutation& m) {
+        return m.partition().clustered_rows().begin()->row().marker().timestamp();
+    }
+
+    bytes encode_value(const mutation& m) const {
+        const auto ts = record_timestamp(m);
+        bytes value(bytes::initialized_later(), measure_row_value(*_schema, m.partition(), ts));
+        auto out = seastar::simple_memory_output_stream(reinterpret_cast<char*>(value.data()), value.size());
+        write_row_value(out, *_schema, m.partition(), ts);
+        return value;
     }
 
     mutation make_mutation(const dht::decorated_key& key) const {
@@ -503,10 +551,11 @@ private:
 
     void prepare_single_step_inputs() {
         _mutation = make_mutation(_keys[0]);
+        _row_value = encode_value(*_mutation);
         _canonical_mutation = canonical_mutation(*_mutation);
         _record_writer.emplace(log_record{
             .header = make_record_header(_mutation->decorated_key()),
-            .mut = _canonical_mutation,
+            .value = row_value{_row_value},
         });
         _serialization_buffer->reset();
         auto appended = _serialization_buffer->append(*_record_writer);
@@ -543,6 +592,10 @@ std::vector<perf_result_with_io> run_test(sharded<logstor_bench>& bench, test_ki
         return cpu_test(&logstor_bench::do_build_mutation);
     case test_kind::freeze:
         return cpu_test(&logstor_bench::do_freeze);
+    case test_kind::encode:
+        return cpu_test(&logstor_bench::do_encode);
+    case test_kind::decode:
+        return cpu_test(&logstor_bench::do_decode);
     case test_kind::record_header:
         return cpu_test(&logstor_bench::do_record_header);
     case test_kind::record_sizes:
@@ -710,8 +763,11 @@ int main(int argc, char** argv) {
                 const auto record_bytes = bench.local().record_size();
                 const auto payload_bytes = bench.local().payload_size();
                 fmt::print("dataset written: {} of {} segments of shard 0 are free\n", usage.free_segments, usage.total_segments);
-                fmt::print("record: {} bytes in a segment for {} bytes of value ({:.2f}x)\n",
-                        record_bytes, payload_bytes, payload_bytes ? double(record_bytes) / payload_bytes : 0.0);
+                const auto canonical_bytes = bench.local().canonical_mutation_record_size();
+                fmt::print("record: {} bytes in a segment for {} bytes of value ({:.2f}x), against {} bytes"
+                        " ({:.2f}x) with a canonical_mutation value\n",
+                        record_bytes, payload_bytes, payload_bytes ? double(record_bytes) / payload_bytes : 0.0,
+                        canonical_bytes, payload_bytes ? double(canonical_bytes) / payload_bytes : 0.0);
                 for (auto kind : run.tests) {
                     fmt::print("\n{}:\n", name_of(kind));
                     auto results = run_test(bench, kind, cfg);

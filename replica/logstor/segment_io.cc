@@ -12,8 +12,6 @@
 #include <seastar/core/align.hh>
 #include <seastar/core/simple-stream.hh>
 
-#include "idl/frozen_schema.dist.hh"
-#include "idl/frozen_schema.dist.impl.hh"
 #include "serializer_impl.hh"
 
 namespace replica::logstor {
@@ -73,9 +71,12 @@ log_record deserialize_log_record(simple_memory_input_stream buf_stream) {
     auto header_stream = buf_stream.read_substream(rh.header_size);
     auto data_stream = buf_stream.read_substream(rh.data_size);
 
+    bytes value(bytes::initialized_later(), rh.data_size);
+    data_stream.read(reinterpret_cast<char*>(value.data()), value.size());
+
     return log_record {
         .header = ser::deserialize(header_stream, std::type_identity<log_record_header>{}),
-        .mut = ser::deserialize(data_stream, std::type_identity<canonical_mutation>{})
+        .value = row_value{std::move(value)},
     };
 }
 
@@ -189,7 +190,7 @@ future<> scan_segment(seastar::input_stream<char>& in,
                 };
                 co_await on_record(loc, record_header, record_bytes);
             } else {
-                // Skip the canonical_mutation bytes without reading them
+                // Skip the record value without reading it
                 co_await in.skip(rh.data_size);
                 current_position += rh.data_size;
             }
@@ -225,9 +226,7 @@ future<> scan_segment(seastar::input_stream<char>& in,
     co_await scan_segment(in, segment_id, segment_size,
             std::move(on_segment_header), std::move(on_record_header),
             [on_record = std::move(on_record)] (log_location loc, const log_record_header& record_header, log_record_bytes_view record_bytes) mutable -> future<> {
-                auto data_stream = simple_memory_input_stream(reinterpret_cast<const char*>(record_bytes.data.data()), record_bytes.data.size());
-                auto mut = ser::deserialize(data_stream, std::type_identity<canonical_mutation>{});
-                co_await on_record(loc, log_record{record_header, std::move(mut)});
+                co_await on_record(loc, log_record{record_header, row_value{bytes(record_bytes.data)}});
             });
 }
 

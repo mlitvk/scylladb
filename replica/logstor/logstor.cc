@@ -13,6 +13,7 @@
 #include "query/query-request.hh"
 #include "readers/from_mutations.hh"
 #include "keys/keys.hh"
+#include "replica/logstor/record_format.hh"
 #include "replica/logstor/segment_manager.hh"
 #include "replica/logstor/types.hh"
 #include "utils/managed_bytes.hh"
@@ -130,13 +131,17 @@ future<> logstor::write(const mutation& m, write_target target, db::timeout_cloc
 
     const auto ts = extract_logstor_record_timestamp(m);
 
+    bytes value(bytes::initialized_later(), measure_row_value(*m.schema(), m.partition(), ts));
+    auto value_out = seastar::simple_memory_output_stream(reinterpret_cast<char*>(value.data()), value.size());
+    write_row_value(value_out, *m.schema(), m.partition(), ts);
+
     log_record record {
         .header = {
             .key = key,
             .timestamp = ts,
             .table = table,
         },
-        .mut = canonical_mutation(m)
+        .value = row_value{std::move(value)},
     };
 
     auto writer = log_record_writer(std::move(record));
@@ -188,11 +193,14 @@ future<std::optional<mutation>> logstor::read(const schema& s, const primary_ind
     const index_entry entry_for_read = it->entry();
     auto record = co_await _segment_manager.read(entry_for_read.location);
 
-    if (record.mut.key() != dk.key()) [[unlikely]] {
-        on_internal_error(logstor_logger, format("Key mismatch reading log entry: expected {}, got {}", dk.key(), record.mut.key()));
+    const auto& record_key = record.header.key.dk.key();
+    if (record_key.representation() != dk.key().representation()) [[unlikely]] {
+        on_internal_error(logstor_logger, format("Key mismatch reading log entry: expected {}, got {}", dk.key(), record_key));
     }
 
-    mutation m = record.mut.to_mutation(s.shared_from_this());
+    // The record's own timestamp is the base its value's timestamps are deltas from.
+    mutation m(s.shared_from_this(), dk);
+    read_row_value_into(m.partition(), s, record.value.view(), record.header.timestamp, index.translations());
 
     // Populate the cache with the freshly deserialized mutation.
     // Skipped when bypass_cache is set.

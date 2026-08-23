@@ -27,7 +27,7 @@ The `segment_manager` handles the allocation and management of fixed-size segmen
 - **Recovery**: Scans segments on startup to rebuild the index
 - **Separator**: Writes to all _compaction groups_ (tablets and even tables) go to a single active segment. The separator splits these mixed segments, which have records from different compaction groups, into segments that each has a single compaction group. This separation is useful when migrating tablets.
 
-The data in the segments consists of records of type `log_record`. Each record contains the value for some key as a `canonical_mutation` and additional metadata.
+The data in the segments consists of records of type `log_record`. Each record holds the partition of one key, encoded in the logstor record format, together with the metadata of the record.
 
 The `segment_manager` receives new writes via a `write_buffer` and writes them sequentially to the active segment with 4k-block alignment.
 
@@ -323,7 +323,7 @@ Each record within the buffer is structured as:
 ```
 record_header        (8 bytes)
 log_record_header    (header_size bytes)
-canonical_mutation   (data_size bytes)
+record value         (data_size bytes)
 zero_padding         -- to align to record_alignment (8 bytes)
 ```
 
@@ -332,7 +332,7 @@ zero_padding         -- to align to record_alignment (8 bytes)
 | Offset | Size | Field         | Description |
 |--------|------|---------------|-------------|
 | 0      | 4    | `header_size` | Size in bytes of the serialized `log_record_header` that follows. |
-| 4      | 4    | `data_size`   | Size in bytes of the serialized `canonical_mutation` that follows `log_record_header`. |
+| 4      | 4    | `data_size`   | Size in bytes of the record value that follows `log_record_header`. |
 
 **Log Record Header** (`log_record_header`):
 
@@ -342,7 +342,7 @@ bytes plus the partition key:
 | Offset | Size | Field       | Description |
 |--------|------|-------------|-------------|
 | 0      | 8    | `token`     | Raw token of the record's partition key. |
-| 8      | 8    | `timestamp` | Timestamp of the record, used to resolve conflicts by keeping the record with the latest timestamp. |
+| 8      | 8    | `timestamp` | Timestamp of the record, used to resolve conflicts by keeping the record with the latest timestamp. It is also the base every timestamp in the record value is a delta from. |
 | 16     | 16   | `table`     | UUID of the table this record belongs to. |
 | 32     | 2    | `key_size`  | Size in bytes of the partition key that follows. |
 | 34     | n    | `key`       | The `partition_key` representation, verbatim: the compound blob the key has in memory. |
@@ -358,8 +358,41 @@ the 50 this takes.
 
 **Record Value**:
 
-The `data_size` bytes following the log record header are the IDL-serialized
-`canonical_mutation`, which holds the full partition value.
+The `data_size` bytes following the log record header are the partition of the record,
+encoded in the logstor record format. The layout is in `replica/logstor/record_format.hh`,
+next to the code that reads and writes it.
+
+A logstor table has no clustering columns, so a partition is at most one row - the one with
+the empty clustering key - plus a partition tombstone, and has neither static columns nor
+range tombstones. The encoding is built for that shape and for the point read that decodes
+it: one flags byte where the IDL serializer of a `canonical_mutation` frames every field and
+writes a variant index per cell, a varint delta from the record's own timestamp for every
+timestamp - which the whole-partition write model makes almost always zero - the size of a
+value taken from its type where the type is fixed-width, and a non-frozen collection stored
+as its `collection_mutation` blob verbatim.
+
+A record stays self-contained: it carries the version of the schema it was written under and
+a description of that schema's columns, so nothing outside the record is needed to decode
+it, and compaction, the separator and segment streaming go on treating a value as bytes. A
+read under the same schema version steps over the description without parsing it; a read
+under another one translates the record's columns onto the schema's, which is cached per
+pair of schema versions. Phase 2 of the format moves the description to a per-buffer
+dictionary, where it amortizes to a few bytes per record.
+
+`test/perf/perf_logstor` reports what a record takes against the bytes of value it carries,
+and what the same record took with a `canonical_mutation` value:
+
+| Row | Record | With a `canonical_mutation` |
+|---|---|---|
+| 5 columns x 300 B | 1650 B (1.10x) | 2219 B (1.48x) |
+| 5 columns x 20 B | 245 B (2.45x) | 819 B (8.19x) |
+| 1 column x 300 B | 422 B (1.41x) | 639 B (2.13x) |
+| 1 column x 20 B | 141 B (7.05x) | 359 B (17.95x) |
+
+Its `encode` and `decode` tests measure the two halves of the format against the `freeze`
+and `materialize` tests, which measure what a `canonical_mutation` value cost. For the
+5 x 300 B row: encoding 1 allocation per record against 5, and decoding 1999 cycles against
+10395.
 
 **Record Location** (`log_location`):
 

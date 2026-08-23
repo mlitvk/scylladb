@@ -107,20 +107,22 @@ TMPDIR=/nvme taskset -c 2 build/release/test/perf/perf_logstor --smp 1 \
 |---|---|
 | `index-lookup` | look one key up in the primary index |
 | `index-insert` | point the index of one key at a record, which is what a write does once its record is in a segment. Includes the lookup |
-| `deserialize` | deserialize one record from a buffer, which copies out the bytes of its `canonical_mutation` |
-| `materialize` | turn one `canonical_mutation` into the mutation a read returns |
+| `deserialize` | deserialize one record from a buffer, which parses its header and copies out the bytes of its value |
+| `decode` | decode the value of one record into the mutation a read returns |
 | `build-mutation` | build the mutation one write is given. Not a step of a write: a node is handed it by the layer above logstor, and only the `write` test builds one per operation, so this is what has to come off `write` before its steps add up |
-| `freeze` | freeze one mutation into the `canonical_mutation` the record of a write carries |
+| `encode` | encode one mutation into the value the record of a write carries |
 | `record-header` | build the header of one record, which copies the decorated key of the partition into it |
-| `record-sizes` | `record-header`, and then what `log_record_writer::compute_sizes()` does: serialize the record into a stream that only counts its bytes, so that the writer knows how much room to ask the buffer for |
+| `record-sizes` | `record-header`, and then what `log_record_writer::compute_sizes()` does: the size of the header and the size of the value, both arithmetic, so that the writer knows how much room to ask the buffer for |
 | `append` | copy one record whose sizes are already known into the buffer of the writer |
-| `serialize` | what a write pays before its record reaches the buffer: `freeze`, `record-header`, `record-sizes` and `append` |
+| `serialize` | what a write pays before its record reaches the buffer: `encode`, `record-header`, `record-sizes` and `append` |
+| `freeze` | freeze one mutation into a `canonical_mutation`, which is what a record value was before the record format. Not a step of a write any more: it and `materialize` are kept so that the cost of the two forms can be compared in one run |
+| `materialize` | turn one `canonical_mutation` into a mutation, the counterpart of `decode` before the record format |
 | `cache-lookup` | look one cached mutation up and copy its partition out of the cache region |
 | `cache-populate` | evict the cached partition of one entry and admit one in its place |
 | `raw-read` | one DMA read of the size of a record, straight to the data file, with no logstor in it |
 | `read-cached` | a whole read the cache serves |
-| `read-disk` | a whole read that goes to a segment: index lookup, DMA read, deserialization, materialization |
-| `segment-read` | the read of the record from its segment, without the index lookup and without materializing the mutation |
+| `read-disk` | a whole read that goes to a segment: index lookup, DMA read, deserialization, decoding |
+| `segment-read` | the read of the record from its segment, without the index lookup and without decoding the value |
 | `write` | a whole write, up to and including the flush of the buffer its record went into |
 
 Everything above `read-cached` touches no disk - the two cache tests touch the cache, the rest touch
@@ -145,8 +147,10 @@ paths are measured against the same data.
 | `--dir` | where to put the logstor files. Defaults to a temporary directory |
 | `--json-result` | write one file per test, suffixed with the name of the test |
 
-It prints how much of the segment pool the dataset took, and warns when the dataset does not leave
-the pool room for the dead records the overwrites of the write test will leave behind.
+It prints how much of the segment pool the dataset took, what one record of the dataset takes against
+the bytes of value it carries - and what the same record would take with a `canonical_mutation` value,
+for comparison - and warns when the dataset does not leave the pool room for the dead records the
+overwrites of the write test will leave behind.
 
 ## Reading the numbers
 
@@ -156,16 +160,16 @@ the index lookup, and a read the cache serves costs a fraction of either, since 
 partition that is already in memory rather than deserializing one:
 
 ```
-read-disk      ~  segment-read + materialize + index-lookup
+read-disk      ~  segment-read + decode + index-lookup
 read-cached    ~  cache-lookup + index-lookup
 segment-read   ~  raw-read + deserialize + what the segment manager puts between them
-serialize      ~  freeze + record-sizes + append
+serialize      ~  encode + record-sizes + append
 write          ~  build-mutation + serialize + (index-insert - index-lookup)
                   + the writer machinery and the separator
 ```
 
 What is left over on either side of one of these is a number in its own right: `serialize` beyond
-`freeze`, `record-sizes` and `append` is nil, and `write` beyond the rest is what the machinery
+`encode`, `record-sizes` and `append` is nil, and `write` beyond the rest is what the machinery
 around the record costs.
 
 Two subtractions in that last relation are easy to get wrong. `build-mutation` is the test's own
@@ -346,7 +350,7 @@ Symbols need the perf test binaries to keep them, which they do not by default:
 | one step of a path | `perf_logstor --test <step>` |
 | the cost of a row shape | `perf_logstor --columns N --value-size B`, which is what a change to the format of a record is measured against |
 | what logstor adds to a read | `perf_logstor --test raw-read,segment-read` |
-| what a write costs beyond its steps | `perf_logstor --test build-mutation,freeze,record-sizes,append,index-insert,index-lookup,write` |
+| what a write costs beyond its steps | `perf_logstor --test build-mutation,encode,record-sizes,append,index-insert,index-lookup,write` |
 | what a buffer amortizes | `perf_logstor --test write` at several `--concurrency`, from 1 up |
 | a write with compaction working | `perf_logstor --test write --duration 60 --disk-size-in-mb`, small enough that the pool fills |
 

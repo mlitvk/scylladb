@@ -16,8 +16,6 @@
 #include <seastar/core/with_scheduling_group.hh>
 #include <seastar/core/on_internal_error.hh>
 #include <seastar/coroutine/as_future.hh>
-#include "idl/frozen_schema.dist.hh"
-#include "idl/frozen_schema.dist.impl.hh"
 #include "serializer_impl.hh"
 #include <seastar/core/align.hh>
 #include <seastar/core/aligned_buffer.hh>
@@ -27,15 +25,12 @@ namespace replica::logstor {
 
 void log_record_writer::compute_sizes() const {
     _header_size = ondisk::log_record_header_size(_record.header);
-
-    seastar::measuring_output_stream ms_data;
-    ser::serialize(ms_data, _record.mut);
-    _data_size = ms_data.size();
+    _data_size = _record.value.size();
 }
 
 void log_record_writer::write(ostream& out) const {
     ser::serialize(out, _record.header);
-    ser::serialize(out, _record.mut);
+    out.write(reinterpret_cast<const char*>(_record.value.data.data()), _record.value.size());
 }
 
 void log_record_bytes_writer::write(ostream& out) const {

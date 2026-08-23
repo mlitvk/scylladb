@@ -17,6 +17,7 @@
 #include "utils/phased_barrier.hh"
 #include <utility>
 #include "replica/logstor/cache.hh"
+#include "replica/logstor/record_format.hh"
 
 namespace replica::logstor {
 
@@ -114,6 +115,11 @@ private:
     // call non-const methods on the tracker (touch, insert) for LRU accounting.
     mutable cache_tracker* _cache_tracker = nullptr;
 
+    // What the columns of a record written under an older schema version mean under the
+    // current one. Only a read of such a record touches it, and it is filled in as those
+    // reads come, which is why a read can have it while being const.
+    mutable column_translation_cache _translations;
+
     // Currently we support a single subscriber for space accounting which is the segment manager.
     space_accounting_subscriber& _space_accounting;
 
@@ -191,6 +197,10 @@ public:
 
     cache_tracker* cache_tracker() const noexcept {
         return _cache_tracker;
+    }
+
+    column_translation_cache& translations() const noexcept {
+        return _translations;
     }
 
     future<> drain_cache() {
