@@ -328,6 +328,14 @@ def cluster_metadata(workdir: PathLike) -> dict:
             json.dump(res, f)
         return res
 
+def cluster_addrs(workdir: PathLike) -> list[str]:
+    """The addresses of the nodes of the cluster in the given workdir.
+    Workloads which have to talk to every node (rather than to the one that
+    with_cs_train() hands them) get the list from here.
+    """
+    subnet = cluster_metadata(workdir)["subnet"]
+    return [f"{subnet}.{i}" for i in range(1,255)][:3]
+
 class AddressAlreadyInUseException(Exception):
     def __init__(self, addresses, diagnostics):
         super().__init__(f"Attempted to start a cluster with addresses {','.join(addresses)}, but some of them appear to be already used:\n{diagnostics}")
@@ -527,6 +535,23 @@ async def get_bolt_opts(executable: PathLike) -> list[str]:
     else:
         return []
 
+async def scrape_metrics(addrs: list[str], names: list[str]) -> dict[str, float]:
+    """Sums the named Prometheus metrics over every shard of every given node.
+    Metrics which no node exports come back as 0.
+    """
+    _, out, _ = await bash(fr"""for x in {" ".join(addrs)}; do curl --silent $x:9180/metrics; done""",
+                           stdout=asyncio.subprocess.PIPE)
+    assert type(out) == bytes
+    totals = {n: 0.0 for n in names}
+    for line in out.decode().splitlines():
+        if not line or line.startswith("#"):
+            continue
+        # <name>{<labels>} <value>, or <name> <value> for a metric with no labels.
+        name = line.split("{", 1)[0].split(" ", 1)[0]
+        if name in totals:
+            totals[name] += float(line.rsplit(" ", 1)[1])
+    return totals
+
 async def quiesce_cluster(addrs: list[str]) -> None:
     """Waits until all given nodes are done with compactions."""
     training_logger.info("Waiting for compactions to end.")
@@ -552,10 +577,8 @@ async def with_cluster(executable: PathLike, workdir: PathLike, cpusets: Optiona
     to every cluster the training starts. The same options have to be passed when the
     dataset of that workload is populated and when it is trained on.
     """
-    meta = cluster_metadata(workdir)
-    cluster_name = meta["name"]
-    subnet = meta["subnet"]
-    addrs = [f"{subnet}.{i}" for i in range(1,255)][:3]
+    cluster_name = cluster_metadata(workdir)["name"]
+    addrs = cluster_addrs(workdir)
     cpusets = cpusets or NODE_CPUSETS.get()
     extra_opts = await get_bolt_opts(executable) + list(node_opts)
     training_logger.debug(f"BOLT opts for {executable} are {extra_opts}")
@@ -863,6 +886,9 @@ LOGSTOR_NODE_OPTS = [
 # its six shards have between them - 0.83 GiB of 1.5 GiB, or 55%. The training mix deletes
 # one partition for every six it inserts, which settles that at ~6/7 of what was
 # populated, leaving the run at about half a pool.
+#
+# report_logstor_state() prints what it actually came to, so re-derive this from a run
+# rather than from the estimate above whenever ./conf/logstor.yaml changes shape.
 LOGSTOR_ROWS = 150000
 
 # Operations of the training workload. The dataset leaves ~45% of the pool free, which the
@@ -882,17 +908,93 @@ LOGSTOR_TRAIN_OPS = 2600000
 # below the rest because one of them returns a hundred partitions.
 LOGSTOR_TRAIN_MIX = "ops(row-insert=600,read-cache=400,read-disk=200,row-delete=100,scan=1)"
 
+# What a logstor run is checked against. The pool gauges say whether it stayed in the
+# regime it was sized for, the compaction and cache counters say whether the paths it is
+# there to train ran at all, and the failure counters say whether it stalled.
+LOGSTOR_METRICS = [
+    "scylla_logstor_sm_live_record_bytes",
+    "scylla_logstor_sm_live_record_count",
+    "scylla_logstor_sm_segments_in_use",
+    "scylla_logstor_sm_free_segments",
+    "scylla_logstor_sm_bytes_written",
+    "scylla_logstor_sm_bytes_read",
+    "scylla_logstor_sm_compaction_segments_in",
+    "scylla_logstor_sm_compaction_records_rewritten",
+    "scylla_logstor_sm_compaction_bytes_written",
+    "scylla_logstor_sm_separator_buffer_flushed",
+    "scylla_logstor_sm_segment_pool_normal_segments_wait",
+    "scylla_logstor_sm_write_failures",
+    "scylla_logstor_write_failures",
+    "scylla_cache_partition_hits",
+    "scylla_cache_partition_misses",
+    "scylla_cache_partition_insertions",
+    "scylla_cache_partition_evictions",
+]
+
+async def report_logstor_state(addrs: list[str], phase: str) -> None:
+    """Logs what the logstor of the cluster is holding and which of its paths ran.
+    A logstor training run is only worth as much as the state it ran against, and the
+    counters are the only thing that says what that was, so every phase reports them.
+    """
+    m = await scrape_metrics(addrs, LOGSTOR_METRICS)
+    # The segments the shards of the cluster have between them, and the bytes they come
+    # to at the segment size logstor is compiled with (logstor::default_segment_size,
+    # which no configuration option moves).
+    segments = m["scylla_logstor_sm_segments_in_use"] + m["scylla_logstor_sm_free_segments"]
+    capacity = segments * 128 * 1024
+    live = m["scylla_logstor_sm_live_record_bytes"]
+    training_logger.info(
+        f"logstor {phase}:"
+        f" pool {capacity/2**30:.2f} GiB in {segments:.0f} segments,"
+        f" {live/2**30:.2f} GiB live ({100*live/capacity if capacity else 0:.1f}% of the pool),"
+        f" {m['scylla_logstor_sm_segments_in_use']/segments*100 if segments else 0:.1f}% of the segments in use,"
+        f" {m['scylla_logstor_sm_live_record_count']:.0f} records"
+    )
+    training_logger.info(
+        f"logstor {phase}:"
+        f" wrote {m['scylla_logstor_sm_bytes_written']/2**30:.2f} GiB,"
+        f" read {m['scylla_logstor_sm_bytes_read']/2**30:.2f} GiB,"
+        f" compacted {m['scylla_logstor_sm_compaction_segments_in']:.0f} segments"
+        f" rewriting {m['scylla_logstor_sm_compaction_records_rewritten']:.0f} records"
+        f" ({m['scylla_logstor_sm_compaction_bytes_written']/2**30:.2f} GiB),"
+        f" separator flushed {m['scylla_logstor_sm_separator_buffer_flushed']:.0f} buffers"
+    )
+    training_logger.info(
+        f"logstor {phase}:"
+        f" cache {m['scylla_cache_partition_hits']:.0f} hits,"
+        f" {m['scylla_cache_partition_misses']:.0f} misses,"
+        f" {m['scylla_cache_partition_insertions']:.0f} insertions,"
+        f" {m['scylla_cache_partition_evictions']:.0f} evictions,"
+        f" {m['scylla_logstor_sm_segment_pool_normal_segments_wait']:.0f} writes waited for a segment"
+    )
+    # A pool with no room left is the one way this workload stops measuring what it is
+    # for: the writes fail instead of being served, and what the run then spends its time
+    # on is compaction failing to keep up rather than the paths it is here to train.
+    if failures := m["scylla_logstor_sm_write_failures"] + m["scylla_logstor_write_failures"]:
+        training_logger.warning(f"logstor {phase}: {failures:.0f} writes failed"
+                                f" ({m['scylla_logstor_write_failures']:.0f} in logstor,"
+                                f" {m['scylla_logstor_sm_write_failures']:.0f} in the segment manager)."
+                                f" The segment pool is too small for LOGSTOR_ROWS.")
+    elif capacity and live > 0.85 * capacity:
+        training_logger.warning(f"logstor {phase}: the live records take {100*live/capacity:.1f}% of the pool,"
+                                f" leaving compaction almost nothing to reclaim."
+                                f" Lower LOGSTOR_ROWS or raise LOGSTOR_DISK_SIZE_IN_MB.")
+
 async def populate_logstor(executable: PathLike, workdir: PathLike) -> None:
     async with with_cs_populate(executable=executable, workdir=workdir, node_opts=LOGSTOR_NODE_OPTS) as server:
         # Sequential seeds, so that the population covers the key range exactly once
         # instead of leaving a third of it unwritten the way random seeds would.
         await cs(cmd=["user", "profile=./conf/logstor.yaml", "ops(row-insert=1)"],
                  n=LOGSTOR_ROWS, pop=f"seq=1..{LOGSTOR_ROWS}", cl="local_quorum", node=server)
+        await report_logstor_state(cluster_addrs(workdir), "after populating")
 
 async def train_logstor(executable: PathLike, workdir: PathLike) -> None:
     async with with_cs_train(executable=executable, workdir=workdir, node_opts=LOGSTOR_NODE_OPTS) as server:
+        addrs = cluster_addrs(workdir)
+        await report_logstor_state(addrs, "before training")
         await cs(cmd=["user", "profile=./conf/logstor.yaml", LOGSTOR_TRAIN_MIX],
                  n=LOGSTOR_TRAIN_OPS, pop=f"dist=UNIFORM(1..{LOGSTOR_ROWS})", cl="local_quorum", node=server)
+        await report_logstor_state(addrs, "after training")
 
 trainers["logstor"] = ("logstor_dataset", train_logstor)
 populators["logstor_dataset"] = populate_logstor
