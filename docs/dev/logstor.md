@@ -327,7 +327,7 @@ canonical_mutation   (data_size bytes)
 zero_padding         -- to align to record_alignment (8 bytes)
 ```
 
-**Record Header** (`write_buffer::record_header`):
+**Record Header** (`ondisk::record_header`):
 
 | Offset | Size | Field         | Description |
 |--------|------|---------------|-------------|
@@ -336,17 +336,33 @@ zero_padding         -- to align to record_alignment (8 bytes)
 
 **Log Record Header** (`log_record_header`):
 
-The `header_size` bytes immediately following the record header are the IDL-serialized form of `log_record_header`, which contains:
-- `key`: the partition key (`primary_index_key`), including a `decorated_key` with a token and partition key bytes.
-- `timestamp`: the timestamp of the record, used to resolve conflicts by keeping the record with the latest timestamp.
-- `table`: UUID of the table this record belongs to.
+Serialized by hand (`ser::serializer<log_record_header>` in `replica/logstor/ondisk.hh`), 34
+bytes plus the partition key:
 
-**Mutation Data**:
+| Offset | Size | Field       | Description |
+|--------|------|-------------|-------------|
+| 0      | 8    | `token`     | Raw token of the record's partition key. |
+| 8      | 8    | `timestamp` | Timestamp of the record, used to resolve conflicts by keeping the record with the latest timestamp. |
+| 16     | 16   | `table`     | UUID of the table this record belongs to. |
+| 32     | 2    | `key_size`  | Size in bytes of the partition key that follows. |
+| 34     | n    | `key`       | The `partition_key` representation, verbatim: the compound blob the key has in memory. |
 
-The `data_size` bytes immediately following the log record header are the IDL-serialized `canonical_mutation`, which holds the full partition value.
+The fixed-width fields come first so that a point read takes the record's timestamp at a
+fixed offset and compares the record's key against the one it is looking for with a memcmp,
+without deserializing the header. The offsets are `ondisk::log_record_header_*_offset`.
+
+An IDL definition of the same fields would frame every one of them, serialize the token
+through a `bytes` and the key through a vector of its exploded components, and cost several
+allocations on each of the read and the write path, for 84 bytes with a 16-byte key against
+the 50 this takes.
+
+**Record Value**:
+
+The `data_size` bytes following the log record header are the IDL-serialized
+`canonical_mutation`, which holds the full partition value.
 
 **Record Location** (`log_location`):
 
 The `log_location` stored in the index for each record points to the start of the `record_header`:
 - `offset`: byte offset from the start of the segment to the `record_header`.
-- `size`: total size including `record_header` + `log_record_header` + `canonical_mutation`
+- `size`: total size including `record_header` + `log_record_header` + the record value

@@ -12,8 +12,8 @@
 #include <seastar/core/align.hh>
 #include <seastar/core/simple-stream.hh>
 
-#include "idl/logstor.dist.hh"
-#include "idl/logstor.dist.impl.hh"
+#include "idl/frozen_schema.dist.hh"
+#include "idl/frozen_schema.dist.impl.hh"
 #include "serializer_impl.hh"
 
 namespace replica::logstor {

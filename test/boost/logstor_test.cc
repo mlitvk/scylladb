@@ -29,8 +29,6 @@
 #include "replica/logstor/write_buffer.hh"
 #include <seastar/testing/thread_test_case.hh>
 
-#include "idl/logstor.dist.hh"
-#include "idl/logstor.dist.impl.hh"
 #include "replica/logstor/segment_io.hh"
 #include "schema/schema_builder.hh"
 #include <seastar/core/simple-stream.hh>
@@ -409,6 +407,39 @@ mutation make_kv_mutation_of_record_size(schema_ptr schema, const sstring& pk, s
     return make_kv_mutation(schema, pk, sstring(value_size, 'x'));
 }
 
+}
+
+// Checks the compact log_record_header encoding: what it takes, that it round trips, and
+// that the fields a point read reads without deserializing it are where it expects them.
+SEASTAR_THREAD_TEST_CASE(test_logstor_log_record_header_serialization) {
+    auto schema = make_kv_schema();
+    auto record = make_log_record(schema, "pk0", "v0", api::timestamp_type(7));
+    const auto& header = record.header;
+    const auto key = linearized(managed_bytes_view(header.key.dk.key().representation()));
+
+    bytes serialized(bytes::initialized_later(), ondisk::log_record_header_size(header));
+    auto out = seastar::simple_memory_output_stream(reinterpret_cast<char*>(serialized.data()), serialized.size());
+    ser::serialize(out, header);
+    BOOST_REQUIRE_EQUAL(out.size(), 0u);
+    BOOST_REQUIRE_EQUAL(serialized.size(), ondisk::log_record_header_fixed_size + key.size());
+
+    // The timestamp is at a fixed offset and the key right after it, so a point read takes
+    // the one and memcmps the other without deserializing the header.
+    auto timestamp_in = seastar::simple_memory_input_stream(
+            reinterpret_cast<const char*>(serialized.data()) + ondisk::log_record_header_timestamp_offset,
+            sizeof(int64_t));
+    BOOST_REQUIRE_EQUAL(ser::deserialize(timestamp_in, std::type_identity<int64_t>{}), header.timestamp);
+    BOOST_REQUIRE(bytes_view(serialized).substr(ondisk::log_record_header_key_offset, key.size()) == bytes_view(key));
+
+    auto in = seastar::simple_memory_input_stream(reinterpret_cast<const char*>(serialized.data()), serialized.size());
+    auto read = ser::deserialize(in, std::type_identity<log_record_header>{});
+    BOOST_REQUIRE_EQUAL(read.timestamp, header.timestamp);
+    BOOST_REQUIRE_EQUAL(read.table, header.table);
+    BOOST_REQUIRE(read.key.dk.equal(*schema, header.key.dk));
+
+    auto skipped = seastar::simple_memory_input_stream(reinterpret_cast<const char*>(serialized.data()), serialized.size());
+    ser::skip(skipped, std::type_identity<log_record_header>{});
+    BOOST_REQUIRE_EQUAL(skipped.size(), 0u);
 }
 
 // Checks that sealing a full raw write buffer writes the expected header fields.

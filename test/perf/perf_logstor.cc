@@ -56,9 +56,9 @@
 
 // The record header is serialized through the same generated code the write path uses, so that what
 // the size of a record costs to compute here is what it costs there.
+#include "idl/frozen_schema.dist.hh"
+#include "idl/frozen_schema.dist.impl.hh"
 #include "serializer_impl.hh"
-#include "idl/logstor.dist.hh"
-#include "idl/logstor.dist.impl.hh"
 
 using namespace replica::logstor;
 
@@ -355,19 +355,17 @@ public:
         }
     }
 
-    // What log_record_writer::compute_sizes() does: the record is serialized once into a stream that
-    // only counts the bytes, so that the writer knows how much room to ask the buffer for. Measured
-    // over the header building of do_record_header(), since the size of a header can only be
-    // measured on a header, and against a key that changes per operation, so that the measuring
-    // cannot be hoisted out of the loop.
+    // What log_record_writer::compute_sizes() does: the size of the header is arithmetic on its
+    // key, and the value is serialized once into a stream that only counts the bytes, so that the
+    // writer knows how much room to ask the buffer for. Measured over the header building of
+    // do_record_header(), since the size of a header can only be measured on a header, and against
+    // a key that changes per operation, so that the measuring cannot be hoisted out of the loop.
     void do_record_sizes(unsigned count) {
         for (unsigned i = 0; i < count; ++i) {
             auto header = make_record_header(random_key());
-            seastar::measuring_output_stream header_size;
-            ser::serialize(header_size, header);
             seastar::measuring_output_stream data_size;
             ser::serialize(data_size, _canonical_mutation);
-            _sink += header.timestamp + header_size.size() + data_size.size();
+            _sink += header.timestamp + ondisk::log_record_header_size(header) + data_size.size();
         }
     }
 
