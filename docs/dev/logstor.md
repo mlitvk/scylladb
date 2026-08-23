@@ -383,20 +383,31 @@ under another one translates the record's columns onto the schema's, which is ca
 pair of schema versions. Phase 2 of the format moves the description to a per-buffer
 dictionary, where it amortizes to a few bytes per record.
 
-`test/perf/perf_logstor` reports what a record takes against the bytes of value it carries,
-and what the same record took with a `canonical_mutation` value:
+What a record takes against the bytes of value it carries, from `test/perf/perf_logstor`,
+before the format and after it:
 
-| Row | Record | With a `canonical_mutation` |
+| Row | Record | Before |
 |---|---|---|
-| 5 columns x 300 B | 1650 B (1.10x) | 2219 B (1.48x) |
-| 5 columns x 20 B | 245 B (2.45x) | 819 B (8.19x) |
-| 1 column x 300 B | 422 B (1.41x) | 639 B (2.13x) |
-| 1 column x 20 B | 141 B (7.05x) | 359 B (17.95x) |
+| 5 columns x 300 B | 1650 B (1.10x) | 2251 B (1.50x) |
+| 5 columns x 20 B | 245 B (2.45x) | 851 B (8.51x) |
+| 1 column x 300 B | 422 B (1.41x) | 671 B (2.24x) |
+| 1 column x 20 B | 141 B (7.05x) | 391 B (19.55x) |
 
-Its `encode` and `decode` tests measure the two halves of the format against the `freeze`
-and `materialize` tests, which measure what a `canonical_mutation` value cost. For the
-5 x 300 B row: encoding 1 allocation per record against 5, and decoding 1999 cycles against
-10395.
+The narrower the row the larger the difference, because what a `canonical_mutation` spends on
+the mapping of the schema and on the framing of a cell does not shrink with the values. A run
+of the tool prints the second column of its own row shape as it goes, by encoding the same
+partition as a `canonical_mutation` as well; that comparison substitutes only the value, so it
+comes out a few dozen bytes below the numbers here, which are whole records of a build from
+before the format.
+
+The `encode` and `decode` tests measure the two halves of the format against `freeze` and
+`materialize`, which measure what a `canonical_mutation` value cost: for the 5 x 300 B row,
+encoding takes 1 allocation per record against 5, and decoding 6175 instructions against
+17080. Over a whole operation of that shape, a write went from 35.4 allocations and 33038
+instructions to 20.1 and 26885, and a read that goes to a segment from 24.1 and 23925 to 20.1
+and 17310. A read the cache serves is untouched by any of it. At the level of a node,
+`scylla perf-simple-query --logstor --write` went from 93.1k to 102.9k operations per second,
+and the read side of it is flat, since 95% of its reads are cache hits.
 
 **Record Location** (`log_location`):
 
