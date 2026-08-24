@@ -185,8 +185,12 @@ struct compaction_batch {
 // histogram's first `batch_cap` segments, and select_compaction_prefix() picks a prefix of it.
 // Returns nothing when no prefix reclaims a segment, which answers for the whole group rather than
 // only for this batch, since a longer prefix would only add fuller segments.
+//
+// `extension_tolerance` is a parameter only so that the compaction simulator can sweep it; every
+// caller in the engine takes the default.
 std::optional<compaction_batch> select_compaction_batch(const segment_set& segments,
-        uint64_t segment_size, size_t batch_cap);
+        uint64_t segment_size, size_t batch_cap,
+        double extension_tolerance = compaction_batch_extension_tolerance);
 
 // The best `capacity` compaction candidates seen so far, ranked by compaction_candidate_score.
 //
