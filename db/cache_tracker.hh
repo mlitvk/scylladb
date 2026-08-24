@@ -121,6 +121,21 @@ public:
     void on_row_miss() noexcept;
     void on_miss_already_populated() noexcept;
     void on_mispopulate() noexcept;
+    // Row accounting for a cache which evicts whole partitions and therefore does not link its
+    // rows in the LRU, unlike the row cache. See replica/logstor/cache.hh.
+    void on_rows_inserted(size_t n) noexcept { _stats.row_insertions += n; _stats.rows += n; }
+    void on_rows_evicted(size_t n) noexcept { _stats.row_evictions += n; _stats.rows -= n; }
+    void on_rows_removed(size_t n) noexcept { _stats.row_removals += n; _stats.rows -= n; }
+    void on_rows_hit(size_t n) noexcept { _stats.row_hits += n; }
+    void on_rows_missed(size_t n) noexcept { _stats.row_misses += n; }
+    // Read accounting for a cache which has no read_context of its own to count a read from.
+    void on_read_started() noexcept { ++_stats.reads; }
+    void on_read_done(bool with_misses) noexcept {
+        ++_stats.reads_done;
+        if (with_misses) {
+            ++_stats.reads_with_misses;
+        }
+    }
     void on_row_processed_from_memtable() noexcept { ++_stats.rows_processed_from_memtable; }
     void on_row_dropped_from_memtable() noexcept { ++_stats.rows_dropped_from_memtable; }
     void on_row_merged_from_memtable() noexcept { ++_stats.rows_merged_from_memtable; }

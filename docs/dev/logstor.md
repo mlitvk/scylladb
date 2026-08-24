@@ -17,6 +17,33 @@ Logstor consists of several key components:
 
 The primary index is entirely in memory and it maps a partition key to its location in the log segments. It consists of a B-tree per each table that is ordered token.
 
+#### Cache
+
+The cache holds the deserialized partition of a key next to its entry in the primary index, so that
+a read which finds it there is answered without touching the disk. It has no memory, LRU or
+reclaimer of its own: a cached partition is allocated in the LSA region of the row cache and linked
+in its LRU list, so the two caches share the memory of the shard and compete for it under the same
+replacement policy. What logstor keeps is a back-pointer from the index entry to the cached
+partition, entangled with the entry so that it survives the moves LSA compaction makes.
+
+Because it shares the row cache's tracker, the logstor cache also reports through the row cache's
+`cache_*` metrics, and a node running both storage engines sees the sum of the two:
+
+| Metrics | How the logstor cache accounts for them |
+|---|---|
+| `bytes_used`, `bytes_total` | Taken from the shared region, so they cover both caches with nothing to do |
+| `partition_hits`, `partition_misses` | Per read. A key the index does not hold is a hit: the index is the authority on which keys exist, so that answer is served from memory too |
+| `partitions`, `partition_insertions`, `partition_evictions`, `partition_removals` | Per cached partition. Removals are the invalidations, which are a write over the key, an erase of it, or a drain of the cache |
+| `rows`, `row_hits`, `row_misses`, `row_insertions`, `row_evictions`, `row_removals` | A logstor table has no clustering columns, so a partition is at most one row, and a partition which is a tombstone alone is none. The row count of a cached partition is derived from it rather than stored, and its rows are not linked in the LRU: the cache evicts a whole partition at a time |
+| `reads`, `reads_with_misses`, `active_reads` | Per read, from its start to its end. A read that fell through to the disk is one with a miss |
+| `mispopulations` | A read which fetched a record and then found the index entry changed or gone, which makes what it read stale, so it leaves the cache alone |
+| `concurrent_misses_same_key` | Two reads missed the same key, and the second found it populated by the first |
+
+The rest of the `cache_*` metrics belong to structure the logstor cache does not have - the merging
+of partition versions, the update of the cache on a memtable flush, the stitching of an underlying
+reader, dummy rows, and the compaction and tombstone scanning of the cache read path - and stay at
+zero for it.
+
 #### Segment Manager
 
 The `segment_manager` handles the allocation and management of fixed-size segments (default 128KB). Segments are grouped into large files (default 32MB). Key responsibilities include:

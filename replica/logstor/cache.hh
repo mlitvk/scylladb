@@ -21,6 +21,13 @@ class primary_index;
 class primary_index_entry;
 class cached_entry_slot;
 
+// A logstor table has no clustering columns, so a partition holds at most one row - the one with
+// the empty clustering key - plus a partition tombstone. The rows a partition accounts for in the
+// shared cache tracker are therefore derived from it rather than stored alongside it.
+inline size_t partition_row_count(const mutation_partition& p) noexcept {
+    return !p.clustered_rows().empty();
+}
+
 // An evictable node holding the deserialized mutation for one primary_index_entry.
 //
 // Lives inside the shared cache tracker's LSA region. When the shared LSA
@@ -67,6 +74,12 @@ public:
         return _partition;
     }
 
+    // Derived, not stored: upgrade() rebuilds the partition but can neither add nor remove its
+    // row, because the converting applier creates the row before applying any cell to it.
+    size_t row_count() const noexcept {
+        return partition_row_count(_partition);
+    }
+
     void upgrade(schema_ptr schema) {
         if (_schema != schema) {
             _partition.upgrade(*_schema, *schema);
@@ -107,6 +120,35 @@ class cache_tracker {
 public:
     friend class cached_mutation_entry;
 
+    // Counts a read against the shared tracker for as long as it is in scope, the way the row
+    // cache's read_context does: started when the read begins and done when it ends, whether it
+    // returns or throws. A null tracker accounts nothing, which is the bypass_cache case and the
+    // case of a table whose cache is disabled.
+    class read_accounter {
+        cache_tracker* _tracker;
+        bool _missed = false;
+
+    public:
+        explicit read_accounter(cache_tracker* tracker) noexcept
+                : _tracker(tracker) {
+            if (_tracker) {
+                _tracker->_shared_tracker.on_read_started();
+            }
+        }
+
+        read_accounter(const read_accounter&) = delete;
+        read_accounter& operator=(const read_accounter&) = delete;
+
+        ~read_accounter() {
+            if (_tracker) {
+                _tracker->_shared_tracker.on_read_done(_missed);
+            }
+        }
+
+        // The read did not find its partition in the cache and went to the disk for it.
+        void on_miss() noexcept { _missed = true; }
+    };
+
 private:
     ::cache_tracker& _shared_tracker;
     // Used by the read path to lock the LSA region without changing the current allocator
@@ -122,6 +164,22 @@ public:
     std::optional<mutation> lookup(const primary_index_entry&, schema_ptr);
 
     void populate(const primary_index_entry&, const mutation&);
+
+    // A read the index answered by itself: the index is the authority on which keys exist, so a key
+    // it does not hold is a negative answer served from memory, with no disk read.
+    void on_negative_hit() noexcept {
+        _shared_tracker.on_partition_hit();
+    }
+
+    // The rows a read had to fetch from the disk because the cache did not hold them.
+    void on_rows_missed(const mutation_partition& p) noexcept {
+        _shared_tracker.on_rows_missed(partition_row_count(p));
+    }
+
+    // A read which fetched a record and then found it stale, so it left the cache alone.
+    void on_mispopulate() noexcept {
+        _shared_tracker.on_mispopulate();
+    }
 
     logalloc::region& region() noexcept {
         return _shared_tracker.region();

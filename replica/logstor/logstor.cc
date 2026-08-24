@@ -175,9 +175,13 @@ future<std::optional<mutation>> logstor::read(const schema& s, const primary_ind
 
     const auto bypass_cache = slice.options.contains(query::partition_slice::option::bypass_cache);
     auto* cache = bypass_cache ? nullptr : index.cache_tracker();
+    cache_tracker::read_accounter read_acc(cache);
 
     auto it = index.find(dk);
     if (it == index.end()) {
+        if (cache) {
+            cache->on_negative_hit();
+        }
         co_return std::nullopt;
     }
 
@@ -187,6 +191,7 @@ future<std::optional<mutation>> logstor::read(const schema& s, const primary_ind
         if (cached_mut) {
             co_return std::move(*cached_mut);
         }
+        read_acc.on_miss();
     }
 
     // Cache miss (or bypass): read from disk using the entry we already have.
@@ -214,9 +219,15 @@ future<std::optional<mutation>> logstor::read(const schema& s, const primary_ind
     // We must re-find the entry because the iterator may have been invalidated
     // across the co_await above.
     if (cache) {
+        // Counted before the populate below, so that a read which ends up not populating the cache
+        // still counts the rows it had to fetch from the disk.
+        cache->on_rows_missed(m.partition());
         auto it = index.find(dk);
         if (it != index.end() && it->entry().location == entry_for_read.location) {
             cache->populate(*it, m);
+        } else {
+            // The entry changed or went away across the co_await, which makes what was read stale.
+            cache->on_mispopulate();
         }
     }
 

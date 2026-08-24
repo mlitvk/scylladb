@@ -7,30 +7,26 @@
  */
 #include <boost/test/unit_test.hpp>
 #include <optional>
+#include <seastar/util/defer.hh>
 
 #include "replica/logstor/types.hh"
 #include "test/lib/scylla_test_case.hh"
 #include <seastar/testing/thread_test_case.hh>
 
 #include "replica/logstor/index.hh"
+#include "replica/logstor/logstor.hh"
 #include "db/cache_tracker.hh"
+#include "partition_slice_builder.hh"
 #include "schema/schema_builder.hh"
+#include "test/lib/logstor_test_utils.hh"
 #include "test/lib/mutation_assertions.hh"
 #include "test/lib/simple_schema.hh"
+#include "test/lib/tmpdir.hh"
 
 using namespace replica::logstor;
+using namespace tests::logstor;
 
 namespace {
-
-struct shared_logstor_cache {
-    ::cache_tracker shared_tracker;
-    replica::logstor::cache_tracker logstor_tracker;
-
-    shared_logstor_cache()
-        : shared_tracker(utils::updateable_value<double>(1.0), ::cache_tracker::register_metrics::no)
-        , logstor_tracker(shared_tracker) {
-    }
-};
 
 struct noop_space_accounting_subscriber final : space_accounting_subscriber {
     void on_add_record(log_location) noexcept override {}
@@ -56,6 +52,34 @@ mutation make_mutation(simple_schema& schema, sstring pk, sstring value) {
     auto ck = schema.make_ckey(0);
     m.partition().clustered_row(*schema.schema(), ck).apply(row_marker(ts));
     schema.add_row(m, ck, std::move(value), ts);
+    return m;
+}
+
+// The shape a logstor table has: a partition key, no clustering columns, so a partition is at most
+// the row with the empty clustering key plus a partition tombstone.
+schema_ptr make_kv_schema() {
+    return schema_builder(1, "ks", "cf")
+            .with_column("pk", utf8_type, column_kind::partition_key)
+            .with_column("v", utf8_type)
+            .build();
+}
+
+mutation make_kv_mutation(schema_ptr schema, sstring pk, sstring value) {
+    auto dk = dht::decorate_key(*schema, partition_key::from_single_value(*schema, serialized(pk)));
+    mutation m(schema, std::move(dk));
+    const auto ts = api::min_timestamp;
+    auto& row = m.partition().clustered_row(*schema, clustering_key::make_empty());
+    row.apply(row_marker(ts));
+    const auto& v_def = *schema->get_column_definition("v");
+    row.cells().apply(v_def, atomic_cell::make_live(*v_def.type, ts, serialized(value)));
+    return m;
+}
+
+// A partition which is a tombstone alone, holding no row.
+mutation make_kv_tombstone_mutation(schema_ptr schema, sstring pk) {
+    auto dk = dht::decorate_key(*schema, partition_key::from_single_value(*schema, serialized(pk)));
+    mutation m(schema, std::move(dk));
+    m.partition().apply(tombstone(api::min_timestamp, gc_clock::now()));
     return m;
 }
 
@@ -227,6 +251,117 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_drain_cache_preserves_index_
     BOOST_REQUIRE(index.find(dk1) != index.end());
     BOOST_REQUIRE(!lookup_exists(index, cache.logstor_tracker, dk0, schema.schema()));
     BOOST_REQUIRE(!lookup_exists(index, cache.logstor_tracker, dk1, schema.schema()));
+    // Draining the cache leaves nothing accounted for behind.
+    BOOST_REQUIRE_EQUAL(cache.shared_tracker.get_stats().partitions, 0u);
+    BOOST_REQUIRE_EQUAL(cache.shared_tracker.get_stats().rows, 0u);
+}
+
+// The row counters of the shared cache tracker, which the logstor cache accounts a whole partition
+// at a time: a partition of a logstor table is at most one row.
+SEASTAR_THREAD_TEST_CASE(test_logstor_cache_row_accounting) {
+    auto schema = make_kv_schema();
+    primary_index index(schema, noop_space_accounting);
+    shared_logstor_cache cache;
+    index.set_cache_tracker(&cache.logstor_tracker);
+    const auto& stats = cache.shared_tracker.get_stats();
+
+    auto row_mut = make_kv_mutation(schema, "pk0", "v0");
+    auto tombstone_mut = make_kv_tombstone_mutation(schema, "pk1");
+    auto row_key = row_mut.decorated_key();
+    auto tombstone_key = tombstone_mut.decorated_key();
+
+    BOOST_REQUIRE(!index.insert(primary_index_key{row_key}, make_index_entry(1, 0, 10, 1)).second);
+    BOOST_REQUIRE(!index.insert(primary_index_key{tombstone_key}, make_index_entry(1, 10, 10, 1)).second);
+
+    populate(index, row_key, row_mut);
+    populate(index, tombstone_key, tombstone_mut);
+
+    BOOST_REQUIRE_EQUAL(stats.partitions, 2u);
+    BOOST_REQUIRE_EQUAL(stats.rows, 1u);
+    BOOST_REQUIRE_EQUAL(stats.row_insertions, 1u);
+
+    BOOST_REQUIRE(lookup_exists(index, cache.logstor_tracker, row_key, schema));
+    BOOST_REQUIRE_EQUAL(stats.row_hits, 1u);
+    // A hit on a partition which holds no row is a partition hit alone.
+    BOOST_REQUIRE(lookup_exists(index, cache.logstor_tracker, tombstone_key, schema));
+    BOOST_REQUIRE_EQUAL(stats.partition_hits, 2u);
+    BOOST_REQUIRE_EQUAL(stats.row_hits, 1u);
+
+    // Overwriting the index entry invalidates the cached partition.
+    BOOST_REQUIRE(index.insert(primary_index_key{row_key}, make_index_entry(2, 0, 12, 2)).first);
+    BOOST_REQUIRE_EQUAL(stats.rows, 0u);
+    BOOST_REQUIRE_EQUAL(stats.row_removals, 1u);
+    BOOST_REQUIRE_EQUAL(stats.row_evictions, 0u);
+
+    populate(index, row_key, row_mut);
+    BOOST_REQUIRE_EQUAL(stats.rows, 1u);
+    BOOST_REQUIRE_EQUAL(stats.row_insertions, 2u);
+
+    while (evict_one(cache.logstor_tracker)) {}
+    BOOST_REQUIRE_EQUAL(stats.partitions, 0u);
+    BOOST_REQUIRE_EQUAL(stats.rows, 0u);
+    BOOST_REQUIRE_EQUAL(stats.row_evictions, 1u);
+}
+
+// What a read accounts for against the shared cache tracker, along the whole read path.
+SEASTAR_THREAD_TEST_CASE(test_logstor_cache_read_accounting) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    ls.do_recovery_for_test().get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls, true);
+    auto& index = cg.logstor_index();
+    // The index outlives nothing it can drop a cached partition into, so it has to give them up
+    // before it goes, the way a table does when it stops.
+    auto drain_cache = seastar::defer([&index] noexcept { index.drain_cache().get(); });
+    const auto& stats = cache.shared_tracker.get_stats();
+
+    auto m = make_kv_mutation(schema, "pk0", "v0");
+    auto key = m.decorated_key();
+    ls.write(m, write_target(&cg, {}), db::no_timeout).get();
+
+    // The first read misses the cache, fetches the record from the disk and populates the cache
+    // with it.
+    assert_that(*ls.read(*schema, index, key, schema->full_slice()).get()).is_equal_to(m);
+    BOOST_REQUIRE_EQUAL(stats.reads, 1u);
+    BOOST_REQUIRE_EQUAL(stats.active_reads(), 0u);
+    BOOST_REQUIRE_EQUAL(stats.reads_with_misses, 1u);
+    BOOST_REQUIRE_EQUAL(stats.partition_misses, 1u);
+    BOOST_REQUIRE_EQUAL(stats.row_misses, 1u);
+    BOOST_REQUIRE_EQUAL(stats.partition_insertions, 1u);
+    BOOST_REQUIRE_EQUAL(stats.rows, 1u);
+    BOOST_REQUIRE_EQUAL(stats.mispopulations, 0u);
+
+    // The second read is served by the cache, and reaches no disk.
+    assert_that(*ls.read(*schema, index, key, schema->full_slice()).get()).is_equal_to(m);
+    BOOST_REQUIRE_EQUAL(stats.reads, 2u);
+    BOOST_REQUIRE_EQUAL(stats.reads_with_misses, 1u);
+    BOOST_REQUIRE_EQUAL(stats.partition_hits, 1u);
+    BOOST_REQUIRE_EQUAL(stats.row_hits, 1u);
+
+    // A key the index does not hold is a negative answer served from memory: a partition hit of its
+    // own, with no row and no disk read.
+    auto missing_key = make_kv_mutation(schema, "pk-missing", "v").decorated_key();
+    BOOST_REQUIRE(!ls.read(*schema, index, missing_key, schema->full_slice()).get());
+    BOOST_REQUIRE_EQUAL(stats.reads, 3u);
+    BOOST_REQUIRE_EQUAL(stats.reads_with_misses, 1u);
+    BOOST_REQUIRE_EQUAL(stats.partition_hits, 2u);
+    BOOST_REQUIRE_EQUAL(stats.row_hits, 1u);
+
+    // A read which bypasses the cache accounts nothing at all.
+    auto bypassing_slice = partition_slice_builder(*schema)
+            .with_option<query::partition_slice::option::bypass_cache>()
+            .build();
+    assert_that(*ls.read(*schema, index, key, bypassing_slice).get()).is_equal_to(m);
+    BOOST_REQUIRE_EQUAL(stats.reads, 3u);
+    BOOST_REQUIRE_EQUAL(stats.partition_hits, 2u);
+    BOOST_REQUIRE_EQUAL(stats.partition_misses, 1u);
+    BOOST_REQUIRE_EQUAL(stats.row_misses, 1u);
 }
 
 SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_cache_survives_index_rebalancing) {

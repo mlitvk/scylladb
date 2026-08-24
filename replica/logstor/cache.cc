@@ -21,9 +21,13 @@ cached_mutation_entry::cached_mutation_entry(schema_ptr schema, const mutation_p
 }
 
 void cached_mutation_entry::on_evicted() noexcept {
-    if (auto* ct = get_current_cache_tracker()) {
-        ct->on_partition_eviction();
-    }
+    // Eviction always runs with the current tracker set - from the reclaim callback of the region,
+    // from evict_from_lru_shallow() or from clear() - the same invariant the row cache's
+    // rows_entry::on_evicted() relies on. Account before the destruction below, which frees the
+    // partition the row count is derived from.
+    auto& ct = *get_current_cache_tracker();
+    ct.on_rows_evicted(row_count());
+    ct.on_partition_eviction();
     // Destroy and free this object using the LSA allocator that allocated it.
     current_allocator().destroy(this);
 }
@@ -47,17 +51,22 @@ void cache_tracker::evict(const primary_index_entry& pie) {
 
     with_allocator(allocator(), [&] {
         auto& e = *pie._cached_entry;
+        // Taken before the destruction below, which frees the partition it is derived from.
+        const auto rows = e.row_count();
         get_lru().remove(e);
         current_allocator().destroy(&e);
+        _shared_tracker.on_rows_removed(rows);
         _shared_tracker.on_partition_remove();
     });
 }
 
 std::optional<mutation> cache_tracker::lookup(const primary_index_entry& pie, schema_ptr target_schema) {
     std::optional<mutation> cached_mut;
+    size_t cached_rows = 0;
     _read_section(region(), [&] {
         if (pie._cached_entry) {
             get_lru().touch(*pie._cached_entry);
+            cached_rows = pie._cached_entry->row_count();
             if (pie._cached_entry->schema() != target_schema) {
                 with_allocator(allocator(), [&] {
                     pie._cached_entry->upgrade(target_schema);
@@ -69,7 +78,10 @@ std::optional<mutation> cache_tracker::lookup(const primary_index_entry& pie, sc
 
     if (cached_mut) {
         _shared_tracker.on_partition_hit();
+        _shared_tracker.on_rows_hit(cached_rows);
     } else {
+        // The rows of a miss are counted by the read path, where the record is deserialized and
+        // their number becomes known.
         _shared_tracker.on_partition_miss();
     }
 
@@ -85,6 +97,7 @@ void cache_tracker::populate(const primary_index_entry& pie, const mutation& m) 
             }
             auto* e = current_allocator().construct<cached_mutation_entry>(m.schema(), m.partition(), pie._cached_entry);
             get_lru().add(*e);
+            _shared_tracker.on_rows_inserted(e->row_count());
             _shared_tracker.on_partition_insert();
         });
     });
