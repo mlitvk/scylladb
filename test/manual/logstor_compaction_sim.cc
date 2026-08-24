@@ -485,9 +485,12 @@ struct sim_stats {
     double live_bytes_sum = 0;
 
     // The distribution of the segments by utilization, which is what says how much space there is to
-    // reclaim and how cheaply. Sampled rarely, since it is a shape rather than a rate.
+    // reclaim and how cheaply, and what the segments a group owns hold. Sampled rarely, since these
+    // are shapes rather than rates, and cost a walk over the groups.
     uint64_t utilization_samples = 0;
     utilization_histogram utilization{};
+    uint64_t sealed_segments_sum = 0;
+    double sealed_live_bytes_sum = 0;
 };
 
 // The upper bounds of the efficiency histogram buckets, in segments reclaimed per segment-worth of
@@ -534,6 +537,24 @@ struct sim_result {
     }
     double segments_per_job() const noexcept {
         return stats.compaction_jobs ? double(stats.compaction_segments_in) / double(stats.compaction_jobs) : 0;
+    }
+    // The segments a group owns, which are the ones compaction can pick from. The rest of what the
+    // disk holds is the open segment each group is filling, which is not a candidate until it is
+    // sealed and is on average half empty.
+    double mean_sealed_segments() const noexcept {
+        return stats.utilization_samples
+                ? double(stats.sealed_segments_sum) / double(stats.utilization_samples) : 0;
+    }
+    double mean_open_segments() const noexcept {
+        return std::max(0.0, double(segment_count) * (1 - mean_free_fraction()) - mean_sealed_segments());
+    }
+    // The utilization of the segments compaction picks from, which is what its cost is set by. It is
+    // above the utilization of the disk by whatever the open segments are holding back.
+    double sealed_utilization() const noexcept {
+        const auto sealed = mean_sealed_segments();
+        return sealed > 0 && stats.utilization_samples
+                ? stats.sealed_live_bytes_sum / double(stats.utilization_samples) / (sealed * double(params.segment_size))
+                : 0;
     }
 };
 
@@ -1143,6 +1164,8 @@ private:
             ++_stats.utilization_samples;
             for (const auto& g : _groups) {
                 const auto& stats = g->segments.stats();
+                _stats.sealed_segments_sum += stats.segment_count;
+                _stats.sealed_live_bytes_sum += double(stats.live_bytes);
                 for (size_t i = 0; i < utilization_bucket_count; ++i) {
                     _stats.utilization[i] += stats.utilization[i];
                 }
@@ -1237,6 +1260,10 @@ void print_report(const sim_result& r) {
             r.mean_free_fraction() * double(r.segment_count), r.mean_free_fraction() * 100,
             s.free_segments_min, s.free_segments_max);
     fmt::print("  effective utilization U_eff   {:.4f}\n", r.effective_utilization());
+    fmt::print("  segments a group owns         {:.1f}, holding {:.4f} of themselves\n",
+            r.mean_sealed_segments(), r.sealed_utilization());
+    fmt::print("  open segments                 {:.1f} ({:.3f}% of the disk), one per group\n",
+            r.mean_open_segments(), r.mean_open_segments() / double(r.segment_count) * 100);
 
     fmt::print("\nWrite amplification\n");
     fmt::print("  WA_gc      compaction data / user data     {:.3f}\n", r.wa_gc());
@@ -1305,6 +1332,7 @@ struct sweep_column {
 constexpr sweep_column sweep_columns[] = {
     {"U", [] (const sim_result& r) { return r.mean_utilization(); }},
     {"U_eff", [] (const sim_result& r) { return r.effective_utilization(); }},
+    {"U_sealed", [] (const sim_result& r) { return r.sealed_utilization(); }},
     {"free%", [] (const sim_result& r) { return r.mean_free_fraction() * 100; }},
     {"WA_gc", [] (const sim_result& r) { return r.wa_gc(); }},
     {"dev WA", [] (const sim_result& r) { return r.device_wa(); }},
