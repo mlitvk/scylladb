@@ -188,6 +188,49 @@ struct compaction_batch {
 std::optional<compaction_batch> select_compaction_batch(const segment_set& segments,
         uint64_t segment_size, size_t batch_cap);
 
+// The best `capacity` compaction candidates seen so far, ranked by compaction_candidate_score.
+//
+// Kept as a min heap, so that a candidate that cannot make the set costs a single comparison, which
+// is what the scan over a shard's groups does for all but a few of them.
+//
+// `Candidate` is anything carrying a `score`: the compaction manager ranks its groups by the batch
+// each would run, and the compaction simulator (test/manual/logstor_compaction_sim.cc) ranks its own
+// groups with the same code.
+template <typename Candidate>
+requires requires (const Candidate& c) { { c.score } -> std::convertible_to<compaction_candidate_score>; }
+class top_compaction_candidates {
+    std::vector<Candidate> _candidates;
+    size_t _capacity;
+
+    static bool worse(const Candidate& lhs, const Candidate& rhs) noexcept {
+        return rhs.score < lhs.score;
+    }
+
+public:
+    explicit top_compaction_candidates(size_t capacity)
+        : _capacity(capacity) {
+        _candidates.reserve(capacity);
+    }
+
+    void add(Candidate candidate) {
+        if (_candidates.size() < _capacity) {
+            _candidates.push_back(std::move(candidate));
+            std::ranges::push_heap(_candidates, worse);
+        } else if (!_candidates.empty() && _candidates.front().score < candidate.score) {
+            std::ranges::pop_heap(_candidates, worse);
+            _candidates.back() = std::move(candidate);
+            std::ranges::push_heap(_candidates, worse);
+        }
+    }
+
+    // The candidates ranked worst first, so that a caller taking them one at a time from the back
+    // takes the best one first.
+    std::vector<Candidate> take() && {
+        std::ranges::sort(_candidates, std::less<>{}, &Candidate::score);
+        return std::move(_candidates);
+    }
+};
+
 // Where the free-segment target falls on the compaction_shares_pressure() ramp. It is a property of
 // the watermarks rather than a tunable: with the relative hysteresis of make_free_segment_watermarks()
 // the target sits a third of the way up the ramp on any disk size, up to the rounding of the two
