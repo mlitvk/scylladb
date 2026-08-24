@@ -8,6 +8,8 @@ add_scylla_test(gossip
   KIND SEASTAR)
 add_scylla_test(hint_test
   KIND SEASTAR)
+add_scylla_test(logstor_compaction_sim
+  KIND SEASTAR)
 add_scylla_test(message
   SOURCES message.cc
   KIND SEASTAR)

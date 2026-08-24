@@ -682,6 +682,7 @@ scylla_tests = set([
     'test/manual/gce_snitch_test',
     'test/manual/gossip',
     'test/manual/hint_test',
+    'test/manual/logstor_compaction_sim',
     'test/manual/message',
     'test/manual/partition_data_test',
     'test/manual/row_locker_test',
@@ -1651,6 +1652,7 @@ pure_boost_tests = set([
 tests_not_using_seastar_test_framework = set([
     'test/boost/small_vector_test',
     'test/manual/gossip',
+    'test/manual/logstor_compaction_sim',
     'test/manual/message',
     'test/perf/memory_footprint_test',
     'test/perf/perf_cache_eviction',
