@@ -104,6 +104,10 @@ configuration below is dominated by this relation.
 
 ### Over-provisioning
 
+The tables in this section and the next are comparisons rather than predictions of what a disk will
+do: their absolute values were taken with an earlier model and are low, see [The absolute numbers on
+this page are due a re-take](#the-absolute-numbers-on-this-page-are-due-a-re-take).
+
 `U = 0.75`, uniform random overwrites, cap 8, one group. "Absolute" is the absolute-reclaimed score
 with the output buffer flushed at the end of every job, i.e. the behavior before the resolved
 changes in the [Plan](#plan); "Efficiency" is the rule from [Strategy](#strategy), which is what
@@ -1184,34 +1188,84 @@ to be able to see whether the model holds on a real cluster.
 
 ## Appendix: methodology
 
-The numbers in this document come from a discrete-event simulation of the segment pool that models
-logstor's actual mechanics: fixed-size segments; whole-segment reads; `n_out = ceil(live/usable)`;
-the net-gain constraint; candidate sets restricted to an ascending-utilization prefix capped at
-`max_segments_per_compaction`; per-group selection with output segregated by group; and a separate
-compaction output stream, matching the `full`-segment layout.
+The numbers on this page come from a simulation of the segment pool. It lives in
+`test/manual/logstor_compaction_sim.cc` and runs the engine's own selection code over a modeled
+disk, so that a parameter can be swept without a cluster:
 
-Parameters unless stated otherwise: 900 segments (2400 for the group-count table, so that
-open-segment overhead does not confound it), 32 records per segment, `U = 0.75`, 10% free-segment
-target, cap 8, dataset pre-populated before measurement, warm-up of half the run, measurements
-taken over the second half. Workloads: uniform random, zipf 0.99, and 90/10 hot-cold, all
+```
+ninja build/dev/test/manual/logstor_compaction_sim
+build/dev/test/manual/logstor_compaction_sim --smp 1 --utilization 0.75 --trigger-threshold 0.1
+build/dev/test/manual/logstor_compaction_sim --smp 1 --sweep trigger-threshold=0.03,0.05,0.1,0.2
+build/dev/test/manual/logstor_compaction_sim --smp 1 --self-test
+```
+
+`--help` lists every parameter, `--sweep name=v1,v2,...` may be repeated to take the product of
+several of them, and `--csv` prints the resulting table for a spreadsheet. Because write
+amplification is set by the free level rather than by the rule under test, a configuration that
+reclaims faster than another settles at a different level and cannot be compared against it directly;
+`--free-band 1` pins the hysteresis to a single segment so that both run at the same `U_eff`.
+
+What the simulator runs rather than reimplements is everything a change to this page's strategy would
+touch: `segment_descriptor` and `segment_set` with its `log_heap` free-space histogram, so victim
+ordering including the histogram's bucketing is real; `select_compaction_batch()` and with it the
+efficiency score, the extension tolerance and `estimate_required_segments()`;
+`top_compaction_candidates`, which ranks the groups; `make_free_segment_watermarks()` and
+`make_compaction_limits()`; `auto_compaction_wanted()`; and the `ondisk::` sizes and alignments, so
+what a segment holds and what it wastes are what the engine would produce. The index, the compaction
+job, the driver that keeps jobs in flight, the segment pool and the write path are modeled, since the
+engine's versions of them are IO or future bound.
+
+Parameters unless stated otherwise: 900 segments of 128KB, 32 records per segment, `U = 0.75`, a 10%
+free-segment target, one group, uniform random overwrites, the dataset written through once before
+the run and half the run taken as warm-up. Workloads: uniform, zipf 0.99 and 90/10 hot-cold, all
 overwrite-only.
 
-The batch-cap and residual tables were taken with the hysteresis band narrowed to a single segment,
-so that configurations differing in how fast they reclaim are still compared at the same free level.
-Without that, a configuration that fails to reach the stop watermark is credited with the lower write
-amplification its lower `U_eff` produces — see [Batch cap](#batch-cap).
+Divergences from the engine:
 
-Divergences from the implementation, all of which should make the absolute numbers slightly
-optimistic but do not affect the comparisons:
+- The write path is abstracted. A user record goes straight into an open segment of its group, as if
+  the separator were instantaneous, so the mixed segments and the separator buffers are not modeled -
+  they cost space and one more copy of every user byte, and the device therefore writes one copy more
+  than the simulator's device write amplification. What compaction sees - what the segments of a
+  group hold, how they are laid out and how they age - is modeled.
+- There is no clock. Compaction runs whenever the free level asks for it and is taken to keep up, so
+  what is measured is the steady state at the free level the watermarks produce. Compaction falling
+  behind is a property of the device and of the shares controller.
+- Deletes, TTL expiry and tombstones are not modeled, and neither are recovery and tablet splitting.
 
-- Records are fixed size. `estimate_required_segments` assumes a uniform average record size too,
-  so both share this approximation, but a real skewed size distribution adds packing loss.
-- The free-space histogram is modeled with exact ordering. `log_heap` buckets at 8 sub-buckets per
-  octave, so real selection can pick a segment up to ~6% of a segment fuller than optimal.
-- Deletes, TTL expiry and tombstones are not modeled; neither is recovery or tablet splitting.
-- Mixed segments and the separator are modeled only as the constant 2x write floor, not as
-  occupancy.
-- The carried-residual runs model the output stream only. A residual holds its *input* segments
-  alive until it is flushed, which raises `U_eff` and is not in the numbers; see [Carrying the
-  output residual](#carrying-the-output-residual) for the bounds that keep it to one segment per
-  group.
+### The absolute numbers on this page are due a re-take
+
+The tables above were taken with an earlier, throwaway simulation that is not the one described here.
+It modeled an *idealized* cleaner: one victim at a time, always the emptiest segment on the disk, and
+an output stream packed perfectly across jobs. A thirty-line model with those two properties
+reproduces every entry of the [disk utilization](#disk-utilization) table to within 3%, which is what
+identifies it.
+
+The simulator reproduces the comparisons those tables were written to make - the efficiency score and
+the absolute-reclaimed rule differ by well under 1% at cap 8, extending the batch within a tolerance
+costs a few percent of write amplification for half as many jobs, a cap of 32 is the best of 8 to 90,
+and utilization-ordered victims are worth roughly 2x over random ones - but it reports materially
+higher absolute write amplification. At `U = 0.75` and a 10% target it gives `WA_gc` 2.9 at a cap of
+8 and 2.7 at a cap of 32, against the 1.97 above.
+
+The difference is the two idealizations, and both are properties of the engine rather than of the
+model:
+
+- **A job takes a batch, not the emptiest segment.** A single victim can never reclaim, since
+  `n_out = ceil(live/usable)` is 1 for any segment holding anything, so the batch has to reach at
+  least `min_segments_per_compaction`, and its later members are fuller than its first. The mean
+  victim utilization is what the copy cost is proportional to, and over 8 victims it is several
+  points above the emptiest segment's.
+- **The output is whole segments.** A job flushes its residual as a partly filled segment, so it
+  reclaims `n_in - ceil(live/usable)` rather than `n_in - live/usable`. At the operating point above
+  that is about a fifth of what the batch would otherwise reclaim.
+
+They interact, which is why the gap grows with utilization: a more expensive cleaner has to clean
+more often, its segments get less time to decay, and the victims it finds are fuller. That feedback
+is the reason a 25% arithmetic loss shows up as a 45% write-amplification loss.
+
+The practical consequence is that [carrying the output
+residual](#carrying-the-output-residual), which this page concluded was worth 1.7% and dropped, is
+worth re-examining: carrying it is also what would let a job reclaim from a batch smaller than
+`min_segments_per_compaction`, which is where the idealized cleaner's advantage comes from. That
+needs the `floor` form of `estimate_required_segments` the same section calls out as needing its own
+simulation, and it is now cheap to simulate.
