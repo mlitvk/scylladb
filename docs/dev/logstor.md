@@ -248,12 +248,14 @@ DELETE FROM keyspace.table_name WHERE pk = 1;
 
 ## Measuring Performance
 
-Two tests measure the cost of an operation, at two levels. `scylla perf-simple-query --logstor` runs
-the whole read and write path of a single node against a logstor table, and it is the same test that
-measures an sstable backed table, so the two can be compared by dropping the flag.
+Three tests measure the cost of an operation, at three levels. `scylla perf-simple-query --logstor`
+runs the whole read and write path of a single node against a logstor table, and it is the same test
+that measures an sstable backed table, so the two can be compared by dropping the flag.
 `test/perf/perf_logstor` drives a logstor directly and measures the steps of a read and of a write
-one at a time. Which one answers which question, how to run either so that two runs can be compared,
-and how to read what they report is in [logstor_perf.md](logstor_perf.md).
+one at a time. `test/perf/perf_logstor_record_format` measures the encoding and the decoding of a
+record value alone, and what a record takes, for several row shapes in one run. Which one answers
+which question, how to run either so that two runs can be compared, and how to read what they report
+is in [logstor_perf.md](logstor_perf.md).
 
 ## On-Disk Format
 
@@ -398,7 +400,9 @@ the mapping of the schema and on the framing of a cell does not shrink with the 
 of the tool prints the second column of its own row shape as it goes, by encoding the same
 partition as a `canonical_mutation` as well; that comparison substitutes only the value, so it
 comes out a few dozen bytes below the numbers here, which are whole records of a build from
-before the format.
+before the format. `test/perf/perf_logstor_record_format` prints both columns for whatever shapes
+it is given, together with the split of a value into its head, the description of the schema it
+carries and the row itself.
 
 The `encode` and `decode` tests measure the two halves of the format against `freeze` and
 `materialize`, which measure what a `canonical_mutation` value cost. In a release build, 5 x

@@ -91,6 +91,15 @@ add_perf_test(perf_logstor
     schema
     types
     utils)
+add_perf_test(perf_logstor_record_format
+  LIBRARIES
+    dht
+    idl
+    mutation
+    replica
+    schema
+    types
+    utils)
 add_perf_test(perf_mutation)
 add_perf_test(perf_mutation_readers
   LIBRARIES

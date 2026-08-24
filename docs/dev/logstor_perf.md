@@ -37,7 +37,7 @@ tell them apart, and every run should be checked against them before its numbers
 A logstor table has neither a commitlog nor sstables, so for a logstor run these counters attribute
 all of the disk traffic and all of the cache lookups to logstor.
 
-## The two tools
+## The tools
 
 ### `scylla perf-simple-query --logstor`
 
@@ -152,6 +152,46 @@ the bytes of value it carries - and what the same record would take with a `cano
 for comparison - and warns when the dataset does not leave the pool room for the dead records the
 overwrites of the write test will leave behind.
 
+### `test/perf/perf_logstor_record_format`
+
+Measures the record format on its own: what encoding the partition of a mutation into the value of a
+record and decoding it back cost, and what the record takes, for as many row shapes as one run is
+given. It builds no logstor and touches no disk, so it runs in seconds and has almost no variance;
+use it to iterate on a change to `replica/logstor/record_format.cc`, and `perf_logstor` - whose
+`encode` and `decode` tests are the same two steps inside a whole read and a whole write - to see
+what the change did to an operation.
+
+```
+taskset -c 2 build/release/test/perf/perf_logstor_record_format --smp 1 \
+    --columns 1,5,30 --value-size 20,300
+```
+
+| Measurement | What one operation does |
+|---|---|
+| `encode` | encode one partition into the value of a record: measure it, allocate the buffer and fill it, which is what a write does |
+| `encode, sizing walk only` | the first of the two walks of the partition `encode` makes, the one that only measures |
+| `freeze (canonical_mutation)` | freeze the same partition into a `canonical_mutation`, which is what a record value was before the format |
+| `decode` | decode the value into the mutation a read returns, under the schema version the record was written with |
+| `decode, other schema version` | the same under a later version of the schema, which maps the record's columns onto the schema's through a `column_translation`. The translation is built before the measurement, since a read builds one per pair of schema versions and not per record |
+| `materialize (canonical_mutation)` | turn the `canonical_mutation` of the same partition into a mutation, which is what `decode` replaced. Measured under both schema versions as well |
+
+Every measurement reports instructions and allocations per operation, which are the numbers to
+compare, and a duration for scale. There are no cycles and no IO counters here, and no result file.
+
+Each shape prints its sizes first: the encoded value and the whole record in a segment, both against
+the bytes of value the row carries and against what the same partition took with a
+`canonical_mutation` value, and then the value split into its head, the description of the schema it
+carries and the row itself. That split is what says whether a shape pays for the format or for the
+description - phase 2 of the format moves the description to a per-buffer dictionary, and a row of
+thirty columns spends 184 bytes on it.
+
+| Option | Meaning |
+|---|---|
+| `--columns` | comma separated value column counts of the table. The description of the schema a record carries and the framing of its cells both scale with this |
+| `--value-size` | comma separated sizes of the value of one column, in bytes. Every combination of the two is measured |
+| `--columns-set` | columns of the row that carry a cell, or 0 for all of them. Fewer than all makes the record carry a bitmap of the columns it holds, which is what an update of part of a row writes |
+| `--iterations` | samples per measurement, each of a batch of operations, since one operation costs of the order of what the measurement loop itself costs |
+
 ## Reading the numbers
 
 The steps are meant to add up, and that is the first thing to check. A whole read that goes to a
@@ -181,7 +221,7 @@ If a change moves `read-disk` without moving any of the steps under it, either t
 part of the read that none of the steps cover, or the measurement is not measuring what it looks
 like. Check the per operation counters first.
 
-The same holds across the two tools. `perf-simple-query --logstor` costs several times what
+The same holds across the tools. `perf-simple-query --logstor` costs several times what
 `perf_logstor` reports for the same operation, and the difference is the CQL, coordinator and
 replica work that the first includes and the second does not. A change to logstor should move both
 by the same absolute amount; if it moves only the end to end number, it moved something above
@@ -193,7 +233,8 @@ logstor.
   steps are not the same either.
 
 ```
-./tools/toolchain/dbuild ninja build/release/scylla build/release/test/perf/perf_logstor
+./tools/toolchain/dbuild ninja build/release/scylla build/release/test/perf/perf_logstor \
+    build/release/test/perf/perf_logstor_record_format
 ```
 
 - **One shard, pinned.** `--smp 1` with `taskset -c <cpu>` on an otherwise idle machine, with the
@@ -358,6 +399,8 @@ Symbols need the perf test binaries to keep them, which they do not by default:
 | sstable baseline | the same commands without `--logstor` |
 | one step of a path | `perf_logstor --test <step>` |
 | the cost of a row shape | `perf_logstor --columns N --value-size B`, which is what a change to the format of a record is measured against |
+| a change to the record format | `perf_logstor_record_format`, which encodes and decodes alone, over several row shapes in one run |
+| what a record takes, and on what | `perf_logstor_record_format --columns N --value-size B --columns-set K` |
 | what logstor adds to a read | `perf_logstor --test raw-read,segment-read` |
 | what a write costs beyond its steps | `perf_logstor --test build-mutation,encode,record-sizes,append,index-insert,index-lookup,write` |
 | what a buffer amortizes | `perf_logstor --test write` at several `--concurrency`, from 1 up |
@@ -376,6 +419,8 @@ not fit in memory.
   counters.
 - `test/perf/perf_logstor.cc` - the micro benchmark. Adding a step to measure means adding a method
   to `logstor_bench` and a name to `test_kinds`.
+- `test/perf/perf_logstor_record_format.cc` - the record format benchmark: the row shapes it builds,
+  the size report and its own measurement loop.
 - `test/perf/perf.hh`, `test/perf/perf.cc` - the measurement loop, the per operation CPU and IO
   counters, and the result file.
 - `test/lib/logstor_test_utils.hh` - the logstor, the cache and the compaction group a test brings
