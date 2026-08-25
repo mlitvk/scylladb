@@ -603,6 +603,7 @@ private:
         uint64_t compaction_records_rewritten{0};
         uint64_t compaction_bytes_read{0};
         uint64_t compaction_failures{0};
+        uint64_t compaction_batches_refused{0};
         uint64_t separator_buffer_flushed{0};
         uint64_t separator_segments_freed{0};
         uint64_t separator_flush_failures{0};
@@ -1315,6 +1316,8 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
                         sm::description("Counts number of bytes read by compaction.")),
         sm::make_counter("compaction_failures", _compaction_mgr.get_stats().compaction_failures,
                        sm::description("Counts number of logstor compaction failures.")),
+        sm::make_counter("compaction_batches_refused", _compaction_mgr.get_stats().compaction_batches_refused,
+                       sm::description("Counts number of compaction batches that were not started alongside a running compaction because they reclaimed far less per byte copied than the best batch on the shard.")),
         sm::make_counter("separator_bytes_written", _stats.bytes_written[static_cast<size_t>(write_source::separator)],
                        sm::description("Counts number of bytes written to the separator.")),
         sm::make_counter("separator_data_bytes_written", _stats.data_bytes_written[static_cast<size_t>(write_source::separator)],
@@ -2005,6 +2008,9 @@ future<> compaction_manager_impl::run_auto_compaction() {
     auto held_back = co_await get_units(_auto_compaction_sem, max_auto_compaction_parallelism - parallelism);
 
     std::vector<compaction_candidate> pending;
+    // What the marginal-admission gate below measures a candidate against, from the ranking that
+    // produced `pending`.
+    std::optional<compaction_candidate_score> admission_bar;
 
     while (can_submit_compaction() && should_run_auto_compaction()) {
         auto units = co_await get_units(_auto_compaction_sem, 1);
@@ -2019,6 +2025,7 @@ future<> compaction_manager_impl::run_auto_compaction() {
                 co_await seastar::sleep(std::chrono::milliseconds(100));
                 continue;
             }
+            admission_bar = marginal_admission_bar(pending);
         }
 
         auto candidate = std::move(pending.back());
@@ -2026,6 +2033,29 @@ future<> compaction_manager_impl::run_auto_compaction() {
 
         auto it = _groups.find(candidate.group);
         if (it == _groups.end() || it->second->running() || it->second->compaction_disabled_counter > 0) {
+            continue;
+        }
+
+        // Whatever the fiber does not hold of the snapshotted parallelism is held by a job in
+        // flight, so a candidate that reaches here while the semaphore is short of units would run
+        // as a marginal job - one that buys throughput at the marginal write amplification of its
+        // own batch. With unequal groups that is arbitrarily bad: a job slot can only be filled by a
+        // group that is not already compacting, so a shard whose garbage sits in one tablet spends
+        // the rest of its parallelism rewriting groups that hold nothing worth reclaiming. A
+        // marginal job therefore has to keep up with the best batch the shard has to offer.
+        if (admission_bar && std::cmp_less(_auto_compaction_sem.available_units(), parallelism - 1)
+                && !candidate.score.efficiency_at_least(*admission_bar, compaction_marginal_admission_ratio)) {
+            ++_stats.compaction_batches_refused;
+            logstor_logger.debug("Refused a marginal compaction of table {}: efficiency {} against the best candidate's {}",
+                    candidate.group->table_id(), candidate.score.efficiency(_sm.get_segment_size()),
+                    admission_bar->efficiency(_sm.get_segment_size()));
+            // The ranking is best first, so no later candidate clears the bar either, and nothing
+            // the bar is compared with changes until a job finishes and gives its inputs back.
+            // Taking the rest of the parallelism is what waits for the jobs in flight; re-ranking
+            // every group until then would only find the same answer.
+            pending.clear();
+            admission_bar.reset();
+            auto drained = co_await get_units(_auto_compaction_sem, parallelism - 1);
             continue;
         }
 

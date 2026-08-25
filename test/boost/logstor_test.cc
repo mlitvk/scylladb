@@ -2279,6 +2279,72 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_candidate_score_ranks_by_effici
     BOOST_REQUIRE(four_in < all_dead);
 }
 
+// The marginal-admission gate of run_auto_compaction(): a job started while another one is already
+// running has to keep up with the best batch the shard has to offer, because with unequal groups the
+// slots beyond the first are filled by whatever group is not already compacting.
+SEASTAR_THREAD_TEST_CASE(test_logstor_marginal_compaction_admission) {
+    constexpr uint64_t segment_size = 128 * 1024;
+
+    struct candidate {
+        compaction_candidate_score score;
+    };
+
+    // What the one tablet holding the shard's garbage offers, a batch at exactly the admission
+    // ratio, and what a group holding almost nothing dead offers.
+    const compaction_candidate_score rich{.n_in = 8, .n_out = 4, .live_bytes = 4 * segment_size};
+    const compaction_candidate_score borderline{.n_in = 8, .n_out = 5, .live_bytes = 4 * segment_size};
+    const compaction_candidate_score marginal{.n_in = 8, .n_out = 7, .live_bytes = 7 * segment_size};
+    BOOST_REQUIRE_CLOSE(rich.efficiency(segment_size), 1.0, 0.001);
+    BOOST_REQUIRE_CLOSE(borderline.efficiency(segment_size), compaction_marginal_admission_ratio, 0.001);
+
+    top_compaction_candidates<candidate> ranking(4);
+    for (const auto& score : {marginal, rich, borderline}) {
+        ranking.add(candidate{score});
+    }
+    const auto ranked = std::move(ranking).take();
+    // Worst first, so the driver takes the best batch first and the bar is the last of them.
+    BOOST_REQUIRE_EQUAL(ranked.size(), 3u);
+    BOOST_REQUIRE(ranked.front().score == marginal);
+    BOOST_REQUIRE(ranked.back().score == rich);
+
+    const auto bar = marginal_admission_bar(ranked);
+    BOOST_REQUIRE(bar);
+    BOOST_REQUIRE(*bar == rich);
+
+    // The best candidate clears its own bar, so the first job of a run is never refused, a batch at
+    // exactly the ratio is admitted, and a group with nothing worth reclaiming is not.
+    BOOST_REQUIRE(rich.efficiency_at_least(*bar, compaction_marginal_admission_ratio));
+    BOOST_REQUIRE(borderline.efficiency_at_least(*bar, compaction_marginal_admission_ratio));
+    BOOST_REQUIRE(!marginal.efficiency_at_least(*bar, compaction_marginal_admission_ratio));
+
+    // The bar has to be relative to what the disk can offer: above 50% utilization even the best
+    // batch reclaims less than a segment per segment copied, so an absolute floor of one would
+    // refuse every batch there is - including the one the disk depends on.
+    const compaction_candidate_score packed_best{.n_in = 8, .n_out = 6, .live_bytes = 6 * segment_size};
+    BOOST_REQUIRE_LT(packed_best.efficiency(segment_size), 1.0);
+    BOOST_REQUIRE(packed_best.efficiency_at_least(packed_best, compaction_marginal_admission_ratio));
+    BOOST_REQUIRE(!marginal.efficiency_at_least(packed_best, compaction_marginal_admission_ratio));
+
+    // A batch that copies nothing reclaims at infinite efficiency, which nothing that copies is a
+    // fraction of, so it ranks first but does not get to set the bar.
+    const compaction_candidate_score all_dead{.n_in = 2, .n_out = 0, .live_bytes = 0};
+    BOOST_REQUIRE(!rich.efficiency_at_least(all_dead, compaction_marginal_admission_ratio));
+    top_compaction_candidates<candidate> with_dead(4);
+    for (const auto& score : {marginal, all_dead, rich}) {
+        with_dead.add(candidate{score});
+    }
+    const auto dead_ranked = std::move(with_dead).take();
+    BOOST_REQUIRE(dead_ranked.back().score == all_dead);
+    const auto dead_bar = marginal_admission_bar(dead_ranked);
+    BOOST_REQUIRE(dead_bar);
+    BOOST_REQUIRE(*dead_bar == rich);
+
+    // With nothing but free reclamation on offer there is no bar at all, and every candidate runs.
+    top_compaction_candidates<candidate> only_dead(4);
+    only_dead.add(candidate{all_dead});
+    BOOST_REQUIRE(!marginal_admission_bar(std::move(only_dead).take()));
+}
+
 // The statistics of a segment set are maintained as segments are linked, freed from and unlinked,
 // rather than computed by walking it, so every one of those paths has to keep them in step with the
 // segments the set actually holds.

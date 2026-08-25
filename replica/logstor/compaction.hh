@@ -86,6 +86,18 @@ constexpr size_t min_segments_per_compaction = 8;
 // benefit; extending within this tolerance trades about 1% of efficiency for half as many jobs.
 constexpr double compaction_batch_extension_tolerance = 0.8;
 
+// How much of the best batch's reclamation efficiency a batch has to keep to be started while
+// another compaction job is already running. The first job is always admitted, so this bounds the
+// marginal write amplification that parallelism may buy throughput at, rather than being able to
+// stall compaction. When the groups of a shard hold comparable garbage every candidate is close to
+// the best one and the gate never fires; it is unequal groups it exists for, see
+// run_auto_compaction().
+//
+// The bar has to be relative. An absolute floor of one segment reclaimed per segment copied refuses
+// everything a disk at 75% utilization can offer, where even the best batch is below it, and
+// compaction would stop instead of running at the efficiency the disk allows.
+constexpr double compaction_marginal_admission_ratio = 0.75;
+
 // Watermarks, in available segments, that drive automatic compaction. It starts once the number of
 // available segments drops below `low` - the free-segment target - and stops once it is back at
 // `high`. Both are zero when the trigger is disabled.
@@ -234,6 +246,24 @@ public:
         return std::move(_candidates);
     }
 };
+
+// What compaction_marginal_admission_ratio measures a candidate against: the best batch of a
+// ranking that copies anything, out of `candidates` ranked worst first as top_compaction_candidates
+// leaves them. Nothing when every candidate copies nothing, which admits them all.
+//
+// A batch of fully dead segments copies nothing and so reclaims at infinite efficiency, which no
+// batch that copies can be a fraction of. Letting one set the bar would refuse every marginal job
+// exactly when reclaiming is at its cheapest.
+template <typename Candidate>
+requires requires (const Candidate& c) { { c.score } -> std::convertible_to<compaction_candidate_score>; }
+std::optional<compaction_candidate_score> marginal_admission_bar(const std::vector<Candidate>& candidates) noexcept {
+    for (const auto& candidate : candidates | std::views::reverse) {
+        if (candidate.score.live_bytes != 0) {
+            return candidate.score;
+        }
+    }
+    return std::nullopt;
+}
 
 // Where the free-segment target falls on the compaction_shares_pressure() ramp. It is a property of
 // the watermarks rather than a tunable: with the relative hysteresis of make_free_segment_watermarks()
