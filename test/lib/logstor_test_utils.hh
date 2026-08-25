@@ -44,6 +44,10 @@ struct logstor_params {
     bool format_on_startup = true;
     bool compaction_enabled = true;
     size_t max_segments_per_compaction = 8;
+    bool direct_group_writes = false;
+    std::chrono::milliseconds direct_sync_period{10000};
+    uint64_t direct_hot_threshold_bytes = 0;
+    size_t max_hot_groups = 8;
 };
 
 inline replica::logstor::logstor_config make_test_logstor_config(const std::filesystem::path& base_dir, logstor_params params = {}) {
@@ -61,6 +65,10 @@ inline replica::logstor::logstor_config make_test_logstor_config(const std::file
             .compaction_max_shares = utils::updateable_value<float>(2000.0f),
             .separator_sg = seastar::current_scheduling_group(),
             .split_compaction_sg = seastar::current_scheduling_group(),
+            .direct_group_writes = params.direct_group_writes,
+            .direct_sync_period = params.direct_sync_period,
+            .direct_hot_threshold_bytes = params.direct_hot_threshold_bytes,
+            .max_hot_groups = params.max_hot_groups,
         },
         .flush_sg = seastar::current_scheduling_group(),
     };

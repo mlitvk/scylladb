@@ -687,6 +687,18 @@ public:
     future<owned_write_buffer> allocate_separator_buffer() override;
     future<> flush_all_separator_buffers(std::optional<segment_sequence>);
 
+    void rotate_direct_buffer(logstor_group&) override;
+    future<> release_direct_buffers(logstor_group&) override;
+    future<> drain_all_direct_buffers();
+
+    // How many of this shard's groups are taking direct writes. Counted rather than tracked: it is
+    // read when a group is promoted, which is rare, and the groups of a shard are few.
+    size_t direct_hot_group_count() const noexcept {
+        return std::ranges::count_if(_groups, [] (const auto& entry) {
+            return entry.first->direct_writes_enabled();
+        });
+    }
+
     void add(logstor_group&) override;
 
     bool contains(logstor_group& cg) const noexcept override {
@@ -771,9 +783,10 @@ enum class write_source {
     compaction,
     separator,
     streaming,
+    direct_write,
 };
 
-static constexpr size_t write_source_count = 4;
+static constexpr size_t write_source_count = 5;
 
 static sstring write_source_to_string(write_source src) {
     switch (src) {
@@ -781,6 +794,7 @@ static sstring write_source_to_string(write_source src) {
         case write_source::compaction: return "compaction";
         case write_source::separator: return "separator";
         case write_source::streaming: return "streaming";
+        case write_source::direct_write: return "direct_write";
     }
     return "unknown";
 }
@@ -847,6 +861,7 @@ public:
             case write_source::normal_write:
             case write_source::separator:
             case write_source::streaming:
+            case write_source::direct_write:
                 return _segments.size() > _reserved_for_compaction ? _segments.size() - _reserved_for_compaction : 0;
         }
     }
@@ -888,6 +903,14 @@ class segment_manager_impl {
         uint64_t live_record_count{0};
         uint64_t separator_task_failures{0};
         uint64_t segment_free_failures{0};
+        uint64_t direct_records_written{0};
+        uint64_t direct_fallbacks{0};
+        uint64_t direct_read_hits{0};
+        uint64_t direct_flush_failures{0};
+        // What the direct buffers of the shard hold that is not on the disk yet, which is what a
+        // crash would lose. Maintained here rather than summed over the groups on demand, because a
+        // metric callback cannot walk them.
+        uint64_t direct_unflushed_bytes{0};
     };
 
     file_manager _file_mgr;
@@ -930,6 +953,17 @@ class segment_manager_impl {
     write_buffer_pool _separator_buffer_pool;
     abort_source _separator_buffer_abort;
 
+    write_buffer_pool _direct_buffer_pool;
+    abort_source _direct_buffer_abort;
+    // The buffers of the groups that are taking direct writes, by the id of the segment each one is
+    // bound to. A read of a record that is still only in memory is served out of these, which is
+    // what makes a direct write visible as soon as it is acknowledged.
+    absl::flat_hash_map<uint32_t, const write_buffer*> _direct_readable;
+    // Buffers whose write to the disk failed. Their records were acknowledged and this memory is
+    // the only copy left of them, so the buffers stay registered above and are not given back to
+    // the pool - the one place the direct path deliberately holds on to a buffer for good.
+    std::vector<direct_write_buffer> _direct_failed_buffers;
+
     static constexpr size_t separator_queue_depth = 16;
 
     seastar::queue<separator_task> _separator_task_queue;
@@ -960,6 +994,21 @@ public:
     // into the group. Split out of write_full_segment() for a caller that holds the segment from
     // before the buffer was filled, rather than taking one to write the buffer it has.
     future<> write_full_segment_tail(seg_ptr, write_buffer&, logstor_group&, write_source);
+
+    // The direct write path, see direct_write_buffer.
+    std::optional<log_location> try_write_direct(logstor_group&, const log_record_writer&);
+    void rotate_direct_buffer(logstor_group&);
+    future<> flush_direct_buffer(logstor_group&, direct_write_buffer full);
+    future<> bind_direct_buffer(logstor_group&, direct_write_buffer& slot);
+    future<> release_direct_slot(direct_write_buffer& slot);
+    future<> release_direct_buffers(logstor_group&);
+    // Gives the group two buffers to write into and counts it as hot, unless the shard has no room
+    // for another hot group. Says whether it did.
+    bool promote_direct_group(logstor_group&);
+    future<> do_promote_direct_group(logstor_group&);
+    uint64_t direct_hot_threshold_bytes() const noexcept {
+        return _cfg.direct_hot_threshold_bytes ? _cfg.direct_hot_threshold_bytes : _cfg.segment_size / 2;
+    }
 
     future<temporary_buffer<char>> read_record_bytes(log_location);
 
@@ -1195,6 +1244,9 @@ void compaction_manager_impl::add(logstor_group& cg) {
     // the separator may write to.
     cg.enable_separator_writes();
     _sm.update_group_count(_groups.size());
+    // Interim: every group that registers is given direct buffers, as long as the shard has room
+    // for it. The controller that promotes a group by what it actually writes comes next.
+    _sm.promote_direct_group(cg);
 }
 
 future<owned_write_buffer> compaction_manager_impl::allocate_separator_buffer() {
@@ -1238,6 +1290,16 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
             .kind = segment_kind::full,
             .preallocate = 0,
             .max_cached = separator_flush_reserve,
+      })
+    // Two buffers per hot group: the one it writes into and the one it rotates to. A group holds no
+    // more than that at any moment - the buffer being written out is the one the group gave up - so
+    // this is both the pool's capacity and the memory the direct path can take.
+    , _direct_buffer_pool(write_buffer_pool::config{
+            .capacity = config.direct_group_writes ? 2 * config.max_hot_groups : 0,
+            .buffer_size = config.segment_size,
+            .kind = segment_kind::full,
+            .preallocate = 0,
+            .max_cached = config.direct_group_writes ? 2 * config.max_hot_groups : 0,
       })
     , _separator_task_queue(separator_queue_depth)
     , _trigger_threshold_observer(_cfg.trigger_compaction_threshold.observe([this] (double new_threshold) {
@@ -1396,6 +1458,14 @@ future<> segment_manager_impl::stop() {
     _separator_buffer_abort.request_abort();
     co_await std::move(_separator_fiber).handle_exception([] (std::exception_ptr) {});
 
+    // Before the separator buffers, and before anything is torn down: a record taken directly is
+    // acknowledged and in the index, but only in memory, so it has to reach the disk here.
+    logstor_logger.debug("Flushing direct write buffers");
+    _direct_buffer_abort.request_abort();
+    co_await _compaction_mgr.drain_all_direct_buffers().handle_exception([] (std::exception_ptr ep) {
+        logstor_logger.warn("Failed to drain the logstor direct write buffers: {}", ep);
+    });
+
     co_await _compaction_mgr.flush_all_separator_buffers(std::nullopt);
 
     if (_active_segment) {
@@ -1411,6 +1481,15 @@ future<> segment_manager_impl::stop() {
     co_await _compaction_mgr.stop();
     co_await _compaction_buffer_pool.stop();
     co_await _separator_buffer_pool.stop();
+    // Nothing reads out of these any more, so the records they hold - which the disk never took -
+    // are finally let go.
+    for (auto& failed : _direct_failed_buffers) {
+        if (failed.seg) {
+            _direct_readable.erase(failed.seg->id().value);
+        }
+    }
+    _direct_failed_buffers.clear();
+    co_await _direct_buffer_pool.stop();
 
     logstor_logger.debug("Stopping segment pool");
     co_await _segment_pool.stop();
@@ -1566,6 +1645,187 @@ future<> segment_manager_impl::write_full_segment_tail(seg_ptr seg, write_buffer
     add_to_group_failed.cancel();
 }
 
+// The direct write path. See direct_write_buffer in compaction.hh for what it is and why the
+// segment immutability the rest of logstor rests on survives it.
+
+std::optional<log_location> segment_manager_impl::try_write_direct(logstor_group& cg, const log_record_writer& writer) {
+    if (!_cfg.direct_group_writes) {
+        return std::nullopt;
+    }
+
+    // Counted for every write of the group, hot or cold: this is the write rate the controller
+    // measures, and a cold group is promoted on it.
+    cg._direct_bytes_this_period += writer.size();
+
+    if (!cg._direct_enabled || !cg._direct_active.bound()) {
+        return std::nullopt;
+    }
+
+    auto& active = cg._direct_active;
+    if (!active.buf->can_fit(writer)) {
+        if (!cg._direct_flush.available()) {
+            // The previous rotation is still being written out, so there is no spare to rotate
+            // into. The record takes the ordinary path, and with it that path's back-pressure.
+            ++_stats.direct_fallbacks;
+            return std::nullopt;
+        }
+        rotate_direct_buffer(cg);
+        if (!active.bound() || !active.buf->can_fit(writer)) {
+            // Either the rotation had no spare to give, or the record does not fit an empty buffer
+            // at all - the ordinary path bounds it by max_record_size_any_kind and rejects it there.
+            ++_stats.direct_fallbacks;
+            return std::nullopt;
+        }
+    }
+
+    if (!active.buf->has_data()) {
+        active.first_append = seastar::lowres_clock::now();
+    }
+
+    const auto appended = active.buf->append_synchronously(writer);
+    ++_stats.direct_records_written;
+    _stats.direct_unflushed_bytes += appended.total_size;
+
+    // A full segment holds exactly one buffer, at offset zero, so a record's offset in the buffer
+    // is its offset in the segment. bind_direct_buffer() checks that the segment is untouched.
+    return record_location(log_location{.segment = active.seg->id(), .offset = 0, .size = 0},
+            appended.record_header_offset, appended.total_size);
+}
+
+void segment_manager_impl::rotate_direct_buffer(logstor_group& cg) {
+    if (!cg._direct_flush.available()) {
+        on_internal_error(logstor_logger, "Attempted to rotate a direct write buffer while a flush is in progress");
+    }
+
+    auto full = std::exchange(cg._direct_active, std::move(cg._direct_spare));
+    cg._direct_spare = {};
+    cg._direct_flush = shared_future<>(flush_direct_buffer(cg, std::move(full)));
+}
+
+future<> segment_manager_impl::flush_direct_buffer(logstor_group& cg, direct_write_buffer full) {
+    // No hold on _async_gate: stopping closes that gate before it drains the direct buffers, the
+    // same way it drains the separator buffers. The phaser is what await_pending_writes() and
+    // stop() see this by.
+    auto write_op = _writes_phaser.start();
+
+    if (full.bound() && !full.empty()) {
+        const auto seg_id = full.seg->id();
+        const auto unflushed_bytes = full.buf->net_data_size();
+
+        // The sequence number is taken here rather than when the segment was handed out: recovery
+        // tie-breaks records of equal timestamp by it, and every segment written while this buffer
+        // was filling has a number of its own. Numbering it at seal time keeps that order. The
+        // numbers the skipped allocations leave behind are harmless - recovery takes the maximum.
+        full.seg->set_seq_num(allocate_segment_seq());
+
+        auto written = co_await coroutine::as_future(
+                write_full_segment_tail(full.seg, *full.buf, cg, write_source::direct_write));
+        if (written.failed()) {
+            // The tail has already marked the segment as failed, which leaks it rather than freeing
+            // it, because the index points into it. Hold on to the buffer for the same reason, and
+            // keep it registered for reads: these records were acknowledged and this memory is the
+            // only copy of them left. The one path that deliberately keeps a buffer out of its pool.
+            ++_stats.direct_flush_failures;
+            logstor_logger.error("Failed to write logstor segment {} of table {} directly: {}."
+                    " Its buffer is kept in memory so that its records stay readable, and neither it"
+                    " nor the segment will be reclaimed", seg_id, cg.table_id(), written.get_exception());
+            _direct_failed_buffers.push_back(std::move(full));
+            co_return;
+        }
+
+        _stats.direct_unflushed_bytes -= unflushed_bytes;
+        // Only now that the records are on the disk and their segment is in the group: until here a
+        // read of one of them had to come out of this buffer.
+        _direct_readable.erase(seg_id.value);
+        // Given back before another is asked for below, so a group never holds three at once.
+        full.buf.reset();
+        full.seg = {};
+    } else if (full.bound()) {
+        // Nothing went into it, so there is nothing to seal. Keep it rather than giving its segment
+        // back only to take another one.
+        if (cg._direct_spare.bound()) {
+            co_await release_direct_slot(full);
+        } else {
+            cg._direct_spare = std::move(full);
+        }
+    }
+
+    // Give the group back what it rotated out of, so its next rotation has somewhere to go.
+    co_await bind_direct_buffer(cg, cg._direct_active);
+    co_await bind_direct_buffer(cg, cg._direct_spare);
+}
+
+future<> segment_manager_impl::bind_direct_buffer(logstor_group& cg, direct_write_buffer& slot) {
+    if (!cg._direct_enabled || _async_gate.is_closed() || slot.bound()) {
+        co_return;
+    }
+
+    auto buf = co_await _direct_buffer_pool.allocate(_direct_buffer_abort);
+    auto seg = co_await get_segment(write_source::direct_write);
+
+    if (seg->bytes_remaining() != _cfg.segment_size) {
+        on_internal_error(logstor_logger, format("Segment {} bound to a direct write buffer is not empty", seg->id()));
+    }
+
+    slot.buf = std::move(buf);
+    slot.seg = std::move(seg);
+    slot.first_append = {};
+    _direct_readable.emplace(slot.seg->id().value, slot.buf.get());
+}
+
+future<> segment_manager_impl::release_direct_slot(direct_write_buffer& slot) {
+    if (slot.seg) {
+        _direct_readable.erase(slot.seg->id().value);
+    }
+    if (slot.buf) {
+        if (slot.buf->has_data()) {
+            on_internal_error(logstor_logger, "Releasing a logstor direct write buffer that was not written out");
+        }
+        // The pool takes a buffer back only once it is closed, and one that was only appended to
+        // directly holds nothing, so this completes right away.
+        co_await slot.buf->close();
+        slot.buf.reset();
+    }
+    if (slot.seg) {
+        // The segment was never written, so it holds no data and is in no segment set: dropping the
+        // last reference to it below simply gives the slot back to the pool.
+        co_await slot.seg->stop();
+        slot.seg = {};
+    }
+    slot.first_append = {};
+}
+
+future<> segment_manager_impl::release_direct_buffers(logstor_group& cg) {
+    cg._direct_enabled = false;
+    co_await release_direct_slot(cg._direct_active);
+    co_await release_direct_slot(cg._direct_spare);
+    cg._direct_underfilled_periods = 0;
+}
+
+bool segment_manager_impl::promote_direct_group(logstor_group& cg) {
+    if (!_cfg.direct_group_writes || cg._direct_enabled || _async_gate.is_closed()) {
+        return false;
+    }
+    // Room for another hot group, and for the two segments its buffers are going to be bound to.
+    if (_compaction_mgr.direct_hot_group_count() >= _cfg.max_hot_groups
+            || available_segment_count(write_source::direct_write) < 2) {
+        return false;
+    }
+    if (!cg._direct_flush.available()) {
+        return false;
+    }
+
+    cg._direct_enabled = true;
+    cg._direct_underfilled_periods = 0;
+    cg._direct_flush = shared_future<>(do_promote_direct_group(cg));
+    return true;
+}
+
+future<> segment_manager_impl::do_promote_direct_group(logstor_group& cg) {
+    co_await bind_direct_buffer(cg, cg._direct_active);
+    co_await bind_direct_buffer(cg, cg._direct_spare);
+}
+
 void segment_manager_impl::on_add_record(log_location location) noexcept {
     auto& desc = get_segment_descriptor(location);
     desc.on_write(location);
@@ -1591,6 +1851,18 @@ future<temporary_buffer<char>> segment_manager_impl::read_record_bytes(log_locat
         co_return coroutine::exception(std::make_exception_ptr(std::runtime_error(fmt::format(
             "Read beyond end of segment {}: offset {} + size {} > segment size {}",
             location.segment, location.offset, location.size, _cfg.segment_size))));
+    }
+
+    // A record taken by the direct path is in the index, and readable, before its segment has been
+    // written, so a location may point into a buffer rather than at the disk. The copy below is
+    // synchronous, so nothing can give the buffer back to its pool between finding it and reading
+    // it, and the bytes of a record never change once it has been appended - sealing only fills in
+    // the header area the buffer reserved and pads its tail.
+    if (!_direct_readable.empty()) [[unlikely]] {
+        if (auto it = _direct_readable.find(location.segment.value); it != _direct_readable.end()) {
+            ++_stats.direct_read_hits;
+            co_return temporary_buffer<char>(it->second->data() + location.offset, location.size);
+        }
     }
 
     auto [file_id, file_offset] = segment_id_to_file_location(location.segment);
@@ -1875,6 +2147,12 @@ future<> compaction_manager_impl::remove(logstor_group& cg) {
 
     auto state = std::move(it->second);
     _groups.erase(it);
+
+    auto direct_result = co_await coroutine::as_future(cg.close_direct_writes());
+    if (direct_result.failed()) {
+        logstor_logger.warn("Failed to close the direct writes of a logstor compaction group: {}",
+                direct_result.get_exception());
+    }
 
     auto close_result = co_await coroutine::as_future(cg.close_separator());
     if (close_result.failed()) {
@@ -2387,6 +2665,20 @@ future<> compaction_manager_impl::flush_all_separator_buffers(std::optional<segm
     });
 }
 
+void compaction_manager_impl::rotate_direct_buffer(logstor_group& cg) {
+    _sm.rotate_direct_buffer(cg);
+}
+
+future<> compaction_manager_impl::release_direct_buffers(logstor_group& cg) {
+    return _sm.release_direct_buffers(cg);
+}
+
+future<> compaction_manager_impl::drain_all_direct_buffers() {
+    co_await coroutine::parallel_for_each(_groups, [] (auto& entry) {
+        return entry.first->close_direct_writes();
+    });
+}
+
 void separator_index_update::operator()(log_location new_location, seastar::gate::holder) const {
     index->update_record_location(key, prev_location, new_location);
 }
@@ -2790,6 +3082,10 @@ future<> segment_manager::write(write_buffer& wb) {
     return _impl->write(wb);
 }
 
+std::optional<log_location> segment_manager::try_write_direct(logstor_group& cg, const log_record_writer& writer) {
+    return _impl->try_write_direct(cg, writer);
+}
+
 future<temporary_buffer<char>> segment_manager::read_record_bytes(log_location location) {
     return _impl->read_record_bytes(location);
 }
@@ -2944,7 +3240,41 @@ future<> separator_buffer::release() {
     min_seq_num.reset();
 }
 
+// Defined here, where writeable_segment is a complete type.
+direct_write_buffer::direct_write_buffer() noexcept = default;
+direct_write_buffer::direct_write_buffer(direct_write_buffer&&) noexcept = default;
+direct_write_buffer& direct_write_buffer::operator=(direct_write_buffer&&) noexcept = default;
+direct_write_buffer::~direct_write_buffer() = default;
+
 // logstor_group
+
+future<> logstor_group::await_direct_settled() {
+    while (!_direct_flush.available()) {
+        auto f = co_await coroutine::as_future(_direct_flush.get_future());
+        // Like the separator waits: a flush that failed has already said so and left the records
+        // readable, and there is nothing a waiter here can do about it.
+        f.ignore_ready_future();
+    }
+}
+
+future<> logstor_group::flush_direct_writes() {
+    // At most two waits: rotating needs the previous flush to have finished, so the first wait may
+    // only see that one out, and the second waits for the flush of what is in the buffer now.
+    co_await await_direct_settled();
+    if (!_direct_active.empty()) {
+        logstor_compaction_manager().rotate_direct_buffer(*this);
+        co_await await_direct_settled();
+    }
+}
+
+future<> logstor_group::close_direct_writes() {
+    // Before anything that can wait, so that a write which resumes into the direct path finds the
+    // group closed rather than appending into a buffer that is on its way back to the pool.
+    _direct_enabled = false;
+
+    co_await flush_direct_writes();
+    co_await logstor_compaction_manager().release_direct_buffers(*this);
+}
 
 void logstor_group::switch_active_separator_buffer() {
     if (!_separator_flush.available()) {
@@ -3010,6 +3340,14 @@ template future<> logstor_group::write_to_separator(log_record_writer, segment_r
 template future<> logstor_group::write_to_separator(log_record_bytes_writer, segment_ref, std::optional<segment_sequence>, separator_index_update);
 
 future<> logstor_group::flush_separator(std::optional<segment_sequence> seq_num) {
+    // Only for a drain of everything the group holds. A sequence number means the caller is after
+    // the buffers still pinning segments older than it - the periodic nudge from
+    // switch_active_segment() - which is no reason to force a partly filled direct buffer out.
+    // Every real drain - table flush, split, snapshot, group stop, truncate - passes none.
+    if (!seq_num) {
+        co_await flush_direct_writes();
+    }
+
     auto should_flush = [seq_num] (separator_buffer& buf) {
         return !buf.empty() && (!seq_num || (buf.min_seq_num && buf.min_seq_num < *seq_num));
     };

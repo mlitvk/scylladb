@@ -2073,6 +2073,249 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_and_separator_flush) {
     assert_that(*actual).is_equal_to(expected);
 }
 
+namespace {
+
+logstor_params direct_write_params(logstor_params params = {}) {
+    params.direct_group_writes = true;
+    return params;
+}
+
+// A group is given its buffers in the background when it registers, so a test that means to write
+// directly waits for that here. flush_direct_writes() on a group with nothing buffered is exactly
+// that wait.
+void await_direct_buffers(test_logstor_group& cg) {
+    cg.flush_direct_writes().get();
+    BOOST_REQUIRE(cg.direct_writes_enabled());
+}
+
+}
+
+// The point of the direct path: a record goes into a buffer that is already bound to a segment of
+// its group, so its location in that segment is known when it is written and never changes. Checks
+// that the record is readable from the moment it is acknowledged, while it is still only in memory,
+// that the separator is given nothing, and that writing the buffer out leaves the index alone.
+SEASTAR_THREAD_TEST_CASE(test_logstor_direct_write_is_readable_before_it_reaches_the_disk) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path(), direct_write_params()), cache.shared_tracker);
+    ls.do_recovery_for_test().get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+    await_direct_buffers(cg);
+
+    auto expected = make_kv_mutation(schema, "pk0", "direct-value");
+    auto key = expected.decorated_key();
+
+    ls.write(expected, write_target(&cg, {}), db::no_timeout).get();
+
+    BOOST_REQUIRE(cg.direct_has_data());
+    BOOST_REQUIRE(!cg.separator_has_data());
+    BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 0u);
+    BOOST_REQUIRE(!cg.empty());
+
+    auto entry = cg.logstor_index().get(primary_index_key{key});
+    BOOST_REQUIRE(entry);
+
+    // Read out of the buffer: the segment the index points at holds nothing yet.
+    auto before_flush = ls.read(*schema, cg.logstor_index(), key, schema->full_slice()).get();
+    BOOST_REQUIRE(before_flush);
+    assert_that(*before_flush).is_equal_to(expected);
+
+    cg.flush_direct_writes().get();
+
+    BOOST_REQUIRE(!cg.direct_has_data());
+    BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 1u);
+    BOOST_REQUIRE(!cg.empty());
+
+    auto entry_after = cg.logstor_index().get(primary_index_key{key});
+    BOOST_REQUIRE(entry_after);
+    BOOST_REQUIRE(entry_after->location == entry->location);
+
+    auto snapshot = ls.get_segment_manager().make_snapshot(cg).get();
+    BOOST_REQUIRE_EQUAL(snapshot.size(), 1u);
+    BOOST_REQUIRE_EQUAL(entry_after->location.segment.value, snapshot.front().segment_id.value);
+
+    // The same read, now from the disk.
+    auto after_flush = ls.read(*schema, cg.logstor_index(), key, schema->full_slice()).get();
+    BOOST_REQUIRE(after_flush);
+    assert_that(*after_flush).is_equal_to(expected);
+}
+
+// Checks that a group goes on taking direct writes across the flushes: each one writes the buffer
+// out, links its segment into the group and binds a fresh buffer and segment to write into next.
+SEASTAR_THREAD_TEST_CASE(test_logstor_direct_writes_continue_across_flushes) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path(), direct_write_params()), cache.shared_tracker);
+    ls.do_recovery_for_test().get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+    await_direct_buffers(cg);
+
+    constexpr unsigned record_count = 3;
+    std::vector<mutation> expected;
+    for (unsigned i = 0; i < record_count; ++i) {
+        expected.push_back(make_kv_mutation(schema, format("pk{}", i), format("value{}", i)));
+        ls.write(expected.back(), write_target(&cg, {}), db::no_timeout).get();
+        cg.flush_direct_writes().get();
+        BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), i + 1);
+    }
+
+    BOOST_REQUIRE(!cg.separator_has_data());
+    for (const auto& m : expected) {
+        auto actual = ls.read(*schema, cg.logstor_index(), m.decorated_key(), schema->full_slice()).get();
+        BOOST_REQUIRE(actual);
+        assert_that(*actual).is_equal_to(m);
+    }
+}
+
+// Checks that records keep going in once the buffer they were going into is full: the group rotates
+// into its spare and writes the full one out behind it. Whatever a rotation cannot take falls back
+// to the ordinary path, so what this defends is that every record ends up readable either way.
+SEASTAR_THREAD_TEST_CASE(test_logstor_direct_writes_rotate_when_the_buffer_fills) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path(), direct_write_params()), cache.shared_tracker);
+    ls.do_recovery_for_test().get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+    await_direct_buffers(cg);
+
+    // Four records of a third of a segment each: the third one does not fit the buffer the first
+    // two went into.
+    const auto record_size = ls.get_segment_manager().get_segment_size() / 3;
+    constexpr unsigned record_count = 4;
+    std::vector<mutation> expected;
+    for (unsigned i = 0; i < record_count; ++i) {
+        expected.push_back(make_kv_mutation_of_record_size(schema, format("pk{}", i), record_size));
+        ls.write(expected.back(), write_target(&cg, {}), db::no_timeout).get();
+    }
+
+    ls.flush_to_separator().get();
+    cg.flush_separator().get();
+
+    BOOST_REQUIRE(!cg.direct_has_data());
+    BOOST_REQUIRE(!cg.separator_has_data());
+    BOOST_REQUIRE_GE(cg.logstor_segments().segment_count(), 2u);
+
+    for (const auto& m : expected) {
+        auto actual = ls.read(*schema, cg.logstor_index(), m.decorated_key(), schema->full_slice()).get();
+        BOOST_REQUIRE(actual);
+        assert_that(*actual).is_equal_to(m);
+    }
+}
+
+// A record overwritten while both copies are still in the same buffer is freed at a location in a
+// segment that has not been written yet, and its descriptor is only linked into the group once the
+// buffer reaches the disk. Checks that the space accounting of the segment survives that ordering.
+SEASTAR_THREAD_TEST_CASE(test_logstor_direct_write_overwritten_in_its_buffer_is_accounted_for) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path(), direct_write_params()), cache.shared_tracker);
+    ls.do_recovery_for_test().get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+    await_direct_buffers(cg);
+
+    auto first = make_kv_mutation(schema, "pk0", "first", api::timestamp_type(1));
+    auto second = make_kv_mutation(schema, "pk0", "second", api::timestamp_type(2));
+    auto other = make_kv_mutation(schema, "pk1", "other", api::timestamp_type(1));
+
+    ls.write(first, write_target(&cg, {}), db::no_timeout).get();
+    ls.write(second, write_target(&cg, {}), db::no_timeout).get();
+    ls.write(other, write_target(&cg, {}), db::no_timeout).get();
+
+    cg.flush_direct_writes().get();
+    BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 1u);
+
+    const auto stats = cg.logstor_segments().stats();
+    const auto recomputed = cg.logstor_segments().recompute_stats_for_test();
+    BOOST_REQUIRE_EQUAL(recomputed.segment_count, stats.segment_count);
+    BOOST_REQUIRE_EQUAL(recomputed.live_bytes, stats.live_bytes);
+    BOOST_REQUIRE(recomputed.utilization == stats.utilization);
+
+    auto actual = ls.read(*schema, cg.logstor_index(), second.decorated_key(), schema->full_slice()).get();
+    BOOST_REQUIRE(actual);
+    assert_that(*actual).is_equal_to(second);
+}
+
+// A group is removed while it still holds records that are only in memory. Unlike the separator's
+// buffers, which hold a second copy of records that are already on the disk, these are the only
+// copy there is, so removing the group has to write them out rather than discard them.
+SEASTAR_THREAD_TEST_CASE(test_logstor_removed_group_writes_out_what_it_took_directly) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path(), direct_write_params()), cache.shared_tracker);
+    ls.do_recovery_for_test().get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+    await_direct_buffers(cg);
+
+    auto expected = make_kv_mutation(schema, "pk0", "unflushed");
+    ls.write(expected, write_target(&cg, {}), db::no_timeout).get();
+    BOOST_REQUIRE(cg.direct_has_data());
+
+    // The group's destructor removes it too; removing twice must be harmless.
+    ls.get_compaction_manager().remove(cg).get();
+
+    BOOST_REQUIRE(!cg.direct_writes_enabled());
+    BOOST_REQUIRE(!cg.direct_has_data());
+    BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 1u);
+
+    auto actual = ls.read(*schema, cg.logstor_index(), expected.decorated_key(), schema->full_slice()).get();
+    BOOST_REQUIRE(actual);
+    assert_that(*actual).is_equal_to(expected);
+}
+
+// The same, at shutdown: stopping the store writes out what the groups took directly, and gives
+// back the buffers and the segments that were bound to them but never written.
+SEASTAR_THREAD_TEST_CASE(test_logstor_stop_writes_out_what_was_taken_directly) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path(), direct_write_params()), cache.shared_tracker);
+    ls.do_recovery_for_test().get();
+    ls.start().get();
+    bool stopped = false;
+    auto stop_store = seastar::defer([&ls, &stopped] noexcept { if (!stopped) { ls.stop().get(); } });
+
+    {
+        test_logstor_group cg(schema, ls);
+        await_direct_buffers(cg);
+
+        auto expected = make_kv_mutation(schema, "pk0", "unflushed");
+        ls.write(expected, write_target(&cg, {}), db::no_timeout).get();
+        BOOST_REQUIRE(cg.direct_has_data());
+
+        ls.stop().get();
+        stopped = true;
+
+        BOOST_REQUIRE(!cg.direct_has_data());
+        BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 1u);
+    }
+}
+
 // Checks that a group discarded while the separator still holds unflushed records for it gives up
 // what it was holding: its records are left where they are, and the segments they are in are left
 // allocated. The index still points at them there, so freeing one would let it be reallocated over

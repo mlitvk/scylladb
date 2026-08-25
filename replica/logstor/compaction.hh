@@ -13,7 +13,9 @@
 #include "utils/chunked_vector.hh"
 #include "write_buffer.hh"
 #include "utils/log_heap.hh"
+#include <seastar/core/lowres_clock.hh>
 #include <seastar/core/semaphore.hh>
+#include <seastar/core/shared_ptr.hh>
 #include <seastar/util/noncopyable_function.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 #include "mutation_writer/token_group_based_splitting_writer.hh"
@@ -40,6 +42,9 @@ struct segment_set;
 struct separator_buffer;
 class segment_ref;
 class logstor_group;
+class writeable_segment;
+class segment_manager_impl;
+class compaction_manager_impl;
 
 // What the separator owes the index for one record it rewrote: the entry that pointed at the record
 // in the segment it came from has to point at the copy the separator wrote. There is one of these
@@ -603,6 +608,43 @@ struct separator_buffer {
     future<> abort(std::exception_ptr);
 };
 
+// A write buffer bound to a segment of the group from the moment it is allocated, which is what
+// lets a write into it be placed without a second pass. A full segment holds exactly one buffer, at
+// offset zero, so the final location of a record follows from the segment and the record's offset
+// in the buffer as soon as it is appended - the index can be updated with it there and then, and
+// the write acknowledged, rather than after the buffer has reached the disk. The buffer is written
+// out and its segment linked into the group when the buffer fills or its deadline expires.
+//
+// The segment is unwritten and belongs to no segment set while the buffer fills, exactly like the
+// output of the separator or of a compaction, so nothing can pick it, scan it or free it before it
+// holds what the index says it holds.
+struct direct_write_buffer {
+    owned_write_buffer buf;
+    // The segment this buffer is going to be written into. writeable_segment is private to
+    // segment_manager.cc, which is where the special members below are defined.
+    seastar::lw_shared_ptr<writeable_segment> seg;
+    // When the first record went into the buffer, which is what the sync deadline is measured from.
+    seastar::lowres_clock::time_point first_append{};
+
+    direct_write_buffer() noexcept;
+    direct_write_buffer(direct_write_buffer&&) noexcept;
+    direct_write_buffer& operator=(direct_write_buffer&&) noexcept;
+    ~direct_write_buffer();
+
+    direct_write_buffer(const direct_write_buffer&) = delete;
+    direct_write_buffer& operator=(const direct_write_buffer&) = delete;
+
+    // Whether the buffer can take records: it needs both a buffer and a segment to put it in.
+    bool bound() const noexcept {
+        return buf && seg;
+    }
+
+    // Whether it holds records that have not reached the disk.
+    bool empty() const noexcept {
+        return !buf || !buf->has_data();
+    }
+};
+
 class compaction_reenabler {
     std::function<void()> _release;
 public:
@@ -624,6 +666,15 @@ public:
     virtual future<> flush_separator_buffer(separator_buffer&, logstor_group&) = 0;
 
     virtual future<owned_write_buffer> allocate_separator_buffer() = 0;
+
+    // A group owns its direct write buffers, but the segments they are bound to and the pool the
+    // buffers come from belong to the segment manager, so the group asks for them to be moved.
+    // Rotating hands the full buffer over to be written out in the background and leaves the group
+    // writing into its spare; it requires that no flush of this group is already in flight.
+    virtual void rotate_direct_buffer(logstor_group&) = 0;
+    // Gives both of the group's direct buffers and the segments they are bound to back. The buffers
+    // are expected to have been flushed first, since their records are nowhere else.
+    virtual future<> release_direct_buffers(logstor_group&) = 0;
 
     virtual void add(logstor_group&) = 0;
     virtual future<> remove(logstor_group&) = 0;
@@ -665,9 +716,26 @@ class logstor_group {
     // manager in order for it to be enabled.
     bool _separator_enabled{false};
 
+    // The direct write path. The group writes into _direct_active and rotates into _direct_spare
+    // when that fills, so a write never has to wait for a buffer. _direct_flush is the one
+    // asynchronous step the direct path of this group may have in flight - a flush, a bind or a
+    // release - and everything that has to see the group settled waits on it.
+    direct_write_buffer _direct_active;
+    direct_write_buffer _direct_spare;
+    shared_future<> _direct_flush{make_ready_future<>()};
+    // Whether writes of this group go into its own buffer instead of the shared active segment.
+    bool _direct_enabled{false};
+    // What the group has written since the controller last looked, which is what it promotes and
+    // demotes the group on. Fed by every write of the group, direct or not.
+    uint64_t _direct_bytes_this_period{0};
+    unsigned _direct_underfilled_periods{0};
+
     void switch_active_separator_buffer();
 
     future<> allocate_active_separator_buffer();
+
+    // Waits until nothing is in flight on the group's direct path.
+    future<> await_direct_settled();
 
 protected:
     // `table_stats` is the level of the segment statistics rollup of the table this group belongs to,
@@ -722,10 +790,22 @@ public:
     // anything this finds costs the segments it is holding, and it says so.
     future<> close_separator();
 
+    // Writes out what the group has taken directly but not yet put on disk, and waits for it to be
+    // in a segment of the group. This is the drain every tablet operation goes through.
+    future<> flush_direct_writes();
+
+    // Stops taking direct writes, flushes what is already buffered and gives the buffers and their
+    // segments back. Unlike close_separator() this flushes rather than discards: a record here is
+    // nowhere else, and the index already points at the segment the buffer has yet to be written
+    // into, so dropping it would lose it outright.
+    future<> close_direct_writes();
+
     bool empty() const noexcept {
         return _logstor_segments.empty()
             && _active_buffer.empty() && _flushing_buffer.empty()
-            && _separator_flush.available();
+            && _separator_flush.available()
+            && _direct_active.empty() && _direct_spare.empty()
+            && _direct_flush.available();
     }
 
     bool separator_has_data() const noexcept {
@@ -736,6 +816,18 @@ public:
         return _active_buffer.held_segments.size() + _flushing_buffer.held_segments.size();
     }
 
+    bool direct_writes_enabled() const noexcept {
+        return _direct_enabled;
+    }
+
+    bool direct_has_data() const noexcept {
+        return !_direct_active.empty() || !_direct_spare.empty();
+    }
+
+    // The direct write path is driven from the segment manager, which owns the buffers' segments
+    // and decides which groups are hot enough to have them.
+    friend class segment_manager_impl;
+    friend class compaction_manager_impl;
 };
 
 } // namespace replica::logstor

@@ -155,6 +155,17 @@ future<> logstor::write(const mutation& m, write_target target, db::timeout_cloc
 
     auto writer = log_record_writer(std::move(record));
 
+    // A group that writes fast enough has a buffer of its own, already bound to one of its
+    // segments, so the record goes straight in and its final location is known here. The write is
+    // acknowledged once the record is in that buffer and in the index - it reaches the disk when
+    // the buffer is written out, which is what the periodic sync mode promises. Nothing is awaited
+    // between the two, so the record is visible to a reader and to a drain from the moment the
+    // buffer takes it, and the gate holders of the write target are released by returning.
+    if (auto location = _segment_manager.try_write_direct(cg, writer)) {
+        index.insert(key, index_entry{.location = *location, .timestamp = ts});
+        co_return;
+    }
+
     // Two waits, not one: first for the record to be taken into a buffer, then for that buffer to
     // reach a segment. They are awaited here rather than behind a call of their own, which would
     // cost a coroutine frame per write to do nothing else.

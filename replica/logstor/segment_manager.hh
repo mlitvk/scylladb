@@ -54,6 +54,21 @@ struct segment_manager_config {
     utils::updateable_value<float> compaction_max_shares;
     seastar::scheduling_group separator_sg;
     seastar::scheduling_group split_compaction_sg;
+    // Whether a group that writes fast enough may write into a segment of its own instead of the
+    // shared active segment, which takes its records to the disk once rather than twice. The
+    // records of such a write are acknowledged before they are on the disk, so this is only on in
+    // the periodic commitlog sync mode, whose semantics it matches.
+    bool direct_group_writes = false;
+    // How long a partly filled direct buffer may wait for more records before it is written out,
+    // which is what bounds the loss window.
+    std::chrono::milliseconds direct_sync_period{10000};
+    // What a group has to write in one sync period to be given direct buffers. Zero means half a
+    // segment, which is the point below which a partly filled segment costs more in occupied pool
+    // slots than the second write it saves.
+    uint64_t direct_hot_threshold_bytes{0};
+    // The most groups of a shard that may hold direct buffers at once. Each one holds two, so this
+    // also bounds the memory the direct path takes and the records it can lose.
+    size_t max_hot_groups{8};
 };
 
 // What the logstor of one shard is using and what it has to use. Every field is shard wide and
@@ -117,6 +132,16 @@ public:
     future<> stop();
 
     future<> write(write_buffer& wb);
+
+    // Takes a record straight into the buffer of the group it belongs to, and says where in the
+    // group's segments it will be. The record is in memory only until that buffer is written out,
+    // so a caller that inserts this location into the index is acknowledging the write before it is
+    // durable - see direct_group_writes.
+    //
+    // Returns nullopt when the group is not taking direct writes, when it has no buffer to take the
+    // record right now, or when the record does not fit one. The caller then writes it the ordinary
+    // way. Never waits.
+    std::optional<log_location> try_write_direct(logstor_group&, const log_record_writer&);
 
     // The bytes of one record, as they are on disk: the read of a record does not parse its
     // header, which holds a key the read already has, and decodes its value straight out of
