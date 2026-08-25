@@ -37,6 +37,15 @@
 // laid out, and how they age. The device therefore writes one copy more per user byte than the
 // device write amplification reported below - see the separator section of the document.
 //
+// Two changes the compaction document proposes but the engine does not make are modeled so that
+// they can be measured before they are built: --carry-residual carries a job's output residual over
+// to the next job of its group instead of sealing it as a partly filled segment, and --eager-free
+// frees a segment the moment its last live record dies. Carrying diverges from the design in the
+// document in that a pinned input is unlinked from its segment set rather than marked pinned inside
+// it, which is equivalent for what is measured here - it holds a segment and cannot be selected -
+// and in that the batch score is not seeded with what the buffer already holds, so n_out is
+// over-estimated for a job that starts on a non-empty buffer.
+//
 // The simulation has no clock. Compaction runs whenever the free-segment level asks for it and is
 // taken to keep up, so what is measured is the steady state at the free level the watermarks
 // produce. Compaction falling behind is a property of the device and of the shares controller and is
@@ -133,6 +142,33 @@ struct sim_params {
     size_t parallelism = 0;
     double extension_tolerance = compaction_batch_extension_tolerance;
     strategy_kind strategy = strategy_kind::efficiency;
+    // Carry a job's output residual over to the next job of the same group instead of sealing it as
+    // a partly filled segment, which is the design in the compaction document's "Carrying the output
+    // residual". The inputs whose records the buffer still holds are pinned until it is flushed.
+    bool carry_residual = false;
+    // Input segments a carried residual may pin at the end of a job before it is flushed instead.
+    // The document's rule is 1 - pinning k inputs holds k segments while flushing costs one - but a
+    // batch of near-empty segments spreads its residual over several inputs, so at a large batch cap
+    // that rule flushes every job and nothing is ever carried. Raising it measures what carrying
+    // could buy if the pinned space were spent.
+    size_t carry_pin_limit = 1;
+    // Free a segment as soon as its last live record dies, instead of waiting for a compaction job
+    // to select it (open defect 3 in the compaction document).
+    bool eager_free = false;
+    // Compaction jobs one group may run at once. The engine serializes them per group, so a shard
+    // whose garbage sits in few groups has to spend its parallelism on groups that hold little.
+    // Above 1 a job's inputs are reserved out of the candidate set when it starts, which is what
+    // would let two jobs of one group pick disjoint batches.
+    size_t max_jobs_per_group = 1;
+    // The least reclamation efficiency - segments reclaimed per segment-worth of data copied - a
+    // batch must have to be started while another job is already running. The best candidate is
+    // always admitted, so this bounds the marginal write amplification parallelism may buy at,
+    // rather than being able to stall compaction. 0 admits everything, which is what runs today.
+    double marginal_admission_efficiency = 0;
+    // The same gate expressed relative to the best candidate of the current ranking rather than as
+    // an absolute efficiency, so that it adapts to what the disk can offer instead of stalling
+    // compaction on a full disk where no batch clears an absolute floor. 0 admits everything.
+    double marginal_admission_ratio = 0;
 
     workload_kind workload = workload_kind::uniform;
     double zipf_theta = 0.99;
@@ -173,6 +209,16 @@ uint64_t parse_size(const std::string& s) {
         throw std::invalid_argument(fmt::format("unknown size suffix '{}'", suffix));
     }
     return static_cast<uint64_t>(value * multiplier);
+}
+
+bool parse_bool(const std::string& s) {
+    if (s == "1" || s == "true" || s == "yes" || s == "on") {
+        return true;
+    }
+    if (s == "0" || s == "false" || s == "no" || s == "off") {
+        return false;
+    }
+    throw std::invalid_argument(fmt::format("'{}' is not a boolean", s));
 }
 
 template <typename Enum, size_t N>
@@ -259,6 +305,24 @@ const std::vector<param_desc>& all_params() {
         {"strategy", "candidate scoring rule: efficiency, absolute or random",
             [] (sim_params& p, const std::string& v) { p.strategy = parse_enum<strategy_kind>(v, strategy_names); },
             [] (const sim_params& p) { return std::string(enum_name(p.strategy, strategy_names)); }},
+        {"carry-residual", "carry a job's output residual over to the next job of its group",
+            [] (sim_params& p, const std::string& v) { p.carry_residual = parse_bool(v); },
+            [] (const sim_params& p) { return fmt::format("{}", int(p.carry_residual)); }},
+        {"marginal-admission-ratio", "least efficiency, relative to the best candidate, a batch needs to run alongside another job",
+            [] (sim_params& p, const std::string& v) { p.marginal_admission_ratio = std::stod(v); },
+            [] (const sim_params& p) { return fmt::format("{}", p.marginal_admission_ratio); }},
+        {"carry-pin-limit", "input segments a carried residual may pin before it is flushed",
+            [] (sim_params& p, const std::string& v) { p.carry_pin_limit = std::stoul(v); },
+            [] (const sim_params& p) { return fmt::format("{}", p.carry_pin_limit); }},
+        {"jobs-per-group", "compaction jobs one group may run at once",
+            [] (sim_params& p, const std::string& v) { p.max_jobs_per_group = std::stoul(v); },
+            [] (const sim_params& p) { return fmt::format("{}", p.max_jobs_per_group); }},
+        {"marginal-admission-efficiency", "least efficiency a batch needs to run alongside another job",
+            [] (sim_params& p, const std::string& v) { p.marginal_admission_efficiency = std::stod(v); },
+            [] (const sim_params& p) { return fmt::format("{}", p.marginal_admission_efficiency); }},
+        {"eager-free", "free a segment as soon as its last live record dies",
+            [] (sim_params& p, const std::string& v) { p.eager_free = parse_bool(v); },
+            [] (const sim_params& p) { return fmt::format("{}", int(p.eager_free)); }},
         {"workload", "key distribution: uniform, zipf or hot-cold",
             [] (sim_params& p, const std::string& v) { p.workload = parse_enum<workload_kind>(v, workload_names); },
             [] (const sim_params& p) { return std::string(enum_name(p.workload, workload_names)); }},
@@ -404,13 +468,23 @@ class sim_group {
 public:
     explicit sim_group(uint64_t segment_size)
         : segments(segment_size)
-        , open_buffer(segment_size) {
+        , open_buffer(segment_size)
+        , output(segment_size) {
     }
 
     segment_set segments;
     sim_write_buffer open_buffer;
     uint32_t open_segment = no_segment;
-    bool compacting = false;
+    size_t jobs_in_flight = 0;
+
+    // The compaction output buffer carrying is done through; it belongs to the group rather than to
+    // the job, which is what lets a residual outlive the job that produced it. Without carrying a
+    // job writes into its own buffer, as the engine's compaction_buffer pool gives it.
+    sim_write_buffer output;
+    // The input segments whose records the output buffer still holds. They are unlinked from the
+    // segment set so that they cannot be selected again, and they are freed by the flush - until
+    // then the index still points into them, which is what makes carrying cost space.
+    std::vector<uint32_t> pinned;
 };
 
 // The batch one compaction job reads, in ascending utilization order.
@@ -467,7 +541,9 @@ struct sim_stats {
     uint64_t compaction_records_skipped = 0;
     uint64_t segments_allocated = 0;
     uint64_t segments_freed = 0;
+    uint64_t segments_freed_eagerly = 0;
     uint64_t empty_candidate_scans = 0;
+    uint64_t batches_refused = 0;
 
     double victim_utilization_sum = 0;
     uint64_t victim_segments = 0;
@@ -483,6 +559,7 @@ struct sim_stats {
     uint64_t free_segments_min = std::numeric_limits<uint64_t>::max();
     uint64_t free_segments_max = 0;
     double live_bytes_sum = 0;
+    uint64_t pinned_segments_sum = 0;
 
     // The distribution of the segments by utilization, which is what says how much space there is to
     // reclaim and how cheaply, and what the segments a group owns hold. Sampled rarely, since these
@@ -534,6 +611,9 @@ struct sim_result {
     double effective_utilization() const noexcept {
         const auto free = mean_free_fraction();
         return free < 1 ? mean_utilization() / (1 - free) : 0;
+    }
+    double mean_pinned_segments() const noexcept {
+        return stats.samples ? double(stats.pinned_segments_sum) / double(stats.samples) : 0;
     }
     double segments_per_job() const noexcept {
         return stats.compaction_jobs ? double(stats.compaction_segments_in) / double(stats.compaction_jobs) : 0;
@@ -587,8 +667,20 @@ class compaction_sim {
     std::vector<uint32_t> _key_group;
 
     std::vector<sim_job> _jobs;
+    // Whether a segment is an input of a job in flight, so that eager freeing leaves it to the job.
+    std::vector<uint8_t> _in_job;
+    // Input segments pinned by a carried output residual, over the whole shard, and the bound that
+    // keeps them from eating the free-segment target.
+    uint64_t _pinned_segments = 0;
+    uint64_t _max_pinned = 0;
     std::vector<sim_candidate> _pending_candidates;
     bool _in_compaction_poll = false;
+    // Set when the admission floor turned a candidate away, cleared when a job finishes: until then
+    // the answer cannot change, and re-ranking every group on every allocation is what would
+    // dominate the run.
+    bool _admission_blocked = false;
+    // The best batch the last ranking found, which the relative admission gate is measured against.
+    compaction_candidate_score _best_candidate_score{};
 
     uint64_t _live_bytes = 0;
     sim_stats _stats;
@@ -602,11 +694,29 @@ public:
         , _segment_count((_p.disk_size / _p.file_size) * (_p.file_size / _p.segment_size))
         , _watermarks(make_free_segment_watermarks(_segment_count, _p.trigger_threshold))
         , _rng(_p.seed) {
+        // segment_descriptor_hist indexes a fixed-size bucket array without checking its bounds, so
+        // a segment larger than the histogram's maximum computes an out of range bucket for a fully
+        // free segment. The segment manager rejects such a configuration; without the same check
+        // here a sweep over the segment size silently corrupts memory.
+        if (_p.segment_size > segment_descriptor_hist_options.max_size) {
+            throw std::invalid_argument(fmt::format("a segment of {} is above the {} the free-space"
+                    " histogram is built for", _p.segment_size, segment_descriptor_hist_options.max_size));
+        }
+        if (_p.file_size < _p.segment_size || _p.disk_size < _p.file_size) {
+            throw std::invalid_argument("the disk holds whole files and a file holds whole segments");
+        }
         if (_segment_count < 4 * min_segments_per_compaction) {
             throw std::invalid_argument(fmt::format("a disk of {} segments is too small to compact", _segment_count));
         }
         if (_p.groups == 0) {
             throw std::invalid_argument("a shard has at least one compaction group");
+        }
+        if (_p.max_jobs_per_group == 0) {
+            throw std::invalid_argument("a group runs at least one compaction job at a time");
+        }
+        if (_p.carry_residual && _p.max_jobs_per_group > 1) {
+            throw std::invalid_argument("a carried residual lives in the group's one output buffer,"
+                    " so the group's jobs have to be serialized");
         }
         if (_p.free_band > 0) {
             _watermarks.high = std::min(_segment_count, _watermarks.low + _p.free_band);
@@ -622,8 +732,14 @@ public:
                         std::max<uint64_t>(_p.batch_cap, min_segments_per_compaction))
                 : limits.batch_cap;
 
+        // Pinning k inputs holds k segments while flushing the residual consumes one, so the total
+        // has to stay well inside the free-segment target or automatic compaction could never reach
+        // its stop watermark.
+        _max_pinned = std::max<uint64_t>(max_compaction_parallelism, _watermarks.low / 4);
+
         _descs.resize(_segment_count);
         _segments.resize(_segment_count);
+        _in_job.assign(_segment_count, 0);
         for (uint64_t i = 0; i < _segment_count; ++i) {
             _descs[i].reset(_p.segment_size);
             _free_segments.push_back(static_cast<uint32_t>(i));
@@ -713,13 +829,24 @@ private:
 
     // --- the index, mirroring what primary_index and the segment manager account on a record ---
 
-    void free_record(sim_location loc) noexcept {
+    void free_record(sim_location loc) {
         const auto net_size = _segments[loc.segment].records[loc.slot].net_size;
         auto& desc = _descs[loc.segment];
         desc.on_free(net_size);
         _live_bytes -= net_size;
-        if (desc.owner) {
-            desc.owner->update_segment(desc, net_size);
+        if (!desc.owner) {
+            // The open segment of a group, or an input pinned by a carried residual; neither is a
+            // compaction candidate and neither is freed here.
+            return;
+        }
+        desc.owner->update_segment(desc, net_size);
+        // A segment whose last live record has died holds nothing worth reading, but it is not
+        // freed until a compaction job happens to select it. It sorts first in the histogram, so
+        // that is usually quick, but it still costs a job slot on a group that is serialized.
+        if (_p.eager_free && desc.net_data_size(_p.segment_size) == 0 && !_in_job[loc.segment]) {
+            desc.owner->remove_segment(desc);
+            free_segment(loc.segment);
+            ++_stats.segments_freed_eagerly;
         }
     }
 
@@ -884,7 +1011,7 @@ private:
     std::vector<sim_candidate> rank_candidates(size_t max_candidates) {
         top_compaction_candidates<sim_candidate> best(max_candidates);
         for (const auto& g : _groups) {
-            if (g->compacting) {
+            if (g->jobs_in_flight >= _p.max_jobs_per_group) {
                 continue;
             }
             if (auto batch = select_batch(*g)) {
@@ -921,29 +1048,62 @@ private:
     }
 
     void start_jobs() {
+        if (_admission_blocked && !_jobs.empty()) {
+            return;
+        }
+        _admission_blocked = false;
         while (_jobs.size() < _parallelism) {
             if (_pending_candidates.empty()) {
                 _pending_candidates = rank_candidates(_parallelism);
                 if (_pending_candidates.empty()) {
                     return;
                 }
+                // take() ranks worst first, so the last one is the best batch on the shard; the
+                // relative gate is measured against it.
+                _best_candidate_score = _pending_candidates.back().score;
             }
             const auto candidate = _pending_candidates.back();
             _pending_candidates.pop_back();
-            if (candidate.group->compacting) {
+            auto& g = *candidate.group;
+            if (g.jobs_in_flight >= _p.max_jobs_per_group) {
                 continue;
             }
             // do_compaction() discards the batch the ranking chose and selects again, so a candidate
             // that has been queued for a while runs the batch its group holds now.
-            auto batch = select_batch(*candidate.group);
+            auto batch = select_batch(g);
             if (!batch) {
                 continue;
             }
+            // A job beyond the first buys throughput at the marginal write amplification of the
+            // batch it runs, which is not bounded by anything today. The candidates are ranked best
+            // first, so once one falls under the floor no later one clears it either.
+            const auto refused = !_jobs.empty()
+                    && ((_p.marginal_admission_efficiency > 0
+                                && batch->score.efficiency(_p.segment_size) < _p.marginal_admission_efficiency)
+                        || (_p.marginal_admission_ratio > 0
+                                && !batch->score.efficiency_at_least(_best_candidate_score, _p.marginal_admission_ratio)));
+            if (refused) {
+                ++_stats.batches_refused;
+                // Nothing changes until a job finishes, so keep the candidate and stop looking
+                // rather than re-ranking every group on the next allocation.
+                _pending_candidates.push_back(candidate);
+                _admission_blocked = true;
+                return;
+            }
             // The engine reads the inputs of a job in segment id order.
             std::ranges::sort(batch->segments);
-            candidate.group->compacting = true;
-            _jobs.emplace_back(*candidate.group, std::move(batch->segments), batch->score, _p.segment_size);
+            ++g.jobs_in_flight;
+            _jobs.emplace_back(g, std::move(batch->segments), batch->score, _p.segment_size);
             account_batch(_jobs.back());
+            for (const auto id : _jobs.back().inputs) {
+                _in_job[id] = 1;
+                // Two jobs of one group can only pick disjoint batches if a job's inputs leave the
+                // candidate set when it starts. With one job per group the engine has no such need,
+                // and the inputs stay in the set until the job frees them.
+                if (_p.max_jobs_per_group > 1) {
+                    g.segments.remove_segment(_descs[id]);
+                }
+            }
         }
     }
 
@@ -982,39 +1142,63 @@ private:
     // Scans one input segment, which is what the engine reads at a time, copying the records that
     // are still live into the output buffer.
     void step_job(sim_job& job) {
+        auto& g = *job.group;
+        // Carrying is what makes the buffer outlive the job, so it is the group's; otherwise the job
+        // has one of its own, as the compaction buffer pool gives it.
+        auto& buffer = _p.carry_residual ? g.output : job.output;
         const auto seg_id = job.inputs[job.next_input++];
-        if (_descs[seg_id].net_data_size(_p.segment_size) == 0) {
-            // A segment with nothing live in it is not read at all, which is what the nonempty
-            // filter in do_compaction() leaves out.
+        // Records of this segment that are in the buffer now. A flush resets it, so it says whether
+        // the buffer still holds anything of the segment once the scan is over.
+        size_t buffered = 0;
+        // A segment with nothing live in it is not read at all, which is what the nonempty filter in
+        // do_compaction() leaves out.
+        if (_descs[seg_id].net_data_size(_p.segment_size) != 0) {
+            _stats.compaction_bytes_read += _p.segment_size;
+
+            const auto& records = _segments[seg_id].records;
+            for (uint32_t slot = 0; slot < records.size(); ++slot) {
+                const auto loc = sim_location{.segment = seg_id, .slot = slot};
+                if (_index[records[slot].key] != loc) {
+                    ++_stats.compaction_records_skipped;
+                    continue;
+                }
+                const auto payload = uint64_t(records[slot].net_size) - ondisk::record_header_size;
+                if (!buffer.can_fit(payload)) {
+                    flush_buffer(g, buffer);
+                    buffered = 0;
+                }
+                buffer.append(records[slot].key, payload, loc);
+                ++buffered;
+            }
+        }
+
+        if (!_p.carry_residual) {
+            // The buffer is sealed at the end of the job and the inputs are freed with it.
             return;
         }
-        _stats.compaction_bytes_read += _p.segment_size;
-
-        const auto& records = _segments[seg_id].records;
-        for (uint32_t slot = 0; slot < records.size(); ++slot) {
-            const auto loc = sim_location{.segment = seg_id, .slot = slot};
-            if (_index[records[slot].key] != loc) {
-                ++_stats.compaction_records_skipped;
-                continue;
-            }
-            const auto payload = uint64_t(records[slot].net_size) - ondisk::record_header_size;
-            if (!job.output.can_fit(payload)) {
-                flush_output(job);
-            }
-            job.output.append(records[slot].key, payload, loc);
+        // The scan is over, so nothing of this segment is left to read. Either the buffer still
+        // holds a copy of some of its records, in which case the index still points into it and only
+        // the flush can free it, or everything it held has already been written out and it is dead.
+        g.segments.remove_segment(_descs[seg_id]);
+        if (buffered > 0) {
+            g.pinned.push_back(seg_id);
+            ++_pinned_segments;
+        } else {
+            free_segment(seg_id);
         }
     }
 
-    void flush_output(sim_job& job) {
-        if (!job.output.has_data()) {
+    // Writes what the buffer holds into a fresh segment of the group and moves the index onto it.
+    void flush_buffer(sim_group& g, sim_write_buffer& buffer) {
+        if (!buffer.has_data()) {
             return;
         }
         const auto seg_id = allocate_segment(write_source::compaction);
-        _stats.compaction_bytes_written += job.output.sealed_size();
-        _stats.compaction_data_bytes += job.output.net_data_size();
-        // A record the workload overwrote while the buffer held it is written out but never indexed,
-        // so the space it takes is dead the moment it lands.
-        for (const auto& rec : job.output.records()) {
+        _stats.compaction_bytes_written += buffer.sealed_size();
+        _stats.compaction_data_bytes += buffer.net_data_size();
+        // A record the workload overwrote while the buffer held it is written out but never
+        // indexed, so the space it takes is dead the moment it lands.
+        for (const auto& rec : buffer.records()) {
             if (_index[rec.key] != rec.src) {
                 ++_stats.compaction_records_skipped;
                 continue;
@@ -1023,22 +1207,60 @@ private:
             _index[rec.key] = add_record(seg_id, rec.key, rec.net_size);
             ++_stats.compaction_records_rewritten;
         }
-        job.group->segments.add_segment(_descs[seg_id]);
-        job.output.reset();
+        g.segments.add_segment(_descs[seg_id]);
+        buffer.reset();
         ++_stats.compaction_segments_out;
     }
 
-    void finish_job(sim_job& job) {
-        // compaction_buffer::close() flushes whatever is left as a partly filled segment, which is
-        // the output residual every job leaves behind.
-        flush_output(job);
-        for (const auto id : job.inputs) {
-            job.group->segments.remove_segment(_descs[id]);
-            if (_descs[id].ref_count == 0) {
-                free_segment(id);
-            }
+    // Flushes a carried residual and frees the inputs it was holding: everything the buffer held is
+    // now indexed where it was written, so those segments hold nothing live.
+    void flush_output(sim_group& g) {
+        flush_buffer(g, g.output);
+        for (const auto id : g.pinned) {
+            free_segment(id);
         }
-        job.group->compacting = false;
+        _pinned_segments -= g.pinned.size();
+        g.pinned.clear();
+    }
+
+    void finish_job(sim_job& job) {
+        auto& g = *job.group;
+        if (!_p.carry_residual) {
+            // compaction_buffer::close() flushes whatever is left as a partly filled segment, which
+            // is the output residual every job leaves behind.
+            flush_buffer(g, job.output);
+            for (const auto id : job.inputs) {
+                if (_p.max_jobs_per_group == 1) {
+                    g.segments.remove_segment(_descs[id]);
+                }
+                if (_descs[id].ref_count == 0) {
+                    free_segment(id);
+                }
+            }
+        } else if (g.pinned.size() > _p.carry_pin_limit) {
+            // Pinning k inputs holds k segments while flushing the residual consumes one, so
+            // carrying only pays while the buffer spans few inputs.
+            flush_output(g);
+        }
+        for (const auto id : job.inputs) {
+            _in_job[id] = 0;
+        }
+        --g.jobs_in_flight;
+        _admission_blocked = false;
+        enforce_pinned_bound();
+    }
+
+    // One pinned segment per group times many groups can exceed the whole free-segment target, in
+    // which case automatic compaction could never reach its stop watermark.
+    void enforce_pinned_bound() {
+        while (_pinned_segments > _max_pinned) {
+            const auto it = std::ranges::max_element(_groups, {},
+                    [] (const auto& g) { return g->pinned.size(); });
+            if ((*it)->pinned.empty()) {
+                return;
+            }
+            flush_output(**it);
+        }
     }
 
     // --- the workload ---
@@ -1158,6 +1380,7 @@ private:
         _stats.free_segments_min = std::min(_stats.free_segments_min, free);
         _stats.free_segments_max = std::max(_stats.free_segments_max, free);
         _stats.live_bytes_sum += double(_live_bytes);
+        _stats.pinned_segments_sum += _pinned_segments;
 
         static constexpr uint64_t utilization_sample_period = 1024;
         if (_stats.samples % utilization_sample_period == 0) {
@@ -1239,8 +1462,13 @@ void print_report(const sim_result& r) {
             p.group_skew != 0 ? fmt::format(", skew {}", p.group_skew) : "");
     fmt::print("  free target    {:.4g}% -> low {} high {}{}\n", p.trigger_threshold * 100,
             r.watermarks.low, r.watermarks.high, p.free_band ? " (band pinned)" : "");
-    fmt::print("  compaction     batch cap {}, parallelism {}, tolerance {}, strategy {}\n",
-            r.batch_cap, r.parallelism, p.extension_tolerance, enum_name(p.strategy, strategy_names));
+    fmt::print("  compaction     batch cap {}, parallelism {}, tolerance {}, strategy {}{}{}\n",
+            r.batch_cap, r.parallelism, p.extension_tolerance, enum_name(p.strategy, strategy_names),
+            p.carry_residual ? ", residual carried" : "", p.eager_free ? ", eager free" : "");
+    if (p.max_jobs_per_group > 1 || p.marginal_admission_efficiency > 0 || p.marginal_admission_ratio > 0) {
+        fmt::print("                 {} jobs per group, marginal admission efficiency {}, ratio {}\n",
+                p.max_jobs_per_group, p.marginal_admission_efficiency, p.marginal_admission_ratio);
+    }
     fmt::print("  workload       {}, {} keys, values {} ~{}\n",
             enum_name(p.workload, workload_names), r.keys,
             enum_name(p.value_size_dist, value_size_names), format_bytes(p.value_size));
@@ -1264,6 +1492,10 @@ void print_report(const sim_result& r) {
             r.mean_sealed_segments(), r.sealed_utilization());
     fmt::print("  open segments                 {:.1f} ({:.3f}% of the disk), one per group\n",
             r.mean_open_segments(), r.mean_open_segments() / double(r.segment_count) * 100);
+    if (p.carry_residual) {
+        fmt::print("  pinned by a carried residual  {:.1f} ({:.3f}% of the disk)\n",
+                r.mean_pinned_segments(), r.mean_pinned_segments() / double(r.segment_count) * 100);
+    }
 
     fmt::print("\nWrite amplification\n");
     fmt::print("  WA_gc      compaction data / user data     {:.3f}\n", r.wa_gc());
@@ -1282,6 +1514,13 @@ void print_report(const sim_result& r) {
     fmt::print("  records rewritten {}, skipped {}\n", s.compaction_records_rewritten, s.compaction_records_skipped);
     if (s.empty_candidate_scans) {
         fmt::print("  scans that found no candidate with a net gain: {}\n", s.empty_candidate_scans);
+    }
+    if (s.batches_refused) {
+        fmt::print("  batches refused a second job slot by the admission floor: {}\n", s.batches_refused);
+    }
+    if (s.segments_freed_eagerly) {
+        fmt::print("  segments freed on their last record dying rather than by a job: {} of {}\n",
+                s.segments_freed_eagerly, s.segments_freed);
     }
 
     fmt::print("\n  executed batch size\n");
@@ -1428,6 +1667,33 @@ int self_test() {
         p.strategy = strategy_kind::absolute;
         p.batch_cap = 8;
         cases.push_back({"absolute rule, pinned free level", p});
+    }
+    {
+        auto p = base();
+        p.groups = 8;
+        p.carry_residual = true;
+        cases.push_back({"residual carried, eight groups", p});
+    }
+    {
+        auto p = base();
+        p.groups = 8;
+        p.workload = workload_kind::hot_cold;
+        p.eager_free = true;
+        cases.push_back({"eager free, hot-cold", p});
+    }
+    {
+        auto p = base();
+        p.groups = 32;
+        p.group_skew = 1.5;
+        p.max_jobs_per_group = 4;
+        cases.push_back({"four jobs per group, skewed groups", p});
+    }
+    {
+        auto p = base();
+        p.groups = 32;
+        p.group_skew = 1.5;
+        p.marginal_admission_efficiency = 1.0;
+        cases.push_back({"marginal admission floor, skewed groups", p});
     }
 
     bool failed = false;
