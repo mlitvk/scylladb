@@ -127,9 +127,11 @@ Insisting on 20% free instead of 5% free costs **4x the write amplification**. N
 comes close to that leverage.
 
 The corollary is worth stating plainly: **at steady state write amplification is set by how much
-space you insist on keeping free, not by the admission filter. The filter only controls when you
-pay.** Refusing an expensive batch does not avoid the work; it defers it until pressure rises and
-the filter widens, by which time the segment is usually no cheaper.
+space you insist on keeping free, not by what compaction refuses. Refusing only controls when you
+pay.** Refusing an expensive batch does not avoid the work; it defers it until the disk has nothing
+cheaper left, by which time the segment usually is not cheaper either. The one exception, and the
+reason the marginal-admission gate exists at all, is a job that would run *in addition* to another
+one: that work is bought rather than deferred.
 
 ### Disk utilization
 
@@ -168,6 +170,30 @@ only with measurements.
 A second, more mundane cost of many groups: each group holds an open user segment and an open
 compaction output segment, so `2 * G` segments are partially filled at any time. At 128 groups
 that is 32MB per shard of half-used space, which raises `U_eff` and therefore `WA_gc`.
+
+### Unequal groups, and what parallelism costs on them
+
+Everything above assumes the groups of a shard hold comparable garbage. Tablets on a shard are not
+equal, and where they are not, parallelism is what turns the imbalance into write amplification:
+`find_top_compaction_candidates` skips a group that is already compacting and
+`submit_group_compaction` serializes per group, so the `auto_parallelism` job slots have to be
+filled by that many *different* groups. On a shard whose garbage sits in one tablet, the first job
+takes it and the rest rewrite groups that hold nothing worth reclaiming.
+
+Simulated with `--groups 64 --group-skew 2`, gate off against the
+`compaction_marginal_admission_ratio` of 0.75:
+
+| `U` | `WA_gc`, no gate | `WA_gc`, gate at 0.75 |
+|---|---|---|
+| 0.40 | 1.82 | 0.45 |
+| 0.50 | 2.15 | 1.10 |
+| 0.60 | 3.05 | 1.76 |
+| 0.75 | 5.58 | 4.38 |
+
+With the groups balanced the two columns are within noise of each other, and on a single group the
+runs are identical: every candidate is then close to the best one, so the gate never fires. What it
+takes away is the marginal job's cost, not the parallelism — it refuses jobs rather than slots, and
+a group that offers a batch keeping up with the best one runs alongside it as before.
 
 ### Compaction output residual, and why the batch cap is the cheaper fix
 
@@ -292,7 +318,8 @@ efficiency = reclaimed * segment_size / estimated_live_bytes
 ```
 
 By the identity above this is the reciprocal of the job's marginal write amplification, which makes
-the score directly interpretable and gives the admission gate a unit operators understand.
+the score directly interpretable and gives the admission gate a unit operators understand — the
+gate is a fraction of it, see [Admission gate](#admission-gate-implemented).
 `compaction_candidate_score::operator<` ranks by it — comparing the cross products, so the common
 `segment_size` factor cancels and no floating point enters the ordering — and ties by `reclaimed()`.
 A batch that copies nothing has infinite efficiency and outranks every batch that copies.
@@ -388,18 +415,16 @@ efficiency = reclaimed * segment_size / estimated_live_bytes    // == 1 / margin
   score of the batch that would actually run, so a small tablet holding one nearly-dead segment can
   win — which is correct, since that job is nearly free.
 
-**Admission gate.** `max_used_fraction` is now driven by the trigger's watermarks (see [Admission
-gate](#admission-gate-implemented)). The remaining step is to express it as a write-amplification
-budget: accept a batch only if `efficiency >= theta(pressure)`, where `theta` ramps from about 1.0
-at zero pressure (spend at most one segment-write per segment reclaimed) down to a small floor at
-full pressure (take anything with a net gain). Now that the score *is* efficiency, this is the same
-admission decision in a unit that can be reasoned about and alerted on, and it applies to the batch
-rather than to each segment considered.
+**Admission gate** (implemented). There is no floor on what a job may cost, only on what a
+*marginal* job may cost: a batch is admitted unconditionally when nothing else is running, and
+alongside another job only if it keeps `compaction_marginal_admission_ratio` of the best batch of
+its ranking. See [Admission gate](#admission-gate-implemented).
 
 **Batch cap and parallelism** (implemented). Both are derived from the free-segment target by
 `make_compaction_limits()`, which is what keeps `parallelism * cap <= low` — see [Batch cap and
 parallelism are one parameter](#batch-cap-and-parallelism-are-one-parameter). On any disk large
-enough for the target to cover them, that is a cap of 32 and 6 jobs in flight; below it the batch
+enough for the target to cover them, that is a cap of 32 and `max_auto_compaction_parallelism` — 4 —
+jobs in flight; below it the batch
 shrinks first, down to `min_segments_per_compaction`, and then the parallelism. The cap is a safety
 bound rather than a write-amplification knob only because the efficiency score plus tolerance decides
 where inside it the batch actually stops.
@@ -499,8 +524,8 @@ the trigger's stop condition.
 
 A per-group semaphore held by `do_compaction` for the whole job and by every out-of-job flush or
 abort. It cannot go through `submit_group_compaction`: `database::truncate` takes
-`disable_compaction()` on every group *before* calling `flush_separator()`, so a flush behind the
-admission gate would throw.
+`disable_compaction()` on every group *before* calling `flush_separator()`, so a flush submitted
+that way would throw.
 
 `disable_compaction()` on its own is no longer sufficient exclusion. A flush now mutates the segment
 set from outside a job, and `segment_set::unlink` keeps the list compact by swapping in the last
@@ -582,7 +607,7 @@ mis-classified. Making the fast path aggregate every buffer header in the segmen
 `logstor_compaction_controller` is a `backlog_controller` whose backlog is
 `compaction_shares_pressure()` directly, so control point inputs are in `[0, 1]`. Pressure is
 piecewise linear in available segments, with all three anchors taken from the same
-`free_segment_watermarks` the trigger and the admission gate use:
+`free_segment_watermarks` the trigger uses:
 
 | `available` | pressure | shares | meaning |
 |---|---|---|---|
@@ -627,7 +652,7 @@ Two properties matter more than the slope:
   enough — which is write throttling's problem, not the controller's.
 
 `logstor_compaction_trigger_threshold` is the only knob on the *shape* of the control loop: it sets
-the free-segment target, the hysteresis band, the admission gate and the shares ramp.
+the free-segment target, the hysteresis band and the shares ramp.
 `logstor_compaction_max_shares` only caps the ramp's top.
 
 This is an interim controller. It remains a pure space-pressure ratio: at a given free level it asks
@@ -911,12 +936,12 @@ accordingly (see [Open defect #4](#open)).
   stopped at 0.25. Across all of `[0.15, 0.25)` pressure was 0, `max_used_fraction` clamped to 0.25,
   no segment qualified, `find_top_compaction_candidates` returned nothing, and available never rose
   to the stop watermark — so `run_auto_compaction` rescanned every group's histogram at 10Hz
-  forever. The gate is now driven by `compaction_admission_pressure()`, derived from the trigger's
-  own watermarks (see [Admission gate](#admission-gate-implemented)). An empty candidate set now
+  forever. The gate was first re-derived from the trigger's own watermarks and has since been
+  removed altogether (see [Admission gate](#admission-gate-implemented)). An empty candidate set now
   means the disk genuinely holds no batch with a net gain.
 - **Unreachable filter bound.** `max_used_fraction` of 0.90 at full pressure could not produce a
-  reclaiming batch at cap 8. The high bound is now the reclaim ceiling
-  `1 - 1/max_segments_per_compaction`, which is that bound by construction.
+  reclaiming batch at cap 8. Its high bound was raised to the reclaim ceiling
+  `1 - 1/max_segments_per_compaction`, which made the filter redundant, and it is gone with it.
 - **Unsatisfiable free-segment target.** The 20% target with a 25% stop watermark required packing
   occupied segments to `U/0.75`, i.e. to 100% at `U = 0.75`, so auto compaction never reached its
   stop condition on any disk more than ~75% full. See [Free-segment target](#free-segment-target).
@@ -935,6 +960,12 @@ accordingly (see [Open defect #4](#open)).
   it could not be changed for one without moving the other two. The reserve is now
   `max_compaction_parallelism` — the quantity it protects is one output segment per concurrent job,
   not one per batch — and the floor is `min_segments_per_compaction`.
+
+- **Parallelism was unpriced on unequal groups.** A job slot can only be filled by a group that is
+  not already compacting, so with the garbage of a shard concentrated in one tablet the jobs beyond
+  the first rewrote groups that held nothing worth reclaiming, at no bound on what that cost —
+  `WA_gc` 2.15 against 1.10 at `U = 0.5` with 64 skewed groups. A marginal job now has to keep 75%
+  of the best batch's efficiency; see [Admission gate](#admission-gate-implemented).
 
 - **Nothing related the batch cap to the parallelism.** The two were independent constants whose
   product could exceed the free-segment target, which is a stall rather than a slowdown. Both are now
@@ -977,28 +1008,44 @@ accordingly (see [Open defect #4](#open)).
 
 ### Admission gate (implemented)
 
-`compaction_max_used_fraction()` bounds the utilization of the segments
-`select_segments_for_compaction` will consider:
+The per-segment utilization filter this section used to describe — `compaction_max_used_fraction()`
+over `compaction_admission_pressure()` — is gone. It could only ever refuse a batch the score would
+have refused anyway: the histogram prefix is already ordered by ascending utilization, so the score
+decides where the batch stops, and `reclaimed() >= 1` decides whether there is a batch at all. Per
+the corollary in [Over-provisioning](#over-provisioning), refusing an expensive batch does not avoid
+the work either — it defers it until the segment is usually no cheaper.
+
+What is left is the one admission decision that does *not* defer work but avoids it: whether to run
+a *second* job. `run_auto_compaction` admits the best candidate of a ranking unconditionally, and
+admits a candidate while another job is in flight only if
 
 ```
-gate = 0.25 + admission_pressure * (1 - 1/max_segments_per_compaction - 0.25)
+efficiency >= compaction_marginal_admission_ratio * best_efficiency    // 0.75
 ```
 
-`compaction_admission_pressure()` is 0 at or above the auto-compaction stop watermark, 1 at or
-below the free-segment target, and linear in between — the same watermarks
-`should_run_auto_compaction()` uses. That gives the invariant the old gate lacked: **whenever auto
-compaction is triggered, the gate is fully open, so any batch with a net gain is admitted.** The
-0.25 floor now applies only where auto compaction is not running, i.e. to compaction submitted
-explicitly via `trigger_logstor_compaction`, and inside the hysteresis band.
+where `best_efficiency` is `marginal_admission_bar()`, the best batch of the ranking that copies
+anything. A batch of fully dead segments copies nothing and so reclaims at infinite efficiency,
+which nothing that copies is a fraction of, so one is never allowed to set the bar — that would
+refuse every marginal job exactly when reclaiming is cheapest.
 
-The high bound is the reclaim ceiling `1 - 1/n_in` rather than the old constant 0.90, which at cap
-8 could not produce a reclaiming batch at all. Opening the gate fully at the trigger costs
-essentially nothing: `reclaimed() >= 1` is enforced independently, the histogram prefix is already
-ordered by ascending utilization so the score still decides where to stop, and at cap 8 the scoring
-rules differ by under 1% in write amplification. Per the corollary above, refusing an expensive
-batch does not avoid the work — it defers it until the segment is usually no cheaper.
+The bar is relative rather than absolute because an absolute one cannot be set. An efficiency floor
+of 1.0 — one segment reclaimed per segment copied — refuses everything a disk above 50% utilization
+can offer, so at `U = 0.75` compaction would stop rather than run at the efficiency the disk allows;
+a floor low enough to be safe there is one the marginal jobs this gate exists to refuse already
+clear. A fraction of the best batch on the shard adapts to both.
 
-The shares controller is driven by a second pressure function over the same watermarks, saturating at
+Refusing is only worth anything because a refused job's slot is not lost: the candidates are ranked
+best first, so once one falls under the bar no later one clears it either, and nothing the bar is
+compared with changes until a job finishes and gives its inputs back. The fiber therefore waits for
+the jobs in flight — by taking the rest of its parallelism from `_auto_compaction_sem` — and
+re-ranks, rather than re-scanning every group in the meantime. Progress does not depend on the gate:
+with no job in flight the best candidate is admitted whatever it costs.
+
+This is what makes parallelism safe on unequal groups; the measurements are in [Unequal groups, and
+what parallelism costs on them](#unequal-groups-and-what-parallelism-costs-on-them), and
+`compaction_batches_refused` counts the refusals.
+
+The shares controller is driven by a pressure function over the trigger's watermarks, saturating at
 half the target rather than at it; see [Today](#today-a-linear-ramp-on-the-trigger-watermarks).
 
 ## Configuration
@@ -1006,7 +1053,7 @@ half the target rather than at it; see [Today](#today-a-linear-ramp-on-the-trigg
 | Option | Meaning in write-amplification terms |
 |---|---|
 | `logstor_disk_size_in_mb` | Sets `U = live_bytes / disk_size`. The dominant WA knob — see the utilization table. |
-| `logstor_compaction_trigger_threshold` | The free-segment target, hence `U_eff = U/(1-target)`. Default 0.05 (5%). `0` disables the trigger. Also anchors the admission gate and the shares ramp. |
+| `logstor_compaction_trigger_threshold` | The free-segment target, hence `U_eff = U/(1-target)`. Default 0.05 (5%). `0` disables the trigger. Also anchors the batch cap, the parallelism and the shares ramp. |
 | `max_segments_per_compaction` (`segment_manager_config`, not user-facing) | Upper bound on job size. The bound actually applied is derived per disk by `make_compaction_limits()`, so this only binds on a disk whose target can cover it. Default 32. |
 | `compaction_static_shares` | Pins shares and disables the controller. It is the global option, so it disables the sstable compaction controller at the same time. |
 | `logstor_compaction_max_shares` | Top of the shares ramp, reached at full space pressure. Default 2000, live-updatable. Caps the peak only; the target and idle points scale down with it only below a cap of 300. |
@@ -1059,13 +1106,19 @@ disk, with the utilization table above as the guide.
 Available today: `compaction_segments_in`, `compaction_segments_out`,
 `compaction_records_rewritten`, `compaction_records_skipped`, `compaction_bytes_read`,
 `compaction_data_bytes_written`, `free_segments`, `segments_in_use`, `live_record_bytes`,
-`compaction_buffers_in_use`, `compaction_buffer_allocation_waits`, `compaction_buffers_dropped`.
+`compaction_buffers_in_use`, `compaction_buffer_allocation_waits`, `compaction_buffers_dropped`,
+`compaction_batches_refused`.
 
 The three buffer metrics make the pool's role as the concurrency cap visible: `in_use` against
 `max_compaction_parallelism` is the achieved concurrency, and `allocation_waits` counts the
 compactions that queued behind it. `buffers_dropped` is normally zero and only moves when a buffer
 could not be reclaimed, which shrinks the pool - and the concurrency cap with it - for the lifetime
 of the shard.
+
+`compaction_batches_refused` counts what the marginal-admission gate turned away. It is normally
+flat: it moves only where the groups of a shard are unequal enough that the second-best candidate is
+far behind the best, and it moving together with `compaction_buffers_in_use` sitting below
+`compaction_limits::auto_parallelism` is the signature of that.
 
 `WA_gc` is derivable as `compaction_data_bytes_written / data_bytes_written`, and the model
 predicts `compaction_bytes_read == compaction_data_bytes_written + data_bytes_written` in steady
@@ -1083,10 +1136,10 @@ Gaps worth closing:
 - `compaction_bytes_read` is charged as `nonempty_segments * segment_size`, which is right for the
   IO but should be stated as such, and does not distinguish skipped from copied bytes.
 - No histogram of executed-batch efficiency — i.e. observed marginal write amplification. This is
-  the single most useful signal for validating the model and for alerting when the admission gate
-  is being forced open by pressure.
+  the single most useful signal for validating the model, and the one that would say where the
+  admission ratio should sit.
 - No metric for how often `find_top_compaction_candidates` returns empty while auto compaction is
-  active (defect 1). Now that the gate is fully open at the trigger this is a genuine out-of-space
+  active (defect 1). With nothing left that can refuse a first job this is a genuine out-of-space
   signal rather than a symptom of the dead window, which makes it worth alerting on.
 - Nothing exports the derived `compaction_limits`. They move only when the trigger threshold does,
   so a pair of gauges would be enough, but without them there is no way to tell from outside whether
@@ -1109,6 +1162,11 @@ Ordered by value per unit of risk, not by how interesting they are.
 - Shares controller re-anchored on the trigger's watermarks, saturating while half the free-segment
   target is still in hand, and `logstor_compaction_soft_pressure_threshold` removed. Interim, until
   the work-based backlog below.
+- Marginal-admission gate: a job started while another one is in flight has to keep 75% of the
+  efficiency of the best batch on the shard. It is what prices parallelism on unequal groups, where
+  the slots beyond the first are filled by whatever tablet is not already compacting; see [Unequal
+  groups, and what parallelism costs on them](#unequal-groups-and-what-parallelism-costs-on-them).
+  Neutral when the groups are balanced.
 - Batch cap and automatic-compaction parallelism derived from the free-segment target by
   `make_compaction_limits()`, so that their product cannot exceed it; the `segment_pool` compaction
   reserve re-based on `max_compaction_parallelism` and the target's floor on
@@ -1124,9 +1182,9 @@ to be able to see whether the model holds on a real cluster.
    returning empty while auto compaction is active. Nearly free — `compaction_candidate` already
    carries the executed batch's score — and it is the instrument for everything below: without it
    there is no way to tell whether observed marginal write amplification matches the tables above,
-   whether the 5% target is actually being held, or whether the gate is being forced open by
-   pressure. The empty-candidate counter is now an out-of-space signal worth alerting on rather
-   than a symptom of the dead window.
+   whether the 5% target is actually being held, or where the marginal-admission ratio should sit.
+   The empty-candidate counter is now an out-of-space signal worth alerting on rather than a symptom
+   of the dead window.
 
 2. **Pass the candidate from `find_top_compaction_candidates` into `do_compaction`** and re-validate
    it instead of re-selecting (open defect 2). Small and self-contained, and it matters more than it
@@ -1159,10 +1217,6 @@ to be able to see whether the model holds on a real cluster.
 - Add an integral term to pin the free level at the target, and with it `WA_gc`. Only after 4 and 5:
   the `/theta` term is what keeps the loop gain high enough for an integrator to be both fast and
   damped. See [Later: an integral term](#later-an-integral-term-to-pin-the-target).
-- Replace the per-segment `max_used_fraction` gate with a per-batch efficiency budget
-  `efficiency >= theta(pressure)`. The natural expression now that the score is in efficiency units,
-  but by the corollary in [Over-provisioning](#over-provisioning) the gate has almost no leverage on
-  write amplification, so it buys clarity rather than performance.
 - Remove the 100ms candidate-rescan loop and re-arm the fiber on events (open defect 1). Now a
   CPU-waste cleanup rather than a correctness problem.
 - Free a segment eagerly when its live bytes reach zero, instead of waiting for a job to select it
@@ -1196,6 +1250,7 @@ disk, so that a parameter can be swept without a cluster:
 ninja build/dev/test/manual/logstor_compaction_sim
 build/dev/test/manual/logstor_compaction_sim --smp 1 --utilization 0.75 --trigger-threshold 0.1
 build/dev/test/manual/logstor_compaction_sim --smp 1 --sweep trigger-threshold=0.03,0.05,0.1,0.2
+build/dev/test/manual/logstor_compaction_sim --smp 1 --groups 64 --group-skew 2 --sweep marginal-admission-ratio=0,0.75
 build/dev/test/manual/logstor_compaction_sim --smp 1 --self-test
 ```
 
@@ -1216,7 +1271,8 @@ job, the driver that keeps jobs in flight, the segment pool and the write path a
 engine's versions of them are IO or future bound.
 
 Parameters unless stated otherwise: 900 segments of 128KB, 32 records per segment, `U = 0.75`, a 10%
-free-segment target, one group, uniform random overwrites, the dataset written through once before
+free-segment target, one group, the marginal-admission gate at the engine's ratio (`0` turns it off,
+which is how the tables that compare against it were produced), uniform random overwrites, the dataset written through once before
 the run and half the run taken as warm-up. Workloads: uniform, zipf 0.99 and 90/10 hot-cold, all
 overwrite-only.
 
