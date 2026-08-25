@@ -53,6 +53,7 @@ The `segment_manager` handles the allocation and management of fixed-size segmen
 - **Compaction**: Copies live data from sparse segments to reclaim space
 - **Recovery**: Scans segments on startup to rebuild the index
 - **Separator**: Writes to all _compaction groups_ (tablets and even tables) go to a single active segment. The separator splits these mixed segments, which have records from different compaction groups, into segments that each has a single compaction group. This separation is useful when migrating tablets.
+- **Direct writes**: A group that writes fast enough skips both of those: it writes into a buffer bound to a segment of its own, and the separator never sees its records. See the data flow section below.
 
 The data in the segments consists of records of type `log_record`. Each record holds the partition of one key, encoded in the logstor record format, together with the metadata of the record.
 
@@ -76,6 +77,11 @@ The `buffered_writer` manages multiple write buffers for user writes, an active 
 
 Only step 4 writes to the disk - all other steps only update in-memory metadata.
 
+A record written this way reaches the disk twice: once here, into the shared active segment, and
+once more when the separator rewrites it into a segment of its own compaction group. The direct
+write path below is the same write without the second pass, for the groups that write enough to be
+worth it.
+
 **Read Path:**
 1. Application requests data for a partition key
 2. Cache lookup, which serves the read when the partition is cached
@@ -90,6 +96,40 @@ Only step 4 writes to the disk - all other steps only update in-memory metadata.
 1. When a record is written to the active segment, it is also written to its compaction group's separator buffer. The separator buffer holds a reference to the original segment.
 2. The separator buffer is flushed when it's full, or requested to flush for other reason. It is written into a new segment in the compaction group, and it updates the location of the records from the original mixed segments to the new segments in the compaction group.
 3. After the separator buffer is flushed and all records from the original segment are moved, it releases the reference of the segment. When there are no more reference to the segment it is freed.
+
+**Direct writes:**
+1. A compaction group that writes fast enough is given two write buffers of its own, each bound to
+   one of the group's segments from the moment the buffer is allocated. A full segment holds exactly
+   one buffer, at offset zero, so the final location of a record appended to such a buffer is known
+   as soon as it is appended.
+2. A write of that group goes straight into the buffer, the index is updated with the final location
+   there and then, and the write is acknowledged - with the record still only in memory. Nothing
+   goes to the active segment and the separator is given nothing, so the record reaches the disk
+   once instead of twice.
+3. The buffer is written out when it fills, or when it has held records for a whole sync period, and
+   its segment is linked into the group after that - exactly like the output of the separator or of
+   a compaction. While the buffer fills, its segment is unwritten and belongs to no segment set, so
+   nothing can pick it for compaction, scan it or free it. The group rotates into its second buffer
+   while the first one is being written, and is given a fresh buffer and segment afterwards.
+4. A read of a record that has been acknowledged but is not on the disk yet is served out of the
+   buffer: the segment manager keeps the buffers of the hot groups by the id of the segment each one
+   is bound to, and `read_record_bytes` looks there before it looks at the disk.
+5. The sequence number of the segment is assigned when the buffer is sealed, not when the segment
+   was handed out, so that recovery's tie-break between records of equal timestamp still orders it
+   against everything written while the buffer was filling.
+
+The acknowledgement is therefore not durable: a crash loses what the buffers of the shard hold,
+bounded by the sync period and by two segments per hot group. That is what the periodic commitlog
+sync mode promises, so the path is on exactly when `commitlog_sync` is `periodic`, and its deadline
+is `commitlog_sync_period_in_ms`. In `batch` mode every write takes the ordinary path above, whose
+acknowledgement waits for the disk.
+
+Which groups get buffers is measured rather than declared. Every write of a group is counted against
+the current sync period; a group that wrote at least half a segment over a period is given buffers,
+and one that writes less than that for two periods in a row gives them back. Below that rate the
+partly filled segment such a group leaves at the end of every period occupies more of the segment
+pool than the second write it saves is worth. At most `max_hot_groups` groups of a shard hold
+buffers at once, which is what bounds both the memory and the loss window.
 
 **Compaction:**
 1. The amount of live data is tracked for each segment in its (in-memory) segment_descriptor. The segment descriptors are stored in a histogram by live data. This histogram is called a `segment_set` and each compaction group owns one.
@@ -225,6 +265,7 @@ own, so that the CPU each one takes is accounted and controlled separately:
 |---|---|---|
 | Write buffer flush to the active segment | `clog` (shared with the commitlog) | 1000 |
 | Separator | `lsep` | 1000, fixed |
+| Direct write sync | `lsep` (shared with the separator) | 1000, fixed |
 | Compaction | `lcmp` | driven by `logstor_compaction_controller`, see [logstor_compaction.md](logstor_compaction.md) |
 | Split compaction | `mant` (maintenance) | 200 |
 

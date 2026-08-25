@@ -135,6 +135,7 @@ struct test_config {
     size_t file_size;
     size_t disk_size;
     bool compaction;
+    bool direct_writes;
     bool stop_on_error;
 };
 
@@ -146,6 +147,7 @@ std::ostream& operator<<(std::ostream& os, const test_config& cfg) {
            << ", segment_size=" << cfg.segment_size
            << ", disk_size=" << cfg.disk_size
            << ", compaction=" << (cfg.compaction ? "yes" : "no")
+           << ", direct_writes=" << (cfg.direct_writes ? "yes" : "no")
            << "}";
 }
 
@@ -216,6 +218,10 @@ public:
             .file_size = cfg.file_size,
             .disk_size = cfg.disk_size,
             .compaction_enabled = cfg.compaction,
+            .direct_group_writes = cfg.direct_writes,
+            // Far shorter than a node's sync period, so that the group is promoted while the run is
+            // populating rather than partway through the measurement.
+            .direct_sync_period = std::chrono::seconds(1),
         });
         // The same share of memory a node gives the writes it has taken but not yet flushed, which
         // is what bounds how far ahead of the disk the write path may run.
@@ -637,6 +643,7 @@ void write_json_result(const std::string& file, const test_config& cfg, test_kin
     params["segment_size"] = Json::UInt64(cfg.segment_size);
     params["disk_size"] = Json::UInt64(cfg.disk_size);
     params["compaction"] = cfg.compaction;
+    params["direct_writes"] = cfg.direct_writes;
 
     Json::Value extra_stats;
     extra_stats["reads_per_op"] = median.reads;
@@ -691,6 +698,7 @@ run_config make_run_config(const boost::program_options::variables_map& config) 
             .file_size = config["file-size-in-mb"].as<unsigned>() * 1024ull * 1024ull,
             .disk_size = config["disk-size-in-mb"].as<unsigned>() * 1024ull * 1024ull,
             .compaction = config["compaction"].as<bool>(),
+            .direct_writes = config["direct-writes"].as<bool>(),
             .stop_on_error = config["stop-on-error"].as<bool>(),
         },
         .tests = parse_tests(config["test"].as<std::string>()),
@@ -724,6 +732,8 @@ int main(int argc, char** argv) {
         ("segment-size-in-kb", bpo::value<unsigned>()->default_value(128), "size of a logstor segment")
         ("file-size-in-mb", bpo::value<unsigned>()->default_value(32), "size of a logstor data file")
         ("disk-size-in-mb", bpo::value<unsigned>()->default_value(512), "size of the logstor segment pool of a shard")
+        ("direct-writes", bpo::value<bool>()->default_value(false),
+                "write the records of a compaction group straight into a segment of that group, instead of through the shared active segment and the separator. Acknowledges a write before it is on the disk, the way the periodic commitlog sync mode does")
         ("compaction", bpo::value<bool>()->default_value(true), "let compaction run, which is what gives free segments back")
         ("dir", bpo::value<std::string>(), "directory for the logstor files (default: a temporary directory)")
         ("stop-on-error", bpo::value<bool>()->default_value(true), "stop after encountering the first error")

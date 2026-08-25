@@ -972,6 +972,13 @@ database::init_logstor() {
             .compaction_max_shares = _cfg.logstor_compaction_max_shares,
             .separator_sg = _dbcfg.logstor_separator_scheduling_group,
             .split_compaction_sg = _dbcfg.maintenance_scheduling_group,
+            // The direct write path acknowledges a write once its record is in memory and in the
+            // index, and takes it to the disk within a sync period, which is what the periodic
+            // commitlog sync mode already promises. The batch mode promises the opposite, so it
+            // keeps the ordinary path, whose acknowledgement waits for the disk. The same two
+            // options say so for logstor as they do for the commitlog, rather than a pair of its own.
+            .direct_group_writes = _cfg.commitlog_sync() == "periodic",
+            .direct_sync_period = std::chrono::milliseconds(_cfg.commitlog_sync_period_in_ms()),
         },
         .flush_sg = _dbcfg.commitlog_scheduling_group,
         .max_queued_write_bytes = _dbcfg.available_memory * 1 / 100,

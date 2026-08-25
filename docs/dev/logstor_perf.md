@@ -144,6 +144,7 @@ paths are measured against the same data.
 | `--duration` / `--operations-per-shard` | one second iterations, or a fixed number of operations per shard |
 | `--segment-size-in-kb`, `--file-size-in-mb`, `--disk-size-in-mb` | the geometry of the segment pool of a shard |
 | `--compaction` | let compaction run. On by default, for the same reason as above |
+| `--direct-writes` | write the records of a compaction group straight into a segment of that group, instead of through the shared active segment and the separator. Off by default; the run uses a one second sync period, so the group is promoted while the run is populating |
 | `--dir` | where to put the logstor files. Defaults to a temporary directory |
 | `--json-result` | write one file per test, suffixed with the name of the test |
 
@@ -298,6 +299,15 @@ logstor.
   record's bytes at a concurrency of one, 15.1k at sixteen, and 14.4k from sixty-four up, where it is
   flat. A number taken at one concurrency describes that concurrency only, and the low end is the
   latency-bound case a workload actually cares about.
+
+- **`write_bytes_per_op` is what the direct write path is measured by.** A write on the ordinary path
+  puts its record on the disk twice, once into the shared active segment and once more when the
+  separator rewrites it into a segment of its group - 2.02 to 2.17 times the bytes of the record, at
+  every row shape measured. `--direct-writes` takes the second pass away for a group that writes fast
+  enough, so the same run should report about one times the record's bytes plus the padding of the
+  seal, and next to nothing under `separator_bytes_written`. Run the `write` test with and without
+  the flag and diff the two: `write_bytes_per_op` is the headline, and `instructions_per_op` says how
+  much of the machinery around the second pass went with it.
 
 - **Give a write test of a wide row a pool it cannot fill, and no compaction.** The write test
   overwrites the dataset, and the wider the row the sooner the dead records fill the segment pool;
