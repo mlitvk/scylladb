@@ -131,12 +131,79 @@ partly filled segment such a group leaves at the end of every period occupies mo
 pool than the second write it saves is worth. At most `max_hot_groups` groups of a shard hold
 buffers at once, which is what bounds both the memory and the loss window.
 
+This path is a prototype, and one of the things it does not do yet makes it unsafe for real data.
+Read [Direct Writes: State of the Implementation](#direct-writes-state-of-the-implementation) before
+relying on it.
+
 **Compaction:**
 1. The amount of live data is tracked for each segment in its (in-memory) segment_descriptor. The segment descriptors are stored in a histogram by live data. This histogram is called a `segment_set` and each compaction group owns one.
 2. A segment set from a single compaction group is submitted for compaction.
 3. Compaction picks segments for compaction from the segment set. It chooses segments with the lowest utilization such that compacting them results in net gain of free segments.
 4. It reads the segments, finding all live records, and writing them into a write buffer. When the buffer is full it is flushed into a new segment, and for each recording updating the index location to the new location.
 5. After all live records are rewritten the old segments are freed.
+
+### Direct Writes: State of the Implementation
+
+The direct write path described above is a **prototype**. It is complete enough to be correct in
+normal operation and to be measured, and it is not complete enough to be relied on for durability.
+This section says exactly where the line is, so that nobody has to infer it from the code.
+
+**What is there.** The write path itself (`segment_manager::try_write_direct`, the branch at the top
+of `logstor::write`), the per-group buffers and the segments bound to them (`direct_write_buffer` in
+`compaction.hh`), the rotation and the write-out, the read-through for records that have been
+acknowledged but are not on the disk yet, the seal-time sequence number, the measured-rate
+controller and its sync fiber, and the metrics. Every drain a tablet operation goes through - a
+table flush, a split, a snapshot, a truncate, the group being removed, the shard stopping - writes
+the buffers out rather than discarding them, and `logstor_group::empty()` accounts for them, so a
+split does not acknowledge an empty group that is still holding records.
+
+**What is missing, and why it matters.**
+
+- **Superseded segments are not pinned.** When a direct write overwrites a key, the index frees the
+  old record's location straight away, while the new record is still only in memory. A crash in that
+  window loses both copies: the new one was never written, and the old one's space may already have
+  been reclaimed and reused. That is worse than the loss window the periodic mode promises - it is
+  not "the last few seconds of writes are gone" but "this key went backwards past where it was".
+  The fix is the pattern the separator already uses: hold a reference to the segment the old record
+  is in, deduplicated per buffer, until the new record is durable - see
+  `separator_buffer::held_segments`.
+  **This is the one gap that makes the path unsafe to enable on real data.**
+- **Same-timestamp writes can be ordered wrongly.** A write already queued on the ordinary path and
+  a later direct write of the same key with the same timestamp can reach the index in the opposite
+  order, and the index's `cmp <= 0` tie-break then keeps the older value. The window is
+  sub-millisecond and only opens when a group is promoted or when a direct write falls back, and it
+  is the same class of race as the fresh-sequence rewrites the separator and compaction already do -
+  but it is a race the ordinary path on its own does not have.
+- **Tablet operations racing the window are only covered by the drain hooks.** The hooks are the
+  right ones and they are exercised, but there are no tests for an operation that starts while a
+  buffer is filling, and none for a migration or a merge specifically.
+- **Recovery is untested against this path.** No code change was needed - the segments a direct
+  write produces are ordinary full segments, and an unwritten pre-bound segment loses on sequence
+  number the same way a reused free slot does - but "no change needed" is an argument, not a test.
+  What is worth writing: crash with unflushed buffers and check the loss is bounded to the window
+  and that older values are intact; crash after a same-timestamp overwrite and check the ordering.
+- **It is on by default.** `commitlog_sync` defaults to `periodic`, so a logstor cluster gets this
+  path with no configuration. That is deliberate while it is being measured, and it has to be
+  revisited - most likely by making it explicit - before the gaps above are closed.
+
+**What has not been measured.** The whole point of the path is the second write going away:
+2.02-2.17 times a record's bytes on the ordinary path, against about one times plus the padding of
+the seal here. Run `test/perf/perf_logstor --test write` with and without `--direct-writes` and diff
+`write_bytes_per_op`; see [logstor_perf.md](logstor_perf.md). Until that number exists, the path is
+a hypothesis with an implementation attached.
+
+**Next steps**, in the order they should be taken:
+
+1. Measure, with `perf_logstor`. Everything else is only worth doing if the number is what the
+   design predicts.
+2. Pin superseded segments. This is what turns the path from a prototype into something that can be
+   enabled.
+3. Recovery tests, and tests for tablet operations that start mid-window.
+4. Decide how the path is turned on. Riding `commitlog_sync` costs no new option and matches the
+   durability promise exactly, but it also means a cluster gets it without asking.
+5. Then the deferred items from the write-path design: what the `batch` mode can do about its own
+   write amplification (lazy separation by compaction), and the `is_record_alive` check in the
+   separator, which is a cheap independent win for every group that stays on the ordinary path.
 
 ### Space Accounting
 
