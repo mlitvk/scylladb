@@ -167,8 +167,9 @@ struct sim_params {
     double marginal_admission_efficiency = 0;
     // The same gate expressed relative to the best candidate of the current ranking rather than as
     // an absolute efficiency, so that it adapts to what the disk can offer instead of stalling
-    // compaction on a full disk where no batch clears an absolute floor. 0 admits everything.
-    double marginal_admission_ratio = 0;
+    // compaction on a full disk where no batch clears an absolute floor. This is the gate the engine
+    // runs; 0 admits everything, which is what it did before it had one.
+    double marginal_admission_ratio = compaction_marginal_admission_ratio;
 
     workload_kind workload = workload_kind::uniform;
     double zipf_theta = 0.99;
@@ -679,8 +680,8 @@ class compaction_sim {
     // the answer cannot change, and re-ranking every group on every allocation is what would
     // dominate the run.
     bool _admission_blocked = false;
-    // The best batch the last ranking found, which the relative admission gate is measured against.
-    compaction_candidate_score _best_candidate_score{};
+    // What the relative admission gate measures a candidate against, from the last ranking.
+    std::optional<compaction_candidate_score> _admission_bar;
 
     uint64_t _live_bytes = 0;
     sim_stats _stats;
@@ -1058,9 +1059,7 @@ private:
                 if (_pending_candidates.empty()) {
                     return;
                 }
-                // take() ranks worst first, so the last one is the best batch on the shard; the
-                // relative gate is measured against it.
-                _best_candidate_score = _pending_candidates.back().score;
+                _admission_bar = marginal_admission_bar(_pending_candidates);
             }
             const auto candidate = _pending_candidates.back();
             _pending_candidates.pop_back();
@@ -1080,8 +1079,8 @@ private:
             const auto refused = !_jobs.empty()
                     && ((_p.marginal_admission_efficiency > 0
                                 && batch->score.efficiency(_p.segment_size) < _p.marginal_admission_efficiency)
-                        || (_p.marginal_admission_ratio > 0
-                                && !batch->score.efficiency_at_least(_best_candidate_score, _p.marginal_admission_ratio)));
+                        || (_p.marginal_admission_ratio > 0 && _admission_bar
+                                && !batch->score.efficiency_at_least(*_admission_bar, _p.marginal_admission_ratio)));
             if (refused) {
                 ++_stats.batches_refused;
                 // Nothing changes until a job finishes, so keep the candidate and stop looking
