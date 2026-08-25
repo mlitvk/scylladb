@@ -137,6 +137,14 @@ public:
     segment_sequence seq_num() const noexcept {
         return _seq_num;
     }
+
+    // Gives the segment a sequence number later than the one it was started with. Recovery
+    // tie-breaks records of equal timestamp by the sequence number of the segment they are in, so a
+    // segment that is handed out long before it is written has to be renumbered when it is sealed,
+    // or it would lose the tie to every segment allocated in between.
+    void set_seq_num(segment_sequence seq_num) noexcept {
+        _seq_num = seq_num;
+    }
 };
 
 segment::segment(log_segment_id id, seastar::file file, uint64_t file_offset, uint64_t max_size)
@@ -948,6 +956,10 @@ public:
 
     future<> write(write_buffer&);
     future<> write_full_segment(write_buffer&, logstor_group&, write_source);
+    // Writes a buffer out into a segment that has already been allocated, and links the segment
+    // into the group. Split out of write_full_segment() for a caller that holds the segment from
+    // before the buffer was filled, rather than taking one to write the buffer it has.
+    future<> write_full_segment_tail(seg_ptr, write_buffer&, logstor_group&, write_source);
 
     future<temporary_buffer<char>> read_record_bytes(log_location);
 
@@ -1514,6 +1526,10 @@ future<> segment_manager_impl::write_full_segment(write_buffer& wb, logstor_grou
     }
 
     auto seg = co_await get_segment(source);
+    co_await write_full_segment_tail(std::move(seg), wb, cg, source);
+}
+
+future<> segment_manager_impl::write_full_segment_tail(seg_ptr seg, write_buffer& wb, logstor_group& cg, write_source source) {
     logstor_logger.trace("Write full segment {} seq {} from {}", seg->id(), seg->seq_num(), write_source_to_string(source));
 
     wb.seal(seg->seq_num(), cg.table_id(), block_alignment);
