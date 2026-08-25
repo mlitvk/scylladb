@@ -216,6 +216,26 @@ The `/storage_service/logstor_info` API reports the same distribution for a tabl
 numbers derived from it - the space its segments take, the part of it that is live and the part that
 is reclaimable - both for the node and per shard, which is where a skew between the shards shows.
 
+### Scheduling Groups
+
+Every stage of logstor other than the foreground read and write runs in a scheduling group of its
+own, so that the CPU each one takes is accounted and controlled separately:
+
+| Stage | Group | Shares |
+|---|---|---|
+| Write buffer flush to the active segment | `clog` (shared with the commitlog) | 1000 |
+| Separator | `lsep` | 1000, fixed |
+| Compaction | `lcmp` | driven by `logstor_compaction_controller`, see [logstor_compaction.md](logstor_compaction.md) |
+| Split compaction | `mant` (maintenance) | 200 |
+
+The separator used to run in the memtable group, `mt`, whose shares belong to the memtable flush
+controller. A logstor table has no memtables, so that controller sees no backlog and leaves the group
+at its one-share floor - which starved the separator, since it is on the critical path of every
+write: the write path blocks on the separator task queue, so what the separator does not get to do,
+no write completes either. It has a group of its own for that reason, and the shares are fixed rather
+than controlled because the work is not discretionary - unlike compaction, which trades write
+amplification for space and therefore has something to control.
+
 ## Usage
 
 ### Enabling Logstor
