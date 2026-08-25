@@ -371,6 +371,14 @@ public:
     template <log_record_writer_concept Writer>
     future<log_location_with_holder> write(Writer writer, write_target target = {});
 
+    // Appends a record and says where in the buffer it landed, without tracking its completion.
+    // A record written into a buffer that is already bound to a segment knows its final location
+    // as soon as it is appended, so it needs neither the continuation on the buffer's flush nor
+    // the gate holder that write() hands out - which is the per-record cost this avoids.
+    // Full buffers only: a mixed buffer would also have to retain the record for the separator.
+    template <log_record_writer_concept Writer>
+    raw_write_buffer::append_result append_synchronously(const Writer& writer);
+
     // Complete all tracked writes with their locations when the buffer is flushed to base_location
     future<> complete_writes(log_location base_location);
     future<> abort_writes(std::exception_ptr);
@@ -392,6 +400,9 @@ extern template raw_write_buffer::append_result raw_write_buffer::append<log_rec
 
 extern template future<log_location_with_holder> write_buffer::write<log_record_writer>(log_record_writer, write_target);
 extern template future<log_location_with_holder> write_buffer::write<log_record_bytes_writer>(log_record_bytes_writer, write_target);
+
+extern template raw_write_buffer::append_result write_buffer::append_synchronously<log_record_writer>(const log_record_writer&);
+extern template raw_write_buffer::append_result write_buffer::append_synchronously<log_record_bytes_writer>(const log_record_bytes_writer&);
 
 class write_buffer_pool;
 

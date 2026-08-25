@@ -245,8 +245,19 @@ future<log_location_with_holder> write_buffer::write(Writer writer, write_target
     });
 }
 
+template <log_record_writer_concept Writer>
+raw_write_buffer::append_result write_buffer::append_synchronously(const Writer& writer) {
+    if (with_record_copy()) [[unlikely]] {
+        on_internal_error(logstor_logger, "Synchronous appends are not supported for mixed write buffers");
+    }
+    return _raw.append(writer);
+}
+
 template future<log_location_with_holder> write_buffer::write<log_record_writer>(log_record_writer, write_target);
 template future<log_location_with_holder> write_buffer::write<log_record_bytes_writer>(log_record_bytes_writer, write_target);
+
+template raw_write_buffer::append_result write_buffer::append_synchronously<log_record_writer>(const log_record_writer&);
+template raw_write_buffer::append_result write_buffer::append_synchronously<log_record_bytes_writer>(const log_record_bytes_writer&);
 
 template raw_write_buffer::append_result raw_write_buffer::append<log_record_writer>(const log_record_writer&);
 template raw_write_buffer::append_result raw_write_buffer::append<log_record_bytes_writer>(const log_record_bytes_writer&);

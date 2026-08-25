@@ -28,6 +28,7 @@
 #include "replica/logstor/ondisk.hh"
 #include "replica/logstor/record_format.hh"
 #include "replica/logstor/write_buffer.hh"
+#include <seastar/testing/on_internal_error.hh>
 #include <seastar/testing/thread_test_case.hh>
 
 #include "replica/logstor/segment_io.hh"
@@ -619,6 +620,73 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_abort_writes_reclaims_unflush
     wb.reset();
     BOOST_REQUIRE(!wb.is_closed());
     BOOST_REQUIRE(!wb.has_data());
+}
+
+// A record appended to a buffer that is already bound to a segment knows its final location right
+// away, so it is appended without the completion tracking write() sets up. Checks that the two ways
+// in produce the same bytes and the same offsets, so that a location computed at append time is the
+// location the record ends up at.
+SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_append_synchronously_matches_a_raw_append) {
+    auto schema = make_kv_schema();
+    const auto records = std::vector<log_record>{
+        make_log_record(schema, "pk0", "v0", api::timestamp_type(1)),
+        make_log_record(schema, "pk1", "v1", api::timestamp_type(2)),
+        make_log_record(schema, "pk2", "v2", api::timestamp_type(3)),
+    };
+
+    raw_write_buffer expected_wb(32 * 1024, segment_kind::full);
+    write_buffer wb(32 * 1024, segment_kind::full);
+
+    for (const auto& record : records) {
+        const auto expected = expected_wb.append(log_record_writer(record));
+        const auto actual = wb.append_synchronously(log_record_writer(record));
+        BOOST_REQUIRE_EQUAL(actual.record_header_offset, expected.record_header_offset);
+        BOOST_REQUIRE_EQUAL(actual.total_size, expected.total_size);
+        BOOST_REQUIRE_EQUAL(wb.offset_in_buffer(), expected_wb.offset_in_buffer());
+        BOOST_REQUIRE_EQUAL(wb.net_data_size(), expected_wb.net_data_size());
+        BOOST_REQUIRE_EQUAL(wb.record_count(), expected_wb.record_count());
+    }
+
+    expected_wb.seal(segment_sequence{5}, schema->id(), ondisk::block_alignment);
+    wb.seal(segment_sequence{5}, schema->id(), ondisk::block_alignment);
+
+    // The segment header carries the token range of the appended records, which append() is what
+    // maintains, so equal bytes here also say the range came out right.
+    const auto expected_bytes = make_serialized_buffer_copy(expected_wb);
+    const auto actual_bytes = make_serialized_buffer_copy(wb);
+    BOOST_REQUIRE_EQUAL(actual_bytes.size(), expected_bytes.size());
+    BOOST_REQUIRE(std::equal(actual_bytes.begin(), actual_bytes.end(), expected_bytes.begin()));
+}
+
+// A mixed buffer also has to retain a copy of every record for the separator to replay, which an
+// append that tracks nothing cannot do, so it is refused rather than silently losing the copy.
+SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_append_synchronously_refuses_a_mixed_buffer) {
+    auto schema = make_kv_schema();
+
+    seastar::testing::scoped_no_abort_on_internal_error no_abort;
+    write_buffer wb(32 * 1024, segment_kind::mixed);
+    BOOST_REQUIRE_THROW(wb.append_synchronously(
+            log_record_writer(make_log_record(schema, "pk0", "v0", api::timestamp_type(1)))),
+            std::runtime_error);
+}
+
+// Nothing subscribes to the flush of a buffer that was only appended to synchronously, so the flush
+// has to complete and close it all the same - which is what lets it go back to its pool.
+SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_appended_synchronously_returns_to_its_pool) {
+    auto schema = make_kv_schema();
+    abort_source as;
+    write_buffer_pool pool(make_test_write_buffer_pool_config(1, 1));
+    auto stop_pool = seastar::defer([&pool] noexcept { pool.stop().get(); });
+
+    {
+        auto buf = pool.allocate(as).get();
+        buf->append_synchronously(log_record_writer(make_log_record(schema, "pk0", "v0", api::timestamp_type(1))));
+        buf->complete_writes(log_location{.segment = log_segment_id{3}, .offset = 0, .size = 0}).get();
+        BOOST_REQUIRE(buf->is_closed());
+    }
+
+    BOOST_REQUIRE_EQUAL(pool.used_buffer_count(), 0u);
+    close_and_return(pool.allocate(as).get());
 }
 
 // Checks that a pool builds its buffers at the point of use and keeps only max_cached of them once
