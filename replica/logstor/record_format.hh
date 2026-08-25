@@ -201,14 +201,36 @@ public:
 // partition being walked once to size a buffer and once to fill it. The walk costs about as
 // much per column as the copy costs per byte, so the copy is much the cheaper of the two.
 //
+// It also holds the schema descriptions the records it has encoded carry. A description is a
+// pure function of the schema version, and is the other per-column cost of a record: building
+// it interns the type names of the columns and then looks every column's type up in that
+// table, and its size has to be known before it is written.
+//
 // One encoder is held per shard and reused, so two encodes must not interleave on it. A write
 // encodes its record before it awaits anything, so none do.
 class row_value_encoder {
+    // The columns of one schema version, encoded as a record carries them.
+    struct schema_description {
+        table_schema_version version;
+        bytes encoded;
+    };
+    // A shard writes under more schema versions than this only while several ALTERs are in
+    // flight, and a description is cheap to rebuild, so the cache is simply emptied rather
+    // than grown or ordered by use. Mirrors column_translation_cache, the read side of this.
+    static constexpr size_t max_descriptions = 8;
+
     encode_buffer _buffer;
+    std::vector<schema_description> _descriptions;
+
+    // The encoded description of the columns of s, built on the first record encoded under a
+    // schema version. Valid until the next call that does not find one.
+    bytes_view description_of(const schema& s);
 
 public:
     // The partition encoded. Valid until the next encode() on this encoder.
     bytes_view encode(const schema& s, const mutation_partition& p, api::timestamp_type base_ts);
+
+    size_t description_count() const noexcept { return _descriptions.size(); }
 };
 
 // Decodes an encoded partition into p, which must be empty. The cells are read straight

@@ -701,6 +701,51 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_format_column_translation_cache) {
     BOOST_REQUIRE_EQUAL(translations.size(), 1);
 }
 
+// The description of a schema's columns is the same in every record written under a schema
+// version, so the encoder builds it once and copies it into the records that follow. What it
+// writes has to stay exactly what building it per record wrote, which is what checking every
+// encode against measure_row_value() - which does build it per record - says.
+SEASTAR_THREAD_TEST_CASE(test_logstor_record_format_schema_description_cache) {
+    const auto ts = api::timestamp_type(1700000000000000);
+    row_value_encoder encoder;
+
+    auto record_under = [&] (schema_ptr s) {
+        auto m = make_logstor_mutation(s);
+        row_of(m).apply(row_marker(ts));
+        set_blob_cell(m, "column00", to_bytes("v"), ts);
+        return m;
+    };
+    auto check = [&] (const mutation& m) {
+        const auto encoded = encoder.encode(*m.schema(), m.partition(), ts);
+        BOOST_REQUIRE_EQUAL(measure_row_value(*m.schema(), m.partition(), ts), encoded.size());
+        column_translation_cache translations;
+        assert_that(decode(m.schema(), m.decorated_key(), encoded, ts, translations)).is_equal_to(m);
+    };
+
+    auto s = make_blob_column_schema(2);
+    const auto m = record_under(s);
+
+    // One entry per schema version, however many records go through it.
+    for (int i = 0; i < 3; ++i) {
+        check(m);
+    }
+    BOOST_REQUIRE_EQUAL(encoder.description_count(), 1);
+
+    // A column added is another schema version and another description, and a record written
+    // under it has to carry that one and not the description of the version before it.
+    auto added = schema_builder(s).with_column(to_bytes("a"), bytes_type).build();
+    check(record_under(added));
+    BOOST_REQUIRE_EQUAL(encoder.description_count(), 2);
+
+    // Past the entries the encoder keeps, the cache is emptied and refills.
+    for (int i = 0; i < 10; ++i) {
+        added = schema_builder(added).with_column(to_bytes(fmt::format("added{:02}", i)), bytes_type).build();
+        check(record_under(added));
+    }
+    BOOST_REQUIRE_LE(encoder.description_count(), 8);
+    check(record_under(added));
+}
+
 SEASTAR_THREAD_TEST_CASE(test_logstor_record_format_round_trips_random_mutations) {
     const auto seed = tests::random::get_int<uint32_t>();
     BOOST_TEST_MESSAGE(fmt::format("random seed: {}", seed));

@@ -244,6 +244,32 @@ void encode_schema_description(Sink& sink, const schema& s, const type_table& ty
     }
 }
 
+// How encode_row_value() puts the description of the schema into a record: built on the spot,
+// which is what the measuring oracle does and how the encoder builds the copy it caches, or
+// taken from that copy, which is what a write does.
+struct build_description {
+    const schema& s;
+
+    template <typename Sink>
+    void operator()(Sink& sink) const {
+        const type_table types(s);
+        measuring_sink size;
+        encode_schema_description(size, s, types);
+        sink.uvint(size.size);
+        encode_schema_description(sink, s, types);
+    }
+};
+
+struct cached_description {
+    bytes_view encoded;
+
+    template <typename Sink>
+    void operator()(Sink& sink) const {
+        sink.uvint(encoded.size());
+        sink.blob(encoded);
+    }
+};
+
 template <typename Sink>
 void encode_column_bitmap(Sink& sink, const row& cells, column_count_type n_columns) {
     if (n_columns <= 64) {
@@ -496,8 +522,9 @@ void encode_cell(Sink& sink, const column_definition& cdef, const atomic_cell_or
     }
 }
 
-template <typename Sink>
-void encode_row_value(Sink& sink, const schema& s, const mutation_partition& p, api::timestamp_type base_ts) {
+template <typename Sink, typename WriteDescription>
+void encode_row_value(Sink& sink, const schema& s, const mutation_partition& p, api::timestamp_type base_ts,
+        WriteDescription&& write_description) {
     const auto* row = single_row(p);
     const auto partition_tombstone = p.partition_tombstone();
     const auto kind = row ? kind_of(row->marker()) : marker_kind::none;
@@ -525,11 +552,7 @@ void encode_row_value(Sink& sink, const schema& s, const mutation_partition& p, 
     sink.u64(static_cast<uint64_t>(version.get_most_significant_bits()));
     sink.u64(static_cast<uint64_t>(version.get_least_significant_bits()));
 
-    const type_table types(s);
-    measuring_sink description_size;
-    encode_schema_description(description_size, s, types);
-    sink.uvint(description_size.size);
-    encode_schema_description(sink, s, types);
+    write_description(sink);
 
     const auto dt_base = deletion_time_base(base_ts);
     auto encode_tombstone = [&sink, base_ts, dt_base] (const tombstone& t) {
@@ -642,7 +665,7 @@ const column_translation& column_translation_cache::get(const schema& s, table_s
 
 size_t measure_row_value(const schema& s, const mutation_partition& p, api::timestamp_type base_ts) {
     measuring_sink sink;
-    encode_row_value(sink, s, p, base_ts);
+    encode_row_value(sink, s, p, base_ts, build_description{s});
     return sink.size;
 }
 
@@ -657,12 +680,30 @@ void encode_buffer::grow(size_t needed) {
     _data = std::move(grown);
 }
 
+bytes_view row_value_encoder::description_of(const schema& s) {
+    const auto version = s.version();
+    for (const auto& description : _descriptions) {
+        if (description.version == version) {
+            return description.encoded;
+        }
+    }
+    if (_descriptions.size() >= max_descriptions) {
+        _descriptions.clear();
+    }
+    encode_buffer buffer;
+    growing_sink sink(buffer);
+    encode_schema_description(sink, s, type_table(s));
+    _descriptions.push_back({version, bytes(buffer.written())});
+    return _descriptions.back().encoded;
+}
+
 bytes_view row_value_encoder::encode(const schema& s, const mutation_partition& p, api::timestamp_type base_ts) {
+    const auto description = description_of(s);
     // Reset before the encode rather than after it: a partition the format cannot hold throws
     // part way through one, and the next encode has to find the buffer empty.
     _buffer.reset();
     growing_sink sink(_buffer);
-    encode_row_value(sink, s, p, base_ts);
+    encode_row_value(sink, s, p, base_ts, cached_description{description});
     return _buffer.written();
 }
 
