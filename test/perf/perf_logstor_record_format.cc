@@ -32,7 +32,6 @@
 #include <seastar/core/app-template.hh>
 #include <seastar/core/memory.hh>
 #include <seastar/core/reactor.hh>
-#include <seastar/core/simple-stream.hh>
 #include <seastar/testing/linux_perf_event.hh>
 
 #include "keys/keys.hh"
@@ -128,12 +127,11 @@ mutation make_row(schema_ptr s, const row_shape& shape, const bytes& value, api:
     return m;
 }
 
-// What a write does to turn the partition of a mutation into the value of its record.
-bytes encode(const mutation& m, api::timestamp_type base_ts) {
-    bytes value(bytes::initialized_later(), measure_row_value(*m.schema(), m.partition(), base_ts));
-    auto out = seastar::simple_memory_output_stream(reinterpret_cast<char*>(value.data()), value.size());
-    write_row_value(out, *m.schema(), m.partition(), base_ts);
-    return value;
+// What a write does to turn the partition of a mutation into the value of its record: encode
+// it through the buffer the shard's encoder reuses, and copy the exact bytes out into the
+// value the record owns.
+bytes encode(row_value_encoder& encoder, const mutation& m, api::timestamp_type base_ts) {
+    return bytes(encoder.encode(*m.schema(), m.partition(), base_ts));
 }
 
 // What an encoded value is made of. The head and the description of the schema are what a record
@@ -200,7 +198,8 @@ void run_shape(const row_shape& shape, size_t samples) {
     // timestamp in its value is a delta from.
     const auto ts = api::new_timestamp();
     const auto m = make_row(s, shape, value, ts);
-    const auto encoded = encode(m, ts);
+    row_value_encoder encoder;
+    const auto encoded = encode(encoder, m, ts);
     const canonical_mutation cm(m);
 
     fmt::print("\n{} columns x {} B, {} set, {} B of value:\n", shape.columns, shape.value_size,
@@ -208,10 +207,10 @@ void run_shape(const row_shape& shape, size_t samples) {
     print_sizes(shape, *s, m, encoded, cm);
 
     time_op("encode", samples, [&] {
-        sink += encode(m, ts).size();
+        sink += encode(encoder, m, ts).size();
     });
-    // The first of the two walks of the partition that encode() makes, which is the one that only
-    // sizes the buffer the second fills.
+    // What the encode used to spend on sizing the buffer it fills: a second walk of the partition,
+    // which the single-pass encoder does not make. Kept to measure what it cost.
     time_op("encode, sizing walk only", samples, [&] {
         sink += measure_row_value(*s, m.partition(), ts);
     });

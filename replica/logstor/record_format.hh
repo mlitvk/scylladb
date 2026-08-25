@@ -11,8 +11,7 @@
 #include <optional>
 #include <vector>
 
-#include <seastar/core/simple-stream.hh>
-
+#include "bytes.hh"
 #include "bytes_fwd.hh"
 #include "mutation/timestamp.hh"
 #include "schema/schema_fwd.hh"
@@ -168,13 +167,49 @@ public:
     size_t size() const noexcept { return _translations.size(); }
 };
 
-// The size the partition takes encoded. Walks the partition without allocating or
-// copying, so that the record can be written straight into the write buffer.
+// The size the partition takes encoded, computed by walking it without writing anything.
+// Not on the write path - a write encodes the partition without knowing its size in advance
+// - and kept as the oracle the format tests check the encoder against, and as the measure
+// of what the second walk of the partition used to cost.
 size_t measure_row_value(const schema& s, const mutation_partition& p, api::timestamp_type base_ts);
 
-// Encodes the partition into out, which must have room for measure_row_value() bytes.
-void write_row_value(seastar::simple_memory_output_stream& out, const schema& s, const mutation_partition& p,
-        api::timestamp_type base_ts);
+// The buffer a record value is encoded into: grown to fit the record and reused across
+// records, which is what lets the encoder write a record without knowing its size first.
+class encode_buffer {
+    bytes _data;
+    size_t _size = 0;
+
+    void grow(size_t needed);
+
+public:
+    void reset() noexcept { _size = 0; }
+    bytes_view written() const noexcept { return bytes_view(_data.data(), _size); }
+
+    // Room for size more bytes at the end of the buffer, which is grown if it does not have
+    // it. The pointer is invalidated by the next reserve().
+    char* reserve(size_t size) {
+        if (_size + size > _data.size()) [[unlikely]] {
+            grow(_size + size);
+        }
+        return reinterpret_cast<char*>(_data.data()) + _size;
+    }
+    void commit(size_t size) noexcept { _size += size; }
+};
+
+// Encodes partitions into a buffer it owns and reuses. A record is encoded in one pass: the
+// partition is walked once and the exact bytes are copied out of the buffer, rather than the
+// partition being walked once to size a buffer and once to fill it. The walk costs about as
+// much per column as the copy costs per byte, so the copy is much the cheaper of the two.
+//
+// One encoder is held per shard and reused, so two encodes must not interleave on it. A write
+// encodes its record before it awaits anything, so none do.
+class row_value_encoder {
+    encode_buffer _buffer;
+
+public:
+    // The partition encoded. Valid until the next encode() on this encoder.
+    bytes_view encode(const schema& s, const mutation_partition& p, api::timestamp_type base_ts);
+};
 
 // Decodes an encoded partition into p, which must be empty. The cells are read straight
 // out of value, so it does not have to outlive the call. translations is consulted only for

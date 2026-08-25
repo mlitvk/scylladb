@@ -33,7 +33,6 @@
 #include <seastar/core/memory.hh>
 #include <seastar/core/on_internal_error.hh>
 #include <seastar/core/sharded.hh>
-#include <seastar/core/simple-stream.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/testing/test_runner.hh>
 
@@ -184,6 +183,8 @@ class logstor_bench {
     // one run.
     bytes _row_value;
     canonical_mutation _canonical_mutation;
+    // The buffer every encode goes through, as a shard holds one for all of its writes.
+    mutable row_value_encoder _encoder;
     std::optional<mutation> _mutation;
     // A record whose sizes have already been computed, for the append test, which is about what the
     // copy into the buffer costs and not about what computing the sizes of a record costs.
@@ -504,12 +505,11 @@ private:
         return m.partition().clustered_rows().begin()->row().marker().timestamp();
     }
 
+    // What a write does with the partition it is given: encode it through the buffer the
+    // shard's encoder reuses, and copy the exact bytes out into the value the record owns.
     bytes encode_value(const mutation& m) const {
         const auto ts = record_timestamp(m);
-        bytes value(bytes::initialized_later(), measure_row_value(*_schema, m.partition(), ts));
-        auto out = seastar::simple_memory_output_stream(reinterpret_cast<char*>(value.data()), value.size());
-        write_row_value(out, *_schema, m.partition(), ts);
-        return value;
+        return bytes(_encoder.encode(*_schema, m.partition(), ts));
     }
 
     mutation make_mutation(const dht::decorated_key& key) const {

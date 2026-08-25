@@ -16,6 +16,7 @@
 #include "replica/logstor/compaction.hh"
 #include "types.hh"
 #include "index.hh"
+#include "record_format.hh"
 #include "segment_manager.hh"
 #include "write_buffer.hh"
 #include "cache.hh"
@@ -45,6 +46,8 @@ class logstor {
 
     segment_manager _segment_manager;
     buffered_writer _write_buffer;
+    // The buffer every write of this shard encodes its record value through.
+    row_value_encoder _encoder;
     cache_tracker _cache_tracker;
     seastar::metrics::metric_groups _metrics;
     stats _stats;

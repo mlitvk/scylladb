@@ -6,6 +6,9 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 #include "replica/logstor/logstor.hh"
+
+#include <cstring>
+
 #include <seastar/core/coroutine.hh>
 #include <seastar/util/log.hh>
 #include <seastar/core/future.hh>
@@ -132,9 +135,14 @@ future<> logstor::write(const mutation& m, write_target target, db::timeout_cloc
 
     const auto ts = extract_logstor_record_timestamp(m);
 
-    bytes value(bytes::initialized_later(), measure_row_value(*m.schema(), m.partition(), ts));
-    auto value_out = seastar::simple_memory_output_stream(reinterpret_cast<char*>(value.data()), value.size());
-    write_row_value(value_out, *m.schema(), m.partition(), ts);
+    // The record owns its value, because the separator replays a retained copy of the record
+    // after the write buffer it was appended to has been reset. So the partition is encoded
+    // into the buffer the encoder reuses and the exact bytes are copied out of it - one walk
+    // of the partition and a memcpy, rather than a walk to size this allocation and another
+    // to fill it. Nothing is awaited in between, so no other write can take the buffer.
+    const auto encoded = _encoder.encode(*m.schema(), m.partition(), ts);
+    bytes value(bytes::initialized_later(), encoded.size());
+    std::memcpy(value.data(), encoded.data(), encoded.size());
 
     log_record record {
         .header = {

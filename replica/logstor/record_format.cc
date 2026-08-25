@@ -7,6 +7,9 @@
  */
 #include "replica/logstor/record_format.hh"
 
+#include <algorithm>
+#include <cstring>
+
 #include <seastar/core/byteorder.hh>
 
 #include "bytes.hh"
@@ -52,9 +55,9 @@ gc_clock::time_point deletion_time_from_delta(int64_t delta, int64_t base) noexc
     return gc_clock::time_point(gc_clock::duration(value_of_delta(delta, base)));
 }
 
-// Counts the bytes the encoding takes without touching memory, so that the size of a
-// record is known before a buffer is reserved for it. The encoder runs against this and
-// against writing_sink, which is what keeps the two in step.
+// Counts the bytes the encoding takes without touching memory. Not what a write runs: it
+// encodes in one pass, into a buffer that grows to fit. Kept as the oracle behind
+// measure_row_value().
 struct measuring_sink {
     size_t size = 0;
 
@@ -66,40 +69,36 @@ struct measuring_sink {
     void blob(managed_bytes_view v) noexcept { size += v.size_bytes(); }
 };
 
-class writing_sink {
-    seastar::simple_memory_output_stream& _out;
-
-    // The vint codec writes through a raw pointer, so the room for it is checked here.
-    char* reserve(size_t size) {
-        if (size > _out.size()) {
-            throw std::out_of_range("logstor record value buffer overflow");
-        }
-        return _out.begin();
-    }
+// Writes into a buffer that grows to fit whatever the record turns out to take. What lets
+// the encoder run in one pass: nothing has to know the size of a record before it is
+// encoded, and no write of it can overrun the buffer.
+class growing_sink {
+    encode_buffer& _buffer;
 
 public:
-    explicit writing_sink(seastar::simple_memory_output_stream& out) noexcept : _out(out) { }
+    explicit growing_sink(encode_buffer& buffer) noexcept : _buffer(buffer) { }
 
     void u8(uint8_t v) {
-        *reserve(sizeof(v)) = static_cast<char>(v);
-        _out.skip(sizeof(v));
+        *_buffer.reserve(sizeof(v)) = static_cast<char>(v);
+        _buffer.commit(sizeof(v));
     }
     void u64(uint64_t v) {
-        seastar::write_le<uint64_t>(reserve(sizeof(v)), v);
-        _out.skip(sizeof(v));
+        seastar::write_le<uint64_t>(_buffer.reserve(sizeof(v)), v);
+        _buffer.commit(sizeof(v));
     }
     void uvint(uint64_t v) {
         const auto size = unsigned_vint::serialized_size(v);
-        unsigned_vint::serialize(v, reinterpret_cast<bytes::iterator>(reserve(size)));
-        _out.skip(size);
+        unsigned_vint::serialize(v, reinterpret_cast<bytes::iterator>(_buffer.reserve(size)));
+        _buffer.commit(size);
     }
     void svint(int64_t v) {
         const auto size = signed_vint::serialized_size(v);
-        signed_vint::serialize(v, reinterpret_cast<bytes::iterator>(reserve(size)));
-        _out.skip(size);
+        signed_vint::serialize(v, reinterpret_cast<bytes::iterator>(_buffer.reserve(size)));
+        _buffer.commit(size);
     }
     void blob(bytes_view v) {
-        _out.write(reinterpret_cast<const char*>(v.data()), v.size());
+        std::memcpy(_buffer.reserve(v.size()), v.data(), v.size());
+        _buffer.commit(v.size());
     }
     void blob(managed_bytes_view v) {
         for (bytes_view fragment : fragment_range(v)) {
@@ -647,10 +646,24 @@ size_t measure_row_value(const schema& s, const mutation_partition& p, api::time
     return sink.size;
 }
 
-void write_row_value(seastar::simple_memory_output_stream& out, const schema& s, const mutation_partition& p,
-        api::timestamp_type base_ts) {
-    writing_sink sink(out);
+void encode_buffer::grow(size_t needed) {
+    // The buffer a shard encodes through settles at the size of the largest record it has
+    // written, which the write buffer bounds, so it is doubled rather than fitted: growing
+    // it is a rare cost and a record that outgrows it must not reallocate per field.
+    static constexpr size_t initial_capacity = 1024;
+    const auto capacity = std::max({needed, size_t(_data.size()) * 2, initial_capacity});
+    bytes grown(bytes::initialized_later(), capacity);
+    std::memcpy(grown.data(), _data.data(), _size);
+    _data = std::move(grown);
+}
+
+bytes_view row_value_encoder::encode(const schema& s, const mutation_partition& p, api::timestamp_type base_ts) {
+    // Reset before the encode rather than after it: a partition the format cannot hold throws
+    // part way through one, and the next encode has to find the buffer empty.
+    _buffer.reset();
+    growing_sink sink(_buffer);
     encode_row_value(sink, s, p, base_ts);
+    return _buffer.written();
 }
 
 void read_row_value_into(mutation_partition& p, const schema& s, bytes_view value, api::timestamp_type base_ts,

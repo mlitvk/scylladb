@@ -53,16 +53,14 @@ schema_ptr make_kv_schema() {
 }
 
 log_record make_log_record(const mutation& m, api::timestamp_type ts) {
-    bytes value(bytes::initialized_later(), measure_row_value(*m.schema(), m.partition(), ts));
-    auto out = seastar::simple_memory_output_stream(reinterpret_cast<char*>(value.data()), value.size());
-    write_row_value(out, *m.schema(), m.partition(), ts);
+    row_value_encoder encoder;
     return log_record {
         .header = {
             .key = primary_index_key{m.decorated_key()},
             .timestamp = ts,
             .table = m.schema()->id(),
         },
-        .value = row_value{std::move(value)},
+        .value = row_value{bytes(encoder.encode(*m.schema(), m.partition(), ts))},
     };
 }
 

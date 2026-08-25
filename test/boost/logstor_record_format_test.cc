@@ -12,7 +12,6 @@
 
 #include <random>
 
-#include <seastar/core/simple-stream.hh>
 #include <seastar/testing/thread_test_case.hh>
 
 #include "keys/keys.hh"
@@ -84,14 +83,15 @@ api::timestamp_type base_timestamp_of(const mutation& m) {
     return api::min_timestamp;
 }
 
+// Encodes through an encoder of its own, so that every case also encodes into a buffer that
+// has to grow from nothing.
 bytes encode(const mutation& m, api::timestamp_type base_ts) {
-    const auto size = measure_row_value(*m.schema(), m.partition(), base_ts);
-    bytes encoded(bytes::initialized_later(), size);
-    auto out = seastar::simple_memory_output_stream(reinterpret_cast<char*>(encoded.data()), encoded.size());
-    write_row_value(out, *m.schema(), m.partition(), base_ts);
-    // A record is written straight into the write buffer, at the offset the measured size
-    // reserved for it, so the two must agree exactly.
-    BOOST_REQUIRE_EQUAL(out.size(), 0);
+    row_value_encoder encoder;
+    bytes encoded(encoder.encode(*m.schema(), m.partition(), base_ts));
+    // The encoder writes the record in one pass and measure_row_value() walks the partition
+    // to size it without writing anything. Nothing keeps the two in step by construction, so
+    // every case checks them against each other.
+    BOOST_REQUIRE_EQUAL(measure_row_value(*m.schema(), m.partition(), base_ts), encoded.size());
     return encoded;
 }
 
@@ -481,6 +481,52 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_format_rejects_a_partition_it_canno
                 tombstone(ts, gc_clock::now()));  // a strict prefix of the two-column key
         BOOST_REQUIRE_THROW(measure_row_value(*s, m.partition(), ts), std::runtime_error);
     }
+}
+
+// The encoder writes every record into a buffer it reuses, so a record has to come out of it
+// as its own bytes whatever the record encoded before it was, and one the format cannot hold
+// has to leave the encoder fit for the next.
+SEASTAR_THREAD_TEST_CASE(test_logstor_record_format_encoder_reuses_its_buffer) {
+    auto s = make_blob_column_schema(4);
+    const auto ts = api::timestamp_type(1700000000000000);
+
+    auto record_of = [&] (size_t value_size) {
+        auto m = make_logstor_mutation(s);
+        row_of(m).apply(row_marker(ts));
+        for (size_t i = 0; i < 4; ++i) {
+            set_blob_cell(m, fmt::format("column{:02}", i), bytes(bytes::initialized_later(), value_size), ts);
+        }
+        return m;
+    };
+
+    row_value_encoder encoder;
+    auto check = [&] (const mutation& m) {
+        const auto encoded = encoder.encode(*s, m.partition(), ts);
+        BOOST_REQUIRE_EQUAL(measure_row_value(*s, m.partition(), ts), encoded.size());
+        column_translation_cache translations;
+        assert_that(decode(s, m.decorated_key(), encoded, ts, translations)).is_equal_to(m);
+    };
+
+    // A record that outgrows the buffer several times over, a small one after it, and the
+    // large one again.
+    for (auto value_size : {size_t(8), size_t(64 * 1024), size_t(8), size_t(300), size_t(64 * 1024)}) {
+        check(record_of(value_size));
+    }
+
+    // A partition of a shape the format cannot hold throws part way into the encode, so the
+    // buffer is left holding a partial record.
+    auto with_static_column = schema_builder(1, "ks", "cf2")
+            .with_column("pk", bytes_type, column_kind::partition_key)
+            .with_column("ck", bytes_type, column_kind::clustering_key)
+            .with_column("st", bytes_type, column_kind::static_column)
+            .with_column("v", bytes_type)
+            .build();
+    mutation unsupported(with_static_column, partition_key::from_single_value(*with_static_column, to_bytes("key")));
+    const auto& st = *with_static_column->get_column_definition(to_bytes("st"));
+    unsupported.partition().static_row().maybe_create().apply(st, atomic_cell::make_live(*st.type, ts, to_bytes("v")));
+    BOOST_REQUIRE_THROW(encoder.encode(*with_static_column, unsupported.partition(), ts), std::runtime_error);
+
+    check(record_of(300));
 }
 
 SEASTAR_THREAD_TEST_CASE(test_logstor_record_format_read_after_add_column) {
