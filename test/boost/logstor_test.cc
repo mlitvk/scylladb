@@ -18,6 +18,7 @@
 #include <vector>
 #include <fmt/format.h>
 #include <seastar/core/semaphore.hh>
+#include <seastar/core/sleep.hh>
 #include <seastar/core/format.hh>
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/util/memory-data-source.hh>
@@ -2080,11 +2081,11 @@ logstor_params direct_write_params(logstor_params params = {}) {
     return params;
 }
 
-// A group is given its buffers in the background when it registers, so a test that means to write
-// directly waits for that here. flush_direct_writes() on a group with nothing buffered is exactly
-// that wait.
-void await_direct_buffers(test_logstor_group& cg) {
-    cg.flush_direct_writes().get();
+// A group is given its buffers by the controller, once it has measured that the group writes fast
+// enough. A test of what the direct path does with a record, rather than of when a group is given
+// one, asks for them here instead of writing at a rate for a while.
+void await_direct_buffers(logstor& ls, test_logstor_group& cg) {
+    ls.get_compaction_manager().promote_direct_writes_for_test(cg).get();
     BOOST_REQUIRE(cg.direct_writes_enabled());
 }
 
@@ -2105,7 +2106,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_direct_write_is_readable_before_it_reaches
     auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
 
     test_logstor_group cg(schema, ls);
-    await_direct_buffers(cg);
+    await_direct_buffers(ls, cg);
 
     auto expected = make_kv_mutation(schema, "pk0", "direct-value");
     auto key = expected.decorated_key();
@@ -2158,7 +2159,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_direct_writes_continue_across_flushes) {
     auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
 
     test_logstor_group cg(schema, ls);
-    await_direct_buffers(cg);
+    await_direct_buffers(ls, cg);
 
     constexpr unsigned record_count = 3;
     std::vector<mutation> expected;
@@ -2191,7 +2192,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_direct_writes_rotate_when_the_buffer_fills
     auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
 
     test_logstor_group cg(schema, ls);
-    await_direct_buffers(cg);
+    await_direct_buffers(ls, cg);
 
     // Four records of a third of a segment each: the third one does not fit the buffer the first
     // two went into.
@@ -2231,7 +2232,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_direct_write_overwritten_in_its_buffer_is_
     auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
 
     test_logstor_group cg(schema, ls);
-    await_direct_buffers(cg);
+    await_direct_buffers(ls, cg);
 
     auto first = make_kv_mutation(schema, "pk0", "first", api::timestamp_type(1));
     auto second = make_kv_mutation(schema, "pk0", "second", api::timestamp_type(2));
@@ -2269,7 +2270,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_removed_group_writes_out_what_it_took_dire
     auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
 
     test_logstor_group cg(schema, ls);
-    await_direct_buffers(cg);
+    await_direct_buffers(ls, cg);
 
     auto expected = make_kv_mutation(schema, "pk0", "unflushed");
     ls.write(expected, write_target(&cg, {}), db::no_timeout).get();
@@ -2302,7 +2303,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_stop_writes_out_what_was_taken_directly) {
 
     {
         test_logstor_group cg(schema, ls);
-        await_direct_buffers(cg);
+        await_direct_buffers(ls, cg);
 
         auto expected = make_kv_mutation(schema, "pk0", "unflushed");
         ls.write(expected, write_target(&cg, {}), db::no_timeout).get();
@@ -2414,6 +2415,97 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_closed_group_takes_no_separator_writes) {
     auto actual = ls.read(*schema, cg.logstor_index(), key, schema->full_slice()).get();
     BOOST_REQUIRE(actual);
     assert_that(*actual).is_equal_to(expected);
+}
+
+// Checks the two decisions the direct write controller makes: the threshold is a floor a group has
+// to reach, and once it has buffers it keeps them through one quiet period, so that a momentary dip
+// does not cost it a round trip through the buffer pool.
+SEASTAR_THREAD_TEST_CASE(test_logstor_direct_write_promotion_and_demotion) {
+    constexpr uint64_t threshold = 64 * 1024;
+
+    BOOST_REQUIRE(!direct_promotion_wanted(0, threshold));
+    BOOST_REQUIRE(!direct_promotion_wanted(threshold - 1, threshold));
+    BOOST_REQUIRE(direct_promotion_wanted(threshold, threshold));
+    BOOST_REQUIRE(direct_promotion_wanted(4 * threshold, threshold));
+
+    // A group that keeps up is never demoted, however many periods it has been going.
+    for (unsigned periods = 0; periods < 4; ++periods) {
+        BOOST_TEST_CONTEXT("periods=" << periods) {
+            BOOST_REQUIRE(!direct_demotion_wanted(threshold, threshold, periods));
+        }
+    }
+
+    // Exactly the documented number of under-filled periods, not one fewer.
+    static_assert(direct_underfilled_periods_before_demotion == 2);
+    BOOST_REQUIRE(!direct_demotion_wanted(threshold - 1, threshold, 1));
+    BOOST_REQUIRE(direct_demotion_wanted(threshold - 1, threshold, 2));
+    BOOST_REQUIRE(direct_demotion_wanted(0, threshold, 3));
+}
+
+// Checks the controller end to end: a group that writes fast enough is given buffers of its own,
+// and once it stops writing they are taken back - with what it had buffered written out first, and
+// the segments they were bound to freed rather than left half full.
+SEASTAR_THREAD_TEST_CASE(test_logstor_direct_write_controller_promotes_and_demotes_a_group) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    // A short period so the controller runs several times over the test, and a threshold of one
+    // record, so that a single write is a group writing fast enough.
+    auto params = direct_write_params();
+    params.direct_sync_period = std::chrono::milliseconds(40);
+    params.direct_hot_threshold_bytes = 1;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path(), params), cache.shared_tracker);
+    ls.do_recovery_for_test().get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    const auto free_segments_before = ls.get_segment_manager().get_usage().free_segments;
+
+    test_logstor_group cg(schema, ls);
+    BOOST_REQUIRE(!cg.direct_writes_enabled());
+
+    auto expected = make_kv_mutation(schema, "pk0", "controlled");
+    ls.write(expected, write_target(&cg, {}), db::no_timeout).get();
+
+    // One period to measure the write, one tick to act on it.
+    auto await_until = [] (auto&& predicate) {
+        for (unsigned i = 0; i < 200 && !predicate(); ++i) {
+            seastar::sleep(std::chrono::milliseconds(10)).get();
+        }
+        BOOST_REQUIRE(predicate());
+    };
+    await_until([&cg] { return cg.direct_writes_enabled(); });
+
+    // Write once more so that the record the group holds went in directly, then stop writing.
+    auto second = make_kv_mutation(schema, "pk1", "controlled-too");
+    ls.write(second, write_target(&cg, {}), db::no_timeout).get();
+    BOOST_REQUIRE(cg.direct_has_data());
+
+    // Idle: the deadline writes the buffer out, and two under-filled periods take the buffers back.
+    await_until([&cg] { return !cg.direct_writes_enabled(); });
+
+    BOOST_REQUIRE(!cg.direct_has_data());
+
+    ls.flush_to_separator().get();
+    cg.flush_separator().get();
+
+    // One segment written directly and one written by the separator, at most: an empty buffer is
+    // never sealed into a segment of its own.
+    BOOST_REQUIRE_GE(cg.logstor_segments().segment_count(), 1u);
+    BOOST_REQUIRE_LE(cg.logstor_segments().segment_count(), 2u);
+
+    // Nothing is held back: the segments the buffers were bound to but never written into went back
+    // to the pool along with the buffers, so the only segments the cycle cost are the group's own.
+    const auto free_segments_after = ls.get_segment_manager().get_usage().free_segments;
+    BOOST_REQUIRE_GE(free_segments_after + cg.logstor_segments().segment_count(), free_segments_before);
+
+    for (const auto& m : {expected, second}) {
+        auto actual = ls.read(*schema, cg.logstor_index(), m.decorated_key(), schema->full_slice()).get();
+        BOOST_REQUIRE(actual);
+        assert_that(*actual).is_equal_to(m);
+    }
 }
 
 // Checks that free-segment watermarks are correctly derived from disk size and target fraction,

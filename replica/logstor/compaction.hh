@@ -103,6 +103,22 @@ constexpr double compaction_batch_extension_tolerance = 0.8;
 // compaction would stop instead of running at the efficiency the disk allows.
 constexpr double compaction_marginal_admission_ratio = 0.75;
 
+// How many sync periods in a row a group has to write less than the threshold before its direct
+// write buffers are taken back. One is not enough: a group whose load dips for a moment would give
+// its buffers up and take them again, and each round trip leaves a partly filled segment behind.
+constexpr unsigned direct_underfilled_periods_before_demotion = 2;
+
+// Whether a group that writes this many bytes in a sync period is worth giving write buffers of its
+// own. Below the threshold - half a segment per period - the partly filled segment such a group
+// leaves at the end of every period occupies more of the pool than the second write it saves is
+// worth, and the ordinary path is the better place for it.
+bool direct_promotion_wanted(uint64_t bytes_this_period, uint64_t hot_threshold_bytes) noexcept;
+
+// Whether a group that has its own write buffers has gone quiet for long enough to take them back.
+// `underfilled_periods` counts the periods it has been under the threshold for, this one included.
+bool direct_demotion_wanted(uint64_t bytes_this_period, uint64_t hot_threshold_bytes,
+        unsigned underfilled_periods) noexcept;
+
 // Watermarks, in available segments, that drive automatic compaction. It starts once the number of
 // available segments drops below `low` - the free-segment target - and stops once it is back at
 // `high`. Both are zero when the trigger is disabled.
@@ -675,6 +691,9 @@ public:
     // Gives both of the group's direct buffers and the segments they are bound to back. The buffers
     // are expected to have been flushed first, since their records are nowhere else.
     virtual future<> release_direct_buffers(logstor_group&) = 0;
+    // Gives the group its buffers now, rather than waiting for the controller to find that it
+    // writes fast enough to deserve them.
+    virtual future<> promote_direct_writes_for_test(logstor_group&) = 0;
 
     virtual void add(logstor_group&) = 0;
     virtual future<> remove(logstor_group&) = 0;

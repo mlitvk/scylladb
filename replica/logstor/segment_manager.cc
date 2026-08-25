@@ -690,6 +690,9 @@ public:
     void rotate_direct_buffer(logstor_group&) override;
     future<> release_direct_buffers(logstor_group&) override;
     future<> drain_all_direct_buffers();
+    future<> promote_direct_writes_for_test(logstor_group&) override;
+    // One pass of the direct write sync over every group of the shard.
+    future<> tick_direct_writes(seastar::lowres_clock::time_point now, bool run_controller);
 
     // How many of this shard's groups are taking direct writes. Counted rather than tracked: it is
     // read when a group is promoted, which is rare, and the groups of a shard are few.
@@ -959,6 +962,8 @@ class segment_manager_impl {
     // bound to. A read of a record that is still only in memory is served out of these, which is
     // what makes a direct write visible as soon as it is acknowledged.
     absl::flat_hash_map<uint32_t, const write_buffer*> _direct_readable;
+    future<> _direct_sync_fiber{make_ready_future<>()};
+    abort_source _direct_abort;
     // Buffers whose write to the disk failed. Their records were acknowledged and this memory is
     // the only copy left of them, so the buffers stay registered above and are not given back to
     // the pool - the one place the direct path deliberately holds on to a buffer for good.
@@ -1006,6 +1011,10 @@ public:
     // for another hot group. Says whether it did.
     bool promote_direct_group(logstor_group&);
     future<> do_promote_direct_group(logstor_group&);
+    // One pass over a group: the deadline of its buffer, and, once a period, whether it still
+    // writes fast enough to keep its buffers - or fast enough to be given them.
+    future<> tick_direct_writes(logstor_group&, seastar::lowres_clock::time_point now, bool run_controller);
+    future<> run_direct_sync_fiber();
     uint64_t direct_hot_threshold_bytes() const noexcept {
         return _cfg.direct_hot_threshold_bytes ? _cfg.direct_hot_threshold_bytes : _cfg.segment_size / 2;
     }
@@ -1244,9 +1253,6 @@ void compaction_manager_impl::add(logstor_group& cg) {
     // the separator may write to.
     cg.enable_separator_writes();
     _sm.update_group_count(_groups.size());
-    // Interim: every group that registers is given direct buffers, as long as the shard has room
-    // for it. The controller that promotes a group by what it actually writes comes next.
-    _sm.promote_direct_group(cg);
 }
 
 future<owned_write_buffer> compaction_manager_impl::allocate_separator_buffer() {
@@ -1433,6 +1439,14 @@ future<> segment_manager_impl::start() {
         return run_separator_fiber();
     });
 
+    if (_cfg.direct_group_writes) {
+        // In the separator's group: it does the same work for the same reason, taking the records
+        // of a group to a segment of that group, only without the second write.
+        _direct_sync_fiber = with_scheduling_group(_cfg.separator_sg, [this] {
+            return run_direct_sync_fiber();
+        });
+    }
+
     co_await switch_active_segment();
 
     logstor_logger.info("Segment manager started with base directory {}", _cfg.base_dir.string());
@@ -1460,7 +1474,9 @@ future<> segment_manager_impl::stop() {
 
     // Before the separator buffers, and before anything is torn down: a record taken directly is
     // acknowledged and in the index, but only in memory, so it has to reach the disk here.
-    logstor_logger.debug("Flushing direct write buffers");
+    logstor_logger.debug("Stopping the direct write sync fiber and flushing the direct write buffers");
+    _direct_abort.request_abort();
+    co_await std::move(_direct_sync_fiber).handle_exception([] (std::exception_ptr) {});
     _direct_buffer_abort.request_abort();
     co_await _compaction_mgr.drain_all_direct_buffers().handle_exception([] (std::exception_ptr ep) {
         logstor_logger.warn("Failed to drain the logstor direct write buffers: {}", ep);
@@ -1824,6 +1840,76 @@ bool segment_manager_impl::promote_direct_group(logstor_group& cg) {
 future<> segment_manager_impl::do_promote_direct_group(logstor_group& cg) {
     co_await bind_direct_buffer(cg, cg._direct_active);
     co_await bind_direct_buffer(cg, cg._direct_spare);
+}
+
+future<> segment_manager_impl::tick_direct_writes(logstor_group& cg, seastar::lowres_clock::time_point now,
+        bool run_controller) {
+    // The deadline: a buffer that has been holding records for a whole sync period is written out
+    // even though it is not full, which is what bounds how much a crash can lose.
+    if (cg._direct_enabled && !cg._direct_active.empty() && cg._direct_flush.available()
+            && now - cg._direct_active.first_append >= _cfg.direct_sync_period) {
+        rotate_direct_buffer(cg);
+    }
+
+    if (!run_controller) {
+        co_return;
+    }
+
+    // What the group wrote over the period just ended, direct or not, which is the rate the
+    // decisions below are made on.
+    const auto bytes = std::exchange(cg._direct_bytes_this_period, 0);
+    const auto threshold = direct_hot_threshold_bytes();
+
+    if (!cg._direct_enabled) {
+        if (direct_promotion_wanted(bytes, threshold)) {
+            promote_direct_group(cg);
+        }
+        co_return;
+    }
+
+    if (bytes >= threshold) {
+        cg._direct_underfilled_periods = 0;
+        co_return;
+    }
+
+    ++cg._direct_underfilled_periods;
+    if (direct_demotion_wanted(bytes, threshold, cg._direct_underfilled_periods)) {
+        // Writes out what is buffered and gives the buffers and their segments back, so that a
+        // group that is actually writing can have them.
+        co_await cg.close_direct_writes();
+    }
+}
+
+future<> segment_manager_impl::run_direct_sync_fiber() {
+    // Several ticks per period: a buffer's deadline runs from its first record rather than from the
+    // start of a period, so it has to be looked at more often than once a period to be honoured
+    // anywhere near it. The controller itself only decides once per whole period, which is the
+    // window the rate it measures is over.
+    const auto tick = std::clamp(_cfg.direct_sync_period / 4,
+            std::chrono::milliseconds(10), std::chrono::milliseconds(1000));
+    auto period_start = seastar::lowres_clock::now();
+
+    while (true) {
+        try {
+            co_await seastar::sleep_abortable(tick, _direct_abort);
+        } catch (const seastar::sleep_aborted&) {
+            break;
+        }
+
+        const auto now = seastar::lowres_clock::now();
+        const bool run_controller = now - period_start >= _cfg.direct_sync_period;
+        if (run_controller) {
+            period_start = now;
+        }
+
+        try {
+            co_await _compaction_mgr.tick_direct_writes(now, run_controller);
+        } catch (...) {
+            logstor_logger.warn("logstor direct write sync failed: {}. Ignored", std::current_exception());
+        }
+    }
+
+    logstor_logger.debug("Direct write sync fiber stopped");
 }
 
 void segment_manager_impl::on_add_record(log_location location) noexcept {
@@ -2677,6 +2763,28 @@ future<> compaction_manager_impl::drain_all_direct_buffers() {
     co_await coroutine::parallel_for_each(_groups, [] (auto& entry) {
         return entry.first->close_direct_writes();
     });
+}
+
+future<> compaction_manager_impl::promote_direct_writes_for_test(logstor_group& cg) {
+    _sm.promote_direct_group(cg);
+    co_await cg.flush_direct_writes();
+}
+
+future<> compaction_manager_impl::tick_direct_writes(seastar::lowres_clock::time_point now, bool run_controller) {
+    // The groups are re-checked after every yield: one of them can be removed while this walks them.
+    std::vector<logstor_group*> group_snapshot;
+    group_snapshot.reserve(_groups.size());
+    for (const auto& [cg, state] : _groups) {
+        group_snapshot.push_back(cg);
+    }
+
+    for (auto* cg : group_snapshot) {
+        co_await coroutine::maybe_yield();
+        if (!_groups.contains(cg)) {
+            continue;
+        }
+        co_await _sm.tick_direct_writes(*cg, now, run_controller);
+    }
 }
 
 void separator_index_update::operator()(log_location new_location, seastar::gate::holder) const {

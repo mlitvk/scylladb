@@ -38,6 +38,16 @@ bool auto_compaction_wanted(bool running, uint64_t available_segments, free_segm
     return available_segments < (running ? watermarks.high : watermarks.low);
 }
 
+bool direct_promotion_wanted(uint64_t bytes_this_period, uint64_t hot_threshold_bytes) noexcept {
+    return bytes_this_period >= hot_threshold_bytes;
+}
+
+bool direct_demotion_wanted(uint64_t bytes_this_period, uint64_t hot_threshold_bytes,
+        unsigned underfilled_periods) noexcept {
+    return bytes_this_period < hot_threshold_bytes
+            && underfilled_periods >= direct_underfilled_periods_before_demotion;
+}
+
 compaction_limits make_compaction_limits(free_segment_watermarks watermarks, size_t max_batch_cap) noexcept {
     // With the trigger disabled there is no target to protect, and automatic compaction never runs;
     // the limits still have to be sane for compaction submitted explicitly, so fall back to the
