@@ -910,6 +910,11 @@ class segment_manager_impl {
         uint64_t direct_fallbacks{0};
         uint64_t direct_read_hits{0};
         uint64_t direct_flush_failures{0};
+        // Which of the two reasons wrote a direct buffer out. A shard whose buffers mostly go out
+        // on the deadline is one whose groups do not fill a segment per period, so the segments it
+        // writes are partly empty and its groups belong on the ordinary path.
+        uint64_t direct_full_flushes{0};
+        uint64_t direct_deadline_flushes{0};
         // What the direct buffers of the shard hold that is not on the disk yet, which is what a
         // crash would lose. Maintained here rather than summed over the groups on demand, because a
         // metric callback cannot walk them.
@@ -1424,6 +1429,28 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
                        sm::description("Counts number of logstor segment references that failed to free the segment.")),
         sm::make_gauge("separator_task_queue_size", [this]() { return _separator_task_queue.size(); },
                        sm::description("Current number of pending tasks in the separator task queue.")),
+        sm::make_counter("direct_bytes_written", _stats.bytes_written[static_cast<size_t>(write_source::direct_write)],
+                       sm::description("Counts number of bytes written to segments by the direct write path, which writes the records of a group straight into a segment of that group instead of through the shared active segment and the separator.")),
+        sm::make_counter("direct_data_bytes_written", _stats.data_bytes_written[static_cast<size_t>(write_source::direct_write)],
+                       sm::description("Counts number of data bytes written to segments by the direct write path.")),
+        sm::make_counter("direct_records_written", _stats.direct_records_written,
+                       sm::description("Counts number of records taken by the direct write path, and therefore acknowledged before they were on the disk.")),
+        sm::make_counter("direct_fallbacks", _stats.direct_fallbacks,
+                       sm::description("Counts number of writes of a group that takes direct writes that the direct path could not take, and that went the ordinary way instead - because the group's flush was still in flight, or because the record does not fit a buffer.")),
+        sm::make_counter("direct_read_hits", _stats.direct_read_hits,
+                       sm::description("Counts number of reads served out of a direct write buffer, of a record that had been acknowledged but was not on the disk yet.")),
+        sm::make_counter("direct_full_flushes", _stats.direct_full_flushes,
+                       sm::description("Counts number of direct write buffers written out because they were full, which is the direct path working as intended.")),
+        sm::make_counter("direct_deadline_flushes", _stats.direct_deadline_flushes,
+                       sm::description("Counts number of direct write buffers written out because their sync period expired. A shard where these dominate is writing partly empty segments, and its groups belong on the ordinary path.")),
+        sm::make_counter("direct_flush_failures", _stats.direct_flush_failures,
+                       sm::description("Counts number of direct write buffers whose write to the disk failed. Their records stay readable from memory, at the cost of the buffer and the segment never being reclaimed.")),
+        sm::make_gauge("direct_unflushed_bytes", [this] { return _stats.direct_unflushed_bytes; },
+                       sm::description("Bytes of records that have been acknowledged but are only in a direct write buffer, which is what a crash of this shard would lose.")),
+        sm::make_gauge("direct_hot_groups", [this] { return _compaction_mgr.direct_hot_group_count(); },
+                       sm::description("Number of compaction groups currently writing into buffers of their own.")),
+        sm::make_gauge("direct_buffers_in_use", [this] { return _direct_buffer_pool.used_buffer_count(); },
+                       sm::description("Counts number of write buffers currently held by the direct write path, two per hot compaction group.")),
     });
 }
 
@@ -1685,6 +1712,7 @@ std::optional<log_location> segment_manager_impl::try_write_direct(logstor_group
             ++_stats.direct_fallbacks;
             return std::nullopt;
         }
+        ++_stats.direct_full_flushes;
         rotate_direct_buffer(cg);
         if (!active.bound() || !active.buf->can_fit(writer)) {
             // Either the rotation had no spare to give, or the record does not fit an empty buffer
@@ -1848,6 +1876,7 @@ future<> segment_manager_impl::tick_direct_writes(logstor_group& cg, seastar::lo
     // even though it is not full, which is what bounds how much a crash can lose.
     if (cg._direct_enabled && !cg._direct_active.empty() && cg._direct_flush.available()
             && now - cg._direct_active.first_append >= _cfg.direct_sync_period) {
+        ++_stats.direct_deadline_flushes;
         rotate_direct_buffer(cg);
     }
 
