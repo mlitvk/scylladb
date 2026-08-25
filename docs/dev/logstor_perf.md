@@ -110,7 +110,7 @@ TMPDIR=/nvme taskset -c 2 build/release/test/perf/perf_logstor --smp 1 \
 | `deserialize` | deserialize one record from a buffer, which parses its header and copies out the bytes of its value. Not a step of a point read any more - it takes the fields it needs from the header at their offsets and decodes the value out of the buffer it read - and kept to measure what that saves |
 | `decode` | decode the value of one record into the mutation a read returns |
 | `build-mutation` | build the mutation one write is given. Not a step of a write: a node is handed it by the layer above logstor, and only the `write` test builds one per operation, so this is what has to come off `write` before its steps add up |
-| `encode` | encode one mutation into the value the record of a write carries |
+| `encode` | encode one mutation into the value the record of a write carries: one walk of the partition into the buffer the encoder reuses, and a copy of the exact bytes out of it |
 | `record-header` | build the header of one record, which copies the decorated key of the partition into it |
 | `record-sizes` | `record-header`, and then what `log_record_writer::compute_sizes()` does: the size of the header and the size of the value, both arithmetic, so that the writer knows how much room to ask the buffer for |
 | `append` | copy one record whose sizes are already known into the buffer of the writer |
@@ -168,8 +168,8 @@ taskset -c 2 build/release/test/perf/perf_logstor_record_format --smp 1 \
 
 | Measurement | What one operation does |
 |---|---|
-| `encode` | encode one partition into the value of a record: measure it, allocate the buffer and fill it, which is what a write does |
-| `encode, sizing walk only` | the first of the two walks of the partition `encode` makes, the one that only measures |
+| `encode` | encode one partition into the value of a record, which is what a write does: one walk of the partition into the buffer the encoder reuses, and a copy of the exact bytes out of it |
+| `encode, sizing walk only` | what `encode` used to spend sizing the buffer it fills, before it encoded in one pass: a walk of the partition that writes nothing, which is what `measure_row_value()` still does. Kept to measure what it cost |
 | `freeze (canonical_mutation)` | freeze the same partition into a `canonical_mutation`, which is what a record value was before the format |
 | `decode` | decode the value into the mutation a read returns, under the schema version the record was written with |
 | `decode, other schema version` | the same under a later version of the schema, which maps the record's columns onto the schema's through a `column_translation`. The translation is built before the measurement, since a read builds one per pair of schema versions and not per record |

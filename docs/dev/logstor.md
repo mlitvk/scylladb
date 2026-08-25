@@ -404,6 +404,11 @@ timestamp - which the whole-partition write model makes almost always zero - the
 value taken from its type where the type is fixed-width, and a non-frozen collection stored
 as its `collection_mutation` blob verbatim.
 
+A write encodes the partition in one pass, into a buffer `row_value_encoder` owns and reuses
+across the records of the shard, and copies the exact bytes out into the value the record
+carries - the record has to own its value, because the separator replays a retained copy of it
+after the write buffer has been reset.
+
 A record stays self-contained: it carries the version of the schema it was written under and
 a description of that schema's columns, so nothing outside the record is needed to decode
 it, and compaction, the separator and segment streaming go on treating a value as bytes. A
@@ -438,30 +443,47 @@ The `encode` and `decode` tests measure the two halves of the format against `fr
 | | before | after |
 |---|---:|---:|
 | `decode` / `materialize` | 9115 insns, 10 allocs | **4427**, 9 |
-| `encode` / `freeze` | 5511 insns, 5 allocs | **8666**, 1 |
+| `encode` / `freeze` | 5512 insns, 5 allocs | **2929**, 1 |
 | `read-disk`, whole read from a segment | 15173, 28.2 | **10806**, 24.2 |
-| `write`, whole | 21020, 34.8 | 20516, **19.5** |
+| `write`, whole | 20439, 34.8 | **14169**, 19.5 |
 | `read-cached`, whole read from the cache | 4038, 10.0 | 3885, 10.0 |
 
 The read is the win: decoding costs 647 instructions per column against materializing's 979
 and 872 fixed against 2475, the record is no longer deserialized at all, and a whole read from
 a segment costs 34% less at one column, 29% at five and 20% at thirty.
 
-The write is a trade, and its sign depends on the row. Framing, sizing and appending a record
-fell from 2192-2637 instructions to 513-573 - the value reaches the write buffer already
-encoded, so the append is a memcpy and both sizes are arithmetic - and the separator no longer
-serializes the value a second time. Against that, `encode_value()` walks the partition twice,
-once to size the buffer and once to fill it, at about 690 instructions per column per walk,
-where the IDL serializer it replaced walked it once. The two cancel at about six columns: a
-whole write is 21% cheaper at 1 x 200 B, unchanged at 5 x 300 B and 31% dearer at 30 x 20 B.
-What it gains at every shape is 13 to 19 allocations and 27% to 76% of the record's bytes.
-Making the encode single-pass would put the write ahead at every shape.
+The write took two goes. Framing, sizing and appending a record fell from 2192-2637
+instructions to 513-573 - the value reaches the write buffer already encoded, so the append is
+a memcpy and both sizes are arithmetic - and the separator no longer serializes the value a
+second time. But the first encoder gave that back and more, because it walked the partition
+twice, once to size the buffer and once to fill it, and rebuilt the description of the schema
+for every record on top of that: 1379 instructions per column against the freeze's 666, and a
+whole write 21% cheaper than before the format at one column, unchanged at five and 31% dearer
+at thirty. The encoder now walks the partition once, into a buffer it owns and grows to fit,
+and copies the exact bytes of the record out of it, and it takes the description from the copy
+it built for that schema version:
+
+| `encode`, instructions per operation | 1 x 200 B | 5 x 300 B | 30 x 20 B | per column |
+|---|---:|---:|---:|---:|
+| `freeze`, before the format | 2376 | 5512 | 21700 | 666 |
+| two walks, the description per record | 2848 | 8666 | 42838 | 1379 |
+| one walk | 2075 | 6104 | 28371 | 907 |
+| one walk, the description cached | **1074** | **2929** | **11638** | **364** |
+
+Removing the second walk takes less than half of the cost off, because the walk that only
+measured was the cheaper of the two; caching the description takes more off than that, because
+building one interns the type names of the columns, looks every column's type up in that table
+by comparing type names, and has to size the whole before writing it. What is left is half of
+what the `canonical_mutation` freeze cost at every shape, and a whole write 34% cheaper than
+before the format at 1 x 200 B, 31% at 5 x 300 B and 29% at 30 x 20 B, on top of the 13 to 19
+allocations and the 27% to 76% of the record's bytes the format already gained.
 
 A read the cache serves is untouched by any of it, and measures identical to the instruction on
 both builds. At the level of a node, `scylla perf-simple-query --logstor --write` on a
 one-column table went from 48648 to 46315 instructions, 88.0 to 73.8 allocations, 27380 to
 21799 cycles and 16.4k to 18.4k operations per second, and the bytes it writes to disk from
-2014 to 378 per operation.
+2014 to 378 per operation. That node-level measurement predates the single-pass encoder, which
+takes another 1774 instructions off a one-column write.
 
 **Record Location** (`log_location`):
 
