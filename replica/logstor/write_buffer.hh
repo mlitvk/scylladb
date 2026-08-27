@@ -89,8 +89,8 @@ public:
         return _record;
     }
 
-    const log_record_header& header() const {
-        return _record.header;
+    dht::token token() const noexcept {
+        return _record.header.key.dk.token();
     }
 
     // The record's key, moved out of the writer. Only for a writer that has already been appended:
@@ -119,7 +119,7 @@ public:
         , _data_bytes(record_bytes.data)
     {}
 
-    const log_record_header& header() const { return _header; }
+    dht::token token() const noexcept { return _header.key.dk.token(); }
 
     // See log_record_writer::take_key(). This writer appends bytes that were already serialized, so
     // its own header is there for the key and the token, and is done with once the record is in.
@@ -134,9 +134,38 @@ public:
     void write(ostream& out) const;
 };
 
+// Writer for a log record it owns nothing of: the key belongs to the mutation being written and the
+// value to the encoder's buffer. Only the direct write path can use it - a write it takes has its
+// record in the group's buffer and its entry in the index by the time it returns, so nothing it
+// refers to has to outlive the append. A record that goes through the shared buffer is retained for
+// the separator to replay and needs the owning log_record_writer instead.
+class log_record_ref_writer {
+
+    using ostream = seastar::simple_memory_output_stream;
+
+    log_record_header_view _header;
+    bytes_view _value;
+    size_t _header_size;
+
+public:
+    log_record_ref_writer(log_record_header_view header, bytes_view value) noexcept
+        : _header(header)
+        , _value(value)
+        , _header_size(ondisk::log_record_header_size(header))
+    {}
+
+    dht::token token() const noexcept { return _header.token; }
+
+    size_t header_size() const noexcept { return _header_size; }
+    size_t data_size() const noexcept { return _value.size(); }
+    size_t size() const noexcept { return _header_size + _value.size(); }
+
+    void write(ostream& out) const;
+};
+
 template <typename T>
 concept log_record_writer_concept = requires(const T& w, seastar::simple_memory_output_stream& out) {
-    { w.header() } -> std::convertible_to<const log_record_header&>;
+    { w.token() } -> std::convertible_to<dht::token>;
     { w.header_size() } -> std::convertible_to<size_t>;
     { w.data_size() } -> std::convertible_to<size_t>;
     { w.size() } -> std::convertible_to<size_t>;
@@ -318,7 +347,7 @@ private:
     void write_header(segment_sequence segment_seq, std::optional<table_id> table);
 
     template <std::invocable<ostream&> WriteRecordPayload>
-    append_result append_record(const log_record_header& header, size_t header_size, size_t data_size, WriteRecordPayload write_payload);
+    append_result append_record(dht::token token, size_t header_size, size_t data_size, WriteRecordPayload write_payload);
 
     void pad_to_alignment(size_t alignment);
     void finalize(size_t alignment);
@@ -436,12 +465,14 @@ private:
 
 extern template raw_write_buffer::append_result raw_write_buffer::append<log_record_writer>(const log_record_writer&);
 extern template raw_write_buffer::append_result raw_write_buffer::append<log_record_bytes_writer>(const log_record_bytes_writer&);
+extern template raw_write_buffer::append_result raw_write_buffer::append<log_record_ref_writer>(const log_record_ref_writer&);
 
 extern template future<log_location_with_holder> write_buffer::write<log_record_writer>(log_record_writer, write_target);
 extern template future<log_location_with_holder> write_buffer::write<log_record_bytes_writer>(log_record_bytes_writer, write_target);
 
 extern template raw_write_buffer::append_result write_buffer::append_synchronously<log_record_writer>(const log_record_writer&);
 extern template raw_write_buffer::append_result write_buffer::append_synchronously<log_record_bytes_writer>(const log_record_bytes_writer&);
+extern template raw_write_buffer::append_result write_buffer::append_synchronously<log_record_ref_writer>(const log_record_ref_writer&);
 
 class write_buffer_pool;
 

@@ -132,21 +132,46 @@ future<> logstor::write(const mutation& m, write_target target, db::timeout_cloc
     auto gate_holder = _async_gate.hold();
 
     auto& cg = *target.cg;
-    primary_index_key key(m.decorated_key());
+    const auto& dk = m.decorated_key();
     table_id table = m.schema()->id();
     auto& index = cg.logstor_index();
 
     const auto ts = extract_logstor_record_timestamp(m);
 
-    // The record owns its value, because the separator replays a retained copy of the record
-    // after the write buffer it was appended to has been reset. So the partition is encoded
-    // into the buffer the encoder reuses and the exact bytes are copied out of it - one walk
-    // of the partition and a memcpy, rather than a walk to size this allocation and another
-    // to fill it. Nothing is awaited in between, so no other write can take the buffer.
+    // The partition is encoded into the buffer the encoder reuses - one walk of the partition,
+    // rather than a walk to size an allocation and another to fill it. Nothing is awaited between
+    // here and the append below, so no other write can take that buffer.
     const auto encoded = _encoder.encode(*m.schema(), m.partition(), ts);
+
+    // A group that writes fast enough has a buffer of its own, already bound to one of its
+    // segments, so the record goes straight in and its final location is known here. The write is
+    // acknowledged once the record is in that buffer and in the index - it reaches the disk when
+    // the buffer is written out, which is what the periodic sync mode promises. Nothing is awaited
+    // between the two, so the record is visible to a reader and to a drain from the moment the
+    // buffer takes it, and the gate holders of the write target are released by returning.
+    //
+    // Because the record is serialized before this returns and is never retained, nothing of it has
+    // to be owned: the key stays the mutation's and the value the encoder's, so a direct write
+    // copies neither.
+    const auto header = log_record_header_view {
+        .token = dk.token(),
+        .timestamp = ts,
+        .table = table,
+        .key = managed_bytes_view(dk.key().representation()),
+    };
+
+    if (auto location = _segment_manager.try_write_direct(cg, header, encoded)) {
+        index.insert(primary_index_key(dk), index_entry{.location = *location, .timestamp = ts});
+        return make_ready_future<>();
+    }
+
+    // The record that goes through the shared buffer owns its value, because the separator replays
+    // a retained copy of it after the buffer it was appended to has been reset. The exact bytes are
+    // copied out of the encoder's buffer, which is still the one holding this partition.
     bytes value(bytes::initialized_later(), encoded.size());
     std::memcpy(value.data(), encoded.data(), encoded.size());
 
+    primary_index_key key(dk);
     log_record record {
         .header = {
             .key = key,
@@ -156,22 +181,9 @@ future<> logstor::write(const mutation& m, write_target target, db::timeout_cloc
         .value = row_value{std::move(value)},
     };
 
-    auto writer = log_record_writer(std::move(record));
-
-    // A group that writes fast enough has a buffer of its own, already bound to one of its
-    // segments, so the record goes straight in and its final location is known here. The write is
-    // acknowledged once the record is in that buffer and in the index - it reaches the disk when
-    // the buffer is written out, which is what the periodic sync mode promises. Nothing is awaited
-    // between the two, so the record is visible to a reader and to a drain from the moment the
-    // buffer takes it, and the gate holders of the write target are released by returning.
-    if (auto location = _segment_manager.try_write_direct(cg, writer)) {
-        index.insert(key, index_entry{.location = *location, .timestamp = ts});
-        return make_ready_future<>();
-    }
-
     // The key is moved rather than copied: what the record carries is a copy of its own, made above.
-    return write_through_buffer(std::move(writer), std::move(key), ts, index, std::move(target), timeout,
-            std::move(gate_holder));
+    return write_through_buffer(log_record_writer(std::move(record)), std::move(key), ts, index,
+            std::move(target), timeout, std::move(gate_holder));
 }
 
 future<> logstor::write_through_buffer(log_record_writer writer, primary_index_key key, api::timestamp_type ts,

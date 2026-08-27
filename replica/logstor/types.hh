@@ -12,6 +12,7 @@
 #include "bytes.hh"
 #include "dht/decorated_key.hh"
 #include "mutation/timestamp.hh"
+#include "utils/managed_bytes.hh"
 
 namespace replica::logstor {
 
@@ -39,6 +40,18 @@ struct index_entry {
     api::timestamp_type timestamp;
 
     bool operator==(const index_entry& other) const noexcept = default;
+};
+
+// Everything a record's header is serialized from, owning none of it. A record that has to outlive
+// the call that writes it holds a log_record_header; one that does not - a write the direct path
+// takes is done when it returns - is written out of this, straight from the mutation, without a
+// key copy.
+struct log_record_header_view {
+    dht::token token;
+    api::timestamp_type timestamp;
+    table_id table;
+    // The partition key's representation, which is what the header carries verbatim.
+    managed_bytes_view key;
 };
 
 struct log_record_header {

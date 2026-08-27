@@ -29,6 +29,11 @@ void log_record_writer::write(ostream& out) const {
     out.write(reinterpret_cast<const char*>(_record.value.data.data()), _record.value.size());
 }
 
+void log_record_ref_writer::write(ostream& out) const {
+    ondisk::write_log_record_header(out, _header);
+    out.write(reinterpret_cast<const char*>(_value.data()), _value.size());
+}
+
 void log_record_bytes_writer::write(ostream& out) const {
     out.write(reinterpret_cast<const char*>(_header_bytes.data()), _header_bytes.size());
     out.write(reinterpret_cast<const char*>(_data_bytes.data()), _data_bytes.size());
@@ -70,7 +75,7 @@ bool raw_write_buffer::has_data() const noexcept {
 }
 
 template <std::invocable<raw_write_buffer::ostream&> WriteRecordPayload>
-raw_write_buffer::append_result raw_write_buffer::append_record(const log_record_header& header,
+raw_write_buffer::append_result raw_write_buffer::append_record(dht::token token,
         size_t header_size, size_t data_size, WriteRecordPayload write_payload) {
     const auto payload_size = header_size + data_size;
     if (!can_fit(payload_size)) {
@@ -95,11 +100,11 @@ raw_write_buffer::append_result raw_write_buffer::append_record(const log_record
 
     _net_data_size += total_size;
     _record_count++;
-    if (!_min_token || header.key.dk.token() < *_min_token) {
-        _min_token = header.key.dk.token();
+    if (!_min_token || token < *_min_token) {
+        _min_token = token;
     }
-    if (!_max_token || header.key.dk.token() > *_max_token) {
-        _max_token = header.key.dk.token();
+    if (!_max_token || token > *_max_token) {
+        _max_token = token;
     }
 
     // Add padding to align record
@@ -113,7 +118,7 @@ raw_write_buffer::append_result raw_write_buffer::append_record(const log_record
 
 template <log_record_writer_concept Writer>
 raw_write_buffer::append_result raw_write_buffer::append(const Writer& writer) {
-    return append_record(writer.header(), writer.header_size(), writer.data_size(), [&writer] (ostream& payload_out) {
+    return append_record(writer.token(), writer.header_size(), writer.data_size(), [&writer] (ostream& payload_out) {
         writer.write(payload_out);
     });
 }
@@ -273,9 +278,11 @@ template future<log_location_with_holder> write_buffer::write<log_record_bytes_w
 
 template raw_write_buffer::append_result write_buffer::append_synchronously<log_record_writer>(const log_record_writer&);
 template raw_write_buffer::append_result write_buffer::append_synchronously<log_record_bytes_writer>(const log_record_bytes_writer&);
+template raw_write_buffer::append_result write_buffer::append_synchronously<log_record_ref_writer>(const log_record_ref_writer&);
 
 template raw_write_buffer::append_result raw_write_buffer::append<log_record_writer>(const log_record_writer&);
 template raw_write_buffer::append_result raw_write_buffer::append<log_record_bytes_writer>(const log_record_bytes_writer&);
+template raw_write_buffer::append_result raw_write_buffer::append<log_record_ref_writer>(const log_record_ref_writer&);
 
 std::vector<write_buffer::record_in_buffer> write_buffer::take_separator_records() {
     return std::move(_records_copy);

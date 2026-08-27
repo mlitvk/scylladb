@@ -659,6 +659,48 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_append_synchronously_matches_
     BOOST_REQUIRE(std::equal(actual_bytes.begin(), actual_bytes.end(), expected_bytes.begin()));
 }
 
+// The direct write path appends a record it owns nothing of - the key is the mutation's and the
+// value is the encoder's - so the bytes it writes have to be the bytes a record that owns them
+// writes, or a segment written directly would not be readable the ordinary way. Keys of both sides
+// of the inline/external threshold of a managed_bytes, because the two are serialized by walking
+// the key's fragments.
+SEASTAR_THREAD_TEST_CASE(test_logstor_append_of_a_ref_writer_matches_an_owning_writer) {
+    auto schema = make_kv_schema();
+    const auto records = std::vector<log_record>{
+        make_log_record(schema, "pk0", "v0", api::timestamp_type(1)),
+        make_log_record(schema, sstring(200, 'k'), "v1", api::timestamp_type(2)),
+        make_log_record(schema, "pk2", sstring(2000, 'x'), api::timestamp_type(3)),
+    };
+
+    raw_write_buffer expected_wb(32 * 1024, segment_kind::full);
+    raw_write_buffer wb(32 * 1024, segment_kind::full);
+
+    for (const auto& record : records) {
+        const auto& header = record.header;
+        auto ref_writer = log_record_ref_writer(log_record_header_view{
+            .token = header.key.dk.token(),
+            .timestamp = header.timestamp,
+            .table = header.table,
+            .key = managed_bytes_view(header.key.dk.key().representation()),
+        }, record.value.view());
+
+        const auto expected = expected_wb.append(log_record_writer(record));
+        const auto actual = wb.append(ref_writer);
+        BOOST_REQUIRE_EQUAL(actual.record_header_offset, expected.record_header_offset);
+        BOOST_REQUIRE_EQUAL(actual.total_size, expected.total_size);
+    }
+
+    // Sealing writes the segment header, whose token range the appends are what maintain, so equal
+    // bytes here also say the ref writer reported the same token.
+    expected_wb.seal(segment_sequence{7}, schema->id(), ondisk::block_alignment);
+    wb.seal(segment_sequence{7}, schema->id(), ondisk::block_alignment);
+
+    const auto expected_bytes = make_serialized_buffer_copy(expected_wb);
+    const auto actual_bytes = make_serialized_buffer_copy(wb);
+    BOOST_REQUIRE_EQUAL(actual_bytes.size(), expected_bytes.size());
+    BOOST_REQUIRE(std::equal(actual_bytes.begin(), actual_bytes.end(), expected_bytes.begin()));
+}
+
 // A mixed buffer also has to retain a copy of every record for the separator to replay, which an
 // append that tracks nothing cannot do, so it is refused rather than silently losing the copy.
 SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_append_synchronously_refuses_a_mixed_buffer) {

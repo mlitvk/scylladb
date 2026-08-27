@@ -1025,7 +1025,7 @@ public:
     future<> write_full_segment_tail(seg_ptr, write_buffer&, logstor_group&, write_source);
 
     // The direct write path, see direct_write_buffer.
-    std::optional<log_location> try_write_direct(logstor_group&, const log_record_writer&);
+    std::optional<log_location> try_write_direct(logstor_group&, const log_record_header_view&, bytes_view value);
     void rotate_direct_buffer(logstor_group&);
     future<> flush_direct_buffer(logstor_group&, direct_write_buffer full);
     future<> bind_direct_buffer(logstor_group&, direct_write_buffer& slot);
@@ -1719,10 +1719,13 @@ future<> segment_manager_impl::write_full_segment_tail(seg_ptr seg, write_buffer
 // The direct write path. See direct_write_buffer in compaction.hh for what it is and why the
 // segment immutability the rest of logstor rests on survives it.
 
-std::optional<log_location> segment_manager_impl::try_write_direct(logstor_group& cg, const log_record_writer& writer) {
+std::optional<log_location> segment_manager_impl::try_write_direct(logstor_group& cg,
+        const log_record_header_view& header, bytes_view value) {
     if (!_cfg.direct_group_writes) {
         return std::nullopt;
     }
+
+    const auto writer = log_record_ref_writer(header, value);
 
     // Counted for every write of the group, hot or cold: this is the write rate the controller
     // measures, and a cold group is promoted on it.
@@ -3244,8 +3247,9 @@ future<> segment_manager::write(write_buffer& wb) {
     return _impl->write(wb);
 }
 
-std::optional<log_location> segment_manager::try_write_direct(logstor_group& cg, const log_record_writer& writer) {
-    return _impl->try_write_direct(cg, writer);
+std::optional<log_location> segment_manager::try_write_direct(logstor_group& cg,
+        const log_record_header_view& header, bytes_view value) {
+    return _impl->try_write_direct(cg, header, value);
 }
 
 future<temporary_buffer<char>> segment_manager::read_record_bytes(log_location location) {

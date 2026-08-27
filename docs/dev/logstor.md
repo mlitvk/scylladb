@@ -105,7 +105,10 @@ worth it.
 2. A write of that group goes straight into the buffer, the index is updated with the final location
    there and then, and the write is acknowledged - with the record still only in memory. Nothing
    goes to the active segment and the separator is given nothing, so the record reaches the disk
-   once instead of twice.
+   once instead of twice. Because such a record is serialized before the write returns and is never
+   retained, it is written out of the mutation's own key and the encoder's own buffer, without a
+   record of its own: a write on the ordinary path has to own its value for the separator to replay
+   later, and this one does not.
 3. The buffer is written out when it fills, or when it has held records for a whole sync period, and
    its segment is linked into the group after that - exactly like the output of the separator or of
    a compaction. While the buffer fills, its segment is unwritten and belongs to no segment set, so

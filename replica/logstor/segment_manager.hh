@@ -141,7 +141,12 @@ public:
     // Returns nullopt when the group is not taking direct writes, when it has no buffer to take the
     // record right now, or when the record does not fit one. The caller then writes it the ordinary
     // way. Never waits.
-    std::optional<log_location> try_write_direct(logstor_group&, const log_record_writer&);
+    //
+    // It takes the record's parts rather than a writer over them, and builds the writer itself once
+    // it knows the group can be written into: the caller has no record of its own yet - the record
+    // that goes through the shared buffer is built only if this returns nullopt - and a
+    // configuration with direct writes off must not pay for a writer nothing will use.
+    std::optional<log_location> try_write_direct(logstor_group&, const log_record_header_view&, bytes_view value);
 
     // The bytes of one record, as they are on disk: the read of a record does not parse its
     // header, which holds a key the read already has, and decodes its value straight out of

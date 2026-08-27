@@ -89,6 +89,38 @@ inline size_t log_record_header_size(const log_record_header& h) noexcept {
     return log_record_header_fixed_size + h.key.dk.key().representation().size();
 }
 
+inline size_t log_record_header_size(const log_record_header_view& h) noexcept {
+    return log_record_header_fixed_size + h.key.size();
+}
+
+// Serializes a record header. Both forms of a header - the owning log_record_header and the
+// non-owning log_record_header_view - write the layout documented at
+// ser::serializer<log_record_header>, which reads it back, so both go through here.
+//
+// It takes the fields rather than a header, and the key as whatever the caller already holds - a
+// managed_bytes or a view of one - because this runs per record written: converting either header
+// into the other's shape first showed up on the append and serialize steps of perf_logstor.
+template <typename Output, typename Key>
+void write_log_record_header(Output& out, int64_t token, api::timestamp_type timestamp, const table_id& table,
+        const Key& key) {
+    if (key.size() > max_partition_key_size) [[unlikely]] {
+        throw std::runtime_error(fmt::format("logstor partition key of {} bytes exceeds the maximum of {}",
+                key.size(), max_partition_key_size));
+    }
+    ser::serializer<int64_t>::write(out, token);
+    ser::serializer<int64_t>::write(out, timestamp);
+    ser::serializer<table_id>::write(out, table);
+    ser::serializer<uint16_t>::write(out, static_cast<uint16_t>(key.size()));
+    for (bytes_view fragment : fragment_range(managed_bytes_view(key))) {
+        out.write(reinterpret_cast<const char*>(fragment.data()), fragment.size());
+    }
+}
+
+template <typename Output>
+void write_log_record_header(Output& out, const log_record_header_view& h) {
+    write_log_record_header(out, h.token.raw(), h.timestamp, h.table, h.key);
+}
+
 // The fields of a serialized log_record_header a point read needs, taken at their offsets
 // instead of by deserializing the header, which would allocate for a key the read already
 // has. header must hold at least log_record_header_fixed_size bytes.
@@ -210,18 +242,8 @@ template <>
 struct serializer<replica::logstor::log_record_header> {
     template <typename Output>
     static void write(Output& out, const replica::logstor::log_record_header& h) {
-        const auto& key = h.key.dk.key().representation();
-        if (key.size() > replica::logstor::ondisk::max_partition_key_size) [[unlikely]] {
-            throw std::runtime_error(fmt::format("logstor partition key of {} bytes exceeds the maximum of {}",
-                    key.size(), replica::logstor::ondisk::max_partition_key_size));
-        }
-        serializer<int64_t>::write(out, h.key.dk.token().raw());
-        serializer<int64_t>::write(out, h.timestamp);
-        serializer<table_id>::write(out, h.table);
-        serializer<uint16_t>::write(out, static_cast<uint16_t>(key.size()));
-        for (bytes_view fragment : fragment_range(managed_bytes_view(key))) {
-            out.write(reinterpret_cast<const char*>(fragment.data()), fragment.size());
-        }
+        replica::logstor::ondisk::write_log_record_header(out, h.key.dk.token().raw(), h.timestamp, h.table,
+                h.key.dk.key().representation());
     }
 
     template <typename Input>
