@@ -753,6 +753,12 @@ class logstor_group {
 
     future<> allocate_active_separator_buffer();
 
+    // The part of write_to_separator() that waits: for a buffer to be allocated to the group, or for
+    // the flush of the buffer that is full to finish. Split out so that a record the active buffer
+    // takes as it is pays no coroutine frame.
+    template <log_record_writer_concept Writer>
+    future<> wait_and_write_to_separator(Writer, segment_ref, std::optional<segment_sequence>, separator_index_update);
+
     // Waits until nothing is in flight on the group's direct path.
     future<> await_direct_settled();
 

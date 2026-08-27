@@ -3468,8 +3468,22 @@ future<> logstor_group::allocate_active_separator_buffer() {
     }
 }
 
+// A record the active buffer can take is buffered by returning, with nothing awaited on the way, so
+// this is not a coroutine: one that suspends nowhere would allocate a frame per rewritten record to
+// do nothing with it. The waiting - for a buffer, or for the flush of a full one - is what
+// wait_and_write_to_separator() is for.
 template <log_record_writer_concept Writer>
 future<> logstor_group::write_to_separator(Writer writer, segment_ref seg_ref, std::optional<segment_sequence> segment_seq_num, separator_index_update after_written) {
+    if (!_separator_enabled || !_active_buffer.can_fit(writer)) [[unlikely]] {
+        return wait_and_write_to_separator(std::move(writer), std::move(seg_ref), segment_seq_num, std::move(after_written));
+    }
+
+    _active_buffer.write(std::move(seg_ref), segment_seq_num, std::move(writer), std::move(after_written));
+    return make_ready_future<>();
+}
+
+template <log_record_writer_concept Writer>
+future<> logstor_group::wait_and_write_to_separator(Writer writer, segment_ref seg_ref, std::optional<segment_sequence> segment_seq_num, separator_index_update after_written) {
     while (!_active_buffer.can_fit(writer)) {
         if (!_separator_enabled) {
             break;
