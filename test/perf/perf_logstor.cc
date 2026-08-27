@@ -411,7 +411,7 @@ public:
             if (it == index().end()) [[unlikely]] {
                 on_internal_error(logstor_logger, "key of the dataset is missing from the index");
             }
-            if (!cache->lookup(*it, _schema)) [[unlikely]] {
+            if (!cache->lookup(*it, *_schema)) [[unlikely]] {
                 on_internal_error(logstor_logger, "key of the dataset is missing from the cache");
             }
         }
