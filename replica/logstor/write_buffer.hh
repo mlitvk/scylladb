@@ -54,34 +54,30 @@ class log_record_writer {
     using ostream = seastar::simple_memory_output_stream;
 
     log_record _record;
-    mutable std::optional<size_t> _header_size;
-    mutable std::optional<size_t> _data_size;
-
-    void compute_sizes() const;
+    // Both sizes are arithmetic over a record that does not change once the writer holds it, and
+    // every writer is asked for its size before it is appended, so they are computed here rather
+    // than on demand behind a branch per query.
+    size_t _header_size;
+    size_t _data_size;
 
 public:
     explicit log_record_writer(log_record record)
         : _record(std::move(record))
+        , _header_size(ondisk::log_record_header_size(_record.header))
+        , _data_size(_record.value.size())
     {}
 
-    // Get serialized sizes (computed lazily)
-    size_t header_size() const {
-        if (!_header_size) {
-            compute_sizes();
-        }
-        return *_header_size;
+    size_t header_size() const noexcept {
+        return _header_size;
     }
 
-    size_t data_size() const {
-        if (!_data_size) {
-            compute_sizes();
-        }
-        return *_data_size;
+    size_t data_size() const noexcept {
+        return _data_size;
     }
 
     // Total serialized content size (header + data)
-    size_t size() const {
-        return header_size() + data_size();
+    size_t size() const noexcept {
+        return _header_size + _data_size;
     }
 
     // Write the record to an output stream

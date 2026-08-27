@@ -23,11 +23,6 @@
 
 namespace replica::logstor {
 
-void log_record_writer::compute_sizes() const {
-    _header_size = ondisk::log_record_header_size(_record.header);
-    _data_size = _record.value.size();
-}
-
 void log_record_writer::write(ostream& out) const {
     ser::serialize(out, _record.header);
     out.write(reinterpret_cast<const char*>(_record.value.data.data()), _record.value.size());

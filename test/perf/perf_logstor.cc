@@ -379,7 +379,7 @@ public:
         }
     }
 
-    // What log_record_writer::compute_sizes() does: the sizes of the header and of the value are
+    // What the constructor of a log_record_writer does: the sizes of the header and of the value are
     // both arithmetic, so that the writer knows how much room to ask the buffer for. Measured over
     // the header building of do_record_header(), since the size of a header can only be measured on
     // a header, and against a key that changes per operation, so that the measuring cannot be
