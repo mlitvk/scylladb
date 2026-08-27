@@ -16,6 +16,7 @@
 #include <seastar/core/with_scheduling_group.hh>
 #include <seastar/core/on_internal_error.hh>
 #include <seastar/coroutine/as_future.hh>
+#include <seastar/coroutine/maybe_yield.hh>
 #include "serializer_impl.hh"
 #include <seastar/core/align.hh>
 #include <seastar/core/aligned_buffer.hh>
@@ -168,6 +169,20 @@ void raw_write_buffer::write_header(segment_sequence segment_seq, std::optional<
 }
 
 future<> write_buffer::complete_writes(log_location base_location) {
+    // The index updates the separator owes for the records in this buffer, applied here rather than
+    // waited for: every one of them was computable from this location, and doing them in one loop -
+    // before the buffer's segment joins a compaction group, which is what a caller of this relies
+    // on - costs neither a future nor a continuation per record.
+    // A whole segment worth of records is enough of them for the loop to need a preemption point,
+    // which is what the futures it replaces gave it for free. Yielding here is as safe as they were:
+    // an entry that has not been moved yet still points at the record in the segment it came from,
+    // which the separator buffer holds until this is done.
+    for (const auto& update : _index_updates) {
+        update.apply(base_location);
+        co_await coroutine::maybe_yield();
+    }
+    _index_updates.clear();
+
     _written.set_value(base_location);
     co_await close();
 }
@@ -176,6 +191,10 @@ future<> write_buffer::abort_writes(std::exception_ptr ex) {
     if (!_written.available()) {
         _written.set_exception(std::move(ex));
     }
+
+    // A failed flush moves nothing: the records are still where the index points, in the segments
+    // the separator buffer holds, and those are marked as failed rather than reclaimed.
+    _index_updates.clear();
 
     // Mixed buffers keep copies of their records for separator rewriting. A failed flush has no
     // separator pass to consume them, and they were never written anywhere, so drop them.
@@ -198,6 +217,7 @@ void write_buffer::reset() {
     _raw.reset();
     _written = {};
     _records_copy.clear();
+    _index_updates.clear();
     _write_gate = {};
 }
 

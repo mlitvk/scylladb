@@ -29,12 +29,14 @@
 #include "schema/schema_fwd.hh"
 #include "types.hh"
 #include "timeout_config.hh"
+#include "utils/chunked_vector.hh"
 
 namespace replica {
 
 namespace logstor {
 
 class logstor_group;
+class primary_index;
 
 struct write_target {
     logstor_group* cg = nullptr;
@@ -142,6 +144,25 @@ inline log_location record_location(log_location buffer_location, size_t offset_
 
 struct buffered_write_result {
     future<log_location_with_holder> persisted;
+};
+
+// What the separator owes the index for one record it rewrote: the entry that pointed at the record
+// in the segment it came from has to point at the copy the separator wrote into this buffer, which
+// is at `offset_in_buffer`. There is one of these per record, which is why it is a struct rather
+// than a closure - a closure carrying a key does not fit inside a noncopyable_function and would
+// take a heap allocation of its own on every write.
+//
+// A buffer learns where it was written once, so an update needs nothing of its own to wait for: the
+// buffer applies all of them in one loop in complete_writes(), before the segment it was written to
+// joins its compaction group.
+struct separator_index_update {
+    primary_index* index;
+    primary_index_key key;
+    log_location prev_location;
+    size_t offset_in_buffer{0};
+    size_t size{0};
+
+    void apply(log_location buffer_location) const;
 };
 
 // Serializes one in-memory logstor buffer.
@@ -321,6 +342,7 @@ private:
     seastar::gate _write_gate;
 
     std::vector<record_in_buffer> _records_copy;
+    utils::chunked_vector<separator_index_update> _index_updates;
 
 public:
 
@@ -374,6 +396,13 @@ public:
     // Full buffers only: a mixed buffer would also have to retain the record for the separator.
     template <log_record_writer_concept Writer>
     raw_write_buffer::append_result append_synchronously(const Writer& writer);
+
+    // Takes an index update owed for a record that was appended synchronously, to be applied once
+    // the buffer knows where it was written. The separator's records are the ones that have an
+    // entry to move; a record written through write() carries its own location back to its writer.
+    void add_index_update(separator_index_update update) {
+        _index_updates.push_back(std::move(update));
+    }
 
     // Complete all tracked writes with their locations when the buffer is flushed to base_location
     future<> complete_writes(log_location base_location);

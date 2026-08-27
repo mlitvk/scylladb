@@ -2853,8 +2853,8 @@ future<> compaction_manager_impl::tick_direct_writes(seastar::lowres_clock::time
     }
 }
 
-void separator_index_update::operator()(log_location new_location, seastar::gate::holder) const {
-    index->update_record_location(key, prev_location, new_location);
+void separator_index_update::apply(log_location buffer_location) const {
+    index->update_record_location(key, prev_location, record_location(buffer_location, offset_in_buffer, size));
 }
 
 future<> segment_manager_impl::write_to_separator(std::vector<write_buffer::record_in_buffer>& records, log_location buffer_location,
@@ -2911,9 +2911,8 @@ future<> compaction_manager_impl::flush_separator_buffer(separator_buffer& buf, 
             _stats.separator_buffer_flushed++;
         }
 
-        auto updates = std::move(buf.pending_updates);
-        buf.pending_updates.clear();
-        co_await when_all_succeed(updates.begin(), updates.end());
+        // The index updates the records of the buffer owed were applied by the write above, before
+        // the segment it wrote joined the compaction group - see write_buffer::complete_writes().
         co_await buf.close();
 
         // wait for read operations that use the old locations before freeing the old segments
@@ -3403,13 +3402,6 @@ future<> separator_buffer::release() {
                 std::runtime_error("logstor separator buffer was released before its records were flushed")));
     }
     buf.reset();
-    // A flush hands the updates to when_all_succeed() and leaves nothing here, so the ones still
-    // held are the ones a flush never waited for: writes that were just failed by abort(), or by the
-    // fallback above. Consume them rather than leaving them to be reported as ignored.
-    for (auto& update : pending_updates) {
-        (void)std::move(update).handle_exception([] (std::exception_ptr) {});
-    }
-    pending_updates.clear();
     held_segments.clear();
     min_seq_num.reset();
 }

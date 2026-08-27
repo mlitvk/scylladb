@@ -690,6 +690,83 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_appended_synchronously_return
     close_and_return(pool.allocate(as).get());
 }
 
+// The separator rewrites records into a buffer and owes the index an entry pointing at each copy.
+// Checks that the updates are applied when the buffer learns where it was written, at the location
+// each record ended up at - and that a flush that failed moves nothing, leaving every entry
+// pointing at the record in the segment it was read from.
+SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_applies_separator_index_updates) {
+    auto schema = make_kv_schema();
+    struct : space_accounting_subscriber {
+        void on_add_record(log_location) noexcept override {}
+        void on_free_record(log_location) noexcept override {}
+    } accounting;
+
+    const auto records = std::vector<log_record>{
+        make_log_record(schema, "pk0", "v0", api::timestamp_type(1)),
+        make_log_record(schema, "pk1", "v1", api::timestamp_type(2)),
+        make_log_record(schema, "pk2", "v2", api::timestamp_type(3)),
+    };
+
+    // Where the separator read the records from, and where it wrote the buffer holding their copies.
+    const auto source_location = [] (size_t i) {
+        return log_location{.segment = log_segment_id{1}, .offset = uint32_t(128 * i), .size = 64};
+    };
+    const auto buffer_location = log_location{.segment = log_segment_id{7}, .offset = 4096, .size = 0};
+
+    auto append_records = [&] (write_buffer& wb, primary_index& index) {
+        std::vector<log_location> rewritten;
+        for (size_t i = 0; i < records.size(); ++i) {
+            const auto appended = wb.append_synchronously(log_record_writer(records[i]));
+            wb.add_index_update(separator_index_update{
+                .index = &index,
+                .key = records[i].header.key,
+                .prev_location = source_location(i),
+                .offset_in_buffer = appended.record_header_offset,
+                .size = appended.total_size,
+            });
+            rewritten.push_back(record_location(buffer_location, appended.record_header_offset, appended.total_size));
+        }
+        return rewritten;
+    };
+
+    auto fill_index = [&] (primary_index& index) {
+        for (size_t i = 0; i < records.size(); ++i) {
+            index.insert(records[i].header.key, index_entry{
+                .location = source_location(i),
+                .timestamp = records[i].header.timestamp,
+            });
+        }
+    };
+
+    {
+        primary_index index(schema, accounting);
+        fill_index(index);
+
+        write_buffer wb(32 * 1024, segment_kind::full);
+        const auto rewritten = append_records(wb, index);
+        wb.complete_writes(buffer_location).get();
+
+        for (size_t i = 0; i < records.size(); ++i) {
+            BOOST_REQUIRE(index.is_record_alive(records[i].header.key, rewritten[i]));
+            BOOST_REQUIRE(!index.is_record_alive(records[i].header.key, source_location(i)));
+        }
+    }
+
+    {
+        primary_index index(schema, accounting);
+        fill_index(index);
+
+        write_buffer wb(32 * 1024, segment_kind::full);
+        const auto rewritten = append_records(wb, index);
+        wb.abort_writes(std::make_exception_ptr(std::runtime_error("buffer was not flushed"))).get();
+
+        for (size_t i = 0; i < records.size(); ++i) {
+            BOOST_REQUIRE(index.is_record_alive(records[i].header.key, source_location(i)));
+            BOOST_REQUIRE(!index.is_record_alive(records[i].header.key, rewritten[i]));
+        }
+    }
+}
+
 // Checks that a pool builds its buffers at the point of use and keeps only max_cached of them once
 // they are returned, so that a pool whose capacity is rarely reached does not hold the memory for it.
 SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_pool_builds_buffers_on_demand) {
