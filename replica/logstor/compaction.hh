@@ -563,7 +563,8 @@ struct separator_buffer {
     ~separator_buffer();
 
     template <log_record_writer_concept Writer>
-    void write(segment_ref seg_ref, std::optional<segment_sequence> segment_seq_num, const Writer& writer, separator_index_update after_written) {
+    void write(segment_ref seg_ref, std::optional<segment_sequence> segment_seq_num, Writer writer,
+            primary_index& index, log_location prev_location) {
         // The separator buffer holds a reference to the source segment until its updates are durable.
         if (held_segments.empty() || held_segments.back().id() != seg_ref.id()) {
             held_segments.push_back(std::move(seg_ref));
@@ -578,9 +579,13 @@ struct separator_buffer {
         // the buffer that is, and the index update the record owes waits with the buffer rather than
         // on a future of its own.
         const auto appended = buf->append_synchronously(writer);
-        after_written.offset_in_buffer = appended.record_header_offset;
-        after_written.size = appended.total_size;
-        buf->add_index_update(std::move(after_written));
+        buf->add_index_update(separator_index_update{
+            .index = &index,
+            .key = std::move(writer).take_key(),
+            .prev_location = prev_location,
+            .offset_in_buffer = appended.record_header_offset,
+            .size = appended.total_size,
+        });
     }
 
     bool allocated() const noexcept {
@@ -749,7 +754,7 @@ class logstor_group {
     // the flush of the buffer that is full to finish. Split out so that a record the active buffer
     // takes as it is pays no coroutine frame.
     template <log_record_writer_concept Writer>
-    future<> wait_and_write_to_separator(Writer, segment_ref, std::optional<segment_sequence>, separator_index_update);
+    future<> wait_and_write_to_separator(Writer, segment_ref, std::optional<segment_sequence>, log_location prev_location);
 
     // Waits until nothing is in flight on the group's direct path.
     future<> await_direct_settled();
@@ -790,7 +795,9 @@ public:
     }
 
     template <log_record_writer_concept Writer>
-    future<> write_to_separator(Writer, segment_ref, std::optional<segment_sequence>, separator_index_update);
+    // `prev_location` is where the record being rewritten is now, which is what the index entry the
+    // group owes an update for has to be pointing at for the rewrite to take effect.
+    future<> write_to_separator(Writer, segment_ref, std::optional<segment_sequence>, log_location prev_location);
 
     future<> flush_separator(std::optional<segment_sequence> seq_num = std::nullopt);
 

@@ -2885,13 +2885,8 @@ future<> segment_manager_impl::write_to_separator(std::vector<write_buffer::reco
     co_await seastar::max_concurrent_for_each(groups, separator_group_write_concurrency,
             [buffer_location, seg_ref, segment_seq_num] (separator_group_records& group) -> future<> {
         for (auto* record : group.records) {
-            separator_index_update update {
-                .index = &group.cg->logstor_index(),
-                .key = record->writer.record().header.key,
-                .prev_location = record->location(buffer_location),
-            };
-
-            co_await group.cg->write_to_separator(std::move(record->writer), seg_ref, segment_seq_num, std::move(update));
+            co_await group.cg->write_to_separator(std::move(record->writer), seg_ref, segment_seq_num,
+                    record->location(buffer_location));
         }
     });
 }
@@ -3179,13 +3174,7 @@ future<> segment_manager_impl::add_segment_to_compaction_group(replica::database
                     auto& cg = t.get_logstor_group(record_header.key.dk.token());
                     auto writer = log_record_bytes_writer(record_header, record_bytes);
 
-                    co_await cg.write_to_separator(std::move(writer), seg_ref, std::nullopt,
-                        separator_index_update {
-                            .index = &cg.logstor_index(),
-                            .key = record_header.key,
-                            .prev_location = prev_loc,
-                        }
-                    );
+                    co_await cg.write_to_separator(std::move(writer), seg_ref, std::nullopt, prev_loc);
                 } catch (const replica::no_such_column_family&) {
                     // ignore
                 }
@@ -3465,17 +3454,17 @@ future<> logstor_group::allocate_active_separator_buffer() {
 // do nothing with it. The waiting - for a buffer, or for the flush of a full one - is what
 // wait_and_write_to_separator() is for.
 template <log_record_writer_concept Writer>
-future<> logstor_group::write_to_separator(Writer writer, segment_ref seg_ref, std::optional<segment_sequence> segment_seq_num, separator_index_update after_written) {
+future<> logstor_group::write_to_separator(Writer writer, segment_ref seg_ref, std::optional<segment_sequence> segment_seq_num, log_location prev_location) {
     if (!_separator_enabled || !_active_buffer.can_fit(writer)) [[unlikely]] {
-        return wait_and_write_to_separator(std::move(writer), std::move(seg_ref), segment_seq_num, std::move(after_written));
+        return wait_and_write_to_separator(std::move(writer), std::move(seg_ref), segment_seq_num, prev_location);
     }
 
-    _active_buffer.write(std::move(seg_ref), segment_seq_num, std::move(writer), std::move(after_written));
+    _active_buffer.write(std::move(seg_ref), segment_seq_num, std::move(writer), logstor_index(), prev_location);
     return make_ready_future<>();
 }
 
 template <log_record_writer_concept Writer>
-future<> logstor_group::wait_and_write_to_separator(Writer writer, segment_ref seg_ref, std::optional<segment_sequence> segment_seq_num, separator_index_update after_written) {
+future<> logstor_group::wait_and_write_to_separator(Writer writer, segment_ref seg_ref, std::optional<segment_sequence> segment_seq_num, log_location prev_location) {
     while (!_active_buffer.can_fit(writer)) {
         if (!_separator_enabled) {
             break;
@@ -3513,11 +3502,11 @@ future<> logstor_group::wait_and_write_to_separator(Writer writer, segment_ref s
                 "logstor separator write to a closed compaction group of table {}", table_id()));
     }
 
-    _active_buffer.write(std::move(seg_ref), segment_seq_num, std::move(writer), std::move(after_written));
+    _active_buffer.write(std::move(seg_ref), segment_seq_num, std::move(writer), logstor_index(), prev_location);
 }
 
-template future<> logstor_group::write_to_separator(log_record_writer, segment_ref, std::optional<segment_sequence>, separator_index_update);
-template future<> logstor_group::write_to_separator(log_record_bytes_writer, segment_ref, std::optional<segment_sequence>, separator_index_update);
+template future<> logstor_group::write_to_separator(log_record_writer, segment_ref, std::optional<segment_sequence>, log_location);
+template future<> logstor_group::write_to_separator(log_record_bytes_writer, segment_ref, std::optional<segment_sequence>, log_location);
 
 future<> logstor_group::flush_separator(std::optional<segment_sequence> seq_num) {
     // Only for a drain of everything the group holds. A sequence number means the caller is after

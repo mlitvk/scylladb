@@ -92,6 +92,14 @@ public:
     const log_record_header& header() const {
         return _record.header;
     }
+
+    // The record's key, moved out of the writer. Only for a writer that has already been appended:
+    // the append serializes the key, and taking it leaves the writer with nothing to say about the
+    // record. The separator takes it for the index update it owes, rather than copying a key it is
+    // about to destroy - a decorated_key copy is an allocation per record.
+    primary_index_key take_key() && noexcept {
+        return std::move(_record.header.key);
+    }
 };
 
 // Writer for log records that stores pre-serialized bytes.
@@ -112,6 +120,12 @@ public:
     {}
 
     const log_record_header& header() const { return _header; }
+
+    // See log_record_writer::take_key(). This writer appends bytes that were already serialized, so
+    // its own header is there for the key and the token, and is done with once the record is in.
+    primary_index_key take_key() && noexcept {
+        return std::move(_header.key);
+    }
 
     size_t header_size() const { return _header_bytes.size(); }
     size_t data_size() const { return _data_bytes.size(); }
