@@ -18,6 +18,7 @@
 #include <absl/container/flat_hash_map.h>
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <system_error>
 #include <linux/if_link.h>
@@ -927,6 +928,24 @@ class segment_manager_impl {
     segment_manager_config _cfg;
     uint64_t _segments_per_file;
 
+    // The shifts segment_id_to_file_location() locates a segment with, set when the segments per
+    // file and the segment size are both powers of two.
+    struct pow2_segment_layout {
+        unsigned segments_per_file_log2;
+        unsigned segment_size_log2;
+    };
+    std::optional<pow2_segment_layout> _pow2_layout;
+
+    static std::optional<pow2_segment_layout> make_pow2_layout(uint64_t segments_per_file, uint64_t segment_size) noexcept {
+        if (!std::has_single_bit(segments_per_file) || !std::has_single_bit(segment_size)) {
+            return std::nullopt;
+        }
+        return pow2_segment_layout{
+            .segments_per_file_log2 = static_cast<unsigned>(std::countr_zero(segments_per_file)),
+            .segment_size_log2 = static_cast<unsigned>(std::countr_zero(segment_size)),
+        };
+    }
+
     // configured: segment count allowed by the current configuration; new
     // segment ids are allocated only below this limit.
     // actual: segment slots currently present on disk. Recovery may raise this
@@ -1204,7 +1223,15 @@ private:
         return segment_index * _cfg.segment_size;
     }
 
+    // Every read of a record starts here, so the division by the segments per file and the
+    // multiplication by the segment size are a shift and a mask when both are powers of two, which
+    // is what a configuration uses. The general form runs when they are not.
     segment_location segment_id_to_file_location(log_segment_id segment_id) const noexcept {
+        if (_pow2_layout) [[likely]] {
+            const auto file_id = segment_id.value >> _pow2_layout->segments_per_file_log2;
+            const auto segment_index = segment_id.value & ((uint64_t(1) << _pow2_layout->segments_per_file_log2) - 1);
+            return segment_location{static_cast<file_id_t>(file_id), segment_index << _pow2_layout->segment_size_log2};
+        }
         file_id_t file_id = segment_id.value / _segments_per_file;
         uint64_t file_offset = (segment_id.value % _segments_per_file) * _cfg.segment_size;
         return segment_location{file_id, file_offset};
@@ -1277,6 +1304,7 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
         })
     , _cfg(config)
     , _segments_per_file(config.file_size / config.segment_size)
+    , _pow2_layout(make_pow2_layout(_segments_per_file, config.segment_size))
     , _max_segments{(config.disk_size / config.file_size) * _segments_per_file, (config.disk_size / config.file_size) * _segments_per_file}
     , _segment_descs(static_cast<size_t>(_max_segments.actual))
     // A compaction job takes one segment from the pool per flush, so the reserve that keeps normal
