@@ -53,6 +53,11 @@ class logstor {
     stats _stats;
     seastar::gate _async_gate;
 
+    // The part of a write that goes through the shared write buffer: the record waits to be taken
+    // into a buffer and for that buffer to reach a segment, and is then put in the index.
+    future<> write_through_buffer(log_record_writer, primary_index_key, api::timestamp_type ts, primary_index&,
+            write_target, db::timeout_clock::time_point timeout, seastar::gate::holder);
+
     // The part of a read the cache could not answer: the record is read from its segment, decoded,
     // and admitted to the cache. What read() holds for the duration of a read is handed over to it,
     // because this is where such a read ends.

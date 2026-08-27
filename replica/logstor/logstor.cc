@@ -125,6 +125,9 @@ std::unique_ptr<primary_index> logstor::make_primary_index(schema_ptr schema, bo
     return index;
 }
 
+// A write the direct path takes is done when it returns - the record is in the group's buffer and in
+// the index, with nothing awaited in between - so this is not a coroutine. A write that goes through
+// the shared buffer waits twice, in write_through_buffer().
 future<> logstor::write(const mutation& m, write_target target, db::timeout_clock::time_point timeout) {
     auto gate_holder = _async_gate.hold();
 
@@ -163,9 +166,17 @@ future<> logstor::write(const mutation& m, write_target target, db::timeout_cloc
     // buffer takes it, and the gate holders of the write target are released by returning.
     if (auto location = _segment_manager.try_write_direct(cg, writer)) {
         index.insert(key, index_entry{.location = *location, .timestamp = ts});
-        co_return;
+        return make_ready_future<>();
     }
 
+    // The key is moved rather than copied: what the record carries is a copy of its own, made above.
+    return write_through_buffer(std::move(writer), std::move(key), ts, index, std::move(target), timeout,
+            std::move(gate_holder));
+}
+
+future<> logstor::write_through_buffer(log_record_writer writer, primary_index_key key, api::timestamp_type ts,
+        primary_index& index, write_target target, db::timeout_clock::time_point timeout,
+        seastar::gate::holder gate_holder) {
     // Two waits, not one: first for the record to be taken into a buffer, then for that buffer to
     // reach a segment. They are awaited here rather than behind a call of their own, which would
     // cost a coroutine frame per write to do nothing else.
