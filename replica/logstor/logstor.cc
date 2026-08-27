@@ -187,6 +187,10 @@ future<> logstor::write(const mutation& m, write_target target, db::timeout_cloc
     index.insert(key, std::move(new_entry));
 }
 
+// A read that the index and the cache can answer between them - a key the index does not hold, or a
+// partition the cache holds - waits for nothing, so it is answered here rather than from a
+// coroutine, which would allocate a frame per read to suspend in nowhere. Only a read that goes to
+// a segment pays for one, in read_from_segment().
 future<std::optional<mutation>> logstor::read(const schema& s, const primary_index& index, const dht::decorated_key& dk, const query::partition_slice& slice) {
     auto gate_holder = _async_gate.hold();
 
@@ -201,21 +205,27 @@ future<std::optional<mutation>> logstor::read(const schema& s, const primary_ind
         if (cache) {
             cache->on_negative_hit();
         }
-        co_return std::nullopt;
+        return make_ready_future<std::optional<mutation>>(std::nullopt);
     }
 
     // lookup in cache
     if (cache) {
         auto cached_mut = cache->lookup(*it, s);
         if (cached_mut) {
-            co_return std::move(*cached_mut);
+            return make_ready_future<std::optional<mutation>>(std::move(cached_mut));
         }
         read_acc.on_miss();
     }
 
-    // Cache miss (or bypass): read from disk using the entry we already have.
-    // copy the entry. we want to remember the original entry that we use for the read. the entry may change while we read.
-    const index_entry entry_for_read = it->entry();
+    // Cache miss (or bypass): read from disk using the entry we already have. The entry is copied
+    // because it may change while the record is read.
+    return read_from_segment(s, index, dk, it->entry(), cache, std::move(gate_holder), std::move(op), std::move(read_acc));
+}
+
+future<std::optional<mutation>> logstor::read_from_segment(const schema& s, const primary_index& index,
+        const dht::decorated_key& dk, const index_entry entry_for_read, cache_tracker* cache,
+        seastar::gate::holder gate_holder, utils::phased_barrier::operation op,
+        cache_tracker::read_accounter read_acc) {
     auto buf = co_await _segment_manager.read_record_bytes(entry_for_read.location);
     const auto record = view_log_record(bytes_view(reinterpret_cast<const int8_t*>(buf.get()), buf.size()));
 

@@ -53,6 +53,13 @@ class logstor {
     stats _stats;
     seastar::gate _async_gate;
 
+    // The part of a read the cache could not answer: the record is read from its segment, decoded,
+    // and admitted to the cache. What read() holds for the duration of a read is handed over to it,
+    // because this is where such a read ends.
+    future<std::optional<mutation>> read_from_segment(const schema&, const primary_index&, const dht::decorated_key&,
+            index_entry entry_for_read, cache_tracker* cache, seastar::gate::holder,
+            utils::phased_barrier::operation, cache_tracker::read_accounter);
+
 public:
 
     logstor(logstor_config, ::cache_tracker& shared_cache_tracker);

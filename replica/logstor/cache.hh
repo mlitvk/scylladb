@@ -13,6 +13,7 @@
 #include "utils/lru.hh"
 #include "utils/logalloc.hh"
 #include <optional>
+#include <utility>
 
 namespace replica::logstor {
 
@@ -138,6 +139,13 @@ public:
 
         read_accounter(const read_accounter&) = delete;
         read_accounter& operator=(const read_accounter&) = delete;
+
+        // Moved from the part of a read that the cache could answer into the part that goes to the
+        // disk, which is where such a read ends.
+        read_accounter(read_accounter&& o) noexcept
+                : _tracker(std::exchange(o._tracker, nullptr))
+                , _missed(o._missed)
+        { }
 
         ~read_accounter() {
             if (_tracker) {
