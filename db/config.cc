@@ -987,6 +987,10 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "Trigger automatic logstor compaction when the number of available segments drops below this fraction of the total number of logstor segments. A value of 0 disables the trigger threshold.")
     , logstor_compaction_max_shares(this, "logstor_compaction_max_shares", liveness::LiveUpdate, value_status::Used, 2000,
         "Maximum CPU shares the logstor compaction controller gives the logstor compaction scheduling group, reached at full space pressure. ")
+    , logstor_direct_write_memory_in_mb(this, "logstor_direct_write_memory_in_mb", value_status::Used, 64,
+        "Memory in megabytes, per shard, that logstor may hold in the write buffers of the groups writing directly into segments of their own. "
+        "Every such group holds two buffers of one segment each, so this bounds both the number of groups that write directly at once and the writes a crash can lose. "
+        "A value of 0 disables the direct write path. Has no effect unless commitlog_sync is periodic, which is what the direct write path requires.")
     , file_cache_size_in_mb(this, "file_cache_size_in_mb", value_status::Unused, 512,
         "Total memory to use for SSTable-reading buffers.")
     , memtable_flush_queue_size(this, "memtable_flush_queue_size", value_status::Unused, 4,

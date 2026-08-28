@@ -38,6 +38,8 @@ class primary_index;
 
 static constexpr uint64_t default_segment_size = 128 * 1024;
 static constexpr uint64_t default_file_size = 32 * 1024 * 1024;
+// Two buffers of a segment each for every one of eight hot groups, at the default segment size.
+static constexpr size_t default_direct_write_memory = 2 * 1024 * 1024;
 
 /// Configuration for the segment manager
 struct segment_manager_config {
@@ -66,9 +68,11 @@ struct segment_manager_config {
     // segment, which is the point below which a partly filled segment costs more in occupied pool
     // slots than the second write it saves.
     uint64_t direct_hot_threshold_bytes{0};
-    // The most groups of a shard that may hold direct buffers at once. Each one holds two, so this
-    // also bounds the memory the direct path takes and the records it can lose.
-    size_t max_hot_groups{8};
+    // The memory a shard may hold in direct buffers. Each hot group holds two buffers of one
+    // segment each, so this is what bounds how many groups may be hot at once, and with it the
+    // records the direct path can lose. Less than two segments' worth leaves no room for a single
+    // hot group, which turns the direct path off.
+    size_t direct_write_memory{default_direct_write_memory};
 };
 
 // What the logstor of one shard is using and what it has to use. Every field is shard wide and

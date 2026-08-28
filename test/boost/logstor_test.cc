@@ -2696,6 +2696,72 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_direct_write_controller_promotes_and_demot
     }
 }
 
+// The memory the direct path is given is what bounds how many groups may be hot at once, since a
+// hot group holds two buffers of a segment each. A group that finds no room in the budget keeps
+// writing on the ordinary path.
+SEASTAR_THREAD_TEST_CASE(test_logstor_direct_write_memory_bounds_the_hot_groups) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    auto params = direct_write_params();
+    // Room for the two buffers of one group, and not for a second group's.
+    params.direct_write_memory = 3 * params.segment_size;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path(), params), cache.shared_tracker);
+    ls.do_recovery_for_test().get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group hot(schema, ls);
+    test_logstor_group cold(schema, ls);
+
+    await_direct_buffers(ls, hot);
+    ls.get_compaction_manager().promote_direct_writes_for_test(cold).get();
+    BOOST_REQUIRE(!cold.direct_writes_enabled());
+
+    // The group that was left out writes the ordinary way: through the shared active segment, which
+    // hands the record to the separator rather than keeping it in a buffer of the group.
+    auto expected = make_kv_mutation(schema, "pk0", "on-the-ordinary-path");
+    ls.write(expected, write_target(&cold, {}), db::no_timeout).get();
+    BOOST_REQUIRE(!cold.direct_has_data());
+    // Nothing of a direct write is ever given to the separator, and this write was.
+    ls.flush_to_separator().get();
+    BOOST_REQUIRE(cold.separator_has_data());
+
+    auto actual = ls.read(*schema, cold.logstor_index(), expected.decorated_key(), schema->full_slice()).get();
+    BOOST_REQUIRE(actual);
+    assert_that(*actual).is_equal_to(expected);
+}
+
+// A budget with no room for even one group turns the direct path off, which is how the parameter
+// disables it.
+SEASTAR_THREAD_TEST_CASE(test_logstor_direct_writes_off_when_memory_leaves_no_room) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    auto params = direct_write_params();
+    params.direct_write_memory = params.segment_size;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path(), params), cache.shared_tracker);
+    ls.do_recovery_for_test().get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+    ls.get_compaction_manager().promote_direct_writes_for_test(cg).get();
+    BOOST_REQUIRE(!cg.direct_writes_enabled());
+
+    auto expected = make_kv_mutation(schema, "pk0", "on-the-ordinary-path");
+    ls.write(expected, write_target(&cg, {}), db::no_timeout).get();
+    BOOST_REQUIRE(!cg.direct_has_data());
+
+    auto actual = ls.read(*schema, cg.logstor_index(), expected.decorated_key(), schema->full_slice()).get();
+    BOOST_REQUIRE(actual);
+    assert_that(*actual).is_equal_to(expected);
+}
+
 // Checks that free-segment watermarks are correctly derived from disk size and target fraction,
 // with floor/cap enforcement ensuring no configuration prevents compaction from starting or stopping.
 SEASTAR_THREAD_TEST_CASE(test_logstor_free_segment_watermarks) {

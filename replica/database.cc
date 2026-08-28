@@ -979,6 +979,7 @@ database::init_logstor() {
             // options say so for logstor as they do for the commitlog, rather than a pair of its own.
             .direct_group_writes = _cfg.commitlog_sync() == "periodic",
             .direct_sync_period = std::chrono::milliseconds(_cfg.commitlog_sync_period_in_ms()),
+            .direct_write_memory = _cfg.logstor_direct_write_memory_in_mb() * 1024ull * 1024ull,
         },
         .flush_sg = _dbcfg.commitlog_scheduling_group,
         .max_queued_write_bytes = _dbcfg.available_memory * 1 / 100,

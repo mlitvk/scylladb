@@ -47,7 +47,9 @@ struct logstor_params {
     bool direct_group_writes = false;
     std::chrono::milliseconds direct_sync_period{10000};
     uint64_t direct_hot_threshold_bytes = 0;
-    size_t max_hot_groups = 8;
+    // The memory the direct write path may hold. Zero means room for eight hot groups at the
+    // segment size of the test, which is two buffers each.
+    size_t direct_write_memory = 0;
 };
 
 inline replica::logstor::logstor_config make_test_logstor_config(const std::filesystem::path& base_dir, logstor_params params = {}) {
@@ -68,7 +70,7 @@ inline replica::logstor::logstor_config make_test_logstor_config(const std::file
             .direct_group_writes = params.direct_group_writes,
             .direct_sync_period = params.direct_sync_period,
             .direct_hot_threshold_bytes = params.direct_hot_threshold_bytes,
-            .max_hot_groups = params.max_hot_groups,
+            .direct_write_memory = params.direct_write_memory ? params.direct_write_memory : 8 * 2 * params.segment_size,
         },
         .flush_sg = seastar::current_scheduling_group(),
     };

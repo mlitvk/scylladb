@@ -980,6 +980,9 @@ class segment_manager_impl {
     write_buffer_pool _separator_buffer_pool;
     abort_source _separator_buffer_abort;
 
+    // How many groups the memory budget of the direct path has room for, which is fixed for the
+    // lifetime of the shard: the pool below is sized for exactly this many.
+    size_t _max_hot_groups;
     write_buffer_pool _direct_buffer_pool;
     abort_source _direct_buffer_abort;
     // The buffers of the groups that are taking direct writes, by the id of the segment each one is
@@ -1041,6 +1044,16 @@ public:
     future<> run_direct_sync_fiber();
     uint64_t direct_hot_threshold_bytes() const noexcept {
         return _cfg.direct_hot_threshold_bytes ? _cfg.direct_hot_threshold_bytes : _cfg.segment_size / 2;
+    }
+    // The most groups that may be hot at once: what the memory budget of the direct path holds,
+    // given the two buffers of a segment each that a hot group takes.
+    static size_t max_hot_groups(const segment_manager_config& cfg) noexcept {
+        return cfg.direct_group_writes ? cfg.direct_write_memory / (2 * cfg.segment_size) : 0;
+    }
+    // Whether the direct write path is on: the durability mode has to allow it and the memory
+    // budget has to have room for at least one hot group.
+    bool direct_writes_enabled() const noexcept {
+        return _max_hot_groups > 0;
     }
 
     future<temporary_buffer<char>> read_record_bytes(log_location);
@@ -1332,13 +1345,15 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
       })
     // Two buffers per hot group: the one it writes into and the one it rotates to. A group holds no
     // more than that at any moment - the buffer being written out is the one the group gave up - so
-    // this is both the pool's capacity and the memory the direct path can take.
+    // this is both the pool's capacity and the memory the direct path can take, which is what
+    // direct_write_memory was given as.
+    , _max_hot_groups(max_hot_groups(config))
     , _direct_buffer_pool(write_buffer_pool::config{
-            .capacity = config.direct_group_writes ? 2 * config.max_hot_groups : 0,
+            .capacity = 2 * _max_hot_groups,
             .buffer_size = config.segment_size,
             .kind = segment_kind::full,
             .preallocate = 0,
-            .max_cached = config.direct_group_writes ? 2 * config.max_hot_groups : 0,
+            .max_cached = 2 * _max_hot_groups,
       })
     , _separator_task_queue(separator_queue_depth)
     , _trigger_threshold_observer(_cfg.trigger_compaction_threshold.observe([this] (double new_threshold) {
@@ -1362,6 +1377,13 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
 
     if (_max_segments.configured == 0) {
         throw exceptions::configuration_exception(fmt::format("Disk size {} must be greater than or equal to file size {}", config.disk_size, config.file_size));
+    }
+
+    // A budget of zero is how the direct path is turned off, but one that is set and still too small
+    // for a single group is a configuration that does not do what it was meant to.
+    if (_cfg.direct_group_writes && _cfg.direct_write_memory && !_max_hot_groups) {
+        logstor_logger.warn("Direct write memory of {} bytes has no room for the two {} byte buffers a group takes, direct writes are off",
+                _cfg.direct_write_memory, _cfg.segment_size);
     }
 
     _free_segments.reserve(static_cast<size_t>(_max_segments.actual));
@@ -1494,7 +1516,7 @@ future<> segment_manager_impl::start() {
         return run_separator_fiber();
     });
 
-    if (_cfg.direct_group_writes) {
+    if (direct_writes_enabled()) {
         // In the separator's group: it does the same work for the same reason, taking the records
         // of a group to a segment of that group, only without the second write.
         _direct_sync_fiber = with_scheduling_group(_cfg.separator_sg, [this] {
@@ -1721,7 +1743,7 @@ future<> segment_manager_impl::write_full_segment_tail(seg_ptr seg, write_buffer
 
 std::optional<log_location> segment_manager_impl::try_write_direct(logstor_group& cg,
         const log_record_header_view& header, bytes_view value) {
-    if (!_cfg.direct_group_writes) {
+    if (!direct_writes_enabled()) {
         return std::nullopt;
     }
 
@@ -1878,11 +1900,11 @@ future<> segment_manager_impl::release_direct_buffers(logstor_group& cg) {
 }
 
 bool segment_manager_impl::promote_direct_group(logstor_group& cg) {
-    if (!_cfg.direct_group_writes || cg._direct_enabled || _async_gate.is_closed()) {
+    if (!direct_writes_enabled() || cg._direct_enabled || _async_gate.is_closed()) {
         return false;
     }
     // Room for another hot group, and for the two segments its buffers are going to be bound to.
-    if (_compaction_mgr.direct_hot_group_count() >= _cfg.max_hot_groups
+    if (_compaction_mgr.direct_hot_group_count() >= _max_hot_groups
             || available_segment_count(write_source::direct_write) < 2) {
         return false;
     }

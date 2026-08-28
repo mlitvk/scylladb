@@ -131,8 +131,11 @@ Which groups get buffers is measured rather than declared. Every write of a grou
 the current sync period; a group that wrote at least half a segment over a period is given buffers,
 and one that writes less than that for two periods in a row gives them back. Below that rate the
 partly filled segment such a group leaves at the end of every period occupies more of the segment
-pool than the second write it saves is worth. At most `max_hot_groups` groups of a shard hold
-buffers at once, which is what bounds both the memory and the loss window.
+pool than the second write it saves is worth. How many groups of a shard may hold buffers at once
+follows from `logstor_direct_write_memory_in_mb`, the memory a shard may hold in these buffers,
+divided by the two segments' worth a hot group takes - which is what bounds both the memory and the
+loss window. A budget with no room for a single group, `0` included, turns the path off, as does
+`batch` mode.
 
 This path is a prototype, and one of the things it does not do yet makes it unsafe for real data.
 Read [Direct Writes: State of the Implementation](#direct-writes-state-of-the-implementation) before
