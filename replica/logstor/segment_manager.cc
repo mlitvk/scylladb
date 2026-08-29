@@ -692,8 +692,10 @@ public:
     future<> release_direct_buffers(logstor_group&) override;
     future<> drain_all_direct_buffers();
     future<> promote_direct_writes_for_test(logstor_group&) override;
-    // One pass of the direct write sync over every group of the shard.
-    future<> tick_direct_writes(seastar::lowres_clock::time_point now, bool run_controller);
+    // One deadline pass over every group of the shard, and one controller pass. They are separate
+    // because the controller waits and the deadlines must not.
+    void tick_direct_deadlines(seastar::lowres_clock::time_point now);
+    future<> run_direct_controller();
 
     // How many of this shard's groups are taking direct writes. Counted rather than tracked: it is
     // read when a group is promoted, which is rare, and the groups of a shard are few.
@@ -1057,9 +1059,14 @@ public:
     // Gives the group two buffers to write into and counts it as hot, unless the shard has no room
     // for another hot group. Says whether it did.
     bool promote_direct_group(logstor_group&);
-    // One pass over a group: the deadline of its buffer, and, once a period, whether it still
-    // writes fast enough to keep its buffers - or fast enough to be given them.
-    future<> tick_direct_writes(logstor_group&, seastar::lowres_clock::time_point now, bool run_controller);
+    // Binds what the group is missing and writes out a buffer whose deadline has come. Synchronous
+    // and never fails, so one group's disk cannot delay another group's deadline - which is what
+    // bounds how much a crash of this shard would lose.
+    void tick_direct_deadlines(logstor_group&, seastar::lowres_clock::time_point now);
+    // Whether the group still writes fast enough to keep its buffers, or fast enough to be given
+    // them, over the period that just ended. Waits for a demotion to be drained, so it runs behind
+    // the deadlines rather than in front of them.
+    future<> run_direct_controller(logstor_group&);
     future<> run_direct_sync_fiber();
     uint64_t direct_hot_threshold_bytes() const noexcept {
         return _cfg.direct_hot_threshold_bytes ? _cfg.direct_hot_threshold_bytes : _cfg.segment_size / 2;
@@ -2005,17 +2012,9 @@ bool segment_manager_impl::promote_direct_group(logstor_group& cg) {
     return true;
 }
 
-future<> segment_manager_impl::tick_direct_writes(logstor_group& cg, seastar::lowres_clock::time_point now,
-        bool run_controller) {
-    // A group whose writes the disk keeps refusing goes back to the ordinary path, and so does
-    // every group once the path is off shard wide. Both are checked here rather than at the flush,
-    // which cannot wait for a group to be closed.
-    if (cg._direct_enabled && (!direct_writes_enabled()
-            || cg._direct_flush_failures >= direct_flush_failures_before_demotion)) {
-        logstor_logger.warn("Taking the direct write buffers of a logstor group of table {} back after"
-                " {} failed flushes", cg.table_id(), cg._direct_flush_failures);
-        co_await cg.close_direct_writes();
-        co_return;
+void segment_manager_impl::tick_direct_deadlines(logstor_group& cg, seastar::lowres_clock::time_point now) {
+    if (!cg._direct_enabled) {
+        return;
     }
 
     // A slot can be left unbound by a flush that finished while the shard had no buffer or no
@@ -2023,20 +2022,29 @@ future<> segment_manager_impl::tick_direct_writes(logstor_group& cg, seastar::lo
     // this the group would go on writing through the shared active segment for good while still
     // counting as hot. Not while a flush is in flight: the buffer it is writing is the group's
     // second one, and binding a third here would take more of the pool than a group is allowed.
-    if (cg._direct_enabled && cg._direct_flush.available()) {
+    if (cg._direct_flush.available()) {
         try_bind_direct_slot(cg, cg._direct_active);
         try_bind_direct_slot(cg, cg._direct_spare);
     }
 
     // The deadline: a buffer that has been holding records for a whole sync period is written out
     // even though it is not full, which is what bounds how much a crash can lose.
-    if (cg._direct_enabled && !cg._direct_active.empty() && cg._direct_flush.available()
+    if (!cg._direct_active.empty() && cg._direct_flush.available()
             && now - cg._direct_active.first_append >= _cfg.direct_sync_period) {
         ++_stats.direct_deadline_flushes;
         rotate_direct_buffer(cg);
     }
+}
 
-    if (!run_controller) {
+future<> segment_manager_impl::run_direct_controller(logstor_group& cg) {
+    // A group whose writes the disk keeps refusing goes back to the ordinary path, and so does
+    // every group once the path is off shard wide. Both are decided here rather than at the flush,
+    // which cannot wait for a group to be closed.
+    if (cg._direct_enabled && (!direct_writes_enabled()
+            || cg._direct_flush_failures >= direct_flush_failures_before_demotion)) {
+        logstor_logger.warn("Taking the direct write buffers of a logstor group of table {} back after"
+                " {} failed flushes", cg.table_id(), cg._direct_flush_failures);
+        co_await cg.close_direct_writes();
         co_return;
     }
 
@@ -2073,6 +2081,9 @@ future<> segment_manager_impl::run_direct_sync_fiber() {
     const auto tick = std::clamp(_cfg.direct_sync_period / 4,
             std::chrono::milliseconds(10), std::chrono::milliseconds(1000));
     auto period_start = seastar::lowres_clock::now();
+    // The controller runs beside the ticks rather than in one: a demotion waits for the group it
+    // demotes to be drained, and a deadline that waited behind that would not be a deadline.
+    future<> controller = make_ready_future<>();
 
     while (true) {
         try {
@@ -2082,18 +2093,31 @@ future<> segment_manager_impl::run_direct_sync_fiber() {
         }
 
         const auto now = seastar::lowres_clock::now();
-        const bool run_controller = now - period_start >= _cfg.direct_sync_period;
-        if (run_controller) {
-            period_start = now;
-        }
 
         try {
-            co_await _compaction_mgr.tick_direct_writes(now, run_controller);
+            _compaction_mgr.tick_direct_deadlines(now);
         } catch (...) {
             logstor_logger.warn("logstor direct write sync failed: {}. Ignored", std::current_exception());
         }
+
+        if (now - period_start < _cfg.direct_sync_period) {
+            continue;
+        }
+        // Whole periods, so a pass that took longer than one does not leave the next one measuring
+        // a write rate over part of a period and demoting a group that was writing all along.
+        while (now - period_start >= _cfg.direct_sync_period) {
+            period_start += _cfg.direct_sync_period;
+        }
+        // A controller pass that is still running keeps the period it started in; skipping is what
+        // makes it fall behind the deadlines rather than queue in front of them.
+        if (controller.available()) {
+            controller = _compaction_mgr.run_direct_controller().handle_exception([] (std::exception_ptr ep) {
+                logstor_logger.warn("logstor direct write controller failed: {}. Ignored", ep);
+            });
+        }
     }
 
+    co_await std::move(controller);
     logstor_logger.debug("Direct write sync fiber stopped");
 }
 
@@ -2967,7 +2991,15 @@ future<> compaction_manager_impl::promote_direct_writes_for_test(logstor_group& 
     co_await cg.flush_direct_writes();
 }
 
-future<> compaction_manager_impl::tick_direct_writes(seastar::lowres_clock::time_point now, bool run_controller) {
+void compaction_manager_impl::tick_direct_deadlines(seastar::lowres_clock::time_point now) {
+    // Nothing here yields, so the groups cannot change under it and it needs neither a snapshot of
+    // them nor a re-check after each one.
+    for (const auto& [cg, state] : _groups) {
+        _sm.tick_direct_deadlines(*cg, now);
+    }
+}
+
+future<> compaction_manager_impl::run_direct_controller() {
     // The groups are re-checked after every yield: one of them can be removed while this walks them.
     std::vector<logstor_group*> group_snapshot;
     group_snapshot.reserve(_groups.size());
@@ -2980,7 +3012,7 @@ future<> compaction_manager_impl::tick_direct_writes(seastar::lowres_clock::time
         if (!_groups.contains(cg)) {
             continue;
         }
-        co_await _sm.tick_direct_writes(*cg, now, run_controller);
+        co_await _sm.run_direct_controller(*cg);
     }
 }
 
