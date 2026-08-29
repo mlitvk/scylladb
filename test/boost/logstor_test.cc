@@ -2836,6 +2836,64 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_removed_group_writes_out_what_it_took_dire
     assert_that(*actual).is_equal_to(expected);
 }
 
+// A controller pass waits inside the group it is deciding on - a demotion writes the group's
+// buffers out before it gives them back - and removal takes the group out of the compaction
+// manager before it waits for anything of its own, so being registered is not what keeps the group
+// alive across that wait. Checks that removing a group waits for the pass that is already in it:
+// its caller destroys the group as soon as the removal is done, and a pass that resumed after that
+// would be walking freed memory.
+SEASTAR_THREAD_TEST_CASE(test_logstor_removing_a_group_waits_for_the_direct_write_controller) {
+    if constexpr (!std::is_same_v<utils::error_injection_type, utils::error_injection<true>>) {
+        return;
+    }
+
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    auto params = direct_write_params();
+    // Short enough that a controller pass comes around while the test is waiting for one.
+    params.direct_sync_period = std::chrono::milliseconds(40);
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path(), params), cache.shared_tracker);
+    ls.do_recovery_for_test().get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    auto& injector = utils::get_local_injector();
+    injector.enable("logstor_direct_controller_pass");
+    auto disable_injection = seastar::defer([&injector] noexcept {
+        injector.disable("logstor_direct_controller_pass");
+    });
+
+    test_logstor_group cg(schema, ls);
+    await_direct_buffers(ls, cg);
+
+    // Something for the removal to do once it gets to the group, so that a removal which did not
+    // wait would still have work of its own left rather than being trivially done.
+    auto expected = make_kv_mutation(schema, "pk0", "unflushed");
+    ls.write(expected, write_target(&cg, {}), db::no_timeout).get();
+    BOOST_REQUIRE(cg.direct_has_data());
+
+    // Park a controller pass on the group.
+    await_until([&injector] { return injector.waiters("logstor_direct_controller_pass") > 0; });
+
+    auto removed = ls.get_compaction_manager().remove(cg);
+    seastar::sleep(std::chrono::milliseconds(100)).get();
+    BOOST_REQUIRE(!removed.available());
+
+    injector.receive_message("logstor_direct_controller_pass");
+    removed.get();
+
+    // The removal did what it always does, after the pass was out of the group.
+    BOOST_REQUIRE(!cg.direct_writes_enabled());
+    BOOST_REQUIRE(!cg.direct_has_data());
+
+    auto actual = ls.read(*schema, cg.logstor_index(), expected.decorated_key(), schema->full_slice()).get();
+    BOOST_REQUIRE(actual);
+    assert_that(*actual).is_equal_to(expected);
+}
+
 // The same, at shutdown: stopping the store writes out what the groups took directly, and gives
 // back the buffers and the segments that were bound to them but never written.
 SEASTAR_THREAD_TEST_CASE(test_logstor_stop_writes_out_what_was_taken_directly) {

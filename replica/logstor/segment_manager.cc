@@ -626,6 +626,12 @@ private:
         shared_future<> completion{make_ready_future<>()};
         abort_source as;
         int compaction_disabled_counter{0};
+        // Held by a direct write controller pass for as long as it is working on the group. The
+        // pass waits inside the group - a demotion writes the group's buffers out - and remove()
+        // takes the group out of the map before it waits for anything, so being in the map is not
+        // what keeps the group alive across that wait. This is: remove() closes the gate, on the
+        // state it moved out of the map, before it touches the group at all.
+        seastar::gate direct_controller_gate;
 
         bool running() const noexcept {
             return !completion.available();
@@ -2578,6 +2584,11 @@ future<> compaction_manager_impl::remove(logstor_group& cg) {
     auto state = std::move(it->second);
     _groups.erase(it);
 
+    // The group is out of the map, so no controller pass can pick it up any more; this waits for
+    // the one that already has. The caller destroys the group once this returns, and a pass
+    // suspended inside it would resume into freed memory.
+    co_await state->direct_controller_gate.close();
+
     auto direct_result = co_await coroutine::as_future(cg.close_direct_writes());
     if (direct_result.failed()) {
         logstor_logger.warn("Failed to close the direct writes of a logstor compaction group: {}",
@@ -3142,9 +3153,16 @@ future<> compaction_manager_impl::run_direct_controller(unsigned periods) {
 
     for (auto* cg : group_snapshot) {
         co_await coroutine::maybe_yield();
-        if (!_groups.contains(cg)) {
+        auto it = _groups.find(cg);
+        if (it == _groups.end()) {
             continue;
         }
+        // Taken while the group is still registered, and with nothing awaited since the lookup, so
+        // the gate cannot already be closed. It is what keeps the group alive across the waits
+        // below, see group_compaction_state::direct_controller_gate.
+        auto holder = it->second->direct_controller_gate.hold();
+        co_await utils::get_local_injector().inject("logstor_direct_controller_pass",
+                utils::wait_for_message(std::chrono::seconds(60)));
         co_await _sm.run_direct_controller(*cg, periods);
     }
 }
