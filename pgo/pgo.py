@@ -910,8 +910,8 @@ LOGSTOR_TRAIN_OPS = 4000000
 LOGSTOR_TRAIN_MIX = "ops(row-insert=600,read-cache=400,read-disk=200,row-delete=100,scan=1)"
 
 # What a logstor run is checked against. The pool gauges say whether it stayed in the
-# regime it was sized for, the compaction and cache counters say whether the paths it is
-# there to train ran at all, and the failure counters say whether it stalled.
+# regime it was sized for, the compaction, cache and direct write counters say whether the
+# paths it is there to train ran at all, and the failure counters say whether it stalled.
 LOGSTOR_METRICS = [
     "scylla_logstor_sm_live_record_bytes",
     "scylla_logstor_sm_live_record_count",
@@ -922,8 +922,19 @@ LOGSTOR_METRICS = [
     "scylla_logstor_sm_compaction_segments_in",
     "scylla_logstor_sm_compaction_records_rewritten",
     "scylla_logstor_sm_compaction_bytes_written",
+    "scylla_logstor_sm_compaction_batches_refused",
+    "scylla_logstor_sm_separator_bytes_written",
     "scylla_logstor_sm_separator_buffer_flushed",
     "scylla_logstor_sm_segment_pool_normal_segments_wait",
+    "scylla_logstor_sm_direct_bytes_written",
+    "scylla_logstor_sm_direct_records_written",
+    "scylla_logstor_sm_direct_hot_groups",
+    "scylla_logstor_sm_direct_full_flushes",
+    "scylla_logstor_sm_direct_deadline_flushes",
+    "scylla_logstor_sm_direct_flush_waits",
+    "scylla_logstor_sm_direct_fallbacks",
+    "scylla_logstor_sm_direct_read_hits",
+    "scylla_logstor_sm_direct_flush_failures",
     "scylla_logstor_sm_write_failures",
     "scylla_logstor_write_failures",
     "scylla_cache_partition_hits",
@@ -945,6 +956,12 @@ async def report_logstor_state(addrs: list[str], phase: str) -> None:
     capacity = segments * 128 * 1024
     live = m["scylla_logstor_sm_live_record_bytes"]
     records = m["scylla_logstor_sm_live_record_count"]
+    # The four sources that write to a segment, kept apart: the first two are the two write
+    # paths a record can take, and what a run is worth depends on both of them having run.
+    direct_written = m["scylla_logstor_sm_direct_bytes_written"]
+    normal_written = m["scylla_logstor_sm_bytes_written"]
+    separator_written = m["scylla_logstor_sm_separator_bytes_written"]
+    compaction_written = m["scylla_logstor_sm_compaction_bytes_written"]
     training_logger.info(
         f"logstor {phase}:"
         f" pool {capacity/2**30:.2f} GiB in {segments:.0f} segments,"
@@ -954,30 +971,52 @@ async def report_logstor_state(addrs: list[str], phase: str) -> None:
     )
     training_logger.info(
         f"logstor {phase}:"
-        f" wrote {m['scylla_logstor_sm_bytes_written']/2**30:.2f} GiB,"
-        f" read {m['scylla_logstor_sm_bytes_read']/2**30:.2f} GiB,"
+        f" wrote {(direct_written + normal_written + separator_written + compaction_written)/2**30:.2f} GiB"
+        f" ({direct_written/2**30:.2f} directly,"
+        f" {normal_written/2**30:.2f} to the active segment,"
+        f" {separator_written/2**30:.2f} by the separator,"
+        f" {compaction_written/2**30:.2f} by compaction),"
+        f" read {m['scylla_logstor_sm_bytes_read']/2**30:.2f} GiB"
+    )
+    training_logger.info(
+        f"logstor {phase}:"
         f" compacted {m['scylla_logstor_sm_compaction_segments_in']:.0f} segments"
-        f" rewriting {m['scylla_logstor_sm_compaction_records_rewritten']:.0f} records"
-        f" ({m['scylla_logstor_sm_compaction_bytes_written']/2**30:.2f} GiB),"
-        f" separator flushed {m['scylla_logstor_sm_separator_buffer_flushed']:.0f} buffers"
+        f" rewriting {m['scylla_logstor_sm_compaction_records_rewritten']:.0f} records,"
+        f" refused {m['scylla_logstor_sm_compaction_batches_refused']:.0f} batches,"
+        f" separator flushed {m['scylla_logstor_sm_separator_buffer_flushed']:.0f} buffers,"
+        f" {m['scylla_logstor_sm_segment_pool_normal_segments_wait']:.0f} writes waited for a segment"
+    )
+    training_logger.info(
+        f"logstor {phase}:"
+        f" {m['scylla_logstor_sm_direct_hot_groups']:.0f} groups writing directly,"
+        f" {m['scylla_logstor_sm_direct_records_written']:.0f} records taken directly,"
+        f" {m['scylla_logstor_sm_direct_full_flushes']:.0f} full and"
+        f" {m['scylla_logstor_sm_direct_deadline_flushes']:.0f} deadline flushes,"
+        f" {m['scylla_logstor_sm_direct_flush_waits']:.0f} writes waited for one,"
+        f" {m['scylla_logstor_sm_direct_fallbacks']:.0f} fell back,"
+        f" {m['scylla_logstor_sm_direct_read_hits']:.0f} reads served from a buffer"
     )
     training_logger.info(
         f"logstor {phase}:"
         f" cache {m['scylla_cache_partition_hits']:.0f} hits,"
         f" {m['scylla_cache_partition_misses']:.0f} misses,"
         f" {m['scylla_cache_partition_insertions']:.0f} insertions,"
-        f" {m['scylla_cache_partition_evictions']:.0f} evictions,"
-        f" {m['scylla_logstor_sm_segment_pool_normal_segments_wait']:.0f} writes waited for a segment"
+        f" {m['scylla_cache_partition_evictions']:.0f} evictions"
     )
-    # A pool with no room left is the one way this workload stops measuring what it is
-    # for: the writes fail instead of being served, and what the run then spends its time
-    # on is compaction failing to keep up rather than the paths it is here to train.
-    if failures := m["scylla_logstor_sm_write_failures"] + m["scylla_logstor_write_failures"]:
-        training_logger.warning(f"logstor {phase}: {failures:.0f} writes failed"
-                                f" ({m['scylla_logstor_write_failures']:.0f} in logstor,"
-                                f" {m['scylla_logstor_sm_write_failures']:.0f} in the segment manager)."
+    # The two ways a write can fail say two different things, and the fix differs with them.
+    if failures := m["scylla_logstor_sm_write_failures"]:
+        training_logger.warning(f"logstor {phase}: {failures:.0f} writes failed in the segment manager."
                                 f" The segment pool is too small for LOGSTOR_ROWS.")
-    elif capacity and live > 0.85 * capacity:
+    if failures := m["scylla_logstor_write_failures"]:
+        training_logger.warning(f"logstor {phase}: {failures:.0f} writes were refused before reaching a segment,"
+                                f" which is logstor rejecting them once its queue of writes waiting for a"
+                                f" buffer holds more than 1% of the memory of the shard."
+                                f" A shard is taking writes faster than it can put them on the disk,"
+                                f" and the records of the refused ones are lost on that replica.")
+    if failures := m["scylla_logstor_sm_direct_flush_failures"]:
+        training_logger.warning(f"logstor {phase}: {failures:.0f} direct write buffers failed to reach the disk."
+                                f" Their memory and their segments are held for the life of the node.")
+    if capacity and live > 0.85 * capacity:
         training_logger.warning(f"logstor {phase}: the live records take {100*live/capacity:.1f}% of the pool,"
                                 f" leaving compaction almost nothing to reclaim."
                                 f" Lower LOGSTOR_ROWS or raise LOGSTOR_DISK_SIZE_IN_MB.")
