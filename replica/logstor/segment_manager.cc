@@ -794,6 +794,30 @@ enum class write_source {
 
 static constexpr size_t write_source_count = 5;
 
+// Why a write of a group that is taking direct writes could not be taken by the direct path. They
+// are counted apart because they call for different answers: no buffer means the shard is short of
+// segments or of write buffer memory, a flush in flight means the group outruns what two buffers of
+// a segment each can carry between flushes, and a record too large is neither.
+enum class direct_fallback_reason {
+    no_buffer,
+    flush_in_flight,
+    record_too_large,
+};
+
+static constexpr size_t direct_fallback_reason_count = 3;
+
+// Labels the direct_fallbacks counter, so that a dashboard can sum the reasons or tell them apart.
+static const seastar::metrics::label direct_fallback_reason_label("reason");
+
+static sstring direct_fallback_reason_to_string(direct_fallback_reason reason) {
+    switch (reason) {
+        case direct_fallback_reason::no_buffer: return "no_buffer";
+        case direct_fallback_reason::flush_in_flight: return "flush_in_flight";
+        case direct_fallback_reason::record_too_large: return "record_too_large";
+    }
+    return "unknown";
+}
+
 static sstring write_source_to_string(write_source src) {
     switch (src) {
         case write_source::normal_write: return "normal_write";
@@ -921,7 +945,7 @@ class segment_manager_impl {
         uint64_t separator_task_failures{0};
         uint64_t segment_free_failures{0};
         uint64_t direct_records_written{0};
-        uint64_t direct_fallbacks{0};
+        std::array<uint64_t, direct_fallback_reason_count> direct_fallbacks{0};
         uint64_t direct_read_hits{0};
         uint64_t direct_flush_failures{0};
         // The memory of the buffers whose write failed, which the shard keeps so that the records
@@ -1525,8 +1549,15 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
                        sm::description("Counts number of data bytes written to segments by the direct write path.")),
         sm::make_counter("direct_records_written", _stats.direct_records_written,
                        sm::description("Counts number of records taken by the direct write path, and therefore acknowledged before they were on the disk.")),
-        sm::make_counter("direct_fallbacks", _stats.direct_fallbacks,
-                       sm::description("Counts number of writes of a group that takes direct writes that the direct path could not take, and that went the ordinary way instead - because the group's flush was still in flight, or because the record does not fit a buffer.")),
+        sm::make_counter("direct_fallbacks", _stats.direct_fallbacks[static_cast<size_t>(direct_fallback_reason::no_buffer)],
+                       sm::description("Counts number of writes of a group that takes direct writes that the direct path could not take, and that went the ordinary way instead. The reason label says which of them the shard can do something about: no_buffer means the group has no buffer to write into, because the shard had no write buffer or no segment to spare when its last flush finished; flush_in_flight means the group filled a buffer while the previous one was still being written out, which two buffers of a segment each cannot carry; record_too_large means the record does not fit a segment at all."),
+                       {direct_fallback_reason_label(direct_fallback_reason_to_string(direct_fallback_reason::no_buffer))}),
+        sm::make_counter("direct_fallbacks", _stats.direct_fallbacks[static_cast<size_t>(direct_fallback_reason::flush_in_flight)],
+                       sm::description("See the no_buffer reason of this counter."),
+                       {direct_fallback_reason_label(direct_fallback_reason_to_string(direct_fallback_reason::flush_in_flight))}),
+        sm::make_counter("direct_fallbacks", _stats.direct_fallbacks[static_cast<size_t>(direct_fallback_reason::record_too_large)],
+                       sm::description("See the no_buffer reason of this counter."),
+                       {direct_fallback_reason_label(direct_fallback_reason_to_string(direct_fallback_reason::record_too_large))}),
         sm::make_counter("direct_read_hits", _stats.direct_read_hits,
                        sm::description("Counts number of reads served out of a direct write buffer, of a record that had been acknowledged but was not on the disk yet.")),
         sm::make_counter("direct_full_flushes", _stats.direct_full_flushes,
@@ -1795,24 +1826,36 @@ std::optional<log_location> segment_manager_impl::try_write_direct(logstor_group
     // measures, and a cold group is promoted on it.
     cg._direct_bytes_this_period += writer.size();
 
-    if (!cg._direct_enabled || !cg._direct_active.bound()) {
+    if (!cg._direct_enabled) {
         return std::nullopt;
     }
 
     auto& active = cg._direct_active;
+    if (!active.bound()) {
+        // The group is hot but its last flush could not be given a buffer or a segment for what it
+        // gave back. Counted, because a shard whose reserve is short takes this shape.
+        ++_stats.direct_fallbacks[static_cast<size_t>(direct_fallback_reason::no_buffer)];
+        return std::nullopt;
+    }
+
     if (!active.buf->can_fit(writer)) {
         if (!cg._direct_flush.available()) {
             // The previous rotation is still being written out, so there is no spare to rotate
             // into. The record takes the ordinary path, and with it that path's back-pressure.
-            ++_stats.direct_fallbacks;
+            ++_stats.direct_fallbacks[static_cast<size_t>(direct_fallback_reason::flush_in_flight)];
             return std::nullopt;
         }
         ++_stats.direct_full_flushes;
         rotate_direct_buffer(cg);
-        if (!active.bound() || !active.buf->can_fit(writer)) {
-            // Either the rotation had no spare to give, or the record does not fit an empty buffer
-            // at all - the ordinary path bounds it by max_record_size_any_kind and rejects it there.
-            ++_stats.direct_fallbacks;
+        if (!active.bound()) {
+            // The rotation had no spare to give.
+            ++_stats.direct_fallbacks[static_cast<size_t>(direct_fallback_reason::no_buffer)];
+            return std::nullopt;
+        }
+        if (!active.buf->can_fit(writer)) {
+            // The record does not fit an empty buffer at all - the ordinary path bounds it by
+            // max_record_size_any_kind and rejects it there.
+            ++_stats.direct_fallbacks[static_cast<size_t>(direct_fallback_reason::record_too_large)];
             return std::nullopt;
         }
     }
