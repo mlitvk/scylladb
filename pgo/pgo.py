@@ -879,22 +879,23 @@ LOGSTOR_NODE_OPTS = [
 ]
 
 # Partitions of the dataset, which is what sizes it against the pool above. A row of
-# ./conf/logstor.yaml is ~1 KiB of values and measures ~1.9 KiB as a record, since a
-# record carries the description of the schema along with the frozen mutation. Every one
-# of the three RF=3 nodes holds the whole dataset, so the live bytes of the cluster come
-# to 3 * LOGSTOR_ROWS * 1.9 KiB against the 3 * 2 * LOGSTOR_DISK_SIZE_IN_MB of pool that
-# its six shards have between them - 0.83 GiB of 1.5 GiB, or 55%. The training mix deletes
-# one partition for every six it inserts, which settles that at ~6/7 of what was
-# populated, leaving the run at about half a pool.
+# ./conf/logstor.yaml is ~1 KiB of values and measures ~1.25 KiB as a record: the record
+# format carries the row's cells with a byte of flags each and a description of the schema
+# they belong to, which for this schema is ~200 B of column and type names. Every one of the
+# three RF=3 nodes holds the whole dataset, so the live bytes of the cluster come to
+# 3 * LOGSTOR_ROWS * 1.25 KiB against the 3 * 2 * LOGSTOR_DISK_SIZE_IN_MB of pool that its
+# six shards have between them - 0.84 GiB of 1.5 GiB, or 56%. The training mix deletes one
+# partition for every six it inserts, which settles that at ~6/7 of what was populated,
+# leaving the run at about half a pool.
 #
 # report_logstor_state() prints what it actually came to, so re-derive this from a run
 # rather than from the estimate above whenever ./conf/logstor.yaml changes shape.
-LOGSTOR_ROWS = 150000
+LOGSTOR_ROWS = 235000
 
-# Operations of the training workload. The dataset leaves ~45% of the pool free, which the
+# Operations of the training workload. The dataset leaves ~44% of the pool free, which the
 # workload has to overwrite before compaction starts at all - a tenth of this run - and
 # what is left of it then runs against a pool that compaction is holding at ~92% in use.
-LOGSTOR_TRAIN_OPS = 2600000
+LOGSTOR_TRAIN_OPS = 4000000
 
 # The mix. Writes are weighted above reads because they also drive the compaction, the
 # separator and the segment allocation that no read touches. read-cache is not only a
@@ -943,12 +944,13 @@ async def report_logstor_state(addrs: list[str], phase: str) -> None:
     segments = m["scylla_logstor_sm_segments_in_use"] + m["scylla_logstor_sm_free_segments"]
     capacity = segments * 128 * 1024
     live = m["scylla_logstor_sm_live_record_bytes"]
+    records = m["scylla_logstor_sm_live_record_count"]
     training_logger.info(
         f"logstor {phase}:"
         f" pool {capacity/2**30:.2f} GiB in {segments:.0f} segments,"
         f" {live/2**30:.2f} GiB live ({100*live/capacity if capacity else 0:.1f}% of the pool),"
         f" {m['scylla_logstor_sm_segments_in_use']/segments*100 if segments else 0:.1f}% of the segments in use,"
-        f" {m['scylla_logstor_sm_live_record_count']:.0f} records"
+        f" {records:.0f} records of {live/records if records else 0:.0f} B"
     )
     training_logger.info(
         f"logstor {phase}:"

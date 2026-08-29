@@ -67,7 +67,7 @@ columnspec:
     size: uniform(16..50)
 
   - name: userdata
-    size: fixed(840) # row size ~ 1k
+    size: fixed(840) # ~1 KiB of values per row, which is ~1.25 KiB as a logstor record
 
 queries:
   row-insert:
