@@ -2153,7 +2153,12 @@ future<temporary_buffer<char>> segment_manager_impl::read_record_bytes(log_locat
     // synchronous, so nothing can give the buffer back to its pool between finding it and reading
     // it, and the bytes of a record never change once it has been appended - sealing only fills in
     // the header area the buffer reserved and pads its tail.
-    if (!_direct_readable.empty()) [[unlikely]] {
+    //
+    // A segment that belongs to a compaction group has been written, and one a buffer is bound to
+    // belongs to none until then, so the descriptor rules most reads out with one load. Checking
+    // that the map is non-empty would not: a group that is taking direct writes has its buffers in
+    // it from the moment they are bound, so it is never empty while the path is doing anything.
+    if (!get_segment_descriptor(location.segment).owner) [[unlikely]] {
         if (auto it = _direct_readable.find(location.segment.value); it != _direct_readable.end()) {
             ++_stats.direct_read_hits;
             co_return temporary_buffer<char>(it->second->data() + location.offset, location.size);
