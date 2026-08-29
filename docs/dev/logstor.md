@@ -114,10 +114,17 @@ worth it.
    a compaction. While the buffer fills, its segment is unwritten and belongs to no segment set, so
    nothing can pick it for compaction, scan it or free it. The group rotates into its second buffer
    while the first one is being written, and is given a fresh buffer and segment afterwards.
-4. A read of a record that has been acknowledged but is not on the disk yet is served out of the
+4. Giving it one is best effort. A buffer and a segment are taken only if both can be had without
+   waiting, and a group whose slot stays unbound writes through the shared active segment until the
+   sync fiber can bind it - which is what it already does while a flush is in flight. The flush
+   itself must not wait for the next segment: everything that drains a group waits for it, so a
+   flush that waited for disk space would hang a table flush, a split, a snapshot or shutdown on a
+   shard whose segments have run out.
+5. A read of a record that has been acknowledged but is not on the disk yet is served out of the
    buffer: the segment manager keeps the buffers of the hot groups by the id of the segment each one
-   is bound to, and `read_record_bytes` looks there before it looks at the disk.
-5. The sequence number of the segment is assigned when the buffer is sealed, not when the segment
+   is bound to, and `read_record_bytes` looks there before it looks at the disk - for a segment that
+   belongs to no compaction group, which is the only kind a buffer can be bound to.
+6. The sequence number of the segment is assigned when the buffer is sealed, not when the segment
    was handed out, so that recovery's tie-break between records of equal timestamp still orders it
    against everything written while the buffer was filling.
 
@@ -136,6 +143,19 @@ follows from `logstor_direct_write_memory_in_mb`, the memory a shard may hold in
 divided by the two segments' worth a hot group takes - which is what bounds both the memory and the
 loss window. A budget with no room for a single group, `0` included, turns the path off, as does
 `batch` mode.
+
+A write that the disk refuses is the one case where the path keeps memory rather than giving it
+back: the buffer holds the only copy of records that were acknowledged, and its segment is left
+allocated because the index points into it, so both are kept and reads go on being served out of
+memory. That is the right trade once and the wrong one forever, so a group whose flushes fail three
+times in a row is put back on the ordinary path - which reports the failure to the caller instead of
+taking the record into memory and calling it acknowledged - and once the kept buffers hold the whole
+`logstor_direct_write_memory_in_mb` budget the path goes off for the rest of the life of the shard.
+
+Every drain writes these buffers out rather than dropping them, with one exception: discarding a
+group's segments, which a truncate does after clearing the index, gives them up instead. Nothing
+points at their records by then, and writing them out would put a segment nothing can reach into a
+group that was emptied on purpose.
 
 This path is a prototype, and one of the things it does not do yet makes it unsafe for real data.
 Read [Direct Writes: State of the Implementation](#direct-writes-state-of-the-implementation) before
@@ -181,8 +201,10 @@ split does not acknowledge an empty group that is still holding records.
   is the same class of race as the fresh-sequence rewrites the separator and compaction already do -
   but it is a race the ordinary path on its own does not have.
 - **Tablet operations racing the window are only covered by the drain hooks.** The hooks are the
-  right ones and they are exercised, but there are no tests for an operation that starts while a
-  buffer is filling, and none for a migration or a merge specifically.
+  right ones and they are exercised - the truncate path, whose window between the flush and the
+  discard is the widest of them, gives its buffers up in `discard_segments()` - but there are no
+  tests for an operation that starts while a buffer is filling, and none for a migration or a merge
+  specifically.
 - **Recovery is untested against this path.** No code change was needed - the segments a direct
   write produces are ordinary full segments, and an unwritten pre-bound segment loses on sequence
   number the same way a reused free slot does - but "no change needed" is an argument, not a test.
