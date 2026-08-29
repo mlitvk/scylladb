@@ -58,6 +58,14 @@ class logstor {
     future<> write_through_buffer(log_record_writer, primary_index_key, api::timestamp_type ts, primary_index&,
             write_target, db::timeout_clock::time_point timeout, seastar::gate::holder);
 
+    // A record the direct path could have taken but for the group's buffer being full while the one
+    // before it was still being written out. It waits for that write and offers the record again,
+    // and only takes the shared write buffer - and with it a second trip to the disk - if the group
+    // still cannot have it. The record is owned by then, which is what the shared path needs anyway
+    // and what this needs to survive the wait.
+    future<> write_direct_after_flush(primary_index_key, bytes value, api::timestamp_type ts, table_id,
+            primary_index&, write_target, db::timeout_clock::time_point timeout, seastar::gate::holder);
+
     // The part of a read the cache could not answer: the record is read from its segment, decoded,
     // and admitted to the cache. What read() holds for the duration of a read is handed over to it,
     // because this is where such a read ends.

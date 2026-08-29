@@ -41,6 +41,26 @@ static constexpr uint64_t default_file_size = 32 * 1024 * 1024;
 // Two buffers of a segment each for every one of eight hot groups, at the default segment size.
 static constexpr size_t default_direct_write_memory = 2 * 1024 * 1024;
 
+// Whether a record is being offered to the direct write path for the first time, or again after
+// its caller waited for the group's flush. The second offer does not count the record against the
+// group's write rate a second time, and is never asked to wait again.
+enum class direct_write_attempt {
+    first,
+    after_flush,
+};
+
+// What the direct write path did with a record, see segment_manager::try_write_direct().
+struct direct_write_result {
+    // Where the record landed, when the path took it.
+    std::optional<log_location> location;
+    // Set instead when the group could have taken the record but its buffer is full and the one
+    // before it is still being written out. Waiting for that flush and offering the record again
+    // costs at most one segment write - about what the ordinary path would wait for anyway, the
+    // disk being the same - and saves the record the second trip to the disk that path gives it.
+    // See logstor_group::await_direct_flush().
+    bool retry_after_flush = false;
+};
+
 /// Configuration for the segment manager
 struct segment_manager_config {
     std::filesystem::path base_dir;
@@ -142,15 +162,16 @@ public:
     // so a caller that inserts this location into the index is acknowledging the write before it is
     // durable - see direct_group_writes.
     //
-    // Returns nullopt when the group is not taking direct writes, when it has no buffer to take the
-    // record right now, or when the record does not fit one. The caller then writes it the ordinary
-    // way. Never waits.
+    // Gives back neither a location nor a reason to wait when the group is not taking direct
+    // writes, when it has no buffer to take the record right now, or when the record does not fit
+    // one. The caller then writes it the ordinary way. Never waits itself.
     //
     // It takes the record's parts rather than a writer over them, and builds the writer itself once
     // it knows the group can be written into: the caller has no record of its own yet - the record
-    // that goes through the shared buffer is built only if this returns nullopt - and a
+    // that goes through the shared buffer is built only if this declines the write - and a
     // configuration with direct writes off must not pay for a writer nothing will use.
-    std::optional<log_location> try_write_direct(logstor_group&, const log_record_header_view&, bytes_view value);
+    direct_write_result try_write_direct(logstor_group&, const log_record_header_view&, bytes_view value,
+            direct_write_attempt = direct_write_attempt::first);
 
     // The bytes of one record, as they are on disk: the read of a record does not parse its
     // header, which holds a key the read already has, and decodes its value straight out of

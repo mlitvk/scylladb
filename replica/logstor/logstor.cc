@@ -160,18 +160,27 @@ future<> logstor::write(const mutation& m, write_target target, db::timeout_cloc
         .key = managed_bytes_view(dk.key().representation()),
     };
 
-    if (auto location = _segment_manager.try_write_direct(cg, header, encoded)) {
-        index.insert(primary_index_key(dk), index_entry{.location = *location, .timestamp = ts});
+    const auto direct = _segment_manager.try_write_direct(cg, header, encoded);
+    if (direct.location) {
+        index.insert(primary_index_key(dk), index_entry{.location = *direct.location, .timestamp = ts});
         return make_ready_future<>();
     }
 
-    // The record that goes through the shared buffer owns its value, because the separator replays
-    // a retained copy of it after the buffer it was appended to has been reset. The exact bytes are
-    // copied out of the encoder's buffer, which is still the one holding this partition.
+    // A record that is not taken here has to own itself, whichever of the two ways below it goes:
+    // the shared buffer needs it because the separator replays a retained copy after the buffer it
+    // was appended to has been reset, and a record that waits for the group's flush needs it
+    // because neither the encoder's buffer nor the mutation's key will still be its own by then.
+    // The exact bytes are copied out of the encoder's buffer, which is still the one holding this
+    // partition.
     bytes value(bytes::initialized_later(), encoded.size());
     std::memcpy(value.data(), encoded.data(), encoded.size());
-
     primary_index_key key(dk);
+
+    if (direct.retry_after_flush) {
+        return write_direct_after_flush(std::move(key), std::move(value), ts, table, index,
+                std::move(target), timeout, std::move(gate_holder));
+    }
+
     log_record record {
         .header = {
             .key = key,
@@ -183,6 +192,47 @@ future<> logstor::write(const mutation& m, write_target target, db::timeout_cloc
 
     // The key is moved rather than copied: what the record carries is a copy of its own, made above.
     return write_through_buffer(log_record_writer(std::move(record)), std::move(key), ts, index,
+            std::move(target), timeout, std::move(gate_holder));
+}
+
+future<> logstor::write_direct_after_flush(primary_index_key key, bytes value, api::timestamp_type ts,
+        table_id table, primary_index& index, write_target target,
+        db::timeout_clock::time_point timeout, seastar::gate::holder gate_holder) {
+    auto& cg = *target.cg;
+
+    // The write target is held across this, so the group is still there to be written into when the
+    // wait is over. A failure here is the timeout running out; the ordinary path below is given the
+    // same timeout and is what reports it.
+    auto waited = co_await coroutine::as_future(cg.await_direct_flush(timeout));
+    if (!waited.failed()) {
+        const auto header = log_record_header_view {
+            .token = key.dk.token(),
+            .timestamp = ts,
+            .table = table,
+            .key = managed_bytes_view(key.dk.key().representation()),
+        };
+        // Offered once more, and not asked to wait again: the group may have rotated for another
+        // write while this one waited, or lost its buffers altogether.
+        const auto direct = _segment_manager.try_write_direct(cg, header, value,
+                direct_write_attempt::after_flush);
+        if (direct.location) {
+            index.insert(std::move(key), index_entry{.location = *direct.location, .timestamp = ts});
+            co_return;
+        }
+    } else {
+        waited.ignore_ready_future();
+    }
+
+    log_record record {
+        .header = {
+            .key = key,
+            .timestamp = ts,
+            .table = table,
+        },
+        .value = row_value{std::move(value)},
+    };
+
+    co_await write_through_buffer(log_record_writer(std::move(record)), std::move(key), ts, index,
             std::move(target), timeout, std::move(gate_holder));
 }
 

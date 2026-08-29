@@ -2694,6 +2694,59 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_direct_write_takes_a_buffer_as_soon_as_the
     BOOST_REQUIRE(writer.direct_has_data());
 }
 
+// A group can only have one flush in flight, so a burst that fills its second buffer before the
+// first one reaches the disk has nowhere to go. Taking the ordinary path there would write those
+// records to the disk twice, which is the one thing the direct path exists to avoid, so they wait
+// for the flush instead and are offered to the group again - which is what the shared write buffer
+// does with its own ring when it is full, rather than having a more expensive path to escape to.
+//
+// The writes are issued without waiting for each one, because a direct write is done when it
+// returns: the whole burst reaches the group before the first flush can have finished.
+SEASTAR_THREAD_TEST_CASE(test_logstor_direct_write_waits_for_a_flush_instead_of_taking_the_shared_buffer) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path(), direct_write_params()), cache.shared_tracker);
+    ls.do_recovery_for_test().get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+    await_direct_buffers(ls, cg);
+
+    // Records of a third of a segment each, two to a buffer: the fifth and the sixth arrive with
+    // both of the group's buffers spoken for and the first of them still being written out.
+    const auto record_size = ls.get_segment_manager().get_segment_size() / 3;
+    constexpr unsigned record_count = 6;
+    std::vector<mutation> expected;
+    std::vector<future<>> writes;
+    expected.reserve(record_count);
+    writes.reserve(record_count);
+    for (unsigned i = 0; i < record_count; ++i) {
+        expected.push_back(make_kv_mutation_of_record_size(schema, format("pk{}", i), record_size));
+        writes.push_back(ls.write(expected.back(), write_target(&cg, {}), db::no_timeout));
+    }
+    for (auto& write : writes) {
+        write.get();
+    }
+
+    cg.flush_direct_writes().get();
+    BOOST_REQUIRE(!cg.direct_has_data());
+
+    // The whole burst went into segments of the group. Had any of it taken the ordinary path, the
+    // separator would be holding it for the group here.
+    ls.flush_to_separator().get();
+    BOOST_REQUIRE(!cg.separator_has_data());
+    BOOST_REQUIRE_GE(cg.logstor_segments().segment_count(), 3u);
+
+    for (const auto& m : expected) {
+        auto actual = ls.read(*schema, cg.logstor_index(), m.decorated_key(), schema->full_slice()).get();
+        BOOST_REQUIRE(actual);
+        assert_that(*actual).is_equal_to(m);
+    }
+}
+
 // A group is removed while it still holds records that are only in memory. Unlike the separator's
 // buffers, which hold a second copy of records that are already on the disk, these are the only
 // copy there is, so removing the group has to write them out rather than discard them.

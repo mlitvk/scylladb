@@ -835,6 +835,12 @@ public:
     // in a segment of the group. This is the drain every tablet operation goes through.
     future<> flush_direct_writes();
 
+    // Waits for the flush the group already has in flight, so that a write which found the group's
+    // buffer full can offer its record again instead of taking the ordinary path, which would write
+    // it to the disk twice. Fails once `timeout` has passed, which the caller answers by taking the
+    // ordinary path after all - with the same timeout, which reports it.
+    future<> await_direct_flush(db::timeout_clock::time_point timeout);
+
     // Stops taking direct writes, flushes what is already buffered and gives the buffers and their
     // segments back. Unlike close_separator() this flushes rather than discards: a record here is
     // nowhere else, and the index already points at the segment the buffer has yet to be written

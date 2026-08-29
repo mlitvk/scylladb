@@ -946,6 +946,9 @@ class segment_manager_impl {
         uint64_t separator_task_failures{0};
         uint64_t segment_free_failures{0};
         uint64_t direct_records_written{0};
+        // Records that found the group's buffer full and waited for its flush rather than take the
+        // ordinary path. Not a fallback: the record still reaches the disk once.
+        uint64_t direct_flush_waits{0};
         std::array<uint64_t, direct_fallback_reason_count> direct_fallbacks{0};
         uint64_t direct_read_hits{0};
         uint64_t direct_flush_failures{0};
@@ -1071,7 +1074,8 @@ public:
     future<> write_full_segment_tail(seg_ptr, write_buffer&, logstor_group&, write_source);
 
     // The direct write path, see direct_write_buffer.
-    std::optional<log_location> try_write_direct(logstor_group&, const log_record_header_view&, bytes_view value);
+    direct_write_result try_write_direct(logstor_group&, const log_record_header_view&, bytes_view value,
+            direct_write_attempt);
     void rotate_direct_buffer(logstor_group&);
     future<> flush_direct_buffer(logstor_group&, direct_write_buffer full);
     // Gives a slot a buffer and a segment of the group to put it in, if both can be had without
@@ -1548,6 +1552,8 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
                        sm::description("Counts number of bytes written to segments by the direct write path, which writes the records of a group straight into a segment of that group instead of through the shared active segment and the separator.")),
         sm::make_counter("direct_data_bytes_written", _stats.data_bytes_written[static_cast<size_t>(write_source::direct_write)],
                        sm::description("Counts number of data bytes written to segments by the direct write path.")),
+        sm::make_counter("direct_flush_waits", _stats.direct_flush_waits,
+                       sm::description("Counts number of writes of a group taking direct writes that found its buffer full while the buffer before it was still being written out, and waited for that write rather than take the ordinary path. The record still reaches the disk once, so this is the cost of the direct path being kept, paid in latency; the flush_in_flight reason of direct_fallbacks counts the ones that waited and still had to go the ordinary way.")),
         sm::make_counter("direct_records_written", _stats.direct_records_written,
                        sm::description("Counts number of records taken by the direct write path, and therefore acknowledged before they were on the disk.")),
         sm::make_counter("direct_fallbacks", _stats.direct_fallbacks[static_cast<size_t>(direct_fallback_reason::no_buffer)],
@@ -1815,20 +1821,23 @@ future<> segment_manager_impl::write_full_segment_tail(seg_ptr seg, write_buffer
 // The direct write path. See direct_write_buffer in compaction.hh for what it is and why the
 // segment immutability the rest of logstor rests on survives it.
 
-std::optional<log_location> segment_manager_impl::try_write_direct(logstor_group& cg,
-        const log_record_header_view& header, bytes_view value) {
+direct_write_result segment_manager_impl::try_write_direct(logstor_group& cg,
+        const log_record_header_view& header, bytes_view value, direct_write_attempt attempt) {
     if (!direct_writes_enabled()) {
-        return std::nullopt;
+        return {};
     }
 
     const auto writer = log_record_ref_writer(header, value);
 
-    // Counted for every write of the group, hot or cold: this is the write rate the controller
-    // measures, and a cold group is promoted on it.
-    cg._direct_bytes_this_period += writer.size();
+    if (attempt == direct_write_attempt::first) {
+        // Counted for every write of the group, hot or cold: this is the write rate the controller
+        // measures, and a cold group is promoted on it. Once per record, so that one offered again
+        // after a wait is not counted twice.
+        cg._direct_bytes_this_period += writer.size();
+    }
 
     if (!cg._direct_enabled) {
-        return std::nullopt;
+        return {};
     }
 
     auto& active = cg._direct_active;
@@ -1839,28 +1848,35 @@ std::optional<log_location> segment_manager_impl::try_write_direct(logstor_group
         // there is something to be had. Counted, because a shard whose reserve is short takes this
         // shape.
         ++_stats.direct_fallbacks[static_cast<size_t>(direct_fallback_reason::no_buffer)];
-        return std::nullopt;
+        return {};
     }
 
     if (!active.buf->can_fit(writer)) {
         if (!cg._direct_flush.available()) {
-            // The previous rotation is still being written out, so there is no spare to rotate
-            // into. The record takes the ordinary path, and with it that path's back-pressure.
+            // The buffer the group rotated into is full too and the one before it is still being
+            // written out, so there is nothing to rotate into. Waiting for that flush is what the
+            // ordinary path would cost anyway - the disk is the same one - and it keeps the record
+            // off a path that writes it to the disk twice, so the caller is asked to wait rather
+            // than told to go elsewhere. Once: a record offered again has to be taken or given up.
+            if (attempt == direct_write_attempt::first) {
+                ++_stats.direct_flush_waits;
+                return {.retry_after_flush = true};
+            }
             ++_stats.direct_fallbacks[static_cast<size_t>(direct_fallback_reason::flush_in_flight)];
-            return std::nullopt;
+            return {};
         }
         ++_stats.direct_full_flushes;
         rotate_direct_buffer(cg);
         if (!active.bound()) {
             // The rotation had no spare to give.
             ++_stats.direct_fallbacks[static_cast<size_t>(direct_fallback_reason::no_buffer)];
-            return std::nullopt;
+            return {};
         }
         if (!active.buf->can_fit(writer)) {
             // The record does not fit an empty buffer at all - the ordinary path bounds it by
             // max_record_size_any_kind and rejects it there.
             ++_stats.direct_fallbacks[static_cast<size_t>(direct_fallback_reason::record_too_large)];
-            return std::nullopt;
+            return {};
         }
     }
 
@@ -1874,8 +1890,8 @@ std::optional<log_location> segment_manager_impl::try_write_direct(logstor_group
 
     // A full segment holds exactly one buffer, at offset zero, so a record's offset in the buffer
     // is its offset in the segment. try_bind_direct_slot() checks that the segment is untouched.
-    return record_location(log_location{.segment = active.seg->id(), .offset = 0, .size = 0},
-            appended.record_header_offset, appended.total_size);
+    return {.location = record_location(log_location{.segment = active.seg->id(), .offset = 0, .size = 0},
+            appended.record_header_offset, appended.total_size)};
 }
 
 void segment_manager_impl::rotate_direct_buffer(logstor_group& cg) {
@@ -3502,9 +3518,9 @@ future<> segment_manager::write(write_buffer& wb) {
     return _impl->write(wb);
 }
 
-std::optional<log_location> segment_manager::try_write_direct(logstor_group& cg,
-        const log_record_header_view& header, bytes_view value) {
-    return _impl->try_write_direct(cg, header, value);
+direct_write_result segment_manager::try_write_direct(logstor_group& cg,
+        const log_record_header_view& header, bytes_view value, direct_write_attempt attempt) {
+    return _impl->try_write_direct(cg, header, value, attempt);
 }
 
 future<temporary_buffer<char>> segment_manager::read_record_bytes(log_location location) {
@@ -3679,6 +3695,15 @@ future<> logstor_group::flush_direct_writes() {
         logstor_compaction_manager().rotate_direct_buffer(*this);
         co_await await_direct_settled();
     }
+}
+
+future<> logstor_group::await_direct_flush(db::timeout_clock::time_point timeout) {
+    if (_direct_flush.available()) {
+        return make_ready_future<>();
+    }
+    // The flush reports its own failure and does not fail this future, so the only way this fails
+    // is the timeout running out.
+    return _direct_flush.get_future(timeout);
 }
 
 future<> logstor_group::close_direct_writes() {
