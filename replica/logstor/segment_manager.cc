@@ -995,7 +995,6 @@ class segment_manager_impl {
     // lifetime of the shard: the pool below is sized for exactly this many.
     size_t _max_hot_groups;
     write_buffer_pool _direct_buffer_pool;
-    abort_source _direct_buffer_abort;
     // The buffers of the groups that are taking direct writes, by the id of the segment each one is
     // bound to. A read of a record that is still only in memory is served out of these, which is
     // what makes a direct write visible as soon as it is acknowledged.
@@ -1042,13 +1041,16 @@ public:
     std::optional<log_location> try_write_direct(logstor_group&, const log_record_header_view&, bytes_view value);
     void rotate_direct_buffer(logstor_group&);
     future<> flush_direct_buffer(logstor_group&, direct_write_buffer full);
-    future<> bind_direct_buffer(logstor_group&, direct_write_buffer& slot);
+    // Gives a slot a buffer and a segment of the group to put it in, if both can be had without
+    // waiting. A group whose slot stays unbound writes through the shared active segment instead,
+    // which is what a caller does when this says no; the sync fiber retries. Synchronous, so a
+    // flush never has to wait for the next segment before it can report the records durable.
+    bool try_bind_direct_slot(logstor_group&, direct_write_buffer& slot);
     future<> release_direct_slot(direct_write_buffer& slot);
     future<> release_direct_buffers(logstor_group&);
     // Gives the group two buffers to write into and counts it as hot, unless the shard has no room
     // for another hot group. Says whether it did.
     bool promote_direct_group(logstor_group&);
-    future<> do_promote_direct_group(logstor_group&);
     // One pass over a group: the deadline of its buffer, and, once a period, whether it still
     // writes fast enough to keep its buffers - or fast enough to be given them.
     future<> tick_direct_writes(logstor_group&, seastar::lowres_clock::time_point now, bool run_controller);
@@ -1575,7 +1577,6 @@ future<> segment_manager_impl::stop() {
     logstor_logger.debug("Stopping the direct write sync fiber and flushing the direct write buffers");
     _direct_abort.request_abort();
     co_await std::move(_direct_sync_fiber).handle_exception([] (std::exception_ptr) {});
-    _direct_buffer_abort.request_abort();
     co_await _compaction_mgr.drain_all_direct_buffers().handle_exception([] (std::exception_ptr ep) {
         logstor_logger.warn("Failed to drain the logstor direct write buffers: {}", ep);
     });
@@ -1805,7 +1806,7 @@ std::optional<log_location> segment_manager_impl::try_write_direct(logstor_group
     _stats.direct_unflushed_bytes += appended.total_size;
 
     // A full segment holds exactly one buffer, at offset zero, so a record's offset in the buffer
-    // is its offset in the segment. bind_direct_buffer() checks that the segment is untouched.
+    // is its offset in the segment. try_bind_direct_slot() checks that the segment is untouched.
     return record_location(log_location{.segment = active.seg->id(), .offset = 0, .size = 0},
             appended.record_header_offset, appended.total_size);
 }
@@ -1848,16 +1849,15 @@ future<> segment_manager_impl::flush_direct_buffer(logstor_group& cg, direct_wri
                     " Its buffer is kept in memory so that its records stay readable, and neither it"
                     " nor the segment will be reclaimed", seg_id, cg.table_id(), written.get_exception());
             _direct_failed_buffers.push_back(std::move(full));
-            co_return;
+        } else {
+            _stats.direct_unflushed_bytes -= unflushed_bytes;
+            // Only now that the records are on the disk and their segment is in the group: until
+            // here a read of one of them had to come out of this buffer.
+            _direct_readable.erase(seg_id.value);
+            // Given back before another is asked for below, so a group never holds three at once.
+            full.buf.reset();
+            full.seg = {};
         }
-
-        _stats.direct_unflushed_bytes -= unflushed_bytes;
-        // Only now that the records are on the disk and their segment is in the group: until here a
-        // read of one of them had to come out of this buffer.
-        _direct_readable.erase(seg_id.value);
-        // Given back before another is asked for below, so a group never holds three at once.
-        full.buf.reset();
-        full.seg = {};
     } else if (full.bound()) {
         // Nothing went into it, so there is nothing to seal. Keep it rather than giving its segment
         // back only to take another one.
@@ -1868,27 +1868,48 @@ future<> segment_manager_impl::flush_direct_buffer(logstor_group& cg, direct_wri
         }
     }
 
-    // Give the group back what it rotated out of, so its next rotation has somewhere to go.
-    co_await bind_direct_buffer(cg, cg._direct_active);
-    co_await bind_direct_buffer(cg, cg._direct_spare);
+    // Give the group back what it rotated out of, so its next rotation has somewhere to go. Best
+    // effort and synchronous: what this future means is that the records are on the disk and their
+    // segment is in the group, and making it also mean "and the next segment is in hand" is what
+    // would put an unbounded wait for disk space on every drain that waits for it. A slot left
+    // unbound here is bound by the sync fiber once the shard has room for it again.
+    try_bind_direct_slot(cg, cg._direct_active);
+    try_bind_direct_slot(cg, cg._direct_spare);
 }
 
-future<> segment_manager_impl::bind_direct_buffer(logstor_group& cg, direct_write_buffer& slot) {
-    if (!cg._direct_enabled || _async_gate.is_closed() || slot.bound()) {
-        co_return;
+bool segment_manager_impl::try_bind_direct_slot(logstor_group& cg, direct_write_buffer& slot) {
+    if (slot.bound()) {
+        return true;
+    }
+    if (!cg._direct_enabled || _async_gate.is_closed()) {
+        return false;
+    }
+    // The segments the reserve holds ready, not the free slots on the disk: taking one has to be
+    // synchronous, so only a segment the replenisher has already built is one this can have.
+    // Checked before the buffer is taken, and nothing below yields, so the segment cannot go away
+    // between the two and leave a buffer with nowhere to put it.
+    if (_segment_pool.available_segment_count(write_source::direct_write) == 0) {
+        return false;
     }
 
-    auto buf = co_await _direct_buffer_pool.allocate(_direct_buffer_abort);
-    auto seg = co_await get_segment(write_source::direct_write);
-
-    if (seg->bytes_remaining() != _cfg.segment_size) {
-        on_internal_error(logstor_logger, format("Segment {} bound to a direct write buffer is not empty", seg->id()));
+    auto buf = _direct_buffer_pool.try_allocate();
+    if (!buf) {
+        return false;
+    }
+    auto seg = try_get_segment(write_source::direct_write);
+    if (!seg) [[unlikely]] {
+        on_internal_error(logstor_logger, "A logstor segment for a direct write buffer went away after it was counted");
     }
 
-    slot.buf = std::move(buf);
-    slot.seg = std::move(seg);
+    if ((*seg)->bytes_remaining() != _cfg.segment_size) {
+        on_internal_error(logstor_logger, format("Segment {} bound to a direct write buffer is not empty", (*seg)->id()));
+    }
+
+    slot.buf = std::move(*buf);
+    slot.seg = std::move(*seg);
     slot.first_append = {};
     _direct_readable.emplace(slot.seg->id().value, slot.buf.get());
+    return true;
 }
 
 future<> segment_manager_impl::release_direct_slot(direct_write_buffer& slot) {
@@ -1925,7 +1946,10 @@ bool segment_manager_impl::promote_direct_group(logstor_group& cg) {
         return false;
     }
     // Room for another hot group, and for the two segments its buffers are going to be bound to.
-    if (_compaction_mgr.direct_hot_group_count() >= _max_hot_groups
+    // The room is counted in buffers that are out rather than in groups that are enabled: a group
+    // being demoted clears the flag before it gives its buffers back, and counting groups would let
+    // a promotion in that window take buffers the pool does not have.
+    if (_direct_buffer_pool.used_buffer_count() + 2 > _direct_buffer_pool.capacity()
             || available_segment_count(write_source::direct_write) < 2) {
         return false;
     }
@@ -1935,17 +1959,26 @@ bool segment_manager_impl::promote_direct_group(logstor_group& cg) {
 
     cg._direct_enabled = true;
     cg._direct_underfilled_periods = 0;
-    cg._direct_flush = shared_future<>(do_promote_direct_group(cg));
+    if (!try_bind_direct_slot(cg, cg._direct_active)) {
+        cg._direct_enabled = false;
+        return false;
+    }
+    try_bind_direct_slot(cg, cg._direct_spare);
     return true;
-}
-
-future<> segment_manager_impl::do_promote_direct_group(logstor_group& cg) {
-    co_await bind_direct_buffer(cg, cg._direct_active);
-    co_await bind_direct_buffer(cg, cg._direct_spare);
 }
 
 future<> segment_manager_impl::tick_direct_writes(logstor_group& cg, seastar::lowres_clock::time_point now,
         bool run_controller) {
+    // A slot can be left unbound by a flush that finished while the shard had no buffer or no
+    // segment to spare, and by one whose write failed. Nothing else comes back to it, so without
+    // this the group would go on writing through the shared active segment for good while still
+    // counting as hot. Not while a flush is in flight: the buffer it is writing is the group's
+    // second one, and binding a third here would take more of the pool than a group is allowed.
+    if (cg._direct_enabled && cg._direct_flush.available()) {
+        try_bind_direct_slot(cg, cg._direct_active);
+        try_bind_direct_slot(cg, cg._direct_spare);
+    }
+
     // The deadline: a buffer that has been holding records for a whole sync period is written out
     // even though it is not full, which is what bounds how much a crash can lose.
     if (cg._direct_enabled && !cg._direct_active.empty() && cg._direct_flush.available()
@@ -2878,6 +2911,9 @@ future<> compaction_manager_impl::drain_all_direct_buffers() {
 }
 
 future<> compaction_manager_impl::promote_direct_writes_for_test(logstor_group& cg) {
+    // One attempt, and it never waits - a promotion needs two segments the reserve has already
+    // built, and a caller that wants the answer a running shard would give has to come back for it,
+    // the way the sync fiber does.
     _sm.promote_direct_group(cg);
     co_await cg.flush_direct_writes();
 }

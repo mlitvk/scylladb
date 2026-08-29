@@ -2301,12 +2301,27 @@ logstor_params direct_write_params(logstor_params params = {}) {
     return params;
 }
 
+// Waits for something the shard does on its own - the reserve replenisher building segments, the
+// direct write controller promoting or demoting a group - rather than for a future of it.
+template <typename Predicate>
+void await_until(Predicate&& predicate) {
+    for (unsigned i = 0; i < 200 && !predicate(); ++i) {
+        seastar::sleep(std::chrono::milliseconds(10)).get();
+    }
+    BOOST_REQUIRE(predicate());
+}
+
 // A group is given its buffers by the controller, once it has measured that the group writes fast
 // enough. A test of what the direct path does with a record, rather than of when a group is given
 // one, asks for them here instead of writing at a rate for a while.
+//
+// A promotion is refused rather than queued when the reserve has no segment for the group's
+// buffers, which right after start() it may not have built yet, so this asks until it is given.
 void await_direct_buffers(logstor& ls, test_logstor_group& cg) {
-    ls.get_compaction_manager().promote_direct_writes_for_test(cg).get();
-    BOOST_REQUIRE(cg.direct_writes_enabled());
+    await_until([&ls, &cg] {
+        ls.get_compaction_manager().promote_direct_writes_for_test(cg).get();
+        return cg.direct_writes_enabled();
+    });
 }
 
 }
@@ -2474,6 +2489,63 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_direct_write_overwritten_in_its_buffer_is_
     auto actual = ls.read(*schema, cg.logstor_index(), second.decorated_key(), schema->full_slice()).get();
     BOOST_REQUIRE(actual);
     assert_that(*actual).is_equal_to(second);
+}
+
+// A direct write buffer is bound to a segment, and there is not always a segment to be had. What
+// the flush of a buffer means has to stay "the records are on the disk and their segment is in the
+// group" and not "and the next segment is in hand": everything that drains a group waits for that
+// future - a table flush, a split, a snapshot, shutdown - so a flush that waited for disk space
+// would hang all of them on a shard whose segments have run out.
+//
+// Sizes the shard so that promoting the group takes the last two segments the reserve can hand out,
+// then fills the group's buffer. The rotation's flush finds nothing to bind its next buffer to, and
+// has to complete anyway.
+SEASTAR_THREAD_TEST_CASE(test_logstor_direct_write_flush_does_not_wait_for_its_next_segment) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    // Eleven segments in one file: one goes to the shared active segment at start, eight are the
+    // compaction reserve, and the two that are left are exactly what one hot group takes.
+    auto params = direct_write_params();
+    params.file_size = 11 * params.segment_size;
+    params.disk_size = params.file_size;
+    params.compaction_enabled = false;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path(), params), cache.shared_tracker);
+    ls.do_recovery_for_test().get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+    await_direct_buffers(ls, cg);
+
+    // The premise of the test: all that is left is the compaction reserve, which the direct path
+    // may not take from, so nothing below can be given a segment.
+    BOOST_REQUIRE_EQUAL(ls.get_segment_manager().get_usage().free_segments, max_compaction_parallelism);
+
+    // Three records of a third of a segment each: the third one does not fit the buffer the first
+    // two went into, so the group rotates into its spare and writes the full buffer out.
+    const auto record_size = ls.get_segment_manager().get_segment_size() / 3;
+    std::vector<mutation> expected;
+    for (unsigned i = 0; i < 3; ++i) {
+        expected.push_back(make_kv_mutation_of_record_size(schema, format("pk{}", i), record_size));
+        ls.write(expected.back(), write_target(&cg, {}), db::no_timeout).get();
+    }
+    BOOST_REQUIRE(cg.direct_has_data());
+
+    // The drain every tablet operation goes through. It has to return even though the shard has no
+    // segment to give the group for its next buffer.
+    cg.flush_direct_writes().get();
+
+    BOOST_REQUIRE(!cg.direct_has_data());
+    BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 2u);
+
+    for (const auto& m : expected) {
+        auto actual = ls.read(*schema, cg.logstor_index(), m.decorated_key(), schema->full_slice()).get();
+        BOOST_REQUIRE(actual);
+        assert_that(*actual).is_equal_to(m);
+    }
 }
 
 // A group is removed while it still holds records that are only in memory. Unlike the separator's
@@ -2690,12 +2762,6 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_direct_write_controller_promotes_and_demot
     ls.write(expected, write_target(&cg, {}), db::no_timeout).get();
 
     // One period to measure the write, one tick to act on it.
-    auto await_until = [] (auto&& predicate) {
-        for (unsigned i = 0; i < 200 && !predicate(); ++i) {
-            seastar::sleep(std::chrono::milliseconds(10)).get();
-        }
-        BOOST_REQUIRE(predicate());
-    };
     await_until([&cg] { return cg.direct_writes_enabled(); });
 
     // Write once more so that the record the group holds went in directly, then stop writing.
