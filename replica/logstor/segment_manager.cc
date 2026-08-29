@@ -697,11 +697,12 @@ public:
     void tick_direct_deadlines(seastar::lowres_clock::time_point now);
     future<> run_direct_controller();
 
-    // How many of this shard's groups are taking direct writes. Counted rather than tracked: it is
-    // read when a group is promoted, which is rare, and the groups of a shard are few.
+    // How many of this shard's groups have a buffer of their own to write into. Groups that are
+    // taking direct writes but have no buffer are writing the ordinary way and are not counted.
+    // Counted rather than tracked: it is read by a metric, and the groups of a shard are few.
     size_t direct_hot_group_count() const noexcept {
         return std::ranges::count_if(_groups, [] (const auto& entry) {
-            return entry.first->direct_writes_enabled();
+            return entry.first->direct_writes_bound();
         });
     }
 
@@ -1571,9 +1572,9 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
         sm::make_gauge("direct_unflushed_bytes", [this] { return _stats.direct_unflushed_bytes; },
                        sm::description("Bytes of records that have been acknowledged but are only in a direct write buffer, which is what a crash of this shard would lose.")),
         sm::make_gauge("direct_hot_groups", [this] { return _compaction_mgr.direct_hot_group_count(); },
-                       sm::description("Number of compaction groups currently writing into buffers of their own.")),
+                       sm::description("Number of compaction groups currently writing into buffers of their own. A group that the shard could not give a buffer to is writing the ordinary way and is not counted here, so this falling below the number of groups that qualify is the same story the no_buffer reason of direct_fallbacks tells.")),
         sm::make_gauge("direct_buffers_in_use", [this] { return _direct_buffer_pool.used_buffer_count(); },
-                       sm::description("Counts number of write buffers currently held by the direct write path, two per hot compaction group.")),
+                       sm::description("Counts number of write buffers currently held by the direct write path: two per group writing into buffers of its own, plus every buffer whose write to the disk failed, which is held for good - see direct_failed_buffer_bytes.")),
     });
 }
 
@@ -2088,10 +2089,15 @@ future<> segment_manager_impl::run_direct_controller(logstor_group& cg) {
     // A group whose writes the disk keeps refusing goes back to the ordinary path, and so does
     // every group once the path is off shard wide. Both are decided here rather than at the flush,
     // which cannot wait for a group to be closed.
-    if (cg._direct_enabled && (!direct_writes_enabled()
-            || cg._direct_flush_failures >= direct_flush_failures_before_demotion)) {
-        logstor_logger.warn("Taking the direct write buffers of a logstor group of table {} back after"
-                " {} failed flushes", cg.table_id(), cg._direct_flush_failures);
+    if (cg._direct_enabled && !direct_writes_enabled()) {
+        logstor_logger.info("Taking the direct write buffers of a logstor group of table {} back:"
+                " the direct write path is off for this shard", cg.table_id());
+        co_await cg.close_direct_writes();
+        co_return;
+    }
+    if (cg._direct_enabled && cg._direct_flush_failures >= direct_flush_failures_before_demotion) {
+        logstor_logger.warn("Taking the direct write buffers of a logstor group of table {} back:"
+                " {} flushes of them failed in a row", cg.table_id(), cg._direct_flush_failures);
         co_await cg.close_direct_writes();
         co_return;
     }

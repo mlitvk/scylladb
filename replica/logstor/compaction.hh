@@ -858,6 +858,13 @@ public:
         return !_direct_active.empty() || !_direct_spare.empty();
     }
 
+    // Whether the group actually has a buffer to write into. A group can be taking direct writes
+    // and have none - the shard had nothing to give its last flush - and until it is given one it
+    // writes the ordinary way, see try_write_direct().
+    bool direct_writes_bound() const noexcept {
+        return _direct_active.bound();
+    }
+
     // The direct write path is driven from the segment manager, which owns the buffers' segments
     // and decides which groups are hot enough to have them.
     friend class segment_manager_impl;
