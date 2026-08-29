@@ -2603,6 +2603,40 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_direct_writes_of_a_group_stop_after_repeat
     }
 }
 
+// Truncating a group clears its index and then discards its segments. A record the group took
+// directly is in neither: not in a segment, because its buffer has not been written out, and not in
+// the index any more. Checks that the buffer and the segment it was bound to are given up here,
+// rather than written out later into a group that was emptied on purpose.
+SEASTAR_THREAD_TEST_CASE(test_logstor_discarding_a_group_gives_up_what_it_took_directly) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path(), direct_write_params()), cache.shared_tracker);
+    ls.do_recovery_for_test().get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+    const auto free_segments_before = ls.get_segment_manager().get_usage().free_segments;
+    await_direct_buffers(ls, cg);
+
+    auto m = make_kv_mutation(schema, "pk0", "truncated-away");
+    ls.write(m, write_target(&cg, {}), db::no_timeout).get();
+    BOOST_REQUIRE(cg.direct_has_data());
+
+    // What table::discard_logstor_segments() does: the index first, then the segments.
+    cg.logstor_index().clear().get();
+    ls.get_segment_manager().discard_segments(cg).get();
+
+    BOOST_REQUIRE(!cg.direct_writes_enabled());
+    BOOST_REQUIRE(!cg.direct_has_data());
+    BOOST_REQUIRE(cg.empty());
+    BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 0u);
+    // The two segments the group's buffers were bound to are back, having never been written.
+    BOOST_REQUIRE_EQUAL(ls.get_segment_manager().get_usage().free_segments, free_segments_before);
+}
+
 // A group is removed while it still holds records that are only in memory. Unlike the separator's
 // buffers, which hold a second copy of records that are already on the disk, these are the only
 // copy there is, so removing the group has to write them out rather than discard them.

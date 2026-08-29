@@ -689,7 +689,7 @@ public:
     future<> flush_all_separator_buffers(std::optional<segment_sequence>);
 
     void rotate_direct_buffer(logstor_group&) override;
-    future<> release_direct_buffers(logstor_group&) override;
+    future<> release_direct_buffers(logstor_group&, direct_slot_release) override;
     future<> drain_all_direct_buffers();
     future<> promote_direct_writes_for_test(logstor_group&) override;
     // One deadline pass over every group of the shard, and one controller pass. They are separate
@@ -1054,8 +1054,8 @@ public:
     // which is what a caller does when this says no; the sync fiber retries. Synchronous, so a
     // flush never has to wait for the next segment before it can report the records durable.
     bool try_bind_direct_slot(logstor_group&, direct_write_buffer& slot);
-    future<> release_direct_slot(direct_write_buffer& slot);
-    future<> release_direct_buffers(logstor_group&);
+    future<> release_direct_slot(direct_write_buffer& slot, direct_slot_release);
+    future<> release_direct_buffers(logstor_group&, direct_slot_release);
     // Gives the group two buffers to write into and counts it as hot, unless the shard has no room
     // for another hot group. Says whether it did.
     bool promote_direct_group(logstor_group&);
@@ -1889,7 +1889,7 @@ future<> segment_manager_impl::flush_direct_buffer(logstor_group& cg, direct_wri
         // Nothing went into it, so there is nothing to seal. Keep it rather than giving its segment
         // back only to take another one.
         if (cg._direct_spare.bound()) {
-            co_await release_direct_slot(full);
+            co_await release_direct_slot(full, direct_slot_release::flushed);
         } else {
             cg._direct_spare = std::move(full);
         }
@@ -1956,12 +1956,12 @@ bool segment_manager_impl::try_bind_direct_slot(logstor_group& cg, direct_write_
     return true;
 }
 
-future<> segment_manager_impl::release_direct_slot(direct_write_buffer& slot) {
+future<> segment_manager_impl::release_direct_slot(direct_write_buffer& slot, direct_slot_release release) {
     if (slot.seg) {
         _direct_readable.erase(slot.seg->id().value);
     }
     if (slot.buf) {
-        if (slot.buf->has_data()) {
+        if (slot.buf->has_data() && release == direct_slot_release::flushed) {
             on_internal_error(logstor_logger, "Releasing a logstor direct write buffer that was not written out");
         }
         // The pool takes a buffer back only once it is closed, and one that was only appended to
@@ -1978,10 +1978,10 @@ future<> segment_manager_impl::release_direct_slot(direct_write_buffer& slot) {
     slot.first_append = {};
 }
 
-future<> segment_manager_impl::release_direct_buffers(logstor_group& cg) {
+future<> segment_manager_impl::release_direct_buffers(logstor_group& cg, direct_slot_release release) {
     cg._direct_enabled = false;
-    co_await release_direct_slot(cg._direct_active);
-    co_await release_direct_slot(cg._direct_spare);
+    co_await release_direct_slot(cg._direct_active, release);
+    co_await release_direct_slot(cg._direct_spare, release);
     cg._direct_underfilled_periods = 0;
     cg._direct_flush_failures = 0;
 }
@@ -2310,6 +2310,12 @@ future<> segment_manager_impl::discard_segments(logstor_group& cg) {
     auto compaction_disable_guard = co_await _compaction_mgr.disable_compaction(cg);
 
     auto holder = _async_gate.hold();
+
+    // Records the group took directly are not in any of its segments yet, so the loop below would
+    // not see them, and the flush that came later would put a segment holding them into a group
+    // that was just emptied. The caller clears the index before it discards, so nothing points at
+    // them any more and they go with the buffers.
+    co_await cg.discard_direct_writes();
 
     auto& ss = cg.logstor_segments();
 
@@ -2973,8 +2979,8 @@ void compaction_manager_impl::rotate_direct_buffer(logstor_group& cg) {
     _sm.rotate_direct_buffer(cg);
 }
 
-future<> compaction_manager_impl::release_direct_buffers(logstor_group& cg) {
-    return _sm.release_direct_buffers(cg);
+future<> compaction_manager_impl::release_direct_buffers(logstor_group& cg, direct_slot_release release) {
+    return _sm.release_direct_buffers(cg, release);
 }
 
 future<> compaction_manager_impl::drain_all_direct_buffers() {
@@ -3592,7 +3598,18 @@ future<> logstor_group::close_direct_writes() {
     _direct_enabled = false;
 
     co_await flush_direct_writes();
-    co_await logstor_compaction_manager().release_direct_buffers(*this);
+    co_await logstor_compaction_manager().release_direct_buffers(*this, direct_slot_release::flushed);
+}
+
+future<> logstor_group::discard_direct_writes() {
+    // Before anything that can wait, so that a write which resumes into the direct path finds the
+    // group closed rather than appending into a buffer that is on its way back to the pool.
+    _direct_enabled = false;
+
+    // A flush that is already writing has to finish rather than be dropped: its segment joins the
+    // group, and it is the group's segments the caller goes on to discard.
+    co_await await_direct_settled();
+    co_await logstor_compaction_manager().release_direct_buffers(*this, direct_slot_release::discard_records);
 }
 
 void logstor_group::switch_active_separator_buffer() {
