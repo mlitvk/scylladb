@@ -390,13 +390,7 @@ future<std::vector<owned_write_buffer>> write_buffer_pool::allocate_many(size_t 
     std::vector<std::unique_ptr<write_buffer>> bufs;
     bufs.reserve(count);
     while (bufs.size() < count) {
-        if (!_free.empty()) {
-            bufs.push_back(std::move(_free.back()));
-            _free.pop_back();
-        } else {
-            bufs.push_back(std::make_unique<write_buffer>(_buffer_size, _kind));
-            ++_stats.buffers_created;
-        }
+        bufs.push_back(take_or_make_buffer());
     }
 
     std::vector<owned_write_buffer> buffers;
@@ -406,6 +400,32 @@ future<std::vector<owned_write_buffer>> write_buffer_pool::allocate_many(size_t 
         ++_in_use;
     }
     co_return buffers;
+}
+
+std::optional<owned_write_buffer> write_buffer_pool::try_allocate() {
+    // try_wait() does not fail on a broken semaphore, so a stopped pool has to be refused here.
+    if (_stopped) {
+        return std::nullopt;
+    }
+    auto units = seastar::try_get_units(_available_sem, 1);
+    if (!units) {
+        return std::nullopt;
+    }
+
+    auto buf = take_or_make_buffer();
+    ++_in_use;
+    return owned_write_buffer(buf.release(), write_buffer_returner(*this, std::move(*units)));
+}
+
+std::unique_ptr<write_buffer> write_buffer_pool::take_or_make_buffer() {
+    if (!_free.empty()) {
+        auto buf = std::move(_free.back());
+        _free.pop_back();
+        return buf;
+    }
+    auto buf = std::make_unique<write_buffer>(_buffer_size, _kind);
+    ++_stats.buffers_created;
+    return buf;
 }
 
 void write_buffer_pool::return_buffer(write_buffer* wb, seastar::semaphore_units<> pool_units) noexcept {

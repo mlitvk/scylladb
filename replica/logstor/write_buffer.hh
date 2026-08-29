@@ -544,6 +544,11 @@ public:
     future<owned_write_buffer> allocate(abort_source& as);
     future<std::vector<owned_write_buffer>> allocate_many(size_t count, abort_source& as);
 
+    // Hands out a buffer only if the pool has one to spare right now, so that a caller which has
+    // something better to do than wait - the direct write path, which falls back to the ordinary
+    // one - is never parked on the pool.
+    std::optional<owned_write_buffer> try_allocate();
+
     void return_buffer(write_buffer* wb, seastar::semaphore_units<> pool_units) noexcept;
 
     // Changes the number of buffers the pool may have out at once. Lowering it does not take back
@@ -570,6 +575,10 @@ private:
     bool would_wait(size_t count) const noexcept {
         return _available_sem.available_units() < static_cast<ssize_t>(count) || _available_sem.waiters() > 0;
     }
+
+    // Takes a cached buffer, or builds one when the cache is empty. The pool units for it must
+    // already be held.
+    std::unique_ptr<write_buffer> take_or_make_buffer();
 
     // Permanently removes a buffer from the pool after it could not be taken back.
     void drop_buffer(std::unique_ptr<write_buffer> wb, seastar::semaphore_units<>& pool_units) noexcept;

@@ -914,6 +914,38 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_pool_capacity_shrinks_while_b
     close_and_return(std::move(b2));
 }
 
+// Checks that try_allocate() hands out a buffer only when the pool has one to spare and never waits,
+// which is what lets the direct write path go on without one instead of parking on the pool.
+SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_pool_try_allocate_never_waits) {
+    abort_source as;
+    write_buffer_pool pool(make_test_write_buffer_pool_config(1, 1));
+    auto stop_pool = seastar::defer([&pool] noexcept { pool.stop().get(); });
+
+    auto b0 = pool.try_allocate();
+    BOOST_REQUIRE(b0);
+    BOOST_REQUIRE_EQUAL(pool.used_buffer_count(), 1u);
+
+    // The capacity is taken, so this refuses rather than waits.
+    BOOST_REQUIRE(!pool.try_allocate());
+    BOOST_REQUIRE_EQUAL(pool.used_buffer_count(), 1u);
+    BOOST_REQUIRE_EQUAL(pool.get_stats().allocation_waits, 0u);
+
+    close_and_return(std::move(*b0));
+    auto b1 = pool.try_allocate();
+    BOOST_REQUIRE(b1);
+    close_and_return(std::move(*b1));
+
+    // A waiting allocation holds the capacity too, so a refusal here does not jump the queue.
+    auto b2 = pool.allocate(as).get();
+    auto waiting = pool.allocate(as);
+    seastar::thread::yield();
+    BOOST_REQUIRE(!waiting.available());
+    BOOST_REQUIRE(!pool.try_allocate());
+
+    close_and_return(std::move(b2));
+    close_and_return(waiting.get());
+}
+
 // Checks that a compaction that fails after rewriting records into its buffer returns the buffer to
 // the pool, so that later compactions - and shutdown, which waits for the pool to drain - are not
 // blocked by it.

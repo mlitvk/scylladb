@@ -858,6 +858,17 @@ public:
         co_return _segments.pop();
     }
 
+    // Hands out a segment only if one can be taken without waiting, for a caller that has something
+    // to do other than wait for the disk to give space back - the direct write path, which goes on
+    // writing through the shared active segment until a segment of its own can be had.
+    std::optional<seg_ptr> try_get_segment(write_source src) {
+        if (available_segment_count(src) == 0) {
+            return std::nullopt;
+        }
+        _stats.segments_get[static_cast<size_t>(src)]++;
+        return _segments.pop();
+    }
+
     size_t available_segment_count(write_source src) const noexcept {
         switch (src) {
             case write_source::compaction:
@@ -1206,6 +1217,16 @@ private:
         seg_ptr seg = co_await _segment_pool.get_segment(src);
         seg->start(make_segment_ref(seg->id()), allocate_segment_seq());
         co_return seg;
+    }
+
+    // See segment_pool::try_get_segment(). Synchronous, so a caller can decide against a segment
+    // without a yield between asking and going on without one.
+    std::optional<seg_ptr> try_get_segment(write_source src) {
+        auto seg = _segment_pool.try_get_segment(src);
+        if (seg) {
+            (*seg)->start(make_segment_ref((*seg)->id()), allocate_segment_seq());
+        }
+        return seg;
     }
 
     void free_segment(log_segment_id) noexcept;
