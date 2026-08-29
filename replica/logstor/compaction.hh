@@ -96,6 +96,13 @@ constexpr double compaction_marginal_admission_ratio = 0.75;
 // its buffers up and take them again, and each round trip leaves a partly filled segment behind.
 constexpr unsigned direct_underfilled_periods_before_demotion = 2;
 
+// How many flushes of a group's direct write buffers may fail in a row before the group is put back
+// on the ordinary path. A failed buffer is kept in memory for good - its records were acknowledged
+// and it is the only copy of them left - and its segment is never reclaimed, so a device that keeps
+// failing would cost the shard a buffer and a segment every period for as long as the group stays
+// hot. The ordinary path reports a write failure to the caller instead of taking that on.
+constexpr unsigned direct_flush_failures_before_demotion = 3;
+
 // Whether a group that writes this many bytes in a sync period is worth giving write buffers of its
 // own. Below the threshold - half a segment per period - the partly filled segment such a group
 // leaves at the end of every period occupies more of the pool than the second write it saves is
@@ -745,6 +752,9 @@ class logstor_group {
     // demotes the group on. Fed by every write of the group, direct or not.
     uint64_t _direct_bytes_this_period{0};
     unsigned _direct_underfilled_periods{0};
+    // Flushes of this group's buffers that failed in a row, see
+    // direct_flush_failures_before_demotion.
+    unsigned _direct_flush_failures{0};
 
     void switch_active_separator_buffer();
 

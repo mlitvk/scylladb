@@ -922,6 +922,9 @@ class segment_manager_impl {
         uint64_t direct_fallbacks{0};
         uint64_t direct_read_hits{0};
         uint64_t direct_flush_failures{0};
+        // The memory of the buffers whose write failed, which the shard keeps so that the records
+        // they hold stay readable and therefore never gets back.
+        uint64_t direct_failed_buffer_bytes{0};
         // Which of the two reasons wrote a direct buffer out. A shard whose buffers mostly go out
         // on the deadline is one whose groups do not fill a segment per period, so the segments it
         // writes are partly empty and its groups belong on the ordinary path.
@@ -1005,6 +1008,9 @@ class segment_manager_impl {
     // the only copy left of them, so the buffers stay registered above and are not given back to
     // the pool - the one place the direct path deliberately holds on to a buffer for good.
     std::vector<direct_write_buffer> _direct_failed_buffers;
+    // Set once those buffers hold the whole memory budget of the path, which turns it off for the
+    // rest of the life of the shard, see note_direct_flush_failure().
+    bool _direct_writes_stopped{false};
 
     static constexpr size_t separator_queue_depth = 16;
 
@@ -1063,11 +1069,15 @@ public:
     static size_t max_hot_groups(const segment_manager_config& cfg) noexcept {
         return cfg.direct_group_writes ? cfg.direct_write_memory / (2 * cfg.segment_size) : 0;
     }
-    // Whether the direct write path is on: the durability mode has to allow it and the memory
-    // budget has to have room for at least one hot group.
+    // Whether the direct write path is on: the durability mode has to allow it, the memory budget
+    // has to have room for at least one hot group, and the disk has to have been taking the writes.
     bool direct_writes_enabled() const noexcept {
-        return _max_hot_groups > 0;
+        return _max_hot_groups > 0 && !_direct_writes_stopped;
     }
+
+    // Takes a buffer whose write failed into the memory the path keeps for good, and turns the path
+    // off once those buffers hold as much of it as the path was budgeted to write with.
+    void note_direct_flush_failure(direct_write_buffer failed);
 
     future<temporary_buffer<char>> read_record_bytes(log_location);
 
@@ -1518,6 +1528,8 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
                        sm::description("Counts number of direct write buffers written out because their sync period expired. A shard where these dominate is writing partly empty segments, and its groups belong on the ordinary path.")),
         sm::make_counter("direct_flush_failures", _stats.direct_flush_failures,
                        sm::description("Counts number of direct write buffers whose write to the disk failed. Their records stay readable from memory, at the cost of the buffer and the segment never being reclaimed.")),
+        sm::make_gauge("direct_failed_buffer_bytes", [this] { return _stats.direct_failed_buffer_bytes; },
+                       sm::description("Bytes of memory held by direct write buffers whose write to the disk failed. The shard keeps them so that the records they hold stay readable and never gets that memory back; once they hold the whole memory budget of the direct write path, the path is turned off.")),
         sm::make_gauge("direct_unflushed_bytes", [this] { return _stats.direct_unflushed_bytes; },
                        sm::description("Bytes of records that have been acknowledged but are only in a direct write buffer, which is what a crash of this shard would lose.")),
         sm::make_gauge("direct_hot_groups", [this] { return _compaction_mgr.direct_hot_group_count(); },
@@ -1597,7 +1609,8 @@ future<> segment_manager_impl::stop() {
     co_await _compaction_buffer_pool.stop();
     co_await _separator_buffer_pool.stop();
     // Nothing reads out of these any more, so the records they hold - which the disk never took -
-    // are finally let go.
+    // are finally let go. Their segments are marked as failed, so releasing the last reference to
+    // one leaves it allocated rather than freeing a segment the index still points into.
     for (auto& failed : _direct_failed_buffers) {
         if (failed.seg) {
             _direct_readable.erase(failed.seg->id().value);
@@ -1840,16 +1853,23 @@ future<> segment_manager_impl::flush_direct_buffer(logstor_group& cg, direct_wri
         auto written = co_await coroutine::as_future(
                 write_full_segment_tail(full.seg, *full.buf, cg, write_source::direct_write));
         if (written.failed()) {
-            // The tail has already marked the segment as failed, which leaks it rather than freeing
-            // it, because the index points into it. Hold on to the buffer for the same reason, and
-            // keep it registered for reads: these records were acknowledged and this memory is the
-            // only copy of them left. The one path that deliberately keeps a buffer out of its pool.
             ++_stats.direct_flush_failures;
+            ++cg._direct_flush_failures;
+            // The index points into this segment, so it must never be freed and handed out again
+            // over the records it holds. Marking it as failed leaks it instead.
+            // write_full_segment_tail() only does that once the bytes have reached the disk,
+            // because for the separator and for compaction a target segment that took nothing is
+            // simply given back; the direct path is the one whose index already points into a
+            // segment that was never written. The buffer is kept for the same reason, registered
+            // for reads: these records were acknowledged and this memory is the only copy of them
+            // left. The one path that deliberately keeps a buffer out of its pool.
+            full.seg->ref().set_flush_failure();
             logstor_logger.error("Failed to write logstor segment {} of table {} directly: {}."
                     " Its buffer is kept in memory so that its records stay readable, and neither it"
                     " nor the segment will be reclaimed", seg_id, cg.table_id(), written.get_exception());
-            _direct_failed_buffers.push_back(std::move(full));
+            note_direct_flush_failure(std::move(full));
         } else {
+            cg._direct_flush_failures = 0;
             _stats.direct_unflushed_bytes -= unflushed_bytes;
             // Only now that the records are on the disk and their segment is in the group: until
             // here a read of one of them had to come out of this buffer.
@@ -1875,6 +1895,23 @@ future<> segment_manager_impl::flush_direct_buffer(logstor_group& cg, direct_wri
     // unbound here is bound by the sync fiber once the shard has room for it again.
     try_bind_direct_slot(cg, cg._direct_active);
     try_bind_direct_slot(cg, cg._direct_spare);
+}
+
+void segment_manager_impl::note_direct_flush_failure(direct_write_buffer failed) {
+    _direct_failed_buffers.push_back(std::move(failed));
+    _stats.direct_failed_buffer_bytes = _direct_failed_buffers.size() * _cfg.segment_size;
+
+    // These buffers hold memory the path was given to write with, and they never give it back.
+    // Once they hold all of it, writing directly could only add to them, so the path goes off for
+    // good and every group falls back to the ordinary one - which reports a failed write to its
+    // caller instead of keeping the record in memory and calling it acknowledged.
+    if (!_direct_writes_stopped && _stats.direct_failed_buffer_bytes >= _cfg.direct_write_memory) {
+        _direct_writes_stopped = true;
+        logstor_logger.error("Logstor direct writes are off for the rest of the life of this shard:"
+                " {} buffers holding {} bytes could not be written and are kept in memory, which is"
+                " the whole memory budget of the path", _direct_failed_buffers.size(),
+                _stats.direct_failed_buffer_bytes);
+    }
 }
 
 bool segment_manager_impl::try_bind_direct_slot(logstor_group& cg, direct_write_buffer& slot) {
@@ -1939,6 +1976,7 @@ future<> segment_manager_impl::release_direct_buffers(logstor_group& cg) {
     co_await release_direct_slot(cg._direct_active);
     co_await release_direct_slot(cg._direct_spare);
     cg._direct_underfilled_periods = 0;
+    cg._direct_flush_failures = 0;
 }
 
 bool segment_manager_impl::promote_direct_group(logstor_group& cg) {
@@ -1969,6 +2007,17 @@ bool segment_manager_impl::promote_direct_group(logstor_group& cg) {
 
 future<> segment_manager_impl::tick_direct_writes(logstor_group& cg, seastar::lowres_clock::time_point now,
         bool run_controller) {
+    // A group whose writes the disk keeps refusing goes back to the ordinary path, and so does
+    // every group once the path is off shard wide. Both are checked here rather than at the flush,
+    // which cannot wait for a group to be closed.
+    if (cg._direct_enabled && (!direct_writes_enabled()
+            || cg._direct_flush_failures >= direct_flush_failures_before_demotion)) {
+        logstor_logger.warn("Taking the direct write buffers of a logstor group of table {} back after"
+                " {} failed flushes", cg.table_id(), cg._direct_flush_failures);
+        co_await cg.close_direct_writes();
+        co_return;
+    }
+
     // A slot can be left unbound by a flush that finished while the shard had no buffer or no
     // segment to spare, and by one whose write failed. Nothing else comes back to it, so without
     // this the group would go on writing through the shared active segment for good while still

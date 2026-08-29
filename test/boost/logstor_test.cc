@@ -2548,6 +2548,61 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_direct_write_flush_does_not_wait_for_its_n
     }
 }
 
+// The buffer of a flush that failed is kept in memory for good - its records were acknowledged and
+// this is the only copy of them left - and its segment is never reclaimed. A device that keeps
+// refusing the writes of a hot group would therefore cost the shard a buffer and a segment every
+// period, for records that are not reaching the disk anyway. Checks that a few failures in a row
+// put the group back on the ordinary path, which reports a failed write to its caller instead.
+SEASTAR_THREAD_TEST_CASE(test_logstor_direct_writes_of_a_group_stop_after_repeated_flush_failures) {
+    if constexpr (!std::is_same_v<utils::error_injection_type, utils::error_injection<true>>) {
+        return;
+    }
+
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    auto params = direct_write_params();
+    // Short enough that the sync fiber's pass over the groups - which is what takes the buffers
+    // back - comes around during the test, and long enough that its controller does not run in the
+    // middle of it and demote the group for a quiet period instead.
+    params.direct_sync_period = std::chrono::milliseconds(200);
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path(), params), cache.shared_tracker);
+    ls.do_recovery_for_test().get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+    await_direct_buffers(ls, cg);
+
+    utils::get_local_injector().enable("logstor_fail_segment_write");
+    auto disable_injection = seastar::defer([] noexcept {
+        utils::get_local_injector().disable("logstor_fail_segment_write");
+    });
+
+    std::vector<mutation> expected;
+    for (unsigned i = 0; i < direct_flush_failures_before_demotion; ++i) {
+        expected.push_back(make_kv_mutation(schema, format("pk{}", i), "never-reaches-the-disk"));
+        ls.write(expected.back(), write_target(&cg, {}), db::no_timeout).get();
+        // Does not fail: there is nothing a caller of the drain can do about a record whose only
+        // copy is the buffer it is already in.
+        cg.flush_direct_writes().get();
+    }
+
+    await_until([&cg] { return !cg.direct_writes_enabled(); });
+    BOOST_REQUIRE(!cg.direct_has_data());
+    BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 0u);
+
+    // The whole point of keeping those buffers: the records the disk refused are still where the
+    // index says they are, and reads are served out of memory.
+    for (const auto& m : expected) {
+        auto actual = ls.read(*schema, cg.logstor_index(), m.decorated_key(), schema->full_slice()).get();
+        BOOST_REQUIRE(actual);
+        assert_that(*actual).is_equal_to(m);
+    }
+}
+
 // A group is removed while it still holds records that are only in memory. Unlike the separator's
 // buffers, which hold a second copy of records that are already on the disk, these are the only
 // copy there is, so removing the group has to write them out rather than discard them.
