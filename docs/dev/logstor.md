@@ -115,11 +115,12 @@ worth it.
    nothing can pick it for compaction, scan it or free it. The group rotates into its second buffer
    while the first one is being written, and is given a fresh buffer and segment afterwards.
 4. Giving it one is best effort. A buffer and a segment are taken only if both can be had without
-   waiting, and a group whose slot stays unbound writes through the shared active segment until the
-   sync fiber can bind it - which is what it already does while a flush is in flight. The flush
-   itself must not wait for the next segment: everything that drains a group waits for it, so a
-   flush that waited for disk space would hang a table flush, a split, a snapshot or shutdown on a
-   shard whose segments have run out.
+   waiting, and a group whose slot stays unbound writes through the shared active segment - which is
+   what it already does while a flush is in flight - until a write of the group or the sync fiber
+   can bind it. The flush itself must not wait for the next segment: everything that drains a group
+   waits for it, so a flush that waited for disk space would hang a table flush, a split, a snapshot
+   or shutdown on a shard whose segments have run out. How often this happens is what the no_buffer
+   reason of the `direct_fallbacks` metric counts.
 5. A read of a record that has been acknowledged but is not on the disk yet is served out of the
    buffer: the segment manager keeps the buffers of the hot groups by the id of the segment each one
    is bound to, and `read_record_bytes` looks there before it looks at the disk - for a segment that
@@ -152,10 +153,12 @@ times in a row is put back on the ordinary path - which reports the failure to t
 taking the record into memory and calling it acknowledged - and once the kept buffers hold the whole
 `logstor_direct_write_memory_in_mb` budget the path goes off for the rest of the life of the shard.
 
-Every drain writes these buffers out rather than dropping them, with one exception: discarding a
-group's segments, which a truncate does after clearing the index, gives them up instead. Nothing
-points at their records by then, and writing them out would put a segment nothing can reach into a
-group that was emptied on purpose.
+Every drain writes these buffers out rather than dropping them, discarding a group's segments
+included - which a truncate does after clearing the index, so what comes out is a segment of records
+nothing points at, which the discard then frees. Dropping them instead would be cheaper and is
+wrong: a write taken between the clear and the discard is acknowledged and indexed, and freeing the
+segment it went into is fatal. Written out, it is reported the way a record the separator takes late
+is, and the truncate fails rather than the shard.
 
 This path is a prototype, and one of the things it does not do yet makes it unsafe for real data.
 Read [Direct Writes: State of the Implementation](#direct-writes-state-of-the-implementation) before
