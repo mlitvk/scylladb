@@ -1831,9 +1831,12 @@ std::optional<log_location> segment_manager_impl::try_write_direct(logstor_group
     }
 
     auto& active = cg._direct_active;
-    if (!active.bound()) {
+    if (!active.bound() && !try_bind_direct_slot(cg, active)) {
         // The group is hot but its last flush could not be given a buffer or a segment for what it
-        // gave back. Counted, because a shard whose reserve is short takes this shape.
+        // gave back. Asking again here rather than leaving it to the sync fiber bounds that to this
+        // write instead of to a whole tick, and by now the flush has given its own buffer back, so
+        // there is something to be had. Counted, because a shard whose reserve is short takes this
+        // shape.
         ++_stats.direct_fallbacks[static_cast<size_t>(direct_fallback_reason::no_buffer)];
         return std::nullopt;
     }

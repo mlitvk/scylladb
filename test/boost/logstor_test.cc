@@ -2638,6 +2638,62 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_discarding_a_group_writes_out_what_it_took
     BOOST_REQUIRE_EQUAL(ls.get_segment_manager().get_usage().free_segments, free_segments_before);
 }
 
+// A group whose flush could not be given a buffer or a segment goes on writing the ordinary way
+// until something binds its slots again. The sync fiber does that, but only once a tick, which is a
+// second of writing at twice the bytes; a write of the group asks for a buffer itself, so the shard
+// having segments again is enough to put it back on the direct path.
+//
+// Sized so that promoting two groups takes the last four segments outside the compaction reserve.
+// The first group then fills and rotates twice, which leaves both of its slots unbound, and the
+// second group is removed to give the shard its segments back.
+SEASTAR_THREAD_TEST_CASE(test_logstor_direct_write_takes_a_buffer_as_soon_as_there_is_one) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    auto params = direct_write_params();
+    // Thirteen segments in one file: one for the shared active segment, eight for the compaction
+    // reserve, and four for the two hot groups.
+    params.file_size = 13 * params.segment_size;
+    params.disk_size = params.file_size;
+    params.compaction_enabled = false;
+    // The longest tick the sync fiber takes, so that it does not do the rebinding this is about.
+    params.direct_sync_period = std::chrono::seconds(100);
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path(), params), cache.shared_tracker);
+    ls.do_recovery_for_test().get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group writer(schema, ls);
+    test_logstor_group idle(schema, ls);
+
+    await_direct_buffers(ls, writer);
+    await_direct_buffers(ls, idle);
+    BOOST_REQUIRE_EQUAL(ls.get_segment_manager().get_usage().free_segments, max_compaction_parallelism);
+
+    // Two rotations: the first leaves the spare unbound, because there is no segment for it, and
+    // the second moves that unbound slot into the group's writing position.
+    const auto record_size = ls.get_segment_manager().get_segment_size() / 3;
+    for (unsigned i = 0; i < 6; ++i) {
+        auto m = make_kv_mutation_of_record_size(schema, format("pk{}", i), record_size);
+        ls.write(m, write_target(&writer, {}), db::no_timeout).get();
+    }
+    writer.flush_direct_writes().get();
+    BOOST_REQUIRE(!writer.direct_has_data());
+
+    // Nothing was written to it, so this gives the shard back the two segments it was holding.
+    ls.get_compaction_manager().remove(idle).get();
+
+    // Each write is its own attempt at a buffer, so the group is taking direct writes again within
+    // a handful of them rather than at the next tick of the sync fiber, a second away.
+    for (unsigned i = 0; i < 5 && !writer.direct_has_data(); ++i) {
+        auto m = make_kv_mutation(schema, format("pk-after{}", i), "back-on-the-direct-path");
+        ls.write(m, write_target(&writer, {}), db::no_timeout).get();
+    }
+    BOOST_REQUIRE(writer.direct_has_data());
+}
+
 // A group is removed while it still holds records that are only in memory. Unlike the separator's
 // buffers, which hold a second copy of records that are already on the disk, these are the only
 // copy there is, so removing the group has to write them out rather than discard them.
