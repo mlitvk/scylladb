@@ -45,6 +45,8 @@ struct logstor_params {
     bool compaction_enabled = true;
     size_t max_segments_per_compaction = 8;
     bool direct_group_writes = false;
+    // The live switch a node's operator has. Tests that change it hold a source of their own.
+    utils::updateable_value<bool> direct_writes_enabled{true};
     std::chrono::milliseconds direct_sync_period{10000};
     uint64_t direct_hot_threshold_bytes = 0;
     // The memory the direct write path may hold. Zero means room for eight hot groups at the
@@ -68,6 +70,7 @@ inline replica::logstor::logstor_config make_test_logstor_config(const std::file
             .separator_sg = seastar::current_scheduling_group(),
             .split_compaction_sg = seastar::current_scheduling_group(),
             .direct_group_writes = params.direct_group_writes,
+            .direct_writes_enabled = params.direct_writes_enabled,
             .direct_sync_period = params.direct_sync_period,
             .direct_hot_threshold_bytes = params.direct_hot_threshold_bytes,
             .direct_write_memory = params.direct_write_memory ? params.direct_write_memory : 8 * 2 * params.segment_size,

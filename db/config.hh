@@ -280,6 +280,7 @@ public:
     named_value<bool> logstor_format_on_startup;
     named_value<double> logstor_compaction_trigger_threshold;
     named_value<float> logstor_compaction_max_shares;
+    named_value<bool> logstor_direct_writes_enabled;
     named_value<uint32_t> logstor_direct_write_memory_in_mb;
     named_value<uint32_t> file_cache_size_in_mb;
     named_value<uint32_t> memtable_flush_queue_size;

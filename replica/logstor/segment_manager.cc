@@ -1105,10 +1105,18 @@ public:
     static size_t max_hot_groups(const segment_manager_config& cfg) noexcept {
         return cfg.direct_group_writes ? cfg.direct_write_memory / (2 * cfg.segment_size) : 0;
     }
-    // Whether the direct write path is on: the durability mode has to allow it, the memory budget
-    // has to have room for at least one hot group, and the disk has to have been taking the writes.
+    // Whether this shard is built to take direct writes at all: the durability mode has to allow it
+    // and the memory budget has to have room for at least one hot group. Fixed for the life of the
+    // shard, and what the sync fiber runs on - the fiber has to be there for the live switch below
+    // to have anything to turn back on.
+    bool direct_writes_possible() const noexcept {
+        return _max_hot_groups > 0;
+    }
+
+    // Whether the direct write path is on right now: the shard has to be built for it, the operator
+    // has to have left it on, and the disk has to have been taking the writes.
     bool direct_writes_enabled() const noexcept {
-        return _max_hot_groups > 0 && !_direct_writes_stopped;
+        return direct_writes_possible() && _cfg.direct_writes_enabled() && !_direct_writes_stopped;
     }
 
     // Takes a buffer whose write failed into the memory the path keeps for good, and turns the path
@@ -1596,7 +1604,11 @@ future<> segment_manager_impl::start() {
         return run_separator_fiber();
     });
 
-    if (direct_writes_enabled()) {
+    if (direct_writes_possible()) {
+        // Started whether or not the path is on right now: turning it off leaves this to write out
+        // and give back what the groups are holding, and turning it back on leaves it to hand the
+        // buffers out again.
+        //
         // In the separator's group: it does the same work for the same reason, taking the records
         // of a group to a segment of that group, only without the second write.
         _direct_sync_fiber = with_scheduling_group(_cfg.separator_sg, [this] {
@@ -1997,7 +2009,10 @@ bool segment_manager_impl::try_bind_direct_slot(logstor_group& cg, direct_write_
     if (slot.bound()) {
         return true;
     }
-    if (!cg._direct_enabled || _async_gate.is_closed()) {
+    // The group's own flag is not enough: the path can be turned off under a group that is still
+    // holding buffers, and the deadline pass would go on taking more of them for it until the
+    // controller comes around and takes them all back.
+    if (!cg._direct_enabled || !direct_writes_enabled() || _async_gate.is_closed()) {
         return false;
     }
     // The segments the reserve holds ready, not the free slots on the disk: taking one has to be
@@ -2030,10 +2045,10 @@ bool segment_manager_impl::try_bind_direct_slot(logstor_group& cg, direct_write_
 
 future<> segment_manager_impl::release_direct_slot(direct_write_buffer& slot) {
     // Emptied before anything is awaited. Giving a buffer and a segment back both wait, and a slot
-    // that was half of each while they did could be bound into by anything that binds
-    // synchronously - a write of the group, the sync fiber's pass over it, a promotion that arrives
-    // while this is unwinding - which would drop the half still in it on the floor. What is being
-    // given back is this function's own from here on, and the slot is free for whoever wants it.
+    // that was half of each while they did could be bound into by anything that binds synchronously
+    // - a write of the group, the sync fiber, a promotion that arrives while this is unwinding -
+    // which would drop the half still in it on the floor. What is being given back is this
+    // function's own from here on, and the slot is free for whoever wants it.
     auto released = std::exchange(slot, direct_write_buffer{});
 
     if (released.seg) {
@@ -2121,6 +2136,7 @@ future<> segment_manager_impl::run_direct_controller(logstor_group& cg, unsigned
     if (cg._direct_enabled && !direct_writes_enabled()) {
         logstor_logger.info("Taking the direct write buffers of a logstor group of table {} back:"
                 " the direct write path is off for this shard", cg.table_id());
+        // What the group holds is written out first, so turning the path off loses nothing.
         co_await cg.close_direct_writes();
         co_return;
     }

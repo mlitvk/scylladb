@@ -149,7 +149,12 @@ pool than the second write it saves is worth. How many groups of a shard may hol
 follows from `logstor_direct_write_memory_in_mb`, the memory a shard may hold in these buffers,
 divided by the two segments' worth a hot group takes - which is what bounds both the memory and the
 loss window. A budget with no room for a single group, `0` included, turns the path off, as does
-`batch` mode.
+`batch` mode. Both of those are settled when the shard starts;
+`logstor_direct_writes_enabled` is the switch an operator has on a running one. Turning it off
+refuses the next write straight away and leaves the sync fiber to write out what the groups are
+holding and take their buffers back, which it does within one period; turning it back on lets the
+controller hand them out again. The fiber therefore runs whenever the shard is built for the path,
+whether or not the switch is on - it is what has to act on the switch either way.
 
 A write that the disk refuses is the one case where the path keeps memory rather than giving it
 back: the buffer holds the only copy of records that were acknowledged, and its segment is left

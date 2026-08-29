@@ -978,6 +978,7 @@ database::init_logstor() {
             // keeps the ordinary path, whose acknowledgement waits for the disk. The same two
             // options say so for logstor as they do for the commitlog, rather than a pair of its own.
             .direct_group_writes = _cfg.commitlog_sync() == "periodic",
+            .direct_writes_enabled = _cfg.logstor_direct_writes_enabled,
             .direct_sync_period = std::chrono::milliseconds(_cfg.commitlog_sync_period_in_ms()),
             .direct_write_memory = _cfg.logstor_direct_write_memory_in_mb() * 1024ull * 1024ull,
         },

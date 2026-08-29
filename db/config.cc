@@ -987,10 +987,15 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "Trigger automatic logstor compaction when the number of available segments drops below this fraction of the total number of logstor segments. A value of 0 disables the trigger threshold.")
     , logstor_compaction_max_shares(this, "logstor_compaction_max_shares", liveness::LiveUpdate, value_status::Used, 2000,
         "Maximum CPU shares the logstor compaction controller gives the logstor compaction scheduling group, reached at full space pressure. ")
+    , logstor_direct_writes_enabled(this, "logstor_direct_writes_enabled", liveness::LiveUpdate, value_status::Used, true,
+        "Whether a logstor compaction group that writes fast enough may take its records straight into a write buffer of its own, bound to one of the group's segments, instead of writing them to the shared active segment and having the separator write them again into a segment of the group. "
+        "The first way puts a record on the disk once and acknowledges it before it gets there; the second puts it there twice and acknowledges it once it has. "
+        "Turning this off stops new records from being taken directly at once, and returns the buffers of the groups that hold them - after writing out what they hold - within one commitlog_sync_period_in_ms. "
+        "Has no effect unless commitlog_sync is periodic and logstor_direct_write_memory_in_mb leaves room for a group, both of which the direct write path requires.")
     , logstor_direct_write_memory_in_mb(this, "logstor_direct_write_memory_in_mb", value_status::Used, 64,
         "Memory in megabytes, per shard, that logstor may hold in the write buffers of the groups writing directly into segments of their own. "
         "Every such group holds two buffers of one segment each, so this bounds both the number of groups that write directly at once and the writes a crash can lose. "
-        "A value of 0 disables the direct write path. Has no effect unless commitlog_sync is periodic, which is what the direct write path requires.")
+        "A value of 0 disables the direct write path for the life of the node, unlike logstor_direct_writes_enabled, which can be changed on a running one. Has no effect unless commitlog_sync is periodic, which is what the direct write path requires.")
     , file_cache_size_in_mb(this, "file_cache_size_in_mb", value_status::Unused, 512,
         "Total memory to use for SSTable-reading buffers.")
     , memtable_flush_queue_size(this, "memtable_flush_queue_size", value_status::Unused, 4,

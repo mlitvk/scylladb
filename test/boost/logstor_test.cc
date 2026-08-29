@@ -2747,6 +2747,63 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_direct_write_waits_for_a_flush_instead_of_
     }
 }
 
+// The direct write path can be turned off and on again on a running shard, which is what
+// logstor_direct_writes_enabled is. Turning it off stops records from being taken directly at once,
+// and the sync fiber then writes out what the groups are holding and takes their buffers back;
+// turning it on lets them be handed out again.
+SEASTAR_THREAD_TEST_CASE(test_logstor_direct_writes_follow_the_live_config) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    utils::updateable_value_source<bool> enabled(true);
+    auto params = direct_write_params();
+    params.direct_writes_enabled = utils::updateable_value<bool>(enabled);
+    // Short enough that the sync fiber acts on the switch during the test.
+    params.direct_sync_period = std::chrono::milliseconds(200);
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path(), params), cache.shared_tracker);
+    ls.do_recovery_for_test().get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+    await_direct_buffers(ls, cg);
+
+    auto taken_directly = make_kv_mutation(schema, "pk0", "into-the-group's-own-buffer");
+    ls.write(taken_directly, write_target(&cg, {}), db::no_timeout).get();
+    BOOST_REQUIRE(cg.direct_has_data());
+
+    enabled.set(false);
+
+    // Refused from the next write, without waiting for the sync fiber: this one takes the ordinary
+    // path, which hands it to the separator.
+    auto taken_the_ordinary_way = make_kv_mutation(schema, "pk1", "through-the-shared-segment");
+    ls.write(taken_the_ordinary_way, write_target(&cg, {}), db::no_timeout).get();
+    ls.flush_to_separator().get();
+    BOOST_REQUIRE(cg.separator_has_data());
+
+    // And the group's buffers come back, with what they were holding written out first.
+    await_until([&cg] { return !cg.direct_writes_enabled(); });
+    BOOST_REQUIRE(!cg.direct_has_data());
+
+    // Turning it back on lets the group be given buffers again.
+    enabled.set(true);
+    await_direct_buffers(ls, cg);
+    auto taken_directly_again = make_kv_mutation(schema, "pk2", "and-back-into-its-own-buffer");
+    ls.write(taken_directly_again, write_target(&cg, {}), db::no_timeout).get();
+    BOOST_REQUIRE(cg.direct_has_data());
+
+    cg.flush_direct_writes().get();
+    cg.flush_separator().get();
+
+    for (const auto& m : {taken_directly, taken_the_ordinary_way, taken_directly_again}) {
+        auto actual = ls.read(*schema, cg.logstor_index(), m.decorated_key(), schema->full_slice()).get();
+        BOOST_REQUIRE(actual);
+        assert_that(*actual).is_equal_to(m);
+    }
+}
+
 // A group is removed while it still holds records that are only in memory. Unlike the separator's
 // buffers, which hold a second copy of records that are already on the disk, these are the only
 // copy there is, so removing the group has to write them out rather than discard them.

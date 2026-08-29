@@ -81,6 +81,11 @@ struct segment_manager_config {
     // records of such a write are acknowledged before they are on the disk, so this is only on in
     // the periodic commitlog sync mode, whose semantics it matches.
     bool direct_group_writes = false;
+    // Whether groups that write fast enough may actually use the path, which an operator can change
+    // on a running node - unlike the two above, which are what the shard is built for. Turning it
+    // off stops records from being taken directly at once and returns the buffers of the groups
+    // that hold them within a sync period; turning it on lets the controller give them out again.
+    utils::updateable_value<bool> direct_writes_enabled{true};
     // How long a partly filled direct buffer may wait for more records before it is written out,
     // which is what bounds the loss window.
     std::chrono::milliseconds direct_sync_period{10000};
