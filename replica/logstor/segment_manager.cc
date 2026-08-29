@@ -1885,7 +1885,14 @@ void segment_manager_impl::rotate_direct_buffer(logstor_group& cg) {
 
     auto full = std::exchange(cg._direct_active, std::move(cg._direct_spare));
     cg._direct_spare = {};
-    cg._direct_flush = shared_future<>(flush_direct_buffer(cg, std::move(full)));
+    // Reported here rather than left to whoever happens to wait for this future, or to nobody:
+    // there is nothing a waiter could do about it - the records are where the index says they are
+    // either way - and an exception nobody consumes is reported as an ignored future instead.
+    cg._direct_flush = shared_future<>(flush_direct_buffer(cg, std::move(full))
+            .handle_exception([table = cg.table_id()] (std::exception_ptr ep) {
+        logstor_logger.error("Failed to write out a direct write buffer of a logstor group of table {}: {}",
+                table, seastar::formattable(ep));
+    }));
 }
 
 future<> segment_manager_impl::flush_direct_buffer(logstor_group& cg, direct_write_buffer full) {
@@ -2200,6 +2207,12 @@ future<temporary_buffer<char>> segment_manager_impl::read_record_bytes(log_locat
         co_return coroutine::exception(std::make_exception_ptr(std::runtime_error(fmt::format(
             "Read beyond end of segment {}: offset {} + size {} > segment size {}",
             location.segment, location.offset, location.size, _cfg.segment_size))));
+    }
+    // The descriptor below is indexed by the segment id, so the id has to be one this shard has.
+    if (location.segment.value >= _segment_descs.size()) [[unlikely]] {
+        co_return coroutine::exception(std::make_exception_ptr(std::runtime_error(fmt::format(
+            "Read of segment {}, which is past the {} segments of this shard",
+            location.segment, _segment_descs.size()))));
     }
 
     // A record taken by the direct path is in the index, and readable, before its segment has been
@@ -3065,7 +3078,14 @@ void compaction_manager_impl::tick_direct_deadlines(seastar::lowres_clock::time_
     // Nothing here yields, so the groups cannot change under it and it needs neither a snapshot of
     // them nor a re-check after each one.
     for (const auto& [cg, state] : _groups) {
-        _sm.tick_direct_deadlines(*cg, now);
+        // Per group, so that one of them failing to be given a buffer does not cost every group
+        // after it in the map the deadline of the buffer it is holding.
+        try {
+            _sm.tick_direct_deadlines(*cg, now);
+        } catch (...) {
+            logstor_logger.warn("Direct write sync of a logstor group of table {} failed: {}. Ignored",
+                    cg->table_id(), seastar::formattable(std::current_exception()));
+        }
     }
 }
 
@@ -3640,8 +3660,8 @@ direct_write_buffer::~direct_write_buffer() = default;
 future<> logstor_group::await_direct_settled() {
     while (!_direct_flush.available()) {
         auto f = co_await coroutine::as_future(_direct_flush.get_future());
-        // Like the separator waits: a flush that failed has already said so and left the records
-        // readable, and there is nothing a waiter here can do about it.
+        // The flush reports its own failure and leaves the records readable, so this future does
+        // not fail; ignoring it keeps that from being something a caller has to know.
         f.ignore_ready_future();
     }
 }
