@@ -665,16 +665,6 @@ struct direct_write_buffer {
     }
 };
 
-// What to do with the records a direct write buffer still holds when its slot is given back.
-// Everything that gives a group's buffers back flushes them first - they are the only copy of
-// records the index points at - except a group whose index has just been cleared, where there is
-// nothing left pointing at them and writing them out would put a segment nothing can reach into a
-// group that was emptied on purpose.
-enum class direct_slot_release {
-    flushed,
-    discard_records,
-};
-
 class compaction_reenabler {
     std::function<void()> _release;
 public:
@@ -703,9 +693,8 @@ public:
     // writing into its spare; it requires that no flush of this group is already in flight.
     virtual void rotate_direct_buffer(logstor_group&) = 0;
     // Gives both of the group's direct buffers and the segments they are bound to back. The buffers
-    // are expected to have been flushed first, since their records are nowhere else, unless the
-    // caller says their records are to be discarded - see direct_slot_release.
-    virtual future<> release_direct_buffers(logstor_group&, direct_slot_release) = 0;
+    // are expected to have been flushed first, since their records are nowhere else.
+    virtual future<> release_direct_buffers(logstor_group&) = 0;
     // Gives the group its buffers now, rather than waiting for the controller to find that it
     // writes fast enough to deserve them.
     virtual future<> promote_direct_writes_for_test(logstor_group&) = 0;
@@ -844,12 +833,6 @@ public:
     // nowhere else, and the index already points at the segment the buffer has yet to be written
     // into, so dropping it would lose it outright.
     future<> close_direct_writes();
-
-    // Gives up what the group has taken directly rather than writing it out, and gives the buffers
-    // and their segments back. Only for a group whose index has been cleared: the records in the
-    // buffers are then unreachable, and a segment written out of them would be one nothing points
-    // at, in a group that was just emptied.
-    future<> discard_direct_writes();
 
     bool empty() const noexcept {
         return _logstor_segments.empty()

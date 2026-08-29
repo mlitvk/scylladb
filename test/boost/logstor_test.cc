@@ -2605,9 +2605,10 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_direct_writes_of_a_group_stop_after_repeat
 
 // Truncating a group clears its index and then discards its segments. A record the group took
 // directly is in neither: not in a segment, because its buffer has not been written out, and not in
-// the index any more. Checks that the buffer and the segment it was bound to are given up here,
-// rather than written out later into a group that was emptied on purpose.
-SEASTAR_THREAD_TEST_CASE(test_logstor_discarding_a_group_gives_up_what_it_took_directly) {
+// the index any more. Checks that the buffer is written out here rather than left to be written out
+// later into a group that was emptied on purpose - the segment it produces holds only dead records,
+// and the discard frees it along with the rest.
+SEASTAR_THREAD_TEST_CASE(test_logstor_discarding_a_group_writes_out_what_it_took_directly) {
     auto schema = make_kv_schema();
     tmpdir dir;
 
