@@ -1859,6 +1859,9 @@ future<> segment_manager_impl::flush_direct_buffer(logstor_group& cg, direct_wri
 
         auto written = co_await coroutine::as_future(
                 write_full_segment_tail(full.seg, *full.buf, cg, write_source::direct_write));
+        // Either way this buffer is no longer what a crash of the shard would lose: its records are
+        // on the disk, or they are already gone and counted as direct_failed_buffer_bytes.
+        _stats.direct_unflushed_bytes -= unflushed_bytes;
         if (written.failed()) {
             ++_stats.direct_flush_failures;
             ++cg._direct_flush_failures;
@@ -1877,7 +1880,6 @@ future<> segment_manager_impl::flush_direct_buffer(logstor_group& cg, direct_wri
             note_direct_flush_failure(std::move(full));
         } else {
             cg._direct_flush_failures = 0;
-            _stats.direct_unflushed_bytes -= unflushed_bytes;
             // Only now that the records are on the disk and their segment is in the group: until
             // here a read of one of them had to come out of this buffer.
             _direct_readable.erase(seg_id.value);
@@ -2161,6 +2163,7 @@ future<temporary_buffer<char>> segment_manager_impl::read_record_bytes(log_locat
     if (!get_segment_descriptor(location.segment).owner) [[unlikely]] {
         if (auto it = _direct_readable.find(location.segment.value); it != _direct_readable.end()) {
             ++_stats.direct_read_hits;
+            _stats.bytes_read += location.size;
             co_return temporary_buffer<char>(it->second->data() + location.offset, location.size);
         }
     }
