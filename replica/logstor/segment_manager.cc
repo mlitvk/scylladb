@@ -2029,25 +2029,31 @@ bool segment_manager_impl::try_bind_direct_slot(logstor_group& cg, direct_write_
 }
 
 future<> segment_manager_impl::release_direct_slot(direct_write_buffer& slot) {
-    if (slot.seg) {
-        _direct_readable.erase(slot.seg->id().value);
+    // Emptied before anything is awaited. Giving a buffer and a segment back both wait, and a slot
+    // that was half of each while they did could be bound into by anything that binds
+    // synchronously - a write of the group, the sync fiber's pass over it, a promotion that arrives
+    // while this is unwinding - which would drop the half still in it on the floor. What is being
+    // given back is this function's own from here on, and the slot is free for whoever wants it.
+    auto released = std::exchange(slot, direct_write_buffer{});
+
+    if (released.seg) {
+        _direct_readable.erase(released.seg->id().value);
     }
-    if (slot.buf) {
-        if (slot.buf->has_data()) {
+    if (released.buf) {
+        if (released.buf->has_data()) {
             on_internal_error(logstor_logger, "Releasing a logstor direct write buffer that was not written out");
         }
         // The pool takes a buffer back only once it is closed, and one that was only appended to
         // directly holds nothing, so this completes right away.
-        co_await slot.buf->close();
-        slot.buf.reset();
+        co_await released.buf->close();
+        released.buf.reset();
     }
-    if (slot.seg) {
+    if (released.seg) {
         // The segment was never written, so it holds no data and is in no segment set: dropping the
         // last reference to it below simply gives the slot back to the pool.
-        co_await slot.seg->stop();
-        slot.seg = {};
+        co_await released.seg->stop();
+        released.seg = {};
     }
-    slot.first_append = {};
 }
 
 future<> segment_manager_impl::release_direct_buffers(logstor_group& cg) {
