@@ -2861,23 +2861,31 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_closed_group_takes_no_separator_writes) {
 SEASTAR_THREAD_TEST_CASE(test_logstor_direct_write_promotion_and_demotion) {
     constexpr uint64_t threshold = 64 * 1024;
 
-    BOOST_REQUIRE(!direct_promotion_wanted(0, threshold));
-    BOOST_REQUIRE(!direct_promotion_wanted(threshold - 1, threshold));
-    BOOST_REQUIRE(direct_promotion_wanted(threshold, threshold));
-    BOOST_REQUIRE(direct_promotion_wanted(4 * threshold, threshold));
+    BOOST_REQUIRE(!direct_promotion_wanted(0, threshold, 1));
+    BOOST_REQUIRE(!direct_promotion_wanted(threshold - 1, threshold, 1));
+    BOOST_REQUIRE(direct_promotion_wanted(threshold, threshold, 1));
+    BOOST_REQUIRE(direct_promotion_wanted(4 * threshold, threshold, 1));
 
-    // A group that keeps up is never demoted, however many periods it has been going.
-    for (unsigned periods = 0; periods < 4; ++periods) {
-        BOOST_TEST_CONTEXT("periods=" << periods) {
-            BOOST_REQUIRE(!direct_demotion_wanted(threshold, threshold, periods));
+    // A decision that covers more than one sync period - the controller was still busy when the
+    // next one came around - asks for the threshold once per period it covers, so a group is not
+    // promoted on two periods' worth of bytes measured against one period's bar.
+    BOOST_REQUIRE(!direct_promotion_wanted(threshold, threshold, 2));
+    BOOST_REQUIRE(direct_promotion_wanted(2 * threshold, threshold, 2));
+    BOOST_REQUIRE(!direct_demotion_wanted(2 * threshold, threshold, 2, 2));
+    BOOST_REQUIRE(direct_demotion_wanted(2 * threshold - 1, threshold, 2, 2));
+
+    // A group that keeps up is never demoted, however many decisions it has been going.
+    for (unsigned decisions = 0; decisions < 4; ++decisions) {
+        BOOST_TEST_CONTEXT("decisions=" << decisions) {
+            BOOST_REQUIRE(!direct_demotion_wanted(threshold, threshold, 1, decisions));
         }
     }
 
-    // Exactly the documented number of under-filled periods, not one fewer.
+    // Exactly the documented number of under-filled decisions, not one fewer.
     static_assert(direct_underfilled_periods_before_demotion == 2);
-    BOOST_REQUIRE(!direct_demotion_wanted(threshold - 1, threshold, 1));
-    BOOST_REQUIRE(direct_demotion_wanted(threshold - 1, threshold, 2));
-    BOOST_REQUIRE(direct_demotion_wanted(0, threshold, 3));
+    BOOST_REQUIRE(!direct_demotion_wanted(threshold - 1, threshold, 1, 1));
+    BOOST_REQUIRE(direct_demotion_wanted(threshold - 1, threshold, 1, 2));
+    BOOST_REQUIRE(direct_demotion_wanted(0, threshold, 1, 3));
 }
 
 // Checks the controller end to end: a group that writes fast enough is given buffers of its own,

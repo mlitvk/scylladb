@@ -91,9 +91,10 @@ constexpr double compaction_batch_extension_tolerance = 0.8;
 // compaction would stop instead of running at the efficiency the disk allows.
 constexpr double compaction_marginal_admission_ratio = 0.75;
 
-// How many sync periods in a row a group has to write less than the threshold before its direct
-// write buffers are taken back. One is not enough: a group whose load dips for a moment would give
-// its buffers up and take them again, and each round trip leaves a partly filled segment behind.
+// How many decisions in a row a group has to be found writing less than the threshold before its
+// direct write buffers are taken back. One is not enough: a group whose load dips for a moment
+// would give its buffers up and take them again, and each round trip leaves a partly filled segment
+// behind.
 constexpr unsigned direct_underfilled_periods_before_demotion = 2;
 
 // How many flushes of a group's direct write buffers may fail in a row before the group is put back
@@ -103,16 +104,21 @@ constexpr unsigned direct_underfilled_periods_before_demotion = 2;
 // hot. The ordinary path reports a write failure to the caller instead of taking that on.
 constexpr unsigned direct_flush_failures_before_demotion = 3;
 
-// Whether a group that writes this many bytes in a sync period is worth giving write buffers of its
-// own. Below the threshold - half a segment per period - the partly filled segment such a group
-// leaves at the end of every period occupies more of the pool than the second write it saves is
-// worth, and the ordinary path is the better place for it.
-bool direct_promotion_wanted(uint64_t bytes_this_period, uint64_t hot_threshold_bytes) noexcept;
+// Whether a group that writes this many bytes is worth giving write buffers of its own. Below the
+// threshold - half a segment per sync period - the partly filled segment such a group leaves at the
+// end of every period occupies more of the pool than the second write it saves is worth, and the
+// ordinary path is the better place for it.
+//
+// `periods` is how many sync periods the bytes were counted over, which is one unless a controller
+// pass ran long enough for the next one to be skipped. The threshold is per period, so a decision
+// that covers more of them has to ask for proportionally more.
+bool direct_promotion_wanted(uint64_t bytes, uint64_t hot_threshold_bytes, unsigned periods) noexcept;
 
 // Whether a group that has its own write buffers has gone quiet for long enough to take them back.
-// `underfilled_periods` counts the periods it has been under the threshold for, this one included.
-bool direct_demotion_wanted(uint64_t bytes_this_period, uint64_t hot_threshold_bytes,
-        unsigned underfilled_periods) noexcept;
+// `underfilled_decisions` counts the decisions it has been under the threshold for, this one
+// included; each of them covers `periods` sync periods.
+bool direct_demotion_wanted(uint64_t bytes, uint64_t hot_threshold_bytes, unsigned periods,
+        unsigned underfilled_decisions) noexcept;
 
 // Watermarks, in available segments, that drive automatic compaction. It starts once the number of
 // available segments drops below `low` - the free-segment target - and stops once it is back at
@@ -749,7 +755,8 @@ class logstor_group {
     // Whether writes of this group go into its own buffer instead of the shared active segment.
     bool _direct_enabled{false};
     // What the group has written since the controller last looked, which is what it promotes and
-    // demotes the group on. Fed by every write of the group, direct or not.
+    // demotes the group on. Fed by every write of the group, direct or not. The controller knows
+    // how many sync periods that covers, which is one unless a pass of it ran long.
     uint64_t _direct_bytes_this_period{0};
     unsigned _direct_underfilled_periods{0};
     // Flushes of this group's buffers that failed in a row, see

@@ -695,7 +695,7 @@ public:
     // One deadline pass over every group of the shard, and one controller pass. They are separate
     // because the controller waits and the deadlines must not.
     void tick_direct_deadlines(seastar::lowres_clock::time_point now);
-    future<> run_direct_controller();
+    future<> run_direct_controller(unsigned periods);
 
     // How many of this shard's groups have a buffer of their own to write into. Groups that are
     // taking direct writes but have no buffer are writing the ordinary way and are not counted.
@@ -1089,9 +1089,9 @@ public:
     // bounds how much a crash of this shard would lose.
     void tick_direct_deadlines(logstor_group&, seastar::lowres_clock::time_point now);
     // Whether the group still writes fast enough to keep its buffers, or fast enough to be given
-    // them, over the period that just ended. Waits for a demotion to be drained, so it runs behind
-    // the deadlines rather than in front of them.
-    future<> run_direct_controller(logstor_group&);
+    // them, over the `periods` sync periods that just ended. Waits for a demotion to be drained, so
+    // it runs behind the deadlines rather than in front of them.
+    future<> run_direct_controller(logstor_group&, unsigned periods);
     future<> run_direct_sync_fiber();
     uint64_t direct_hot_threshold_bytes() const noexcept {
         return _cfg.direct_hot_threshold_bytes ? _cfg.direct_hot_threshold_bytes : _cfg.segment_size / 2;
@@ -2092,7 +2092,7 @@ void segment_manager_impl::tick_direct_deadlines(logstor_group& cg, seastar::low
     }
 }
 
-future<> segment_manager_impl::run_direct_controller(logstor_group& cg) {
+future<> segment_manager_impl::run_direct_controller(logstor_group& cg, unsigned periods) {
     // A group whose writes the disk keeps refusing goes back to the ordinary path, and so does
     // every group once the path is off shard wide. Both are decided here rather than at the flush,
     // which cannot wait for a group to be closed.
@@ -2109,25 +2109,25 @@ future<> segment_manager_impl::run_direct_controller(logstor_group& cg) {
         co_return;
     }
 
-    // What the group wrote over the period just ended, direct or not, which is the rate the
+    // What the group wrote over the periods just ended, direct or not, which is the rate the
     // decisions below are made on.
     const auto bytes = std::exchange(cg._direct_bytes_this_period, 0);
     const auto threshold = direct_hot_threshold_bytes();
 
     if (!cg._direct_enabled) {
-        if (direct_promotion_wanted(bytes, threshold)) {
+        if (direct_promotion_wanted(bytes, threshold, periods)) {
             promote_direct_group(cg);
         }
         co_return;
     }
 
-    if (bytes >= threshold) {
+    if (bytes >= threshold * periods) {
         cg._direct_underfilled_periods = 0;
         co_return;
     }
 
     ++cg._direct_underfilled_periods;
-    if (direct_demotion_wanted(bytes, threshold, cg._direct_underfilled_periods)) {
+    if (direct_demotion_wanted(bytes, threshold, periods, cg._direct_underfilled_periods)) {
         // Writes out what is buffered and gives the buffers and their segments back, so that a
         // group that is actually writing can have them.
         co_await cg.close_direct_writes();
@@ -2145,6 +2145,9 @@ future<> segment_manager_impl::run_direct_sync_fiber() {
     // The controller runs beside the ticks rather than in one: a demotion waits for the group it
     // demotes to be drained, and a deadline that waited behind that would not be a deadline.
     future<> controller = make_ready_future<>();
+    // Sync periods that have gone by without the controller looking at them. It measures a write
+    // rate, so a pass that covers more than one period has to weigh its threshold by as many.
+    unsigned pending_periods = 0;
 
     while (true) {
         try {
@@ -2161,19 +2164,21 @@ future<> segment_manager_impl::run_direct_sync_fiber() {
             logstor_logger.warn("logstor direct write sync failed: {}. Ignored", std::current_exception());
         }
 
-        if (now - period_start < _cfg.direct_sync_period) {
-            continue;
-        }
         // Whole periods, so a pass that took longer than one does not leave the next one measuring
         // a write rate over part of a period and demoting a group that was writing all along.
         while (now - period_start >= _cfg.direct_sync_period) {
             period_start += _cfg.direct_sync_period;
+            ++pending_periods;
         }
-        // A controller pass that is still running keeps the period it started in; skipping is what
-        // makes it fall behind the deadlines rather than queue in front of them.
-        if (controller.available()) {
-            controller = _compaction_mgr.run_direct_controller().handle_exception([] (std::exception_ptr ep) {
-                logstor_logger.warn("logstor direct write controller failed: {}. Ignored", ep);
+        // A controller pass that is still running is not queued behind, which is what keeps it
+        // from getting in front of the deadlines. The periods it did not cover are carried to the
+        // next pass rather than dropped, so the bytes it finds and the threshold it weighs them
+        // against are over the same window.
+        if (pending_periods && controller.available()) {
+            controller = _compaction_mgr.run_direct_controller(std::exchange(pending_periods, 0))
+                    .handle_exception([] (std::exception_ptr ep) {
+                logstor_logger.warn("logstor direct write controller failed: {}. Ignored",
+                        seastar::formattable(ep));
             });
         }
     }
@@ -3089,7 +3094,7 @@ void compaction_manager_impl::tick_direct_deadlines(seastar::lowres_clock::time_
     }
 }
 
-future<> compaction_manager_impl::run_direct_controller() {
+future<> compaction_manager_impl::run_direct_controller(unsigned periods) {
     // The groups are re-checked after every yield: one of them can be removed while this walks them.
     std::vector<logstor_group*> group_snapshot;
     group_snapshot.reserve(_groups.size());
@@ -3102,7 +3107,7 @@ future<> compaction_manager_impl::run_direct_controller() {
         if (!_groups.contains(cg)) {
             continue;
         }
-        co_await _sm.run_direct_controller(*cg);
+        co_await _sm.run_direct_controller(*cg, periods);
     }
 }
 
