@@ -113,7 +113,13 @@ worth it.
    its segment is linked into the group after that - exactly like the output of the separator or of
    a compaction. While the buffer fills, its segment is unwritten and belongs to no segment set, so
    nothing can pick it for compaction, scan it or free it. The group rotates into its second buffer
-   while the first one is being written, and is given a fresh buffer and segment afterwards.
+   while the first one is being written, and is given a fresh buffer and segment afterwards. A group
+   has one flush in flight at a time, so a burst that fills the second buffer before the first
+   reaches the disk waits for that write rather than take the ordinary path, which would put the
+   record on the disk twice - the same thing the shared write buffer does when its own ring is full.
+   The wait is bounded by the write's timeout and costs about what acknowledging from the ordinary
+   path would have cost, the disk being the same one, so what a group at that ceiling pays is
+   latency rather than bytes. `direct_flush_waits` counts the records that wait.
 4. Giving it one is best effort. A buffer and a segment are taken only if both can be had without
    waiting, and a group whose slot stays unbound writes through the shared active segment - which is
    what it already does while a flush is in flight - until a write of the group or the sync fiber
