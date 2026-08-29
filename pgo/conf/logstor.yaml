@@ -23,7 +23,10 @@ keyspace: logstor_ks
 
 # Tablets are enabled explicitly: the compaction groups of a logstor table are the
 # tablets of that table, and a fixed initial count keeps the number of compaction groups
-# a shard writes into the same between runs.
+# a shard writes into the same between runs. That number is also what decides how the
+# writes split between logstor's two write paths - see LOGSTOR_DIRECT_WRITE_MEMORY_IN_MB
+# in pgo.py, which is set against the eight groups per shard that these 16 tablets come
+# to - so it cannot be changed here on its own.
 keyspace_definition: |
 
   CREATE KEYSPACE IF NOT EXISTS logstor_ks WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3} AND tablets = {'enabled': true, 'initial': 16};

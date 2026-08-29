@@ -853,15 +853,21 @@ populators["repair_dataset"] = populate_repair
 
 # LOGSTOR ==================================================
 #
-# Logstor is a log structured key-value engine. A write appends a record to the active
-# segment of its compaction group and repoints the primary index at it, a read either
-# finds the partition in the logstor cache or reads its record back out of a segment, and
-# compaction is what turns the dead records that the overwrites and the deletes leave
-# behind into free segments again.
+# Logstor is a log structured key-value engine. A write appends a record to a segment and
+# repoints the primary index at it, a read either finds the partition in the logstor cache
+# or reads its record back out of a segment, and compaction is what turns the dead records
+# that the overwrites and the deletes leave behind into free segments again.
 #
-# Which of those paths a run exercises, and how much each of them does, is decided by how
-# full the segment pool of a shard is, so the workload is sized against the pool rather
-# than in rows. Compaction does not start until the free segments fall under
+# A record reaches a segment one of two ways, and both are here to be trained. A compaction
+# group that writes fast enough is given two write buffers of its own and appends its
+# records straight into a segment of that group: one write per record, acknowledged before
+# it is on the disk. Every other group appends to the shared active segment, which the
+# separator later reads back and rewrites into a segment per group: two writes per record.
+# Which groups get the first way is what LOGSTOR_DIRECT_WRITE_MEMORY_IN_MB decides.
+#
+# How much of the run each of those paths and compaction get is decided by how full the
+# segment pool of a shard is, so the workload is sized against the pool rather than in rows.
+# Compaction does not start until the free segments fall under
 # logstor_compaction_trigger_threshold (5%) of the pool, and what it then pays per segment
 # it takes is the fraction of that segment which is still live - so a pool that is about
 # half live is the regime where compaction has to relocate real data instead of dropping
@@ -873,9 +879,25 @@ populators["repair_dataset"] = populate_repair
 # cluster. Only the logstor cluster is started with these: every other workload runs
 # without the logstor feature and pays neither for the pool nor for formatting its files.
 LOGSTOR_DISK_SIZE_IN_MB = 256
+
+# What the direct write path may hold in the write buffers of the groups writing into
+# segments of their own, per shard. A group takes two buffers of one segment
+# (logstor::default_segment_size, 128 KiB) each, so this is a cap on how many groups write
+# that way at once: 1 MiB is four of them.
+#
+# ./conf/logstor.yaml asks for 16 tablets, and the compaction groups of a logstor table are
+# its tablets, so the six shards of the RF=3 cluster hold 48 tablet replicas between them -
+# eight groups per shard. Half of them therefore write directly and half through the shared
+# active segment and the separator, which is the point of not leaving this at its 2 MiB
+# default: that would cover all eight and leave the second path with nothing but the ramp
+# up. A shard with more groups than the budget covers is also what a production node looks
+# like, where a shard holds far more tablets than the budget of a few could ever cover.
+LOGSTOR_DIRECT_WRITE_MEMORY_IN_MB = 1
+
 LOGSTOR_NODE_OPTS = [
     "--experimental-features=logstor",
     f"--logstor-disk-size-in-mb={LOGSTOR_DISK_SIZE_IN_MB}",
+    f"--logstor-direct-write-memory-in-mb={LOGSTOR_DIRECT_WRITE_MEMORY_IN_MB}",
 ]
 
 # Partitions of the dataset, which is what sizes it against the pool above. A row of
@@ -1003,6 +1025,14 @@ async def report_logstor_state(addrs: list[str], phase: str) -> None:
         f" {m['scylla_cache_partition_insertions']:.0f} insertions,"
         f" {m['scylla_cache_partition_evictions']:.0f} evictions"
     )
+    # The two write paths are what this workload is here for, so a run that only took one of
+    # them trains half of what it was meant to, whatever else its counters say.
+    if bool(direct_written) != bool(normal_written):
+        training_logger.warning(f"logstor {phase}: only one of the two write paths ran"
+                                f" ({direct_written/2**30:.2f} GiB directly,"
+                                f" {normal_written/2**30:.2f} GiB through the active segment)."
+                                f" Check LOGSTOR_DIRECT_WRITE_MEMORY_IN_MB against the compaction"
+                                f" groups a shard holds.")
     # The two ways a write can fail say two different things, and the fix differs with them.
     if failures := m["scylla_logstor_sm_write_failures"]:
         training_logger.warning(f"logstor {phase}: {failures:.0f} writes failed in the segment manager."
