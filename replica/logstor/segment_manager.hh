@@ -181,6 +181,9 @@ public:
     // The bytes of one record, as they are on disk: the read of a record does not parse its
     // header, which holds a key the read already has, and decodes its value straight out of
     // this buffer rather than copying it.
+    //
+    // The disk read is issued over the block-aligned range that covers the record and trimmed back
+    // to it, which costs bandwidth and saves latency - see the read path in the implementation.
     future<temporary_buffer<char>> read_record_bytes(log_location location);
 
     void on_add_record(log_location location) noexcept override;

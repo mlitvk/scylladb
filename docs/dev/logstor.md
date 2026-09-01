@@ -86,7 +86,13 @@ worth it.
 1. Application requests data for a partition key
 2. Cache lookup, which serves the read when the partition is cached
 3. Index lookup returns record location
-4. Segment manager reads the bytes of the record from disk
+4. Segment manager reads the bytes of the record from disk. The read is issued over the
+   4096-byte-aligned range that covers the record and trimmed back to it, rather than over the
+   record as it lies: a record is smaller than a block, and the drive charges for a request that
+   does not start on a block boundary as such, not for the pages it touches, so the covering read
+   is cheaper than the unaligned one over the very same pages. It costs bandwidth - `bytes_read`
+   counts what the disk served, so the ratio of it to the record bytes is the read amplification
+   this buys the latency with
 5. The key of the record is compared against the key of the read, and the value of the record
    is decoded into the mutation the read returns. Neither the header of the record nor its
    value is copied out of the buffer that was read: the read takes the two fields it needs

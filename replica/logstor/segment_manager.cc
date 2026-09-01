@@ -1538,6 +1538,15 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
         throw exceptions::configuration_exception(fmt::format("Segment size {} must be less than or equal to file size {}", config.segment_size, config.file_size));
     }
 
+    // Segments are written a block at a time, and a record is read through the block-aligned range
+    // that covers it - a segment that is not a whole number of blocks would put a segment boundary
+    // inside a block, and the read of a record at the tail of the last segment of a file past the
+    // end of that file.
+    if (config.segment_size % ondisk::block_alignment != 0) {
+        throw exceptions::configuration_exception(fmt::format("Segment size {} must be a multiple of the block alignment {}",
+                config.segment_size, ondisk::block_alignment));
+    }
+
     // The free space of a segment is bucketed by segment_descriptor_hist, which indexes a
     // fixed-size bucket array without checking its bounds. A segment larger than the histogram's
     // maximum would compute an out of range bucket for a fully free segment.
@@ -2380,17 +2389,32 @@ future<temporary_buffer<char>> segment_manager_impl::read_record_bytes(log_locat
         file = co_await _file_mgr.get_file(file_id);
     }
 
-    // The bulk read is what dma_read_exactly() does underneath, over two coroutine frames of its
-    // own: one to trim the buffer the disk gave back to the size that was asked for, and one to
-    // reject a short read. This coroutine is already here to do both.
-    auto buf = co_await file.dma_read_bulk<char>(file_offset + location.offset, location.size);
-    if (buf.size() < location.size) [[unlikely]] {
+    // The read is issued over the range the record lies in, rounded out to read_alignment, and
+    // trimmed back to the record. seastar's own bulk read rounds to the file's DMA alignment, 512
+    // bytes on NVMe, and a record is smaller than a block: the drive charges for a request that is
+    // not on a block boundary as such, not for the pages it touches, so a covering block-aligned
+    // request over the very same pages is measurably cheaper than the unaligned one it replaces.
+    static constexpr size_t read_alignment = ondisk::block_alignment;
+    const uint64_t want = file_offset + location.offset;
+    const uint64_t base = align_down(want, uint64_t(read_alignment));
+    const size_t front = want - base;
+    const size_t len = align_up(front + location.size, read_alignment);
+
+    // The overload that takes a buffer, and not dma_read(pos, len) or dma_read_exactly(): those go
+    // through dma_read_bulk_impl(), which would align the read again to the file's own alignment
+    // and undo the covering read built above.
+    auto buf = temporary_buffer<char>::aligned(file.memory_dma_alignment(), len);
+    const auto n = co_await file.dma_read(base, buf.get_write(), len);
+    if (n < front + location.size) [[unlikely]] {
         co_return coroutine::exception(std::make_exception_ptr(std::runtime_error(fmt::format(
             "Short read of segment {}: got {} bytes of the {} asked for at offset {}",
-            location.segment, buf.size(), location.size, location.offset))));
+            location.segment, n > front ? n - front : 0, location.size, location.offset))));
     }
-    buf.trim(location.size);
-    _stats.bytes_read += location.size;
+    buf.trim(front + location.size);
+    buf.trim_front(front);
+    // What the disk served, which is what the counter says it counts: the covering read is bigger
+    // than the record, and the read amplification it costs is the point of watching it.
+    _stats.bytes_read += len;
     co_return std::move(buf);
 }
 
