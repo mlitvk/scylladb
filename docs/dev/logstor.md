@@ -466,6 +466,14 @@ ls_{shard_id}-{file_id}-Data.db
 
 Files are pre-formatted (zero-filled) before use.
 
+A file is opened where it is formatted and held open for the life of the shard, and the read and the
+write paths share the one handle, which is why it is opened read-write even when a read is what asked
+for it. Nothing in normal operation opens a file: allocating a segment, discarding one and reading a
+record all use the open handle, and the `scylla_logstor_sm_file_opens` counter therefore stops moving
+once the shard has started. The cost of this is a file descriptor per file for the life of the
+process - `logstor_disk_size_in_mb / logstor_file_size_in_mb` of them per shard - so a node with a
+large logstor disk wants a correspondingly large `logstor_file_size_in_mb`.
+
 ### Segments
 
 Each segment is a contiguous fixed-size region within a file (default 128KB). A segment is identified by a `log_segment_id` (a 32-bit integer index), which maps to a file and offset within that file.

@@ -3974,3 +3974,105 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_split_compaction_splits_segments_between_t
     BOOST_REQUIRE(left_records == expected_left);
     BOOST_REQUIRE(right_records == expected_right);
 }
+
+// Files are opened once and held open for the life of the shard, read and written through the same
+// handle. The write path used to open a file for every segment it allocated and every segment it
+// discarded, which put an open() - a thread pool round trip - in front of each 128KB of segment
+// allocation. Checks that a workload crossing several files opens none of them.
+SEASTAR_THREAD_TEST_CASE(test_logstor_files_are_opened_once_and_held_open) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    // Four segments per file, so that a modest workload crosses several files.
+    logstor_params params;
+    params.file_size = 4 * params.segment_size;
+    params.disk_size = 16 * params.file_size;
+    // Compaction allocates segments through the same path, but only when it decides to, and this
+    // is about what the write path does on its own.
+    params.compaction_enabled = false;
+    const auto file_count = params.disk_size / params.file_size;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path(), params), cache.shared_tracker);
+    ls.do_recovery_for_test().get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    auto& sm = ls.get_segment_manager();
+    // Every file was formatted at startup, and every file that was formatted was opened.
+    BOOST_REQUIRE_EQUAL(sm.files_opened(), file_count);
+    const auto opens_after_start = sm.files_opened();
+
+    test_logstor_group cg(schema, ls);
+    const auto free_segments_before = sm.get_usage().free_segments;
+
+    // Three records to a segment, written and then separated into full segments of the group, which
+    // is two segment allocations for every one of them.
+    const auto record_size = sm.get_segment_size() / 3;
+    std::vector<mutation> expected;
+    for (unsigned i = 0; i < 24; ++i) {
+        expected.push_back(make_kv_mutation_of_record_size(schema, format("pk{}", i), record_size));
+        ls.write(expected.back(), write_target(&cg, {}), db::no_timeout).get();
+    }
+    ls.flush_to_separator().get();
+    cg.flush_separator().get();
+
+    // The premise: the segments the group took do not all come out of one file.
+    BOOST_REQUIRE_GT(cg.logstor_segments().segment_count(), params.file_size / params.segment_size);
+    BOOST_REQUIRE_LT(sm.get_usage().free_segments, free_segments_before);
+
+    for (const auto& m : expected) {
+        auto actual = ls.read(*schema, cg.logstor_index(), m.decorated_key(), schema->full_slice()).get();
+        BOOST_REQUIRE(actual);
+        assert_that(*actual).is_equal_to(m);
+    }
+
+    // Discarding used to open the file of every segment it invalidated the header of.
+    cg.logstor_index().clear().get();
+    sm.discard_segments(cg).get();
+    BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 0u);
+
+    BOOST_REQUIRE_EQUAL(sm.files_opened(), opens_after_start);
+}
+
+// The same, for a shard that formats its files lazily: a file is opened where it is formatted, so
+// the opens follow the files into existence and there is still only ever one per file.
+SEASTAR_THREAD_TEST_CASE(test_logstor_lazily_formatted_files_are_opened_once) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    logstor_params params;
+    params.file_size = 4 * params.segment_size;
+    params.disk_size = 16 * params.file_size;
+    params.format_on_startup = false;
+    params.compaction_enabled = false;
+    const auto file_count = params.disk_size / params.file_size;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path(), params), cache.shared_tracker);
+    ls.do_recovery_for_test().get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    auto& sm = ls.get_segment_manager();
+
+    test_logstor_group cg(schema, ls);
+    const auto record_size = sm.get_segment_size() / 3;
+    std::vector<mutation> expected;
+    for (unsigned i = 0; i < 24; ++i) {
+        expected.push_back(make_kv_mutation_of_record_size(schema, format("pk{}", i), record_size));
+        ls.write(expected.back(), write_target(&cg, {}), db::no_timeout).get();
+    }
+    ls.flush_to_separator().get();
+    cg.flush_separator().get();
+
+    for (const auto& m : expected) {
+        auto actual = ls.read(*schema, cg.logstor_index(), m.decorated_key(), schema->full_slice()).get();
+        BOOST_REQUIRE(actual);
+        assert_that(*actual).is_equal_to(m);
+    }
+
+    // More than one file was needed, and no file was opened twice.
+    BOOST_REQUIRE_GT(sm.files_opened(), 1u);
+    BOOST_REQUIRE_LE(sm.files_opened(), file_count);
+}

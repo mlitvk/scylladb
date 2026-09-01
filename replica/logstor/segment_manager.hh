@@ -191,6 +191,10 @@ public:
 
     uint64_t get_segment_size() const noexcept;
 
+    // The times a logstor file was opened. Files are opened once and held open for the life of the
+    // shard, so this stops moving once the shard has started.
+    uint64_t files_opened() const noexcept;
+
     // Removes all the segments of the group and frees them. Waits for an ongoing compaction of
     // the group and keeps compaction disabled while discarding, so the caller doesn't have to.
     // The index must be cleared first, so that no record of the group is reachable.
