@@ -35,10 +35,6 @@ free_segment_watermarks make_free_segment_watermarks(uint64_t segment_count, dou
     return {low, high};
 }
 
-bool auto_compaction_wanted(bool running, uint64_t available_segments, free_segment_watermarks watermarks) noexcept {
-    return available_segments < (running ? watermarks.high : watermarks.low);
-}
-
 bool direct_promotion_wanted(uint64_t bytes, uint64_t hot_threshold_bytes, unsigned periods) noexcept {
     return bytes >= hot_threshold_bytes * periods;
 }
@@ -174,7 +170,10 @@ void compaction_rate_controller::reset() noexcept {
     _credit = 0;
     _alloc_rate = 0;
     _delivered_rate = 0;
-    _bypassed = true;
+    // Not bypassed: with no credit and no rate this holds compaction back until the first tick has
+    // decided what it should be doing. The other way round, a controller that has not ticked yet
+    // would let a job through at whatever the disk happened to offer.
+    _bypassed = false;
 }
 
 void compaction_rate_controller::tick(const sample& s) noexcept {

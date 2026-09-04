@@ -121,9 +121,11 @@ bool direct_promotion_wanted(uint64_t bytes, uint64_t hot_threshold_bytes, unsig
 bool direct_demotion_wanted(uint64_t bytes, uint64_t hot_threshold_bytes, unsigned periods,
         unsigned underfilled_decisions) noexcept;
 
-// Watermarks, in available segments, that drive automatic compaction. It starts once the number of
-// available segments drops below `low` - the free-segment target - and stops once it is back at
-// `high`. Both are zero when the trigger is disabled.
+// Watermarks, in available segments. `low` is the free-segment target: the level the rate controller
+// holds, and the setpoint that write amplification follows from. `high` is what remains of the
+// hysteresis band the trigger used to switch on and off across - compaction runs continuously now,
+// and fades out above the target instead - and is only the zero anchor of the shares ramp. Both are
+// zero when the trigger is disabled.
 struct free_segment_watermarks {
     uint64_t low;
     uint64_t high;
@@ -134,15 +136,6 @@ struct free_segment_watermarks {
 // the disk rounds down to a segment or two.  `target_fraction` is
 // logstor_compaction_trigger_threshold; 0 disables the trigger.
 free_segment_watermarks make_free_segment_watermarks(uint64_t segment_count, double target_fraction) noexcept;
-
-// Whether the free-segment level wants automatic compaction running, given whether it is running
-// now. The two watermarks are a hysteresis band: compaction starts once the free-segment target is
-// breached and runs until the disk is back at the stop watermark, rather than stopping again at the
-// first write that crosses back over the target. Both watermarks are zero when the trigger is
-// disabled, which answers "no" at any number of available segments.
-//
-// This is only the space half of the decision; whether compaction may run at all is the caller's.
-bool auto_compaction_wanted(bool running, uint64_t available_segments, free_segment_watermarks watermarks) noexcept;
 
 // How much automatic compaction may take on at once, derived from the free-segment target.
 // The defaults are the most conservative limits make_compaction_limits() can return, so that a
@@ -347,9 +340,9 @@ constexpr double compaction_rate_saturation_ratio = 0.9;
 //
 // The rate is spent through a credit bucket denominated in reclaimed segments: a job is submitted
 // once the bucket holds what its batch is estimated to reclaim, so the level overshoots the target
-// by at most one burst rather than by a quarter of it. The throttle only ever subtracts - it is
-// bypassed while the level is below half the target, and the caller bypasses it for a batch that
-// copies nothing - so compaction is never slower than it would be without one.
+// by at most one burst rather than by a quarter of it. The throttle only ever subtracts, and it is
+// bypassed altogether while the level is below half the target, so compaction is never slower than
+// it would be without one.
 class compaction_rate_controller {
 public:
     compaction_rate_controller() = default;
@@ -402,7 +395,9 @@ public:
     double integral() const noexcept { return _integral; }
     double allocation_rate() const noexcept { return _alloc_rate; }
     double reclaim_rate() const noexcept { return _delivered_rate; }
-    // Set when the level is low enough that the throttle is off altogether.
+    // Set when the level is low enough that the throttle is off altogether. Never before the first
+    // tick: an un-ticked controller has no rate to command, so it holds everything back rather than
+    // letting everything through.
     bool bypassed() const noexcept { return _bypassed; }
 
     // The setpoint the accumulated error was measured against is gone, so neither the integral nor
@@ -418,9 +413,7 @@ private:
     double _credit = 0;
     double _alloc_rate = 0;
     double _delivered_rate = 0;
-    // No target yet means no throttle, so that a controller that has never ticked cannot hold
-    // compaction back.
-    bool _bypassed = true;
+    bool _bypassed = false;
 };
 
 inline constexpr log_heap_options segment_descriptor_hist_options(4 * 1024, 3, 128 * 1024);

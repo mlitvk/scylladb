@@ -692,6 +692,10 @@ private:
     struct stats {
         uint64_t compaction_segments_in{0};
         uint64_t compaction_segments_out{0};
+        // Segments compaction actually gave back, which is what the rate controller is paced by and
+        // what the cost model is written in. It is not `in - out`: an input still referenced by a
+        // read in flight is freed later, by whoever drops the last reference.
+        uint64_t compaction_segments_reclaimed{0};
         uint64_t compaction_records_skipped{0};
         uint64_t compaction_records_rewritten{0};
         uint64_t compaction_bytes_read{0};
@@ -738,13 +742,45 @@ private:
     segment_stats_node _segment_stats;
 
     shared_future<> _auto_compaction_completion{make_ready_future<>()};
-    // Sized for the static maximum; a run holds back the difference between it and the current
-    // limit for its duration, see run_auto_compaction().
+    // Sized for the static maximum; the driver holds back the difference between it and the current
+    // limit, see run_auto_compaction().
     seastar::semaphore _auto_compaction_sem{max_auto_compaction_parallelism};
 
-    bool auto_compaction_active() const noexcept {
-        return !_auto_compaction_completion.available();
-    }
+    // What the driver is waiting for, which decides what has to wake it: a controller tick refills
+    // credit and so answers `credit`, while only free space appearing or a group being submitted can
+    // answer `candidates`. Waking on everything would put the driver back to rescanning every
+    // group's histogram several times a second for as long as the disk has nothing to reclaim.
+    enum class driver_wait {
+        nothing,
+        credit,
+        candidates,
+    };
+    driver_wait _driver_wait{driver_wait::nothing};
+    seastar::condition_variable _compaction_wanted;
+
+    // Paces the driver so that compaction runs continuously at the rate that holds the free-segment
+    // level at its target, instead of switching on below the target and off above the stop
+    // watermark. Ticked by _rate_timer rather than from the shares controller's callback, which is
+    // not called at all while compaction_static_shares pins the shares.
+    compaction_rate_controller _rate_controller;
+    seastar::timer<seastar::lowres_clock> _rate_timer;
+    seastar::lowres_clock::time_point _last_rate_tick;
+    // The counters the controller's rates are differences of, as of the previous tick.
+    uint64_t _last_segments_allocated{0};
+    uint64_t _last_segments_reclaimed{0};
+    uint64_t _last_reclaim_charged{0};
+    // What the driver has charged the credit bucket for jobs it started, in estimated segments. A
+    // job is charged when it is submitted, because that is all that is known then; the difference
+    // against what those jobs actually reclaimed is settled at the next tick.
+    uint64_t _reclaim_charged{0};
+    // Whether the last ranking found no batch with a net gain - a state rather than an event, since
+    // the driver then stops ranking - and whether the throttle held a job back since the last tick.
+    bool _no_candidates{false};
+    bool _throttled_since_tick{false};
+    // Jobs the driver has submitted and not seen finish. The semaphore cannot answer this: the
+    // driver also holds a unit while it works and holds back the ones the parallelism does not
+    // allow.
+    size_t _auto_compactions_in_flight{0};
 
 public:
     compaction_manager_impl(segment_manager_impl& sm, compaction_config cfg)
@@ -766,12 +802,15 @@ public:
             logstor_logger.info("Updating logstor compaction max shares to {}", new_max_shares);
             _shares_controller.set_max_shares(new_max_shares);
         }))
+        , _rate_timer([this] { tick_rate_controller(); })
     {}
 
     future<> start();
     future<> stop();
 
     const stats& get_stats() const noexcept { return _stats; }
+    const compaction_rate_controller& rate_controller() const noexcept { return _rate_controller; }
+    size_t auto_compactions_in_progress() const noexcept { return _auto_compactions_in_flight; }
     float compaction_pressure() const noexcept;
 
     future<> flush_separator_buffer(separator_buffer&, logstor_group&) override;
@@ -824,9 +863,9 @@ public:
 
 private:
 
-    // Cached result of make_free_segment_watermarks(). should_run_auto_compaction() calls
-    // get_free_segment_watermarks() on every write, so caching avoids repeating the same
-    // computation on every hot-path call.
+    // Cached result of make_free_segment_watermarks(). The watermarks are read on every controller
+    // tick and by every shares-controller pass, and their inputs move only when a live-updatable
+    // setting does, so they are computed when that happens rather than on every read.
     free_segment_watermarks _free_segment_watermarks{};
     compaction_limits _compaction_limits{};
 
@@ -834,8 +873,14 @@ private:
         return _free_segment_watermarks;
     }
 
-    bool should_run_auto_compaction() noexcept;
     future<> run_auto_compaction();
+    // Waits for whatever could make the driver's answer different, and records what that is so that
+    // only the events which can change it wake the driver up.
+    future<> wait_for_compaction_work(driver_wait reason);
+    void tick_rate_controller() noexcept;
+    // Segments taken by everything except compaction, whose own output is already netted out of the
+    // reclaim rate the controller balances against this.
+    uint64_t non_compaction_segments_allocated() const noexcept;
 
     std::optional<compaction_candidate> select_segments_for_compaction(logstor_group&);
     future<std::vector<compaction_candidate>> find_top_compaction_candidates(size_t);
@@ -851,6 +896,17 @@ private:
 
 future<> compaction_manager_impl::start() {
     refresh_free_segment_watermarks();
+    _last_rate_tick = seastar::lowres_clock::now();
+    _last_segments_allocated = non_compaction_segments_allocated();
+    _last_segments_reclaimed = _stats.compaction_segments_reclaimed;
+    _last_reclaim_charged = _reclaim_charged;
+    _rate_timer.arm_periodic(compaction_rate_control_period);
+    // The driver runs for the lifetime of the shard rather than being started and stopped by the
+    // free level: what decides whether compaction runs now is the rate the controller commands, and
+    // it decides it continuously.
+    _auto_compaction_completion = shared_future(run_auto_compaction().handle_exception([] (std::exception_ptr ep) {
+        logstor_logger.error("The automatic logstor compaction driver stopped: {}", ep);
+    }));
     co_return;
 }
 
@@ -859,6 +915,8 @@ future<> compaction_manager_impl::stop() {
         co_return;
     }
     _admission_closed = true;
+    _rate_timer.cancel();
+    _compaction_wanted.broken();
 
     for (auto& [cg, state] : _groups) {
         state->as.request_abort();
@@ -1437,9 +1495,61 @@ float compaction_manager_impl::compaction_pressure() const noexcept {
     return compaction_shares_pressure(_sm.available_segment_count(write_source::normal_write), get_free_segment_watermarks());
 }
 
+uint64_t compaction_manager_impl::non_compaction_segments_allocated() const noexcept {
+    const auto& segments_get = _sm._segment_pool.get_stats().segments_get;
+    uint64_t allocated = 0;
+    for (size_t src = 0; src < write_source_count; ++src) {
+        if (src != static_cast<size_t>(write_source::compaction)) {
+            allocated += segments_get[src];
+        }
+    }
+    return allocated;
+}
+
+void compaction_manager_impl::tick_rate_controller() noexcept {
+    const auto now = seastar::lowres_clock::now();
+    const auto dt = std::chrono::duration<double>(now - _last_rate_tick).count();
+    _last_rate_tick = now;
+
+    const auto allocated = non_compaction_segments_allocated();
+    const auto reclaimed = _stats.compaction_segments_reclaimed;
+
+    _rate_controller.tick({
+        .available_segments = _sm.available_segment_count(write_source::normal_write),
+        .target_segments = get_free_segment_watermarks().low,
+        .segments_allocated = allocated - _last_segments_allocated,
+        .segments_reclaimed = reclaimed - _last_segments_reclaimed,
+        .burst_cap = double(_compaction_limits.batch_cap),
+        .dt = dt,
+        .candidates_empty = _no_candidates,
+        .throttled = _throttled_since_tick || _driver_wait == driver_wait::credit,
+    });
+
+    // A job was charged what its batch was estimated to reclaim; this is the difference against
+    // what the jobs that finished actually gave back, refunded so that the credit stays denominated
+    // in segments the disk really got. Both are cumulative, so a job charged in one period and
+    // finished in another settles by itself.
+    const auto charged = _reclaim_charged - _last_reclaim_charged;
+    const auto delivered = reclaimed - _last_segments_reclaimed;
+    _rate_controller.charge(double(delivered) - double(charged));
+
+    _last_segments_allocated = allocated;
+    _last_segments_reclaimed = reclaimed;
+    _last_reclaim_charged = _reclaim_charged;
+    _throttled_since_tick = false;
+
+    // The bucket has been refilled, so a driver that was waiting for credit may be able to afford
+    // its candidate now. Nothing else the tick does can change the answer.
+    if (_driver_wait == driver_wait::credit) {
+        _compaction_wanted.signal();
+    }
+}
+
 void compaction_manager_impl::refresh_free_segment_watermarks() noexcept {
     _free_segment_watermarks = make_free_segment_watermarks(_sm._max_segments.configured, _sm._cfg.trigger_compaction_threshold());
     _compaction_limits = make_compaction_limits(_free_segment_watermarks, _cfg.max_segments_per_compaction);
+    // The accumulated error and the credit were measured against a setpoint that no longer exists.
+    _rate_controller.reset();
 
     logstor_logger.debug("Free segment target {} (stop at {}), compaction parallelism {}, up to {} segments per compaction",
             _free_segment_watermarks.low, _free_segment_watermarks.high,
@@ -1619,6 +1729,22 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
                        sm::description("Counts number of input segments selected for compaction.")),
         sm::make_counter("compaction_segments_out", _compaction_mgr.get_stats().compaction_segments_out,
                        sm::description("Counts number of output segments written by compaction.")),
+        sm::make_counter("compaction_segments_reclaimed", _compaction_mgr.get_stats().compaction_segments_reclaimed,
+                       sm::description("Counts the segments compaction gave back to the pool, its inputs less its outputs. This is the quantity the compaction cost model is written in, and the one the reclaim rate controller is paced by.")),
+        sm::make_gauge("compaction_target_reclaim_rate", [this] { return _compaction_mgr.rate_controller().rate(); },
+                       sm::description("The reclaim rate the controller is commanding, in segments per second. In steady state it is the rate at which the write path is consuming segments; above it, compaction is catching up.")),
+        sm::make_gauge("compaction_reclaim_rate", [this] { return _compaction_mgr.rate_controller().reclaim_rate(); },
+                       sm::description("The reclaim rate compaction is delivering, in segments per second. Persistently below the commanded rate means compaction is short of CPU, of IO or of candidates rather than being throttled.")),
+        sm::make_gauge("compaction_segment_alloc_rate", [this] { return _compaction_mgr.rate_controller().allocation_rate(); },
+                       sm::description("The rate at which everything except compaction is taking segments, in segments per second, over the last control period. It is what the rate controller feeds forward, and it is deliberately unsmoothed.")),
+        sm::make_gauge("compaction_rate_credit", [this] { return _compaction_mgr.rate_controller().credit(); },
+                       sm::description("Segments of reclaim the controller's credit bucket holds. A job starts once it holds what the job is estimated to reclaim, so a bucket that sits near zero is compaction being paced and one that sits at its cap is compaction with nothing worth reclaiming.")),
+        sm::make_gauge("compaction_rate_integral", [this] { return _compaction_mgr.rate_controller().integral(); },
+                       sm::description("The rate controller's integral state, in segment-seconds. It removes the droop below the free-segment target; a wound-up integrator is otherwise indistinguishable from a genuinely busy disk.")),
+        sm::make_gauge("compaction_controller_backlog", [this] { return _compaction_mgr.compaction_pressure(); },
+                       sm::description("The space pressure driving the compaction shares controller, 0 at the stop watermark and 1 once half the free-segment target is gone.")),
+        sm::make_gauge("auto_compactions_in_progress", [this] { return _compaction_mgr.auto_compactions_in_progress(); },
+                       sm::description("Automatic compaction jobs in flight. Below the derived parallelism it means the driver is throttled or short of candidates rather than busy.")),
         sm::make_counter("compaction_records_skipped", _compaction_mgr.get_stats().compaction_records_skipped,
                        sm::description("Counts number of records skipped during compaction.")),
         sm::make_counter("compaction_records_rewritten", _compaction_mgr.get_stats().compaction_records_rewritten,
@@ -2822,68 +2948,73 @@ compaction_manager_impl::find_top_compaction_candidates(size_t max_candidates) {
     co_return std::move(best_candidates).take();
 }
 
-bool compaction_manager_impl::should_run_auto_compaction() noexcept {
-    const auto running = auto_compaction_active();
-
-    if (_admission_closed) {
-        if (running) {
-            logstor_logger.debug("Stopping auto compaction: admission closed");
-        }
-        return false;
+void compaction_manager_impl::schedule_auto_compaction() {
+    // Free space has moved, which is the one thing that can put a batch with a net gain in front of
+    // a driver that found none.
+    if (_driver_wait != driver_wait::nothing) {
+        _compaction_wanted.signal();
     }
-
-    const auto available_segments = _sm.available_segment_count(write_source::normal_write);
-    const auto watermarks = get_free_segment_watermarks();
-
-    if (!auto_compaction_wanted(running, available_segments, watermarks)) {
-        if (running) {
-            logstor_logger.debug("Stopping auto compaction: available segments {} is above high watermark {}",
-                    available_segments, watermarks.high);
-        }
-        return false;
-    }
-
-    if (!running) {
-        logstor_logger.debug("Starting auto compaction: available segments {} is below the free segment target {}",
-                available_segments, watermarks.low);
-    }
-    return true;
 }
 
-void compaction_manager_impl::schedule_auto_compaction() {
-    if (can_submit_compaction() && should_run_auto_compaction() && !auto_compaction_active()) {
-        _auto_compaction_completion = shared_future(run_auto_compaction().handle_exception([] (std::exception_ptr ep) {
-            logstor_logger.warn("Automatic logstor compaction failed: {}. Ignored", ep);
-        }));
+future<> compaction_manager_impl::wait_for_compaction_work(driver_wait reason) {
+    _driver_wait = reason;
+    // The timeout is a safety net rather than a poll: the events that can change the answer signal
+    // the condition variable, and waking on a timer instead is what the 100ms rescan used to do.
+    auto f = co_await coroutine::as_future(_compaction_wanted.wait(std::chrono::seconds(10)));
+    _driver_wait = driver_wait::nothing;
+    if (f.failed()) {
+        // A timeout, or the condition variable broken by stop(); the loop re-checks either way.
+        f.ignore_ready_future();
     }
 }
 
 future<> compaction_manager_impl::run_auto_compaction() {
-    // The parallelism is snapshotted for the whole run. It only changes with the free-segment
-    // target, which is a rarely moved live-updatable setting, and holding back the difference to
-    // the semaphore's static size for the duration of the run is what lets the drain below wait
-    // for exactly the jobs this run submitted.
-    const auto parallelism = _compaction_limits.auto_parallelism;
-    auto held_back = co_await get_units(_auto_compaction_sem, max_auto_compaction_parallelism - parallelism);
+    // The difference between the semaphore's static size and the parallelism the current
+    // free-segment target allows, held for as long as that target stands. It only moves with a
+    // live-updatable setting, so re-taking it on the rare occasion that it does costs nothing.
+    std::optional<semaphore_units<>> held_back;
+    size_t parallelism = 0;
 
     std::vector<compaction_candidate> pending;
     // What the marginal-admission gate below measures a candidate against, from the ranking that
     // produced `pending`.
     std::optional<compaction_candidate_score> admission_bar;
 
-    while (can_submit_compaction() && should_run_auto_compaction()) {
+    while (!_admission_closed) {
+        if (!can_submit_compaction() || get_free_segment_watermarks().low == 0) {
+            // Compaction is disabled, or the trigger is: there is no free-segment target to hold.
+            // As far as the controller is concerned that is the same as having nothing to reclaim -
+            // a rate it commands cannot be spent - so the integral must not accumulate against it.
+            pending.clear();
+            _no_candidates = true;
+            co_await wait_for_compaction_work(driver_wait::candidates);
+            continue;
+        }
+
+        if (parallelism != _compaction_limits.auto_parallelism) {
+            held_back.reset();
+            parallelism = _compaction_limits.auto_parallelism;
+            held_back = co_await get_units(_auto_compaction_sem, max_auto_compaction_parallelism - parallelism);
+        }
+
         auto units = co_await get_units(_auto_compaction_sem, 1);
 
-        if (!can_submit_compaction() || !should_run_auto_compaction()) {
+        if (_admission_closed) {
             break;
         }
 
         if (pending.empty()) {
             pending = co_await find_top_compaction_candidates(parallelism);
             if (pending.empty()) {
-                co_await seastar::sleep(std::chrono::milliseconds(100));
+                // No group holds a batch with a net gain, so the disk has nothing to reclaim rather
+                // than the driver being between batches. The controller has to know: it is not an
+                // error a higher commanded rate could work off.
+                _no_candidates = true;
+                units.return_all();
+                co_await wait_for_compaction_work(driver_wait::candidates);
                 continue;
             }
+            _no_candidates = false;
             admission_bar = marginal_admission_bar(pending);
         }
 
@@ -2895,7 +3026,22 @@ future<> compaction_manager_impl::run_auto_compaction() {
             continue;
         }
 
-        // Whatever the fiber does not hold of the snapshotted parallelism is held by a job in
+        // The throttle, which is what makes compaction continuous instead of bursting between the
+        // watermarks. It paces a batch of fully dead segments like any other, even though that one
+        // copies nothing: what it costs is not the copying but the job, and reclaiming space the
+        // disk is not short of buys nothing. Below half the target the controller has the throttle
+        // off altogether.
+        if (!_rate_controller.can_afford(candidate.score.reclaimed())) {
+            _throttled_since_tick = true;
+            // The ranking is best first and the credit is shard-wide, so no later candidate is
+            // affordable either. Keep it for when the bucket has filled.
+            pending.push_back(std::move(candidate));
+            units.return_all();
+            co_await wait_for_compaction_work(driver_wait::credit);
+            continue;
+        }
+
+        // Whatever the fiber does not hold of the parallelism is held by a job in
         // flight, so a candidate that reaches here while the semaphore is short of units would run
         // as a marginal job - one that buys throughput at the marginal write amplification of its
         // own batch. With unequal groups that is arbitrarily bad: a job slot can only be filled by a
@@ -2918,15 +3064,24 @@ future<> compaction_manager_impl::run_auto_compaction() {
             continue;
         }
 
+        // Charged with what the batch is estimated to reclaim, which is what is known now; the next
+        // controller tick settles the difference against what the jobs actually gave back.
+        _rate_controller.charge(double(candidate.score.reclaimed()));
+        _reclaim_charged += candidate.score.reclaimed();
+
         // The slot is released only once the job is done, which is what wakes this fiber up to
         // submit the next candidate.
+        ++_auto_compactions_in_flight;
         (void)submit_normal_compaction(*candidate.group).handle_exception([] (std::exception_ptr ep) {
             logstor_logger.warn("Automatic logstor compaction failed: {}. Ignored", ep);
-        }).finally([units = std::move(units)] {});
+        }).finally([this, units = std::move(units)] {
+            --_auto_compactions_in_flight;
+        });
     }
 
-    // Wait for submitted jobs to complete.
-    co_await get_units(_auto_compaction_sem, parallelism);
+    // Wait for the jobs still in flight, which is what makes this future the driver's completion.
+    held_back.reset();
+    co_await get_units(_auto_compaction_sem, max_auto_compaction_parallelism);
 }
 
 // A single buffer used by compaction for rewriting records into new segments in a single compaction group.
@@ -3100,17 +3255,20 @@ future<> compaction_manager_impl::do_compaction(logstor_group& cg, abort_source&
 
     // Free the compacted segments
     auto& ss = cg.logstor_segments();
+    size_t freed = 0;
     for (auto seg_id : segments) {
         logstor_logger.trace("Free segment {} by compaction", seg_id);
         auto& desc = _sm.get_segment_descriptor(seg_id);
         ss.remove_segment(desc);
         if (desc.ref_count == 0) {
             _sm.free_segment(seg_id);
+            ++freed;
         }
     }
 
     _stats.compaction_segments_in += compaction_segments_in;
     _stats.compaction_segments_out += compaction_segments_out;
+    _stats.compaction_segments_reclaimed += freed > compaction_segments_out ? freed - compaction_segments_out : 0;
     _stats.compaction_records_rewritten += cb_stats.records_rewritten;
     _stats.compaction_records_skipped += cb_stats.records_skipped;
     _stats.compaction_bytes_read += nonempty_segments.size() * _sm.get_segment_size();

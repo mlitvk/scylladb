@@ -3512,7 +3512,9 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_rate_controller_bypass) {
     BOOST_REQUIRE(!controller.can_afford(1));
     BOOST_REQUIRE(std::isinf(controller.time_to_afford(1)));
 
-    // A disabled trigger has no setpoint, so the controller commands nothing and holds nothing back.
+    // A disabled trigger has no setpoint, so the controller commands nothing. It does not answer
+    // that everything is affordable either: automatic compaction does not run without a target, and
+    // a throttle with no rate behind it may only hold back.
     controller.tick({
         .available_segments = 0,
         .target_segments = 0,
@@ -3524,7 +3526,12 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_rate_controller_bypass) {
         .throttled = false,
     });
     BOOST_REQUIRE_EQUAL(controller.rate(), 0.0);
-    BOOST_REQUIRE(controller.can_afford(1000));
+    BOOST_REQUIRE(!controller.bypassed());
+    BOOST_REQUIRE(!controller.can_afford(1));
+
+    // Which is also the state a controller that has never ticked is in: it cannot let a job through
+    // at whatever the disk happens to offer before it has decided on a rate.
+    BOOST_REQUIRE(!compaction_rate_controller().can_afford(1));
 }
 
 // Credit is what turns a commanded rate into paced job submissions: over a long run the segments it

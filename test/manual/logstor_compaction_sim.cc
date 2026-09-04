@@ -22,8 +22,9 @@
 //   - top_compaction_candidates, which ranks the groups;
 //   - make_free_segment_watermarks() and make_compaction_limits(), so that the free-segment target,
 //     the batch cap and the parallelism are derived per disk as they are in the engine;
-//   - auto_compaction_wanted(), the trigger's hysteresis band, and compaction_rate_controller, the
-//     rate controller that replaces it - which of them decides when compaction runs is --controller;
+//   - compaction_rate_controller, which decides when compaction runs and paces it. The trigger's
+//     hysteresis band, which it replaced, is reimplemented here as --controller relay, since the
+//     engine no longer has it and it is the baseline the controller tables compare against;
 //   - compaction_shares_pressure(), so that what the shares controller would be asking for is what
 //     is reported here;
 //   - the ondisk:: sizes and alignments, so that what a segment holds and what it wastes are real.
@@ -127,15 +128,22 @@ enum class value_size_kind {
     lognormal,
 };
 
-// What decides when compaction runs. `relay` is the trigger's hysteresis band - on below the
-// free-segment target, off above the stop watermark - which is what the engine runs today. `rate`
-// runs the engine's own compaction_rate_controller: it paces jobs so that the free level settles at
-// the target instead of sweeping the band. Pacing is a statement about time, so `rate` needs a
-// clock, and therefore a write rate.
+// What decides when compaction runs. `rate` is the engine's own compaction_rate_controller, which
+// paces jobs so that the free level settles at the target; pacing is a statement about time, so it
+// needs a clock and therefore a write rate. `relay` is the trigger's hysteresis band - on below the
+// free-segment target, off above the stop watermark - which is what the engine ran before the rate
+// controller, kept here as the baseline every controller table is measured against.
 enum class controller_kind {
     relay,
     rate,
 };
+
+// The relay: automatic compaction starts once the free-segment target is breached and runs until the
+// disk is back at the stop watermark, rather than stopping again at the first write that crosses
+// back over the target. `running` is the state of the driver, not of the jobs it has in flight.
+bool auto_compaction_wanted(bool running, uint64_t available_segments, free_segment_watermarks watermarks) noexcept {
+    return available_segments < (running ? watermarks.high : watermarks.low);
+}
 
 // Which prefix of the candidate segments a job takes. `efficiency` is the implemented rule and runs
 // the engine's own select_compaction_batch(); the other two are simulator-local reimplementations of
@@ -1485,11 +1493,10 @@ private:
                 _admission_blocked = true;
                 return;
             }
-            // The throttle paces what is submitted. A batch that copies nothing reclaims at no
-            // cost, so there is nothing to pay for and it is never held back; below half the target
-            // the controller has the throttle off altogether.
-            if (paced() && batch->score.live_bytes != 0
-                    && !_rate_controller.can_afford(batch->score.reclaimed())) {
+            // The throttle paces what is submitted, a batch of fully dead segments included: what
+            // such a batch costs is not the copying but the job, and reclaiming space the disk is
+            // not short of buys nothing. Below half the target the throttle is off altogether.
+            if (paced() && !_rate_controller.can_afford(batch->score.reclaimed())) {
                 _tick_throttled = true;
                 // Nothing changes until the bucket fills, and the candidate is still the best one.
                 _pending_candidates.push_back(candidate);

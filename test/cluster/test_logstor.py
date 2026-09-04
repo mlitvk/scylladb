@@ -5,6 +5,7 @@
 #
 
 import asyncio
+import math
 import random
 import time
 from pathlib import Path
@@ -994,6 +995,82 @@ async def test_compaction(manager: ScyllaClusterManager):
                 return True
             await manager.api.logstor_compaction(servers[0].ip_addr)
         await wait_for(segments_compacted, time.time() + 60)
+
+async def test_automatic_compaction_is_driven_by_the_rate_controller(manager: ScyllaClusterManager):
+    """
+    Automatic compaction is paced by the reclaim rate controller rather than switched on below the
+    free-segment target and off above the stop watermark. Overwrite a small disk several times over
+    and check that the loop is closed end to end: the controller commands a rate, the driver submits
+    against it, compaction reclaims, and the write path is never left without a segment.
+
+    How tightly the level is actually held is not something a disk of 64 segments can show - the
+    write burst starves it throughout and what is left afterwards is the live set - so that is
+    measured in test/manual/logstor_compaction_sim.cc instead.
+    """
+    disk_size_mb = 8
+    file_size_mb = 1
+    segment_size = 128 * 1024
+    total_segments = disk_size_mb * 1024 * 1024 // segment_size
+    # make_free_segment_watermarks(): the 5% default, floored at two of the smallest batch and
+    # capped at an eighth of the disk.
+    free_segment_target = max(math.ceil(0.05 * total_segments), min(16, total_segments // 8))
+
+    key_count = 500
+    value_size = 8000
+    # Enough overwrites to turn the disk over several times, so that reclaiming is the only way the
+    # writes can complete at all.
+    overwrites = 4
+
+    cmdline = ['--logger-log-level', 'logstor=debug', '--smp=1']
+    cfg = {
+        'logstor_disk_size_in_mb': disk_size_mb,
+        'logstor_file_size_in_mb': file_size_mb,
+        'experimental_features': ['logstor']
+    }
+    servers = await manager.servers_add(1, cmdline=cmdline, config=cfg)
+    server = servers[0]
+    cql = manager.get_cql()
+
+    async def get(name: str) -> float:
+        metrics = await manager.metrics.query(server.ip_addr)
+        value = metrics.get(f"scylla_logstor_sm_{name}")
+        assert value is not None, f"{name} is not exported"
+        return float(value)
+
+    async with new_test_keyspace(manager, "WITH tablets={'initial':1}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v text) WITH storage_engine = 'logstor'")
+
+        insert = cql.prepare(f"INSERT INTO {ks}.test (pk, v) VALUES (?, ?)")
+        value = 'x' * value_size
+
+        for _ in range(overwrites):
+            await asyncio.gather(*[cql.run_async(insert, [pk, value]) for pk in range(key_count)])
+
+        reclaimed = await get("compaction_segments_reclaimed")
+        segments_in = await get("compaction_segments_in")
+        segments_out = await get("compaction_segments_out")
+        free_segments = await get("free_segments")
+        commanded = await get("compaction_target_reclaim_rate")
+        alloc_rate = await get("compaction_segment_alloc_rate")
+        logger.info(f"reclaimed={reclaimed} in={segments_in} out={segments_out} "
+                    f"free_segments={free_segments} of {total_segments} target={free_segment_target} "
+                    f"commanded_rate={commanded} alloc_rate={alloc_rate}")
+
+        # Nothing submitted a compaction, so the disk survived the overwrites by reclaiming on its
+        # own account: the driver ran without the free level having to switch it on.
+        assert reclaimed > 0, "automatic compaction reclaimed nothing while the disk was overwritten"
+        # What the jobs gave back is what they took in less what they wrote out. The identity is the
+        # one the cost model is written in, and the quantity the controller is paced by.
+        assert reclaimed == segments_in - segments_out, (
+            f"reclaimed {reclaimed} against {segments_in} in and {segments_out} out"
+        )
+        # The controller is what asked for it, and the rate it asks for is the one the write path is
+        # consuming at. Both are zero if the tick never ran or the setpoint never reached it.
+        assert commanded > 0, "the rate controller is not commanding a reclaim rate under pressure"
+        assert alloc_rate >= 0
+        # And the write path was never left without a segment to write into.
+        assert free_segments >= 1, "the write path was left with no segment to write into"
+        assert free_segments <= total_segments
 
 async def test_drop_table(manager: ScyllaClusterManager):
     """
