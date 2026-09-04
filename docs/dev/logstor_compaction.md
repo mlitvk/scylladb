@@ -655,134 +655,239 @@ Two properties matter more than the slope:
 the free-segment target, the hysteresis band and the shares ramp.
 `logstor_compaction_max_shares` only caps the ramp's top.
 
-This is an interim controller. It remains a pure space-pressure ratio: at a given free level it asks
-for the same shares whether restoring the target requires rewriting one segment or ten thousand, and
-on a large disk the absolute deficit per unit of pressure is large, so the response just below the
-target is gentle in absolute terms. The work-based backlog below is what fixes that.
+Two things about it are wrong, and they are what the section below replaces. It is a **relay** —
+`auto_compaction_wanted()` is on below `low` and off above `high` — and a relay in feedback around an
+integrator does not settle, it oscillates. And it has **no actuator other than shares**, which have
+no authority at all on an uncontended shard, so what is really limiting the reclaim rate today is the
+relay itself. It is also a pure space-pressure ratio: at a given free level it asks for the same
+shares whether restoring the target requires rewriting one segment or ten thousand.
 
-### Recommended: work-based backlog
+### Recommended: continuous compaction at a controlled reclaim rate
 
-Follow the pattern the sstable strategies use, where backlog is the volume of work outstanding and
-in-flight progress reduces it:
+#### The level does not droop, it cycles
+
+The plant is a pure integrator,
 
 ```
-deficit_segments = max(0, free_target - available_segments)
-backlog_bytes    = deficit_segments * segment_size / max(theta_achievable, theta_floor)
-                 - bytes_already_copied_by_in_flight_jobs
-backlog          = backlog_bytes / available_memory()
+d(available)/dt = reclaim_rate - allocation_rate
 ```
 
-`theta_achievable` is the efficiency of the best batch currently available, read off the head of
-the group histograms — the same quantity the score computes. The division converts "segments I
-must reclaim" into "bytes I must copy to reclaim them".
+and the trigger is a relay with hysteresis on the same variable. That pair has no equilibrium: below
+`low` compaction runs flat out until the level reaches `high`, then stops until the level is back at
+`low`. The free-segment count therefore sweeps the whole hysteresis band, with amplitude `high - low`
+= `0.25 * low` and period `0.25 * low / allocation_rate` — minutes on a large disk, seconds on a
+small one.
 
-This behaves correctly where the space ratio does not: at the same free level, a disk whose
-emptiest segments are 5% live needs far less CPU than one whose emptiest are 60% live. The
-`bytes_already_copied` term is the analog of `Ci` in the size-tiered backlog tracker and keeps
-shares from staying pinned while a long job drains. If deadline pressure is wanted, divide by the
-time to exhaustion (`available_segments / segment_allocation_rate`) to get a required copy rate.
+Shares follow it exactly. `compaction_shares_pressure()` is a linear map of the level, so the sweep
+`low -> high` becomes pressure `1/3 -> 0` and shares `200 -> 50`. **The shares sawtooth is not a
+second defect**; it is the free-segment sawtooth seen through a linear map, and pinning the level
+flattens it without touching the shares curve.
+
+The driver sharpens both edges. `run_auto_compaction()` exits at the stop watermark and drains every
+job in flight before returning, and is restarted only from `allocate_segment()`; the 100ms rescan
+loop (open defect 1) sits inside the same fiber. So each cycle also pays a fiber teardown, a drain
+of up to `auto_parallelism` jobs, and a restart delay.
+
+Since `U_eff = U / (1 - s)` and `WA_gc` is a steep function of `U_eff`, a level that sweeps a quarter
+of the target is also a write amplification that sweeps with it, and the burst is paid in latency:
+the disk alternates between carrying compaction's full bandwidth and none of it.
+
+#### Removing the hysteresis requires a throttle first
+
+Shares are not a rate limiter. A scheduling group at 50 shares still gets the whole CPU when nothing
+competes for it, so on an uncontended shard the shares curve has no authority whatsoever. Delete the
+relay and leave shares as the only actuator, and compaction runs flat out whenever any group holds a
+batch with `reclaimed() >= 1` — that is, until the disk is packed as tightly as the score can pack
+it — paying write amplification for space nobody asked for.
+
+So the change is not "drop the hysteresis and put an integral term on the shares curve". It is to
+make the **reclaim rate** the manipulated variable, control it with a PI loop on the free-segment
+level, and leave the shares curve as the second, slower loop that buys CPU when the commanded rate
+cannot be met.
+
+#### The control law
+
+Sampled every 250ms, shard-wide — the free-segment pool is shard-wide, and which group is compacted
+stays a question for the ranking:
+
+```
+e        = low - available                                 // segments; > 0 is a deficit
+integral = clamp(integral + e * dt, -I_max, I_max)         // conditionally, see anti-windup
+R        = max(0, A + (e + integral / T_i) / T_p)          // segments/s
+```
+
+`R` is a **net** reclaim rate, `n_in - n_out` per second, which is exactly the quantity that balances
+`A` in the plant equation above.
+
+| Term | What it is |
+|---|---|
+| `A` | The measured segment allocation rate of every write source except compaction — compaction's own `n_out` is already netted out of `R`. `segment_pool`'s per-source `segments_get` counters give it directly. |
+| `e / T_p` | Proportional. Sets the closed-loop time constant, and it is the term that supplies the damping. |
+| `integral / (T_p * T_i)` | Integral on the level error. This is what pins the free level at the target, and with it `U_eff` and `WA_gc`. |
+
+The feed-forward term is what makes the loop easy: in steady state on a full disk the required rate
+*is* the allocation rate, so `A` carries the load and the PI only trims the residual. Note that the
+loop already had integral action on the *throughput* error before any of this — the free-segment
+count is the integral of `reclaim_rate - allocation_rate`, which is why throughput error is zero at
+any equilibrium. What is added here is integral action on the *level* error.
+
+**Damping.** With `A` constant the closed loop is
+
+```
+e'' + (1/T_p) e' + (1/(T_p * T_i)) e = 0        =>   zeta = 0.5 * sqrt(T_i / T_p)
+```
+
+so `T_i >= 4 * T_p` is critically damped or better, and that is the rule to keep. The shipped
+constants are `T_p = 10s` and `T_i = 60s`, giving `zeta = 1.22`.
+
+**Delay margin.** A job's credit is charged when it is submitted and delivered when it finishes, so
+job duration enters the loop as a transport delay. A batch at a cap of 32 copying twenty segments is
+2.5MB, tens of milliseconds — three orders of magnitude under `T_p`, so it is not a constraint. It is
+worth re-checking against the executed-batch histogram once that exists.
+
+**There is no stop watermark any more.** `R` reaches zero on its own at
+`available = low + A * T_p` and stays there, so compaction fades out as free space grows rather than
+switching off at a threshold, and fades back in the same way: at `low + A * T_p / 2` it runs at half
+the allocation rate, which is a soft approach to the setpoint instead of a step. While a disk is
+being filled for the first time there is no garbage to reclaim, `select_compaction_batch()` returns
+nothing, and the fade-in costs nothing.
+
+#### Anti-windup is mandatory
+
+The target is unachievable whenever compaction is saturated, IO-starved, or short of candidates. The
+error then stays positive, the integral grows without bound, and the commanded rate stays railed long
+after the load has dropped. Two defences, both cheap:
+
+1. **Conditional integration.** Skip the accumulation when the output is railed and the integral
+   cannot work the error off:
+   - *resource-bound*: the delivered rate is below the commanded rate while nothing is waiting on
+     credit, so compaction is behind for reasons a larger `R` cannot fix;
+   - *fully throttled*: `R == 0` with `e < 0`, where there is nothing left to give back;
+   - the trigger is disabled, or `find_top_compaction_candidates()` came back empty. This makes the
+     empty-candidate signal in [Observability](#observability) an input to the controller rather
+     than only a metric.
+2. **A hard ceiling** `I_max = low * T_i`, so the integral's authority is bounded at roughly
+   doubling the demand at the target.
+
+`refresh_free_segment_watermarks()` must reset both the integral and the credit: the accumulated
+error was measured against a setpoint that no longer exists.
+
+#### The throttle: a credit bucket in reclaimed segments
+
+```
+credit = min(credit + R * dt, burst_cap)          // burst_cap = compaction_limits::batch_cap
+```
+
+A job is submitted once `credit >= candidate.score.reclaimed()`, which is charged at submission and
+corrected by `actual - estimate` at completion.
+
+- **The currency is segments, not copied bytes**, because segments are what the loop integrates.
+  Pacing on bytes would need a division by a measured `theta` and buys nothing.
+- **Waiting for a whole job's worth** rather than submitting on any positive credit and going into
+  debt bounds the overshoot above the target by `burst_cap` instead of by whatever one job happens to
+  reclaim. `reclaimed() < n_in <= batch_cap` guarantees the bar is always reachable.
+- **Parallelism throttles itself.** Each in-flight job needs its own credit, so under a light load
+  the driver settles at fewer concurrent jobs — which also hands back the free segments those jobs
+  would otherwise hold.
+
+#### The throttle only ever subtracts
+
+It cannot make compaction faster than it is today, only slower, and it is bypassed in the two cases
+where slowing down would be wrong:
+
+- `available <= low / 2`, the point where `compaction_shares_pressure()` saturates. Below it
+  compaction is losing, and the throttle must not be the reason.
+- `score.live_bytes == 0`. A batch of fully dead segments reclaims at no copy cost, so there is
+  nothing to pay for and no reason to defer it.
+
+Together these give the property that makes the change safe to reason about: **in every regime where
+the current controller runs compaction hard, the new one runs it at least as hard.**
+
+#### The driver runs continuously
+
+`run_auto_compaction()` stops being started and stopped by the free level. It is started once, waits
+for credit, ranks, submits, and repeats; when there is no credit or no candidate it waits on a
+condition variable that the controller tick signals, with a coarse fallback timeout, instead of
+rescanning every group's histogram at 10Hz. That closes open defect 1 as a side effect, and
+`auto_compaction_wanted()` and the fiber's restart dance go away with the hysteresis.
+
+The parallelism snapshot, the `_auto_compaction_sem` hold-back and the marginal-admission gate are
+unchanged. Credit is checked before the gate, because it is the cheaper of the two.
+
+#### Shares keep their curve
+
+Nothing changes in `compaction_shares_pressure()` or in the control points. Once the level is pinned
+at `low` the pressure is a constant `1/3` and shares sit at the target point; if that is not enough
+CPU to sustain `R`, the level droops, pressure rises along the existing ramp, and shares rise with
+it. That is the correct cascade: a level droop is precisely the signal that compaction is
+resource-bound rather than throttle-bound, and anti-windup keeps the rate loop from fighting it.
+There is no second integrator on the same error, so the two loops cannot wind against each other.
+
+One wiring detail is load-bearing: `backlog_controller::adjust()` does nothing while
+`controller_disabled()`, which is true whenever `compaction_static_shares` is set. The rate
+controller's tick therefore cannot live inside `current_backlog()`, or pinning shares would silently
+disable rate control as well. It needs its own periodic tick.
+
+#### Why this needs neither `theta` nor `B(s_max)`
+
+The sections below propose dividing the backlog by the achievable efficiency `theta`, and ultimately
+by a measured `B(s_max)`, so that the loop gain stops depending on disk state. That is necessary when
+*shares* are the actuator, because the plant gain `k = |d(reclaim_rate)/d(available)|` is then
+unknown and varies with everything. Simulated at each controller's own equilibrium under a fixed
+load, as `theta` falls from 0.70 to 0.25:
+
+| Actuator | `k` at `theta` 0.70 | at 0.25 | spread | smallest safe `T_i` |
+|---|---|---|---|---|
+| shares, proportional ramp | 0.61 | 0.056 | 11x | ~120s |
+| shares, work-based (`/theta`) | 0.61 | 0.16 | 4x | ~30s |
+| commanded reclaim rate | `1/T_p` | `1/T_p` | none | `4 * T_p` |
+
+Commanding the rate cancels the plant gain by construction rather than by measuring it, so `T_p` and
+`T_i` are portable constants instead of numbers that have to be tuned for the worst corner. Two
+consequences of the old analysis survive and are worth restating, because both are counter-intuitive:
+a *longer* `T_i` is better damped, and the proportional term supplies all of the damping — removing
+it leaves `e'' + (1/(T_p T_i)) e = 0`, whose roots are purely imaginary. **The proportional term is
+the damping.**
+
+#### What it does not fix
+
+If the shares curve's maximum cannot sustain `R`, the level droops below the target and `WA_gc` rises
+with it. The throttle cannot manufacture bandwidth; that is write throttling's problem. Explicit and
+major compaction remain unpaced and unbounded (open defect 5), so a major compaction still moves the
+free level as it likes. And once one controller serves both sstable and logstor demand, logstor's
+integral would raise shares for both — defensible, they are the same resource, but it should be a
+conscious choice.
+
+### Work-based backlog — a refinement of the shares curve
+
+Not a prerequisite any more, but still the right shape for the *shares* half of the cascade, which is
+otherwise purely reactive: shares rise only after the level has already drooped. Following the
+pattern the sstable strategies use, where backlog is the volume of work outstanding and in-flight
+progress reduces it:
+
+```
+backlog_bytes = R * segment_size / max(theta_achievable, theta_floor)
+              - bytes_already_copied_by_in_flight_jobs
+backlog       = backlog_bytes / available_memory()
+```
+
+`theta_achievable` is the efficiency of the best batch currently available, read off the head of the
+group histograms — the same quantity the score computes — and the division converts "segments I must
+reclaim per second" into "bytes I must copy per second". This behaves correctly where the space ratio
+does not: at the same free level, a disk whose emptiest segments are 5% live needs far less CPU than
+one whose emptiest are 60% live. The `bytes_already_copied` term is the analog of `Ci` in the
+size-tiered backlog tracker and keeps shares from staying pinned while a long job drains.
+
+Now that the rate controller supplies `R`, the demand this expresses is the *commanded* rate rather
+than a deficit, so it anticipates a change in the write rate instead of following the level down.
 
 The division by `available_memory()` is there only to match the units the sstable backlog already
 uses, so that the two can be summed by one controller. It carries no meaning for logstor, whose
-demand is set by the disk rather than by memory; if logstor compaction ever gets its own scheduling
-group, a better normalizer is available. See [The
+demand is set by the disk rather than by memory; see [The
 normalizer](#the-normalizer-and-why-it-is-only-a-question-under-b).
 
-`logstor_gc.md`'s frontier compactor is a second, non-space-driven source of demand; it adds its
-own term to `backlog_bytes` rather than needing a second controller.
-
-### Later: an integral term, to pin the target
-
-Both the current ramp and the work-based backlog above are proportional-only, so both leave a
-**droop**: the free level settles wherever the curve happens to supply the shares that match the
-write rate, not at the target. Since `U_eff = U/(1-s)`, write amplification is a function of the free
-fraction, so an unpinned level means an unpinned `WA_gc`. Pinning the level is the only way to make
-the numbers in [Over-provisioning](#over-provisioning) a prediction rather than a bound.
-
-Note what is *not* missing: the loop already has integral action, because the free-segment count is
-the integral of `reclaim_rate - allocation_rate`. That is why throughput error is exactly zero at
-equilibrium. What is missing is integral action on the *level* error, which needs a second
-integrator, this time inside the controller.
-
-**Where it goes.** In logstor's backlog function, not in `backlog_controller`, which is stateless and
-shared with the sstable controller. Keeping the shares mapping a monotone bounded lookup is also what
-makes saturation directly detectable for the anti-windup rule below. In integral-time form, so both
-terms are in segments and one `theta` division serves both:
-
-```
-deficit  = max(0, low - available_segments)
-integral = clamp(integral + (low - available_segments) * dt, 0, integral_max)
-backlog_bytes = (deficit + integral / T_i) * segment_size / max(theta, theta_floor)
-```
-
-`dt` is the controller's own 250ms interval, so the integration runs in the same callback that
-computes the backlog and needs no clock. The proportional term uses the one-sided deficit; the
-integral accumulates the *signed* error, so that it unwinds when the level is above target, with the
-state floored at zero because negative compaction demand is meaningless.
-
-**Tuning.** Linearizing around the operating point with `k = |d(reclaim_rate)/d(available)|` in
-1/s gives `e'' + k e' + (k/T_i) e = 0`, hence
-
-```
-zeta = 0.5 * sqrt(k * T_i)
-```
-
-Three consequences, two of them counter-intuitive:
-
-- A *longer* `T_i` is better damped. A slow integrator is the safe one.
-- A *higher* loop gain is better damped, because the plant is a pure integrator and the proportional
-  term supplies all of the damping. Do not be tempted to replace the ramp with the integrator: with
-  the proportional term removed the characteristic equation is `e'' + (k/T_i) e = 0`, whose roots are
-  purely imaginary — undamped oscillation. **The ramp is the damping.**
-- Ringing appears when `k * T_i < 4`, i.e. when the gain is *low* and the integrator fast.
-
-`k` is not a constant, which is what makes the ordering matter. Simulated at each controller's own
-equilibrium under a fixed load, as `theta` falls from 0.70 to 0.25:
-
-| Controller | `k` at `theta` 0.70 | at 0.25 | spread | smallest safe `T_i` (`zeta >= 1`) |
-|---|---|---|---|---|
-| proportional ramp | 0.61 | 0.056 | 11x | ~120s |
-| work-based (`/theta`) | 0.61 | 0.16 | 4x | ~30s |
-
-So the `/theta` term does not merely make the response consistent: by holding `k` up it buys a **4x
-faster integrator at the same damping**. That makes the work-based backlog a prerequisite for the
-integral term rather than a companion to it. `T_i = 30s` closes the droop from a step in write rate
-within about a minute with no overshoot; `T_i` in the low single digits rings.
-
-**Anti-windup is mandatory, not a refinement.** The target is unachievable whenever compaction is
-saturated, IO-starved, capped by `_compaction_buffer_pool`, or `find_top_compaction_candidates`
-returns nothing. The error then stays positive, the integral grows without bound, and shares stay
-railed long after the load has dropped — which looks exactly like a broken controller. Two cheap
-defences, both worth having:
-
-1. **Conditional integration.** Skip accumulation when the error is positive *and* the output is
-   already saturated, which here means the proportional-only backlog already exceeds the last control
-   point's input. Extend the same condition to a disabled trigger and to an empty candidate set,
-   neither of which the integral can work off. This makes the empty-candidate signal in
-   [Observability](#observability) an input to the controller rather than only a metric.
-2. **A hard ceiling** on `integral / T_i`, of order `low`, bounding the integral's authority to
-   roughly doubling the demand at the target.
-
-Usefully, the conditional-integration rule fires in the same low-gain, near-saturation corner where
-damping is weakest, so the anti-windup guard doubles as the damping guard.
-
-**Consequences elsewhere.**
-
-- `refresh_free_segment_watermarks()` must reset the integral: the accumulated error was measured
-  against a setpoint that no longer exists.
-- The trigger's hysteresis loses its purpose. With the level pinned at `low`, compaction runs
-  continuously instead of bursting between `low` and `high`. The total work is identical, since
-  `reclaim_rate = allocation_rate` either way, but spread evenly rather than in bursts, which is
-  better for latency. Either set the integral's setpoint mid-band or accept continuous compaction and
-  simplify `should_run_auto_compaction()`; the latter is preferred.
-- The integral state must be exported as a gauge. A wound-up integrator is indistinguishable from a
-  genuinely busy disk from the outside.
-- Once one controller serves both sstable and logstor demand, logstor's integral raises shares for
-  both. That is defensible — they are the same resource — but it should be a conscious choice.
-
-Completing the analogy, the three classical terms map onto quantities this document already defines:
-proportional is the current deficit, integral pins the level and therefore `WA_gc`, and derivative is
-the allocation rate, i.e. the optional division by time to exhaustion above.
+`logstor_gc.md`'s frontier compactor is a second, non-space-driven source of demand; it adds its own
+term to `backlog_bytes` rather than needing a second controller.
 
 ### Sharing the `comp` scheduling group: one controller, or two groups
 
@@ -978,7 +1083,10 @@ accordingly (see [Open defect #4](#open)).
    `run_auto_compaction` still sleeps 100ms and rescans every group's histogram. The fiber should
    re-arm on an event instead of polling. It is armed only from `allocate_segment` once the disk has
    been written through once, and from the trigger-threshold config observer; it should also re-arm
-   on segment-freed and free-space events.
+   on segment-freed and free-space events. The continuously running driver of [Recommended:
+   continuous compaction at a controlled reclaim
+   rate](#recommended-continuous-compaction-at-a-controlled-reclaim-rate) needs a wait on an event
+   anyway, and closes this with it.
 
 2. **Selection runs twice.** `find_top_compaction_candidates` computes a candidate set and score
    to rank groups, then `do_compaction` discards it and re-selects. Besides the wasted scan, the
@@ -1146,6 +1254,11 @@ Gaps worth closing:
   a small disk is running at the full cap of 32 or at `min_segments_per_compaction`.
 - A histogram of executed-batch size would show where inside the cap the tolerance actually stops,
   which is what decides whether raising the cap changed anything on a given workload.
+- Nothing exports the control loop itself. The rate controller needs the commanded reclaim rate, the
+  delivered one, the segment allocation rate it feeds forward, the credit level and the integral
+  state, all as gauges: a wound-up integrator is indistinguishable from a genuinely busy disk from
+  the outside, and a throttled compaction is indistinguishable from an idle one. `free_segments`
+  against the target is what says whether the level is actually pinned.
 
 ## Plan
 
@@ -1175,52 +1288,48 @@ Ordered by value per unit of risk, not by how interesting they are.
 
 ### Next steps
 
-Those changes alter steady-state behavior on the strength of simulation, so the first step is
-to be able to see whether the model holds on a real cluster.
+1. **Continuous compaction at a controlled reclaim rate** — the PI loop on the free-segment level,
+   the credit bucket that paces jobs, and the hysteresis removed with them. See [Recommended:
+   continuous compaction at a controlled reclaim
+   rate](#recommended-continuous-compaction-at-a-controlled-reclaim-rate). It is first because the
+   relay is what makes the free level, the shares and the disk's compaction bandwidth oscillate, and
+   because everything else on this list is measured at a free level that currently does not sit
+   still. It also subsumes two items that used to be listed separately here — the integral term and
+   the 100ms rescan loop (open defect 1).
 
-1. **Executed-batch efficiency histogram**, plus a counter for `find_top_compaction_candidates`
+2. **Executed-batch efficiency histogram**, plus a counter for `find_top_compaction_candidates`
    returning empty while auto compaction is active. Nearly free — `compaction_candidate` already
    carries the executed batch's score — and it is the instrument for everything below: without it
    there is no way to tell whether observed marginal write amplification matches the tables above,
    whether the 5% target is actually being held, or where the marginal-admission ratio should sit.
    The empty-candidate counter is now an out-of-space signal worth alerting on rather than a symptom
-   of the dead window.
+   of the dead window, and the rate controller consumes it as an anti-windup input.
 
-2. **Pass the candidate from `find_top_compaction_candidates` into `do_compaction`** and re-validate
+3. **Pass the candidate from `find_top_compaction_candidates` into `do_compaction`** and re-validate
    it instead of re-selecting (open defect 2). Small and self-contained, and it matters more than it
    did: the efficiency score depends on the exact prefix, so re-selection can run a materially
-   different batch from the one that won the ranking, and it doubles the histogram scan per job.
+   different batch from the one that won the ranking, it doubles the histogram scan per job, and the
+   credit charged at submission is the score of the batch that won rather than of the one that runs.
 
-3. **Bound explicit compaction** with the same parallelism limit automatic compaction uses (open
+4. **Bound explicit compaction** with the same parallelism limit automatic compaction uses (open
    defect 5), so that `parallelism * cap <= low` holds on every path rather than only the automatic
-   one. Small, and it is the last place where compaction concurrency is implicit.
+   one. Small, and it is the last place where compaction concurrency is implicit — and the last
+   source of free-level movement the rate controller does not see.
 
-4. **One controller for the `comp` scheduling group** (open defect 4). Not an optimization: today an
-   idle sstable controller suppresses logstor's shares roughly half the time, and while that is true
-   no change to logstor's backlog can be evaluated. Take the single-controller option, not the
-   separate-scheduling-group one, until there is a joint CPU cap across the two — the trade is
-   analysed in [Sharing the `comp` scheduling
-   group](#sharing-the-comp-scheduling-group-one-controller-or-two-groups). It touches shared code
-   outside logstor, so it is the largest-blast-radius item here.
-
-5. **Work-based backlog** in `current_backlog()`, including the in-flight-progress term, once 4
-   lands. `theta_achievable` is exactly the quantity the score now computes, so the ingredients are
-   in place.
+5. **Work-based backlog** in `current_backlog()`, including the in-flight-progress term. No longer a
+   prerequisite for anything, since the rate loop carries its own gain; what it buys is shares that
+   anticipate a change in demand instead of following the level down. `theta_achievable` is exactly
+   the quantity the score already computes.
 
 ### Later
 
-- Give logstor compaction its own scheduling group, with a deadline-normalized backlog and a joint
-  CPU cap across the two compaction groups. The better end state, and the only arrangement that can
-  express priority between the two engines, but it needs a measured `B(s_max)` and the cap first —
-  see [Sharing the `comp` scheduling
+- A joint CPU cap across the two compaction scheduling groups, and a measured `B(s_max)` for
+  logstor, so that the shares of `lcmp` and `comp` can be tuned against each other with confidence
+  (open defect 4). See [Sharing the `comp` scheduling
   group](#sharing-the-comp-scheduling-group-one-controller-or-two-groups).
-- Add an integral term to pin the free level at the target, and with it `WA_gc`. Only after 4 and 5:
-  the `/theta` term is what keeps the loop gain high enough for an integrator to be both fast and
-  damped. See [Later: an integral term](#later-an-integral-term-to-pin-the-target).
-- Remove the 100ms candidate-rescan loop and re-arm the fiber on events (open defect 1). Now a
-  CPU-waste cleanup rather than a correctness problem.
 - Free a segment eagerly when its live bytes reach zero, instead of waiting for a job to select it
-  (open defect 3).
+  (open defect 3). The rate controller's zero-copy bypass makes such a batch cheap to run but still
+  spends a job slot on it.
 - Close the remaining [Observability](#observability) gaps.
 
 ### Conditional, measure first
