@@ -21,6 +21,7 @@
 #include "mutation_writer/token_group_based_splitting_writer.hh"
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <limits>
 #include <ranges>
 #include <optional>
@@ -305,6 +306,122 @@ constexpr float compaction_shares_pressure_at_target = 1.0f / 3.0f;
 // is still in hand instead of at the point where writes stall: a workload that needs the maximum
 // shares must be able to settle somewhere that still leaves the write path room.
 float compaction_shares_pressure(uint64_t available_segments, free_segment_watermarks watermarks) noexcept;
+
+// How often the reclaim rate controller samples the free-segment level.
+constexpr std::chrono::milliseconds compaction_rate_control_period{250};
+
+// The controller's proportional time, `T_p`: the time constant of the closed loop, and the term that
+// supplies all of its damping. It also sets how far above the target compaction fades out, at
+// `low + allocation_rate * T_p`, so a large one leaves compaction running on a disk with plenty of
+// room. It has to stay well above the control period and above what one job takes, which at a batch
+// cap of 32 is tens of milliseconds. See the compaction document's "The control law".
+constexpr double compaction_rate_response_time = 4.0;
+
+// The controller's integral time, `T_i`, which is what pins the free level at the target and with it
+// `U_eff` and `WA_gc`. The closed loop is `e'' + e'/T_p + e/(T_p * T_i) = 0`, so
+// `zeta = 0.5 * sqrt(T_i / T_p)` and `T_i >= 4 * T_p` is critically damped or better. Below that the
+// level rings; the ratio, not either constant on its own, is what must be kept.
+constexpr double compaction_rate_integral_time = 30.0;
+
+// The time constant the *delivered* reclaim rate is smoothed over, which is measurement rather than
+// control: it is compared against the commanded rate to decide whether compaction is resource-bound,
+// and a threshold comparison on a noisy signal would trip at random. The allocation rate the
+// feed-forward is built from is deliberately *not* smoothed - the credit bucket integrates it, so
+// noise there cancels over a few periods while lag does not, and a filter in front of it is the
+// single largest term in the level excursion after a step in the write rate.
+constexpr double compaction_rate_measurement_time = 2.0;
+
+// How far below the commanded rate the delivered one may fall before the controller takes itself to
+// be resource-bound rather than throttle-bound, and stops accumulating the integral.
+constexpr double compaction_rate_saturation_ratio = 0.9;
+
+// Paces automatic compaction so that it runs continuously at the rate that holds the free-segment
+// level at the target, instead of switching on below the target and off above the stop watermark.
+// The engine and test/manual/logstor_compaction_sim.cc share it, so the simulated dynamics are the
+// controller's own.
+//
+// The plant is a pure integrator - `d(available)/dt = reclaim_rate - allocation_rate` - so the
+// controller is a PI loop on the level error with feed-forward on the measured allocation rate,
+// which is the term that carries the load in steady state. Its output is a commanded *net* reclaim
+// rate, `n_in - n_out` per second, which is the quantity that balances the allocation rate.
+//
+// The rate is spent through a credit bucket denominated in reclaimed segments: a job is submitted
+// once the bucket holds what its batch is estimated to reclaim, so the level overshoots the target
+// by at most one burst rather than by a quarter of it. The throttle only ever subtracts - it is
+// bypassed while the level is below half the target, and the caller bypasses it for a batch that
+// copies nothing - so compaction is never slower than it would be without one.
+class compaction_rate_controller {
+public:
+    compaction_rate_controller() = default;
+    // The time constants are arguments rather than only constants so that a simulation can sweep
+    // them against the real plant; the engine takes the defaults.
+    compaction_rate_controller(double response_time, double integral_time) noexcept
+        : _response_time(response_time)
+        , _integral_time(integral_time) {
+    }
+
+    // One sampling period. The rates are given as the raw counts since the previous tick, since the
+    // controller is what smooths them.
+    struct sample {
+        uint64_t available_segments;
+        // The free-segment target, free_segment_watermarks::low. Zero disables the controller along
+        // with the trigger.
+        uint64_t target_segments;
+        // Segments allocated since the last tick by everything except compaction, whose output is
+        // already netted out of the reclaim rate.
+        uint64_t segments_allocated;
+        // Segments reclaimed since the last tick, `n_in - n_out` over the jobs that finished.
+        uint64_t segments_reclaimed;
+        // The most credit the bucket may carry from one period into the next, in segments. One
+        // batch's worth, so that a batch is always eventually affordable and an idle stretch banks
+        // no more than one job.
+        double burst_cap;
+        double dt;
+        // Whether the last ranking found no batch with a net gain, and whether a job is waiting for
+        // credit now. Neither is an error the integral can work off, so both suppress it: the first
+        // because there is nothing to reclaim, the second because the rate is already high enough
+        // that the throttle, not the disk, is what compaction is waiting for.
+        bool candidates_empty;
+        bool throttled;
+    };
+
+    void tick(const sample&) noexcept;
+
+    // Whether a batch estimated to reclaim `reclaimed` segments may start now.
+    bool can_afford(size_t reclaimed) const noexcept {
+        return _bypassed || _credit >= double(reclaimed);
+    }
+    void charge(double segments) noexcept { _credit -= segments; }
+    // How long the bucket needs to hold `reclaimed` segments at the commanded rate, for a caller
+    // that would rather wait than poll. Infinite while the rate is zero, where only the next tick
+    // can change the answer.
+    double time_to_afford(size_t reclaimed) const noexcept;
+
+    double rate() const noexcept { return _rate; }
+    double credit() const noexcept { return _credit; }
+    double integral() const noexcept { return _integral; }
+    double allocation_rate() const noexcept { return _alloc_rate; }
+    double reclaim_rate() const noexcept { return _delivered_rate; }
+    // Set when the level is low enough that the throttle is off altogether.
+    bool bypassed() const noexcept { return _bypassed; }
+
+    // The setpoint the accumulated error was measured against is gone, so neither the integral nor
+    // the credit means anything any more.
+    void reset() noexcept;
+
+private:
+    double _response_time = compaction_rate_response_time;
+    double _integral_time = compaction_rate_integral_time;
+    // In segment-seconds: the integral of the level error over time, floored at zero.
+    double _integral = 0;
+    double _rate = 0;
+    double _credit = 0;
+    double _alloc_rate = 0;
+    double _delivered_rate = 0;
+    // No target yet means no throttle, so that a controller that has never ticked cannot hold
+    // compaction back.
+    bool _bypassed = true;
+};
 
 inline constexpr log_heap_options segment_descriptor_hist_options(4 * 1024, 3, 128 * 1024);
 

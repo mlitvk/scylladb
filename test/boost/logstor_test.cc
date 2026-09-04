@@ -3326,6 +3326,259 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_shares_pressure) {
     BOOST_REQUIRE_EQUAL(compaction_shares_pressure(0, minimal), 1.0f);
 }
 
+// Runs the rate controller against the plant it is written for - a pure integrator on the
+// free-segment count - so that the closed loop, not only the arithmetic of one tick, is what the
+// tests below check. `capacity` is the reclaim rate the disk can actually deliver, which is what
+// makes compaction resource-bound rather than throttle-bound.
+struct rate_loop {
+    compaction_rate_controller controller;
+    uint64_t target;
+    double available;
+    double alloc_rate;
+    // Finite, always: while the throttle is bypassed the driver's only bound is what the disk can
+    // deliver, which is exactly the regime this stands in for.
+    double capacity = 400;
+    // What one job reclaims, so that credit is spent in the quanta a driver spends it in.
+    double job_reclaim = 4;
+    double burst_cap = 32;
+    double dt = 0.25;
+
+    double min_available = std::numeric_limits<double>::max();
+    double max_available = 0;
+
+    void step() {
+        const auto allocated = alloc_rate * dt;
+        double reclaimed = 0;
+        double budget = capacity * dt;
+        bool throttled = false;
+        while (budget >= job_reclaim) {
+            if (!controller.can_afford(static_cast<size_t>(job_reclaim))) {
+                throttled = true;
+                break;
+            }
+            controller.charge(job_reclaim);
+            reclaimed += job_reclaim;
+            budget -= job_reclaim;
+        }
+        available = std::max(0.0, available + reclaimed - allocated);
+        min_available = std::min(min_available, available);
+        max_available = std::max(max_available, available);
+        controller.tick({
+            .available_segments = static_cast<uint64_t>(available),
+            .target_segments = target,
+            .segments_allocated = static_cast<uint64_t>(std::llround(allocated)),
+            .segments_reclaimed = static_cast<uint64_t>(std::llround(reclaimed)),
+            .burst_cap = burst_cap,
+            .dt = dt,
+            .candidates_empty = false,
+            .throttled = throttled,
+        });
+    }
+
+    void run(double seconds) {
+        for (double t = 0; t < seconds; t += dt) {
+            step();
+        }
+    }
+
+    void reset_extremes() {
+        min_available = std::numeric_limits<double>::max();
+        max_available = 0;
+    }
+};
+
+// The whole point of the controller: the free-segment level settles at the target instead of
+// sweeping a hysteresis band, and it gets there without overshooting.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_rate_controller_pins_the_level) {
+    rate_loop loop{.target = 400, .available = 400, .alloc_rate = 40};
+
+    // From the setpoint under a steady load: the feed-forward term carries it, so the level barely
+    // moves and the commanded rate settles on the allocation rate.
+    loop.run(600);
+    BOOST_REQUIRE_CLOSE(loop.controller.rate(), loop.alloc_rate, 5.0);
+    BOOST_REQUIRE_LT(std::abs(loop.available - double(loop.target)), 8.0);
+
+    // A step in the write rate is what the integral is there for: the proportional term alone would
+    // leave the level drooping below the target for as long as the new load lasts.
+    loop.alloc_rate = 120;
+    loop.run(600);
+    loop.reset_extremes();
+    loop.run(600);
+    BOOST_REQUIRE_CLOSE(loop.controller.rate(), loop.alloc_rate, 5.0);
+    BOOST_REQUIRE_LT(std::abs(loop.available - double(loop.target)), 8.0);
+
+    // Overdamped at the shipped constants, so the recovery from the step does not ring: once
+    // settled, the level stays inside a few segments of the target rather than oscillating about it.
+    BOOST_REQUIRE_LT(loop.max_available - loop.min_available, 16.0);
+
+    // Recovering a deficit takes the level back to the target from below, not past it.
+    loop.available = double(loop.target) / 2 + 1;
+    loop.run(600);
+    BOOST_REQUIRE_LT(std::abs(loop.available - double(loop.target)), 8.0);
+}
+
+// The shipped ratio of the two time constants is what keeps the loop from ringing. A fast integrator
+// against the same proportional time is underdamped, which is the failure the ratio rule prevents.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_rate_controller_is_overdamped) {
+    BOOST_REQUIRE_GE(compaction_rate_integral_time, 4 * compaction_rate_response_time);
+
+    rate_loop loop{.target = 400, .available = 250, .alloc_rate = 40};
+    loop.run(1200);
+    // Settled, so anything left is ringing rather than the approach.
+    loop.reset_extremes();
+    loop.run(600);
+    BOOST_REQUIRE_LT(loop.max_available - double(loop.target), 8.0);
+    BOOST_REQUIRE_LT(double(loop.target) - loop.min_available, 8.0);
+}
+
+// A disk that cannot deliver the commanded rate must not wind the integral up: the error stays
+// positive for as long as the overload lasts, and an unbounded integral would keep the rate railed
+// long after it ends.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_rate_controller_anti_windup) {
+    rate_loop loop{.target = 400, .available = 400, .alloc_rate = 200, .capacity = 40};
+    loop.run(1200);
+
+    // The level has fallen - the throttle cannot manufacture bandwidth - but the integral is bounded
+    // rather than growing with the length of the overload.
+    BOOST_REQUIRE_LT(loop.available, double(loop.target));
+    const auto integral_after_overload = loop.controller.integral();
+    loop.run(1200);
+    BOOST_REQUIRE_LT(loop.controller.integral(), integral_after_overload + 1.0);
+
+    // With the load gone the commanded rate has to come back down promptly rather than staying
+    // railed while a wound-up integral unwinds.
+    loop.alloc_rate = 10;
+    loop.capacity = 400;
+    loop.run(300);
+    BOOST_REQUIRE_LT(loop.controller.rate(), 40.0);
+    BOOST_REQUIRE_GT(loop.available, double(loop.target) * 0.9);
+}
+
+// The integral is capped even where conditional integration lets it accumulate, so its authority is
+// bounded at roughly a doubling of the demand at the target.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_rate_controller_integral_is_bounded) {
+    compaction_rate_controller controller;
+    constexpr uint64_t target = 400;
+    // No segments at all, and a throttled driver, which is the state conditional integration lets
+    // through: the error is positive and the throttle, not the disk, is what compaction waits for.
+    for (int i = 0; i < 100000; ++i) {
+        controller.tick({
+            .available_segments = 0,
+            .target_segments = target,
+            .segments_allocated = 0,
+            .segments_reclaimed = 0,
+            .burst_cap = 32,
+            .dt = 0.25,
+            .candidates_empty = false,
+            .throttled = true,
+        });
+    }
+    BOOST_REQUIRE_LE(controller.integral(), double(target) * compaction_rate_integral_time);
+    // Which bounds what the integral adds to the commanded rate at a target's worth per T_p.
+    BOOST_REQUIRE_LE(controller.rate(), 3 * double(target) / compaction_rate_response_time);
+}
+
+// The throttle only ever subtracts. Below half the target it is off altogether, so it can never be
+// the reason compaction is slow on a disk that is losing.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_rate_controller_bypass) {
+    compaction_rate_controller controller;
+    constexpr uint64_t target = 400;
+    const auto tick_at = [&] (uint64_t available) {
+        controller.tick({
+            .available_segments = available,
+            .target_segments = target,
+            .segments_allocated = 0,
+            .segments_reclaimed = 0,
+            .burst_cap = 32,
+            .dt = 0.25,
+            .candidates_empty = false,
+            .throttled = false,
+        });
+    };
+
+    tick_at(target / 2);
+    BOOST_REQUIRE(controller.bypassed());
+    BOOST_REQUIRE(controller.can_afford(1000));
+    BOOST_REQUIRE_EQUAL(controller.time_to_afford(1000), 0);
+
+    tick_at(target / 2 + 1);
+    BOOST_REQUIRE(!controller.bypassed());
+
+    // Well above the target the commanded rate is zero, so nothing is affordable and only the next
+    // tick can change that.
+    controller.reset();
+    tick_at(target * 4);
+    BOOST_REQUIRE_EQUAL(controller.rate(), 0.0);
+    BOOST_REQUIRE(!controller.can_afford(1));
+    BOOST_REQUIRE(std::isinf(controller.time_to_afford(1)));
+
+    // A disabled trigger has no setpoint, so the controller commands nothing and holds nothing back.
+    controller.tick({
+        .available_segments = 0,
+        .target_segments = 0,
+        .segments_allocated = 0,
+        .segments_reclaimed = 0,
+        .burst_cap = 32,
+        .dt = 0.25,
+        .candidates_empty = false,
+        .throttled = false,
+    });
+    BOOST_REQUIRE_EQUAL(controller.rate(), 0.0);
+    BOOST_REQUIRE(controller.can_afford(1000));
+}
+
+// Credit is what turns a commanded rate into paced job submissions: over a long run the segments it
+// admits track the rate, and a burst after an idle period is bounded by one batch.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_rate_controller_credit_paces_jobs) {
+    constexpr uint64_t target = 400;
+    constexpr double burst_cap = 32;
+    compaction_rate_controller controller;
+
+    // Held at the target with a steady allocation rate, so the commanded rate is the allocation
+    // rate and the credit admits that many segments a second.
+    double admitted = 0;
+    constexpr double dt = 0.25;
+    constexpr double seconds = 400;
+    for (double t = 0; t < seconds; t += dt) {
+        controller.tick({
+            .available_segments = target,
+            .target_segments = target,
+            .segments_allocated = 10,
+            .segments_reclaimed = 10,
+            .burst_cap = burst_cap,
+            .dt = dt,
+            .candidates_empty = false,
+            .throttled = false,
+        });
+        // What the bucket carries between periods is capped; the period's own accrual is not.
+        BOOST_REQUIRE_LE(controller.credit(), burst_cap + controller.rate() * dt);
+        while (controller.can_afford(4)) {
+            controller.charge(4);
+            admitted += 4;
+        }
+    }
+    // 10 segments per 250ms tick is 40 a second, which is what the pacing has to deliver.
+    BOOST_REQUIRE_CLOSE(admitted / seconds, 40.0, 5.0);
+
+    // An idle stretch cannot bank more than one batch's worth of credit on top of the period it is
+    // in, which is what bounds the overshoot above the target when compaction has been waiting for
+    // candidates.
+    controller.reset();
+    for (double t = 0; t < 600; t += dt) {
+        controller.tick({
+            .available_segments = target,
+            .target_segments = target,
+            .segments_allocated = 100,
+            .segments_reclaimed = 0,
+            .burst_cap = burst_cap,
+            .dt = dt,
+            .candidates_empty = false,
+            .throttled = true,
+        });
+    }
+    BOOST_REQUIRE_CLOSE(controller.credit(), burst_cap + controller.rate() * dt, 0.01);
+}
+
 SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_candidate_score_ranks_by_efficiency) {
     constexpr uint64_t segment_size = 128 * 1024;
 

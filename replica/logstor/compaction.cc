@@ -8,6 +8,7 @@
 #include "replica/logstor/compaction.hh"
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace replica::logstor {
 
@@ -154,6 +155,84 @@ std::optional<compaction_batch> select_compaction_batch(const segment_set& segme
         .segments = std::move(candidates),
         .score = prefix_scores[selected_count - 1],
     };
+}
+
+// An exponential moving average of a rate sampled over `dt`, with `tau` as its time constant. The
+// exponential form rather than a fixed window because `dt` is only nominally the control period: a
+// tick that ran late must weigh proportionally more.
+static double smooth_rate(double previous, double rate, double dt, double tau) noexcept {
+    if (dt <= 0) {
+        return previous;
+    }
+    const auto alpha = 1.0 - std::exp(-dt / tau);
+    return previous + alpha * (rate - previous);
+}
+
+void compaction_rate_controller::reset() noexcept {
+    _integral = 0;
+    _rate = 0;
+    _credit = 0;
+    _alloc_rate = 0;
+    _delivered_rate = 0;
+    _bypassed = true;
+}
+
+void compaction_rate_controller::tick(const sample& s) noexcept {
+    if (s.target_segments == 0 || !(s.dt > 0)) {
+        // The trigger is disabled, so there is no setpoint and automatic compaction does not run.
+        reset();
+        return;
+    }
+
+    // Unsmoothed: the feed-forward is spent through the credit bucket, which is an integrator, so
+    // what a period over- or under-estimates the next one gives back. A filter in front of it only
+    // adds lag, and lag is what the level pays for during a step in the write rate.
+    _alloc_rate = double(s.segments_allocated) / s.dt;
+    _delivered_rate = smooth_rate(_delivered_rate, double(s.segments_reclaimed) / s.dt, s.dt,
+            compaction_rate_measurement_time);
+
+    const auto error = double(s.target_segments) - double(s.available_segments);
+    const auto feed_forward = _alloc_rate + error / _response_time;
+    const auto integral_term = [this] (double integral) {
+        return integral / (_response_time * _integral_time);
+    };
+
+    // Conditional integration: accumulate only where the accumulated error is something a larger
+    // commanded rate could actually work off. Being behind on a rate the disk is not delivering is
+    // not such a state - the integral would grow for as long as the overload lasts and keep the
+    // rate railed long after it ended.
+    const auto railed_high = error > 0 && !s.throttled
+            && _delivered_rate < compaction_rate_saturation_ratio * _rate;
+    if (!s.candidates_empty && !railed_high) {
+        // Floored at zero, because negative compaction demand is meaningless: the integral is there
+        // to remove the droop below the target, and the proportional term already holds the level
+        // down from above. Without the floor a disk that has not been filled yet - where the level
+        // sits far above the target for as long as the fill takes - banks an enormous negative
+        // charge that then has to unwind before compaction can hold the target at all. Bounded
+        // above at a target's worth of error-seconds, so the integral's authority is roughly a
+        // doubling of the demand at the target.
+        const auto limit = double(s.target_segments) * _integral_time;
+        _integral = std::clamp(_integral + error * s.dt, 0.0, limit);
+    }
+
+    _rate = std::max(0.0, feed_forward + integral_term(_integral));
+    // The period's accrual is always added in full, and it is what the bucket carries between
+    // periods that is capped: trimming the accrual itself would silently cap the sustained rate at
+    // a batch per period, which on a fast disk is well below what the level asks for.
+    _credit = std::min(_credit, s.burst_cap) + _rate * s.dt;
+    // Below half the target compaction is losing, and the throttle must not be the reason. This is
+    // the same point compaction_shares_pressure() saturates at, for the same reason.
+    _bypassed = s.available_segments <= s.target_segments / 2;
+}
+
+double compaction_rate_controller::time_to_afford(size_t reclaimed) const noexcept {
+    if (can_afford(reclaimed)) {
+        return 0;
+    }
+    if (_rate <= 0) {
+        return std::numeric_limits<double>::infinity();
+    }
+    return (double(reclaimed) - _credit) / _rate;
 }
 
 float compaction_shares_pressure(uint64_t available_segments, free_segment_watermarks watermarks) noexcept {
