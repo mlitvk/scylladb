@@ -712,7 +712,7 @@ stays a question for the ranking:
 
 ```
 e        = low - available                                 // segments; > 0 is a deficit
-integral = clamp(integral + e * dt, -I_max, I_max)         // conditionally, see anti-windup
+integral = clamp(integral + e * dt, 0, I_max)              // conditionally, see anti-windup
 R        = max(0, A + (e + integral / T_i) / T_p)          // segments/s
 ```
 
@@ -721,7 +721,7 @@ R        = max(0, A + (e + integral / T_i) / T_p)          // segments/s
 
 | Term | What it is |
 |---|---|
-| `A` | The measured segment allocation rate of every write source except compaction — compaction's own `n_out` is already netted out of `R`. `segment_pool`'s per-source `segments_get` counters give it directly. |
+| `A` | The segment allocation rate of every write source except compaction — compaction's own `n_out` is already netted out of `R`. `segment_pool`'s per-source `segments_get` counters give it directly. |
 | `e / T_p` | Proportional. Sets the closed-loop time constant, and it is the term that supplies the damping. |
 | `integral / (T_p * T_i)` | Integral on the level error. This is what pins the free level at the target, and with it `U_eff` and `WA_gc`. |
 
@@ -731,6 +731,22 @@ loop already had integral action on the *throughput* error before any of this �
 count is the integral of `reclaim_rate - allocation_rate`, which is why throughput error is zero at
 any equilibrium. What is added here is integral action on the *level* error.
 
+**`A` is measured over one period and not filtered**, which is worth stating because the opposite
+looks more careful and is not. Over a 250ms period the count is a small integer, so the rate is
+noisy — but it is spent through the credit bucket, which is an integrator, so what one period
+over-estimates the next gives back and only the *lag* of a filter survives. That lag is the single
+largest term in the level excursion after a step in the write rate: at `U = 0.6` a 3x step costs 12
+segments unfiltered and 110 with a 2s filter, and the filtered run's steady-state level is also
+looser, not tighter. The delivered rate *is* smoothed, because it is compared against a threshold
+in the anti-windup rule below, where noise does not cancel.
+
+**The integral is floored at zero.** Negative compaction demand is meaningless: the integral exists
+to remove the droop below the target, and the proportional term already holds the level down from
+above. Without the floor, a disk that has not been filled yet — where the level sits far above the
+target for as long as the fill takes — banks an enormous negative charge that then has to unwind
+before compaction can hold the target at all. In simulation that is not a subtlety: it left the level
+13 segments below a target of 205 for the first 100s of every measured run.
+
 **Damping.** With `A` constant the closed loop is
 
 ```
@@ -738,7 +754,10 @@ e'' + (1/T_p) e' + (1/(T_p * T_i)) e = 0        =>   zeta = 0.5 * sqrt(T_i / T_p
 ```
 
 so `T_i >= 4 * T_p` is critically damped or better, and that is the rule to keep. The shipped
-constants are `T_p = 10s` and `T_i = 60s`, giving `zeta = 1.22`.
+constants are `T_p = 4s` and `T_i = 30s`, giving `zeta = 1.37`. `T_p` also sets how far above the
+target compaction fades out, at `low + A * T_p`, which is the other reason not to make it large:
+at `T_p = 10s` that point is 10 seconds' worth of allocation above the target, and compaction is
+still running on a disk with several times the target free.
 
 **Delay margin.** A job's credit is charged when it is submitted and delivered when it finishes, so
 job duration enters the loop as a transport delay. A batch at a cap of 32 copying twenty segments is
@@ -762,10 +781,12 @@ after the load has dropped. Two defences, both cheap:
    cannot work the error off:
    - *resource-bound*: the delivered rate is below the commanded rate while nothing is waiting on
      credit, so compaction is behind for reasons a larger `R` cannot fix;
-   - *fully throttled*: `R == 0` with `e < 0`, where there is nothing left to give back;
    - the trigger is disabled, or `find_top_compaction_candidates()` came back empty. This makes the
      empty-candidate signal in [Observability](#observability) an input to the controller rather
      than only a metric.
+
+   The low rail needs no rule of its own: the floor at zero is where the integral would wind down to
+   anyway.
 2. **A hard ceiling** `I_max = low * T_i`, so the integral's authority is bounded at roughly
    doubling the demand at the target.
 
@@ -848,6 +869,61 @@ consequences of the old analysis survive and are worth restating, because both a
 a *longer* `T_i` is better damped, and the proportional term supplies all of the damping — removing
 it leaves `e'' + (1/(T_p T_i)) e = 0`, whose roots are purely imaginary. **The proportional term is
 the damping.**
+
+#### What the simulator says
+
+Measured with `test/manual/logstor_compaction_sim`, which runs the controller itself — see the
+[appendix](#appendix-methodology) for what a timed run models. The free level is sampled once per
+control period; its standard deviation is what "smooth" means here, and the shares column is the
+pressure `compaction_shares_pressure()` would hand the shares controller at that level.
+
+512MB, one group, 5MB/s of user writes against 40MB/s of compaction bandwidth, 5% target
+(`low = 205`), no contention for the CPU:
+
+| `U` | Controller | Free level | sd | min | max | Shares pressure sd | `WA_gc` |
+|---|---|---|---|---|---|---|---|
+| 0.40 | relay | 245.8 | 24.0 | 212 | 310 | 0.112 | 0.158 |
+| 0.40 | rate  | 213.0 | 6.5  | 203 | 242 | 0.042 | 0.153 |
+| 0.60 | relay | 237.4 | 19.3 | 212 | 291 | 0.107 | 0.633 |
+| 0.60 | rate  | 210.4 | 5.7  | 205 | 239 | 0.037 | 0.621 |
+| 0.75 | relay | 229.3 | 15.4 | 202 | 272 | 0.099 | 1.767 |
+| 0.75 | rate  | 209.9 | 3.5  | 202 | 234 | 0.023 | 1.676 |
+
+The level is three to four times tighter, the shares three to four times steadier, and the level's
+*mean* lands on the target instead of 12–20% above it — which is why `WA_gc` falls by 2–5% rather
+than rising: the relay spends most of its cycle above the target, at a higher `U_eff`. Compaction is
+not doing less work; it is doing the same work at the free level the operator asked for.
+
+The gain grows with the disk, because the relay's band is a quarter of the target while what is left
+of the rate controller's ripple is a job's inputs being freed in one go — `batch_cap` segments,
+whatever the disk size. 2GB, 8 groups, 20MB/s, `low = 820`:
+
+| Controller | Shares authority | Free level | sd | min | max | Shares pressure sd | `WA_gc` |
+|---|---|---|---|---|---|---|---|
+| relay | 0 | 953.2 | 74.3 | 827 | 1148 | 0.106  | 0.632 |
+| relay | 1 | 848.6 | 26.9 | 762 | 909  | 0.044  | 0.622 |
+| rate  | 0 | 820.2 | 5.7  | 814 | 879  | 0.0093 | 0.614 |
+| rate  | 1 | 820.3 | 5.9  | 775 | 877  | 0.0096 | 0.614 |
+
+The shares-authority rows are the argument of [Removing the hysteresis requires a throttle
+first](#removing-the-hysteresis-requires-a-throttle-first), measured. Where the shares curve *does*
+have authority — a contended shard, authority 1 — it damps the relay by itself, from a spread of 74
+segments to 27. Where it does not, which is the uncontended shard the throttle exists for, it damps
+nothing. The rate controller is the same in both, because it does not depend on that actuator at all.
+
+Two more things a timed run answers that a steady-state one cannot:
+
+- **A step in the write rate.** Tripling it at `U = 0.6` takes the level 12 segments below the target
+  before the loop catches it, against a target of 205, with no overshoot on the way back. That number
+  is almost entirely the lag in `A`: with the allocation rate filtered over 2s it was 110 segments.
+- **A disk that cannot keep up.** At `U = 0.75` with the compaction bandwidth cut to 15MB/s, the two
+  controllers are indistinguishable — level 11.2 against 11.3, 98.7s of write stall against 99.9s,
+  the same `WA_gc` — because the throttle is bypassed below half the target and the disk, not the
+  controller, is what compaction is waiting for.
+
+What the simulator does *not* answer is what the shares controller does with a level that no longer
+moves: it models one compaction bandwidth rather than a scheduling group, so the cascade of
+[Shares keep their curve](#shares-keep-their-curve) has to be confirmed on a real shard.
 
 #### What it does not fix
 
@@ -1360,6 +1436,8 @@ ninja build/dev/test/manual/logstor_compaction_sim
 build/dev/test/manual/logstor_compaction_sim --smp 1 --utilization 0.75 --trigger-threshold 0.1
 build/dev/test/manual/logstor_compaction_sim --smp 1 --sweep trigger-threshold=0.03,0.05,0.1,0.2
 build/dev/test/manual/logstor_compaction_sim --smp 1 --groups 64 --group-skew 2 --sweep marginal-admission-ratio=0,0.75
+build/dev/test/manual/logstor_compaction_sim --smp 1 --write-rate 5M --sweep controller=relay,rate
+build/dev/test/manual/logstor_compaction_sim --smp 1 --write-rate 5M --controller rate --trace rate.csv
 build/dev/test/manual/logstor_compaction_sim --smp 1 --self-test
 ```
 
@@ -1374,7 +1452,9 @@ touch: `segment_descriptor` and `segment_set` with its `log_heap` free-space his
 ordering including the histogram's bucketing is real; `select_compaction_batch()` and with it the
 efficiency score, the extension tolerance and `estimate_required_segments()`;
 `top_compaction_candidates`, which ranks the groups; `make_free_segment_watermarks()` and
-`make_compaction_limits()`; `auto_compaction_wanted()`; and the `ondisk::` sizes and alignments, so
+`make_compaction_limits()`; `auto_compaction_wanted()` and `compaction_rate_controller`, whichever of
+them `--controller` selects; `compaction_shares_pressure()`, so the shares reported are the ones the
+controller would ask for; and the `ondisk::` sizes and alignments, so
 what a segment holds and what it wastes are what the engine would produce. The index, the compaction
 job, the driver that keeps jobs in flight, the segment pool and the write path are modeled, since the
 engine's versions of them are IO or future bound.
@@ -1392,9 +1472,18 @@ Divergences from the engine:
   they cost space and one more copy of every user byte, and the device therefore writes one copy more
   than the simulator's device write amplification. What compaction sees - what the segments of a
   group hold, how they are laid out and how they age - is modeled.
-- There is no clock. Compaction runs whenever the free level asks for it and is taken to keep up, so
-  what is measured is the steady state at the free level the watermarks produce. Compaction falling
-  behind is a property of the device and of the shares controller.
+- Without `--write-rate` there is no clock. Compaction runs whenever the free level asks for it and
+  is taken to keep up, so what is measured is the steady state at the free level the watermarks
+  produce and nothing about the dynamics. Every table on this page other than the controller ones was
+  taken this way.
+- With `--write-rate` the run has one, and the workload is what time passes for: a record advances
+  the clock by its own share of the write rate, compaction spends `--copy-bandwidth` rather than
+  being instantaneous, and the write path waits for a segment instead of failing, so a run that
+  cannot keep up reports the stall rather than ending. `--shares-authority` decides whether
+  compaction's bandwidth follows the shares curve — 0 is the uncontended shard, where shares buy
+  nothing — and `--write-rate-step` multiplies the write rate half way through the measured run.
+  What is *not* modeled is the scheduling group itself: there is one bandwidth, not a CPU shared
+  between compaction, the write path and everything else.
 - Deletes, TTL expiry and tombstones are not modeled, and neither are recovery and tablet splitting.
 
 ### The absolute numbers on this page are due a re-take
