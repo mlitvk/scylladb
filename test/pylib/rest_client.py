@@ -581,6 +581,14 @@ class ScyllaRESTAPIClient:
         data = await self.client.get_json("/raft/leader_host", host=node_ip, params=params)
         return HostID(data)
 
+    async def trigger_raft_stepdown(self, node_ip: str, group_id: Optional[str] = None) -> None:
+        """Makes the contact node step down as the leader of the given raft group, or of group0
+           when group_id is not specified. Fails if the node is not the leader."""
+        params = {}
+        if group_id:
+            params["group_id"] = group_id
+        await self.client.post("/raft/trigger_stepdown/", host=node_ip, params=params)
+
     async def repair(self, node_ip: str, keyspace: str, table: str, ranges: str = '', small_table_optimization: bool = False) -> None:
         """Repair the given table and wait for it to complete"""
         vnode_keyspaces = await self.client.get_json(f"/storage_service/keyspaces", host=node_ip, params={"replication": "vnodes"})
