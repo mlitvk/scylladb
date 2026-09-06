@@ -488,6 +488,30 @@ the current (post-compaction) SSTable set.
 
 For tablets belonging to a strongly-consistent table, the migration also updates the tablet's raft group membership so that it stays compatible with the replica set used by the current migration stage.
 
+Three stages change the group's expected membership: `sc_add_nonvoter` adds the pending
+replica as a non-voter, `sc_become_voter` promotes it and removes the leaving replica,
+and `sc_rollback` restores the old replica set. Every other stage inherits the
+configuration one of those established.
+
+Each of the three drives its configuration change with a `sync_raft_group_config` RPC,
+sent by the topology coordinator to the hosts of the group after the stage's own global
+token metadata barrier, and tracked per tablet like streaming is. On the replica the
+handler checks the stage against live tablet metadata and holds a `tablet_metadata_guard`,
+so a stale trigger is rejected or aborted, and the barrier of the next stage waits for
+one still in flight. Whichever replica is the group's leader commits the change; the
+others verify that they see it.
+
+Establishing a stage's configuration is deliberately *not* part of the global barrier: a
+group that cannot converge - a replica down with RF=2, a long election, a slow follower -
+then fails only its own tablet's migration, which the stage logic retries or rolls back,
+instead of failing every topology barrier in the cluster including those of node
+operations unrelated to tablets.
+
+What the barrier still does for strongly-consistent tablets is wait for the raft server
+of a group whose membership the current stage ended to be torn down, so that nothing can
+apply raft entries to a tablet whose storage the cleanup of the same migration is about
+to remove.
+
 State transition diagram for strongly-consistent tablet migration stages:
 
 ```mermaid
@@ -519,6 +543,8 @@ For strongly-consistent tables, the following additional preconditions hold:
 
     Precondition: All old and new replicas see the transition info from step 1 via local token metadata and effective replication maps.
 
+    Drives a configuration change adding the pending replica as a non-voter.
+
 3. sc_snapshot_transfer
 
     Precondition: the pending replica is a non-voter member of the tablet's raft group.
@@ -527,9 +553,15 @@ For strongly-consistent tables, the following additional preconditions hold:
 
     Precondition: the pending replica has executed a raft read barrier.
 
+    Drives a configuration change promoting the pending replica to a voter and removing
+    the leaving replica.
+
 5. use_new
 
     Precondition: the pending replica is a voter member of the tablet's raft group, and the leaving replica is not a member of the group.
+
+    The leaving replica tears its raft server down here, which the barrier of the next
+    stage waits for.
 
 6. cleanup
 
@@ -543,9 +575,15 @@ In the rollback path, the first stage is `sc_rollback`:
 
 1. sc_rollback
 
+    Drives a configuration change back to the old replica set, removing the pending
+    replica. Retried until it succeeds: there is nothing further to fall back to.
+
 2. cleanup_target
 
     Precondition: the raft group's config matches the old replica set.
+
+    The pending replica tears its raft server down here, which this stage's barrier
+    waits for.
 
 3. revert_migration
 
