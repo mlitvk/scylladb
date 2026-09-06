@@ -790,7 +790,12 @@ future<> groups_manager::run_config_sync(raft_group_state& state, global_tablet_
     // is a parameter and so outlives every local.
     auto sub = utils::chain_abort_source(aoe.abort_source(), *as);
     try {
-        if (utils::get_local_injector().enter("sc_config_sync_fail")) {
+        auto& injector = utils::get_local_injector();
+        // The injection may name a single raft group, so that a test can stall one
+        // tablet's migration while the rest of the cluster keeps working. Checked
+        // before enter(), which would consume a one-shot injection.
+        const auto only_group = injector.inject_parameter<std::string_view>("sc_config_sync_fail", "group_id");
+        if ((!only_group || *only_group == fmt::to_string(gid)) && injector.enter("sc_config_sync_fail")) {
             throw std::runtime_error("sc_config_sync_fail injection");
         }
         co_await state.server->modify_config(std::move(work.to_add), std::move(work.to_del),

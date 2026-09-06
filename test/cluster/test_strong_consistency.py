@@ -2060,6 +2060,11 @@ async def test_tablet_migration_config_change_retried(manager: ScyllaClusterMana
                     # is the group leader fails its first attempt.
                     for server in servers:
                         await manager.api.enable_injection(server.ip_addr, "sc_config_sync_fail", one_shot=True)
+                else:
+                    # Clear any one-shot injection left armed by a previous migration on
+                    # nodes that never reached the injection point.
+                    for server in servers:
+                        await manager.api.disable_injection(server.ip_addr, "sc_config_sync_fail")
 
                 logger.info(f"Migrating replica from {src_host_id}:{src_shard} to {dst_host_id}:0")
                 await manager.api.move_tablet(servers[0].ip_addr, ks, table_name,
@@ -2217,6 +2222,122 @@ async def test_tablet_migration_rollback_from_sc_become_voter(manager: ScyllaClu
             rows = await cql.run_async(f"SELECT * FROM {table} WHERE pk = 100")
             assert len(rows) == 1
             assert rows[0].c == 101
+
+
+@pytest.mark.skip_mode(mode="release", reason="error injections are not supported in release mode")
+async def test_stuck_config_sync_does_not_block_other_migrations(manager: ScyllaClusterManager):
+    """A raft group that can't reach the configuration its stage implies must hold up
+    only its own tablet's migration.
+
+    Driving the configuration is a per-tablet action rather than a part of the global
+    topology barrier, so a tablet parked on a configuration change it cannot make no
+    longer fails the barrier for every other tablet in the batch - which is also what
+    every node operation uses.
+    """
+    logger.info("Bootstrapping cluster")
+    cmdline = DEFAULT_CMDLINE + [
+        '--logger-log-level', 'raft_topology=debug',
+        '--logger-log-level', 'debug_error_injection=debug',
+    ]
+    servers = await manager.servers_add(6, config=DEFAULT_CONFIG, cmdline=cmdline, property_file=[
+        {'dc': 'dc1', 'rack': 'rack1'},
+        {'dc': 'dc1', 'rack': 'rack1'},
+        {'dc': 'dc1', 'rack': 'rack2'},
+        {'dc': 'dc1', 'rack': 'rack2'},
+        {'dc': 'dc1', 'rack': 'rack3'},
+        {'dc': 'dc1', 'rack': 'rack3'},
+    ])
+    cql, _ = await manager.get_ready_cql(servers)
+    host_ids = await gather_safely(*[manager.get_host_id(s.server_id) for s in servers])
+
+    await manager.disable_tablet_balancing()
+
+    ks_opts = ("WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3} "
+               "AND tablets = {'initial': 1} AND consistency = 'global'")
+    # Two keyspaces, so that the two tablets have raft groups of their own and the
+    # injection below can name one of them.
+    async with new_test_keyspace(manager, ks_opts) as stuck_ks, new_test_keyspace(manager, ks_opts) as free_ks:
+        async with new_test_table(manager, stuck_ks, "pk int PRIMARY KEY, c int") as stuck_table, \
+                   new_test_table(manager, free_ks, "pk int PRIMARY KEY, c int") as free_table:
+            stuck_name = stuck_table.split('.')[-1]
+            free_name = free_table.split('.')[-1]
+            stuck_group = await get_table_raft_group_id(manager, stuck_ks, stuck_name)
+
+            for table in (stuck_table, free_table):
+                for i in range(10):
+                    await cql.run_async(f"INSERT INTO {table} (pk, c) VALUES ({i}, {i + 1})")
+
+            async def check(table):
+                for i in range(10):
+                    rows = await cql.run_async(f"SELECT * FROM {table} WHERE pk = {i}")
+                    assert len(rows) == 1, f"Expected 1 row for pk={i}, got {len(rows)}"
+                    assert rows[0].c == i + 1, f"Expected c={i + 1} for pk={i}, got {rows[0].c}"
+
+            # Each rack holds two nodes, so a replica can move within its rack without
+            # changing the rack distribution.
+            racks = [[host_ids[0], host_ids[1]], [host_ids[2], host_ids[3]], [host_ids[4], host_ids[5]]]
+
+            async def plan_move(ks, table_name, rack):
+                tablets = await get_all_tablet_replicas(manager, servers[0], ks, table_name)
+                assert len(tablets) == 1
+                replicas = tablets[0].replicas
+                assert len(replicas) == 3, f"Expected 3 replicas, got {replicas}"
+                src_host_id, src_shard = next((h, s) for h, s in replicas if h in rack)
+                dst_host_id = next(h for h in rack if h != src_host_id)
+                return tablets[0].last_token, src_host_id, src_shard, dst_host_id
+
+            # Every configuration change of the first table's raft group fails, and only
+            # of that one. Its migration parks at sc_add_nonvoter, retrying.
+            logger.info(f"Making configuration changes of group {stuck_group} fail")
+            for server in servers:
+                await manager.api.enable_injection(server.ip_addr, "sc_config_sync_fail", one_shot=False,
+                                                   parameters={'group_id': stuck_group})
+
+            stuck_token, stuck_src, stuck_shard, stuck_dst = await plan_move(stuck_ks, stuck_name, racks[0])
+            logger.info(f"Migrating {stuck_ks} replica from {stuck_src}:{stuck_shard} to {stuck_dst}:0")
+            stuck_move = asyncio.create_task(
+                manager.api.move_tablet(servers[0].ip_addr, stuck_ks, stuck_name,
+                                        stuck_src, stuck_shard, stuck_dst, 0, stuck_token)
+            )
+
+            async def parked_at_sc_add_nonvoter():
+                info = await get_tablet_info(manager, servers[0], stuck_ks, stuck_name, stuck_token)
+                return True if info is not None and info.stage == "write_both_read_old" else None
+
+            await wait_for(parked_at_sc_add_nonvoter, time.time() + 120)
+
+            # The other table's tablet has to migrate to completion meanwhile. Before
+            # configuration convergence became a per-tablet action, the stuck group
+            # failed the shared barrier and this migration never finished.
+            free_token, free_src, free_shard, free_dst = await plan_move(free_ks, free_name, racks[1])
+            logger.info(f"Migrating {free_ks} replica from {free_src}:{free_shard} to {free_dst}:0")
+            await asyncio.wait_for(
+                manager.api.move_tablet(servers[0].ip_addr, free_ks, free_name,
+                                        free_src, free_shard, free_dst, 0, free_token),
+                timeout=300)
+
+            replicas = (await get_all_tablet_replicas(manager, servers[0], free_ks, free_name))[0].replicas
+            assert (free_dst, 0) in replicas, f"Expected {free_dst} among replicas, got {replicas}"
+            assert not any(h == free_src for h, _ in replicas), \
+                f"Expected {free_src} to be gone from replicas, got {replicas}"
+            await check(free_table)
+
+            # The stuck one must not have been dragged along by it.
+            assert await parked_at_sc_add_nonvoter(), \
+                "The migration whose group can't converge advanced past sc_add_nonvoter"
+
+            logger.info("Letting configuration changes succeed again")
+            for server in servers:
+                await manager.api.disable_injection(server.ip_addr, "sc_config_sync_fail")
+
+            await stuck_move
+            await manager.api.quiesce_topology(servers[0].ip_addr)
+
+            replicas = (await get_all_tablet_replicas(manager, servers[0], stuck_ks, stuck_name))[0].replicas
+            assert (stuck_dst, 0) in replicas, f"Expected {stuck_dst} among replicas, got {replicas}"
+            assert not any(h == stuck_src for h, _ in replicas), \
+                f"Expected {stuck_src} to be gone from replicas, got {replicas}"
+            await check(stuck_table)
 
 
 @pytest.mark.skip_mode(mode="release", reason="error injections are not supported in release mode")
