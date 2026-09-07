@@ -35,6 +35,7 @@
 #include "replica/compaction_group.hh"
 #include "test/boost/sstable_test.hh"
 #include "replica/tablets.hh"
+#include "service/strong_consistency/tablet_replica_sets.hh"
 #include "compaction/compaction_manager.hh"
 #include "replica/tablet_mutation_builder.hh"
 #include "locator/tablets.hh"
@@ -8465,6 +8466,83 @@ SEASTAR_TEST_CASE(test_load_stats_split_ready_invalidation) {
     }
 
     return make_ready_future<>();
+}
+
+
+// The two replica sets a request to a strongly consistent tablet is routed by must not
+// drift apart: a replica that holds the tablet's data must always be one a redirect may
+// name. Were a stage to place a replica in the readable set but not the leader-capable
+// one, a read bounced to it could never be answered, because the request would arrive
+// somewhere the coordinator does not consider a valid target.
+//
+// This is the property that made the original defect possible in reverse: the two sets
+// were one, so the wider one silently answered reads it had no data for.
+SEASTAR_THREAD_TEST_CASE(test_sc_readable_replicas_are_always_leader_capable) {
+    using namespace locator;
+    using namespace service::strong_consistency;
+
+    const auto h1 = host_id(utils::UUID_gen::get_time_UUID());
+    const auto h2 = host_id(utils::UUID_gen::get_time_UUID());
+    const auto h3 = host_id(utils::UUID_gen::get_time_UUID());
+    const auto pending = host_id(utils::UUID_gen::get_time_UUID());
+
+    const auto leaving_replica = tablet_replica{h3, 0};
+    const auto pending_replica = tablet_replica{pending, 0};
+
+    tablet_info tinfo(tablet_replica_set{{h1, 0}, {h2, 0}, leaving_replica});
+    tablet_replica_set next{{h1, 0}, {h2, 0}, pending_replica};
+
+    // Every stage a migration of a strongly consistent tablet can be observed in.
+    const auto stages = {
+        tablet_transition_stage::start_migration,
+        tablet_transition_stage::sc_add_nonvoter,
+        tablet_transition_stage::sc_snapshot_transfer,
+        tablet_transition_stage::sc_become_voter,
+        tablet_transition_stage::use_new,
+        tablet_transition_stage::cleanup,
+        tablet_transition_stage::end_migration,
+        tablet_transition_stage::sc_rollback,
+        tablet_transition_stage::cleanup_target,
+        tablet_transition_stage::revert_migration,
+        tablet_transition_stage::write_both_read_old_fallback_cleanup,
+        tablet_transition_stage::rebuild_repair,
+        tablet_transition_stage::repair,
+        tablet_transition_stage::end_repair,
+        tablet_transition_stage::restore,
+    };
+
+    for (auto stage : stages) {
+        tablet_transition_info trinfo(stage, tablet_transition_kind::migration, next, pending_replica);
+
+        const auto readable = get_readable_tablet_replicas(tinfo, &trinfo);
+        const auto leader_capable = get_leader_capable_tablet_replicas(tinfo, &trinfo);
+
+        BOOST_REQUIRE_MESSAGE(!readable.empty(),
+                format("stage {}: nothing can serve a read", stage));
+
+        for (const auto& r : readable) {
+            BOOST_REQUIRE_MESSAGE(contains(leader_capable, r),
+                    format("stage {}: replica {} may serve a read but is not a redirect target; "
+                           "readable={}, leader capable={}", stage, r, readable, leader_capable));
+        }
+    }
+
+    // Without a transition the two coincide, and both are just the replica set.
+    BOOST_REQUIRE_EQUAL(get_readable_tablet_replicas(tinfo, nullptr), tinfo.replicas);
+    BOOST_REQUIRE_EQUAL(get_leader_capable_tablet_replicas(tinfo, nullptr), tinfo.replicas);
+
+    // The pending replica is the one the two sets disagree about, and it may only serve a
+    // read once the snapshot transfer that sc_become_voter attests to has completed.
+    for (auto stage : {tablet_transition_stage::sc_add_nonvoter, tablet_transition_stage::sc_snapshot_transfer}) {
+        tablet_transition_info trinfo(stage, tablet_transition_kind::migration, next, pending_replica);
+        BOOST_REQUIRE_MESSAGE(!contains(get_readable_tablet_replicas(tinfo, &trinfo), pending_replica),
+                format("stage {}: the pending replica may not serve a read yet", stage));
+    }
+    for (auto stage : {tablet_transition_stage::sc_become_voter, tablet_transition_stage::use_new}) {
+        tablet_transition_info trinfo(stage, tablet_transition_kind::migration, next, pending_replica);
+        BOOST_REQUIRE_MESSAGE(contains(get_readable_tablet_replicas(tinfo, &trinfo), pending_replica),
+                format("stage {}: the pending replica holds the data by now", stage));
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

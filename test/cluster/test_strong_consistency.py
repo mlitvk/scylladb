@@ -2629,3 +2629,139 @@ async def test_no_raft_replay_into_a_tablet_that_moved_away(manager: ScyllaClust
                 rows = await cql.run_async(f"SELECT * FROM {table} WHERE pk = {i}")
                 assert len(rows) == 1, f"Expected 1 row for pk={i}, got {len(rows)}"
                 assert rows[0].c == i + 1, f"Expected c={i + 1} for pk={i}, got {rows[0].c}"
+
+
+@pytest.mark.skip_mode(mode="release", reason="error injections are not supported in release mode")
+async def test_eventual_read_is_not_served_by_the_pending_replica(manager: ScyllaClusterManager):
+    """A read that is answered from local storage must only run on a replica that holds
+    the tablet's data.
+
+    The pending replica of a migration is a member of the raft group from sc_add_nonvoter
+    on, and can be the leader from sc_become_voter on, so it belongs to the set a request
+    needing the leader may be sent to. It does not hold the tablet's data until the
+    snapshot transfer has completed, though, and a CL=ONE read reads local storage - there
+    is no answer it can give that sends the request somewhere better. Served there, it
+    silently returns fewer rows than exist.
+
+    The applier on the pending replica is parked for the duration, which is what makes the
+    two sets differ observably: raft replicates the whole log to a new member, so without
+    that the pending replica would already hold everything and serve a correct answer by
+    accident.
+    """
+    logger.info("Bootstrapping cluster")
+    cmdline = DEFAULT_CMDLINE + [
+        '--logger-log-level', 'raft_topology=debug',
+    ]
+    servers = await manager.servers_add(4, config=DEFAULT_CONFIG, cmdline=cmdline, property_file=[
+        {'dc': 'dc1', 'rack': 'rack1'},
+        {'dc': 'dc1', 'rack': 'rack2'},
+        {'dc': 'dc1', 'rack': 'rack3'},
+        {'dc': 'dc1', 'rack': 'rack3'},
+    ])
+    cql, hosts = await manager.get_ready_cql(servers)
+    host_ids = await gather_safely(*[manager.get_host_id(s.server_id) for s in servers])
+
+    def host_by_host_id(host_id):
+        for hid, host in zip(host_ids, hosts):
+            if hid == host_id:
+                return host
+        raise RuntimeError(f"Can't find host for host_id {host_id}")
+
+    def server_by_host_id(host_id):
+        for server, hid in zip(servers, host_ids):
+            if hid == host_id:
+                return server
+        raise RuntimeError(f"Can't find server for host_id {host_id}")
+
+    await manager.disable_tablet_balancing()
+
+    row_count = 10
+    apply_injection = "strong_consistency_state_machine_wait_before_apply"
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3} "
+                                         "AND tablets = {'initial': 1} AND consistency = 'global'") as ks:
+        async with new_test_table(manager, ks, "pk int PRIMARY KEY, c int") as table:
+            table_name = table.split('.')[-1]
+
+            tablets = await get_all_tablet_replicas(manager, servers[0], ks, table_name)
+            assert len(tablets) == 1
+            tablet_token = tablets[0].last_token
+            original_replicas = tablets[0].replicas
+            assert len(original_replicas) == 3, f"Expected 3 replicas, got {original_replicas}"
+
+            for i in range(row_count):
+                await cql.run_async(f"INSERT INTO {table} (pk, c) VALUES ({i}, {i + 1})")
+
+            async def read_all_at_cl_one(host, label):
+                for i in range(row_count):
+                    stmt = SimpleStatement(f"SELECT * FROM {table} WHERE pk = {i}",
+                                           consistency_level=ConsistencyLevel.ONE)
+                    rows = await cql.run_async(stmt, host=host)
+                    assert len(rows) == 1, \
+                        f"{label}: expected 1 row for pk={i}, got {len(rows)}"
+                    assert rows[0].c == i + 1, \
+                        f"{label}: expected c={i + 1} for pk={i}, got {rows[0].c}"
+
+            # Both nodes are in the same rack, so the replica can move between them
+            # without changing the rack distribution.
+            rack3 = [host_ids[2], host_ids[3]]
+            leaving_host_id, leaving_shard = next((h, s) for h, s in original_replicas if h in rack3)
+            pending_host_id = next(h for h in rack3 if h != leaving_host_id)
+            pending_server = server_by_host_id(pending_host_id)
+
+            # Nothing the pending replica receives reaches its tablet storage, so it is a
+            # member of the raft group holding no data at all.
+            logger.info(f"Parking the applier on the pending replica {pending_host_id}")
+            await manager.api.enable_injection(pending_server.ip_addr, apply_injection, one_shot=False)
+
+            logger.info(f"Migrating replica from {leaving_host_id}:{leaving_shard} to {pending_host_id}:0")
+            move = asyncio.create_task(
+                manager.api.move_tablet(servers[0].ip_addr, ks, table_name,
+                                        leaving_host_id, leaving_shard, pending_host_id, 0, tablet_token)
+            )
+
+            # The snapshot transfer ends in a raft read barrier, which waits for the local
+            # apply. So the migration parks at sc_snapshot_transfer for as long as the
+            # applier is, which is the window this test needs.
+            async def parked_at_snapshot_transfer():
+                info = await get_tablet_info(manager, servers[0], ks, table_name, tablet_token)
+                return True if info is not None and info.stage == "streaming" else None
+
+            await wait_for(parked_at_snapshot_transfer, time.time() + 120)
+
+            # Sent straight to the pending replica: it is in the set a request needing the
+            # leader may run on, and must not be in the set a local read may run on. The
+            # bounce path picks its target from that same set, so it is covered by the
+            # same check without having to arrange for a particular node to be closest.
+            logger.info("Reading at CL=ONE from the pending replica")
+            await read_all_at_cl_one(host_by_host_id(pending_host_id), "pending replica")
+
+            # A read that needs the leader is unaffected: the pending replica may be one,
+            # and if it isn't it says so and the request is redirected.
+            logger.info("Reading at CL=QUORUM from the pending replica")
+            for i in range(row_count):
+                stmt = SimpleStatement(f"SELECT * FROM {table} WHERE pk = {i}",
+                                       consistency_level=ConsistencyLevel.QUORUM)
+                rows = await cql.run_async(stmt, host=host_by_host_id(pending_host_id))
+                assert len(rows) == 1 and rows[0].c == i + 1, \
+                    f"linearizable read via the pending replica lost pk={i}"
+
+            # Let the migration finish and check the data is intact from every replica.
+            logger.info("Releasing the applier and letting the migration complete")
+            await manager.api.message_injection(pending_server.ip_addr, apply_injection)
+            await manager.api.disable_injection(pending_server.ip_addr, apply_injection)
+
+            await asyncio.wait_for(move, timeout=300)
+            await manager.api.quiesce_topology(servers[0].ip_addr)
+
+            replicas = (await get_all_tablet_replicas(manager, servers[0], ks, table_name))[0].replicas
+            assert (pending_host_id, 0) in replicas, \
+                f"Expected {pending_host_id} among replicas, got {replicas}"
+
+            for host_id, _ in replicas:
+                await read_all_at_cl_one(host_by_host_id(host_id), f"replica {host_id} after migration")
+            for i in range(row_count):
+                stmt = SimpleStatement(f"SELECT * FROM {table} WHERE pk = {i}",
+                                       consistency_level=ConsistencyLevel.QUORUM)
+                rows = await cql.run_async(stmt)
+                assert len(rows) == 1 and rows[0].c == i + 1
