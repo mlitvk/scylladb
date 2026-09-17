@@ -68,6 +68,7 @@ struct segment_manager_config {
     // compaction_rate_controller.
     utils::updateable_value<float> compaction_max_shares{2000};
     seastar::scheduling_group separator_sg;
+    utils::updateable_value<float> separator_shares;
     seastar::scheduling_group split_compaction_sg;
 };
 
