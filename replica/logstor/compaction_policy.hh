@@ -142,6 +142,15 @@ struct compaction_batch {
     compaction_candidate_score score;
 };
 
+// What bounds the batch select_compaction_batch() picks.
+struct compaction_batch_limits {
+    // Input segments one job may take, compaction_limits::batch_cap.
+    size_t batch_cap;
+    // A parameter only so that the compaction simulator can sweep it; every caller in the engine
+    // takes the default.
+    double extension_tolerance = compaction_batch_extension_tolerance;
+};
+
 // Picks the segments one compaction job should read, out of the ones a group owns.
 //
 // The set's free-space histogram is already ordered by ascending utilization, which is near-optimal
@@ -150,7 +159,7 @@ struct compaction_batch {
 // Returns nothing when no prefix reclaims a segment, which answers for the whole group rather than
 // only for this batch, since a longer prefix would only add fuller segments.
 std::optional<compaction_batch> select_compaction_batch(const segment_set& segments,
-        uint64_t segment_size, size_t batch_cap);
+        uint64_t segment_size, const compaction_batch_limits& limits);
 
 // The best `capacity` compaction candidates seen so far, ranked by compaction_candidate_score.
 //
