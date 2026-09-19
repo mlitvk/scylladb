@@ -9,6 +9,7 @@
 #include "replica/logstor/compaction.hh"
 #include <algorithm>
 #include <cmath>
+#include <optional>
 
 namespace replica::logstor {
 
@@ -39,15 +40,22 @@ bool auto_compaction_wanted(bool running, uint64_t available_segments, free_segm
     return available_segments < (running ? watermarks.high : watermarks.low);
 }
 
-compaction_limits make_compaction_limits(free_segment_watermarks watermarks, size_t max_batch_cap) noexcept {
-    // With the trigger disabled there is no target to protect, and automatic compaction never runs;
-    // the limits still have to be sane for compaction submitted explicitly, so fall back to the
-    // smallest batch rather than to zero.
-    const auto budget = std::max<uint64_t>(watermarks.low, min_segments_per_compaction);
+uint64_t compaction_space_floor(uint64_t segment_count) noexcept {
+    // Two batches at least, so that a job can hold one while the write path still has the other.
+    // The minimum is itself capped, so that the space floor is not most of a tiny disk.
+    const auto minimum = std::min<uint64_t>(2 * min_segments_per_compaction, std::max<uint64_t>(1, segment_count / 8));
+    return std::max<uint64_t>(segment_count / 32, minimum);
+}
+
+compaction_limits make_compaction_limits(uint64_t space_floor, size_t max_batch_cap) noexcept {
+    // A space floor below one batch cannot hold the relation; a batch of
+    // min_segments_per_compaction is the least that can reclaim anything, so run at that rather
+    // than at nothing.
+    const auto budget = std::max<uint64_t>(space_floor, min_segments_per_compaction);
     // Spend the budget on concurrency first, up to the number of jobs the buffer pool can carry,
     // then give what is left to the batch. Both directions of the clamp matter: a batch below
     // min_segments_per_compaction cannot reclaim, and one above max_batch_cap makes a single job
-    // hold too much of the target.
+    // hold too much of the space floor.
     const auto parallelism = std::clamp<uint64_t>(budget / min_segments_per_compaction, 1, max_auto_compaction_parallelism);
     const auto batch_cap = std::clamp<uint64_t>(budget / parallelism, min_segments_per_compaction, std::max<uint64_t>(max_batch_cap, min_segments_per_compaction));
 
@@ -55,6 +63,70 @@ compaction_limits make_compaction_limits(free_segment_watermarks watermarks, siz
         .auto_parallelism = static_cast<size_t>(parallelism),
         .batch_cap = static_cast<size_t>(batch_cap)
     };
+}
+
+utilization_threshold_curve make_utilization_threshold_curve(uint64_t segment_count, uint64_t space_floor,
+        double threshold, double anchor_fraction, double ceiling_fraction) noexcept {
+    // A fraction of the disk, rounded to whole segments; anything that is not a usable fraction
+    // means "not configured".
+    auto segments_of = [segment_count] (double fraction) -> std::optional<uint64_t> {
+        if (!std::isfinite(fraction) || fraction <= 0) {
+            return std::nullopt;
+        }
+        return static_cast<uint64_t>(std::llround(std::min(fraction, 1.0) * double(segment_count)));
+    };
+    // The anchor has to be above the space floor for the pressure band to have a width, and the
+    // ceiling above the anchor for the fall of the threshold to have one; a configuration that says
+    // otherwise gets the narrowest band that works rather than a division by zero.
+    const auto anchor = std::max<uint64_t>(segments_of(anchor_fraction).value_or(2 * space_floor), space_floor + 1);
+    const auto ceiling = segments_of(ceiling_fraction).transform([anchor] (uint64_t c) {
+        return std::max<uint64_t>(c, anchor + 1);
+    }).value_or(0);
+    return utilization_threshold_curve{
+        .space_floor = space_floor,
+        .anchor = anchor,
+        .ceiling = ceiling,
+        .threshold = threshold,
+    };
+}
+
+compaction_limits make_compaction_limits(free_segment_watermarks watermarks, size_t max_batch_cap) noexcept {
+    // With the trigger disabled there is no target to protect, and automatic compaction never runs;
+    // the limits still have to be sane for compaction submitted explicitly, so fall back to the
+    // smallest batch rather than to zero.
+    return make_compaction_limits(std::max<uint64_t>(watermarks.low, min_segments_per_compaction), max_batch_cap);
+}
+
+double compaction_space_pressure(uint64_t available_segments, const utilization_threshold_curve& curve) noexcept {
+    if (curve.anchor <= curve.space_floor) {
+        return available_segments <= curve.space_floor ? 1 : 0;
+    }
+    if (available_segments >= curve.anchor) {
+        return 0;
+    }
+    if (available_segments <= curve.space_floor) {
+        return 1;
+    }
+    return double(curve.anchor - available_segments) / double(curve.anchor - curve.space_floor);
+}
+
+double effective_utilization_threshold(uint64_t available_segments, const utilization_threshold_curve& curve) noexcept {
+    if (available_segments < curve.anchor) {
+        return curve.threshold + (1 - curve.threshold) * compaction_space_pressure(available_segments, curve);
+    }
+    if (curve.ceiling == 0 || curve.ceiling <= curve.anchor) {
+        return curve.threshold;
+    }
+    if (available_segments >= curve.ceiling) {
+        return 0;
+    }
+    const auto rise = double(available_segments - curve.anchor) / double(curve.ceiling - curve.anchor);
+    return std::max(0.0, curve.threshold * (1 - rise));
+}
+
+size_t effective_min_batch(double pressure) noexcept {
+    const auto scaled = std::llround(double(min_segments_per_compaction) * (1 - std::clamp(pressure, 0.0, 1.0)));
+    return std::max<size_t>(1, static_cast<size_t>(scaled));
 }
 
 bool compaction_candidate_score::operator<(const compaction_candidate_score& other) const noexcept {
@@ -109,18 +181,32 @@ static size_t select_compaction_prefix(std::span<const compaction_candidate_scor
 
 std::optional<compaction_batch> select_compaction_batch(const segment_set& segments, uint64_t segment_size,
         const compaction_batch_limits& limits) {
-    const auto batch_cap = limits.batch_cap;
     std::vector<const segment_descriptor*> candidates;
     // prefix_scores[i] scores the batch made of candidates[0..i].
     std::vector<compaction_candidate_score> prefix_scores;
-    candidates.reserve(batch_cap);
-    prefix_scores.reserve(batch_cap);
+    candidates.reserve(limits.batch_cap);
+    prefix_scores.reserve(limits.batch_cap);
+
+    // A segment is a candidate while its utilization is at most the threshold, that is while it has
+    // at least this much free. The histogram is ordered by free space a bucket at a time, so the
+    // first segment over the threshold ends the candidate set for this group only once the buckets
+    // it is ordered by have passed it: inside the bucket the threshold cuts through, the segments are
+    // in no particular order and each is judged on its own.
+    const auto max_record_bytes = static_cast<uint64_t>(std::floor(std::clamp(limits.max_utilization, 0.0, 1.0) * double(segment_size)));
+    const auto min_free_space = segment_size - max_record_bytes;
+    const auto threshold_bucket = min_free_space > 0 ? segment_descriptor_hist_options.bucket_of(min_free_space) : 0;
 
     uint64_t accum_record_bytes = 0;
     uint64_t accum_record_count = 0;
     for (const auto& desc : segments.by_free_space()) {
-        if (candidates.size() >= batch_cap) {
+        if (candidates.size() >= limits.batch_cap) {
             break;
+        }
+        if (min_free_space > 0 && desc.free_space < min_free_space) {
+            if (segment_descriptor_hist_options.bucket_of(desc.free_space) < threshold_bucket) {
+                break;
+            }
+            continue;
         }
         candidates.push_back(&desc);
 
@@ -133,6 +219,12 @@ std::optional<compaction_batch> select_compaction_batch(const segment_set& segme
             .live_bytes = accum_record_bytes,
         };
         prefix_scores.push_back(score);
+    }
+
+    // Fewer candidates than a job is worth running on answers for the whole group: nothing below
+    // the threshold is going to be added to make the batch up.
+    if (candidates.size() < limits.min_batch) {
+        return std::nullopt;
     }
 
     const auto selected_count = select_compaction_prefix(prefix_scores, limits.extension_tolerance);

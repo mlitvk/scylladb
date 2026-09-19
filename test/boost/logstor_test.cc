@@ -2947,6 +2947,290 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_shares_pressure) {
     BOOST_REQUIRE_EQUAL(compaction_shares_pressure(0, minimal), 1.0f);
 }
 
+// The space floor is what the jobs in flight may hold and where space pressure starts, so it
+// has to be reachable on any disk, and the limits derived from it have to keep what the jobs hold
+// inside it.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_space_floor_and_limits) {
+    uint64_t previous_space_floor = 0;
+    for (uint64_t segment_count : {32u, 128u, 256u, 1024u, 4096u, 8192u, 100000u}) {
+        const auto space_floor = compaction_space_floor(segment_count);
+        for (size_t cap : {1u, 8u, 32u, 1024u}) {
+            const auto limits = make_compaction_limits(space_floor, cap);
+            BOOST_TEST_CONTEXT("segment_count=" << segment_count << " cap=" << cap) {
+                BOOST_REQUIRE_GE(space_floor, 1u);
+                BOOST_REQUIRE_LE(space_floor, segment_count);
+                // The minimum is two batches, unless the disk cannot spare that much, and above the
+                // minimum the space floor is a thirty-second of the disk.
+                BOOST_REQUIRE_GE(space_floor, std::min<uint64_t>(2 * min_segments_per_compaction, segment_count / 8));
+                BOOST_REQUIRE_LE(space_floor, std::max<uint64_t>(2 * min_segments_per_compaction, segment_count / 32));
+                BOOST_REQUIRE_GE(limits.auto_parallelism, 1u);
+                BOOST_REQUIRE_LE(limits.auto_parallelism, max_auto_compaction_parallelism);
+                BOOST_REQUIRE_GE(limits.batch_cap, min_segments_per_compaction);
+                BOOST_REQUIRE_LE(limits.batch_cap, std::max<size_t>(cap, min_segments_per_compaction));
+                // A job frees its inputs only when it is done, so what the jobs in flight can hold at
+                // once has to fit in the space floor.
+                if (space_floor >= min_segments_per_compaction) {
+                    BOOST_REQUIRE_LE(limits.auto_parallelism * limits.batch_cap, space_floor);
+                }
+            }
+        }
+        // The space floor grows with the disk.
+        BOOST_REQUIRE_GE(space_floor, previous_space_floor);
+        previous_space_floor = space_floor;
+    }
+
+    // A disk large enough to carry the full configuration runs at it, and the jobs in flight hold
+    // well under the space floor.
+    const auto large = compaction_space_floor(100000);
+    BOOST_REQUIRE_EQUAL(large, 100000 / 32);
+    const auto large_limits = make_compaction_limits(large, 32);
+    BOOST_REQUIRE_EQUAL(large_limits.auto_parallelism, max_auto_compaction_parallelism);
+    BOOST_REQUIRE_EQUAL(large_limits.batch_cap, 32u);
+    BOOST_REQUIRE_LT(large_limits.auto_parallelism * large_limits.batch_cap, large);
+
+    // A job is worth running on a batch's worth of candidates while there is no space pressure,
+    // on fewer as the pressure grows, and on anything at all at the space floor.
+    BOOST_REQUIRE_EQUAL(effective_min_batch(0.0), min_segments_per_compaction);
+    BOOST_REQUIRE_EQUAL(effective_min_batch(0.01), min_segments_per_compaction);
+    BOOST_REQUIRE_EQUAL(effective_min_batch(0.5), min_segments_per_compaction / 2);
+    BOOST_REQUIRE_EQUAL(effective_min_batch(0.9), 1u);
+    BOOST_REQUIRE_EQUAL(effective_min_batch(1.0), 1u);
+    size_t previous = min_segments_per_compaction;
+    for (double pressure = 0; pressure <= 1.0; pressure += 0.05) {
+        BOOST_REQUIRE_LE(effective_min_batch(pressure), previous);
+        previous = effective_min_batch(pressure);
+    }
+
+    // A space floor below one batch still runs the smallest batch that can reclaim anything.
+    const auto tiny = make_compaction_limits(1, 32);
+    BOOST_REQUIRE_EQUAL(tiny.auto_parallelism, 1u);
+    BOOST_REQUIRE_EQUAL(tiny.batch_cap, min_segments_per_compaction);
+}
+
+// Space pressure is 0 at the anchor or above and 1 at the space floor, linear in between, and the
+// effective threshold follows it up to one; above the anchor it is the configured threshold with
+// no ceiling, and falls to zero at the ceiling with one.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_space_pressure) {
+    constexpr uint64_t segments = 10000;
+    constexpr uint64_t space_floor = 200;
+
+    // The defaults: an anchor at twice the space floor, no ceiling.
+    const auto flat = make_utilization_threshold_curve(segments, space_floor, 0.5, 0, 0);
+    BOOST_REQUIRE_EQUAL(flat.space_floor, space_floor);
+    BOOST_REQUIRE_EQUAL(flat.anchor, 2 * space_floor);
+    BOOST_REQUIRE_EQUAL(flat.ceiling, 0u);
+    BOOST_REQUIRE_EQUAL(flat.threshold, 0.5);
+
+    BOOST_REQUIRE_EQUAL(compaction_space_pressure(segments, flat), 0.0);
+    BOOST_REQUIRE_EQUAL(compaction_space_pressure(2 * space_floor, flat), 0.0);
+    BOOST_REQUIRE_CLOSE(compaction_space_pressure(space_floor + space_floor / 2, flat), 0.5, 1e-9);
+    BOOST_REQUIRE_CLOSE(compaction_space_pressure(space_floor + space_floor / 4, flat), 0.75, 1e-9);
+    BOOST_REQUIRE_EQUAL(compaction_space_pressure(space_floor, flat), 1.0);
+    BOOST_REQUIRE_EQUAL(compaction_space_pressure(0, flat), 1.0);
+    // Monotone as the level falls, and the threshold rises with it.
+    double previous_pressure = 0;
+    double previous_threshold = 0;
+    for (uint64_t available = 2 * space_floor; available > 0; --available) {
+        const auto pressure = compaction_space_pressure(available, flat);
+        BOOST_REQUIRE_GE(pressure, previous_pressure);
+        BOOST_REQUIRE_LE(pressure, 1.0);
+        previous_pressure = pressure;
+        const auto threshold = effective_utilization_threshold(available, flat);
+        BOOST_REQUIRE_GE(threshold, previous_threshold);
+        previous_threshold = threshold;
+    }
+    BOOST_REQUIRE_EQUAL(effective_utilization_threshold(segments, flat), 0.5);
+    BOOST_REQUIRE_EQUAL(effective_utilization_threshold(2 * space_floor, flat), 0.5);
+    BOOST_REQUIRE_CLOSE(effective_utilization_threshold(space_floor + space_floor / 2, flat), 0.75, 1e-9);
+    BOOST_REQUIRE_EQUAL(effective_utilization_threshold(space_floor, flat), 1.0);
+    BOOST_REQUIRE_EQUAL(effective_utilization_threshold(0, flat), 1.0);
+
+    // At any configured threshold the curve is exactly that threshold at the anchor and exactly one
+    // at the space floor, where every segment is a candidate.
+    for (double threshold : {0.0, 0.1, 0.3, 0.7}) {
+        const auto curve = make_utilization_threshold_curve(segments, space_floor, threshold, 0, 0);
+        BOOST_REQUIRE_EQUAL(effective_utilization_threshold(2 * space_floor, curve), threshold);
+        BOOST_REQUIRE_EQUAL(effective_utilization_threshold(space_floor, curve), 1.0);
+    }
+
+    // A degenerate curve puts full pressure at the space floor and none above rather than dividing
+    // by zero.
+    const utilization_threshold_curve degenerate{.space_floor = 0, .anchor = 0, .ceiling = 0, .threshold = 0.5};
+    BOOST_REQUIRE_EQUAL(compaction_space_pressure(0, degenerate), 1.0);
+    BOOST_REQUIRE_EQUAL(compaction_space_pressure(1, degenerate), 0.0);
+    BOOST_REQUIRE_EQUAL(effective_utilization_threshold(1, degenerate), 0.5);
+}
+
+// With a ceiling the threshold keeps falling above the anchor, to zero at the ceiling: the curve is
+// continuous at the anchor, monotone in the free level, and its two extremes are a constant
+// threshold and a held free level.
+SEASTAR_THREAD_TEST_CASE(test_logstor_utilization_threshold_curve) {
+    constexpr uint64_t segments = 10000;
+    constexpr uint64_t space_floor = 200;
+
+    // An anchor at 10% and a ceiling at 30% of the disk.
+    const auto soft = make_utilization_threshold_curve(segments, space_floor, 0.5, 0.1, 0.3);
+    BOOST_REQUIRE_EQUAL(soft.anchor, 1000u);
+    BOOST_REQUIRE_EQUAL(soft.ceiling, 3000u);
+    BOOST_REQUIRE_EQUAL(effective_utilization_threshold(space_floor, soft), 1.0);
+    BOOST_REQUIRE_CLOSE(effective_utilization_threshold(600, soft), 0.75, 1e-9);
+    BOOST_REQUIRE_EQUAL(effective_utilization_threshold(1000, soft), 0.5);
+    BOOST_REQUIRE_CLOSE(effective_utilization_threshold(2000, soft), 0.25, 1e-9);
+    BOOST_REQUIRE_EQUAL(effective_utilization_threshold(3000, soft), 0.0);
+    BOOST_REQUIRE_EQUAL(effective_utilization_threshold(segments, soft), 0.0);
+    // The pressure is a property of the segment below the anchor only.
+    BOOST_REQUIRE_EQUAL(compaction_space_pressure(1000, soft), 0.0);
+    BOOST_REQUIRE_EQUAL(compaction_space_pressure(2000, soft), 0.0);
+    BOOST_REQUIRE_CLOSE(compaction_space_pressure(600, soft), 0.5, 1e-9);
+    // Continuous at the anchor and monotone everywhere.
+    BOOST_REQUIRE_CLOSE(effective_utilization_threshold(999, soft), effective_utilization_threshold(1001, soft), 0.2);
+    double previous = 1;
+    for (uint64_t available = 0; available <= segments; available += 7) {
+        const auto threshold = effective_utilization_threshold(available, soft);
+        BOOST_REQUIRE_LE(threshold, previous);
+        BOOST_REQUIRE_GE(threshold, 0.0);
+        previous = threshold;
+    }
+
+    // A ceiling right above the anchor is the steep curve: the whole threshold range is spanned
+    // within a segment of the anchor, which holds the free level there.
+    const auto stiff = make_utilization_threshold_curve(segments, space_floor, 0.5, 0.05, 0.0501);
+    BOOST_REQUIRE_EQUAL(stiff.anchor, 500u);
+    BOOST_REQUIRE_EQUAL(stiff.ceiling, 501u);
+    BOOST_REQUIRE_EQUAL(effective_utilization_threshold(499, stiff), 0.5 + 0.5 * (1.0 / 300));
+    BOOST_REQUIRE_EQUAL(effective_utilization_threshold(500, stiff), 0.5);
+    BOOST_REQUIRE_EQUAL(effective_utilization_threshold(501, stiff), 0.0);
+
+    // The configuration cannot put the anchor at or below the space floor, or the ceiling at or
+    // below the anchor: the narrowest band that works is used instead. Out-of-range fractions mean
+    // "not configured".
+    const auto squeezed = make_utilization_threshold_curve(segments, space_floor, 0.5, 0.01, 0.01);
+    BOOST_REQUIRE_EQUAL(squeezed.anchor, space_floor + 1);
+    BOOST_REQUIRE_EQUAL(squeezed.ceiling, space_floor + 2);
+    const auto unconfigured = make_utilization_threshold_curve(segments, space_floor, 0.5, -1.0, std::numeric_limits<double>::quiet_NaN());
+    BOOST_REQUIRE(unconfigured == make_utilization_threshold_curve(segments, space_floor, 0.5, 0, 0));
+    // A fraction above one is the whole disk.
+    BOOST_REQUIRE_EQUAL(make_utilization_threshold_curve(segments, space_floor, 0.5, 0.1, 5.0).ceiling, segments);
+}
+
+// The utilization threshold ends the candidate set: a segment more utilized than it is never picked,
+// however cheap the batch would be, and with the threshold at one the selection is what it was.
+SEASTAR_THREAD_TEST_CASE(test_logstor_select_compaction_batch_threshold) {
+    constexpr uint64_t segment_size = 128 * 1024;
+    constexpr size_t record_size = 1024;
+    constexpr size_t records_per_segment = segment_size / record_size;
+
+    std::deque<segment_descriptor> descs;
+    segment_set segments{segment_size};
+    auto add_segment = [&] (size_t live_records) {
+        auto& desc = descs.emplace_back();
+        desc.reset(segment_size);
+        desc.on_write(live_records * record_size, live_records);
+        segments.add_segment(desc);
+    };
+    // Three segments a tenth full, five segments six tenths full.
+    for (size_t i = 0; i < 3; ++i) {
+        add_segment(records_per_segment / 10);
+    }
+    for (size_t i = 0; i < 5; ++i) {
+        add_segment(records_per_segment * 6 / 10);
+    }
+
+    // At a threshold of a half only the sparse three qualify: the batch is exactly them.
+    auto under_half = select_compaction_batch(segments, segment_size, compaction_batch_limits{
+        .batch_cap = min_segments_per_compaction,
+        .max_utilization = 0.5,
+    });
+    BOOST_REQUIRE(under_half);
+    BOOST_REQUIRE_EQUAL(under_half->segments.size(), 3u);
+    for (const auto* desc : under_half->segments) {
+        BOOST_REQUIRE_LE(desc->record_bytes(segment_size), segment_size / 2);
+    }
+
+    // With no threshold every segment is a candidate, and the efficiency rule alone decides where
+    // the batch stops.
+    auto unbounded = select_compaction_batch(segments, segment_size, compaction_batch_limits{
+        .batch_cap = min_segments_per_compaction,
+    });
+    BOOST_REQUIRE(unbounded);
+    BOOST_REQUIRE_GE(unbounded->segments.size(), 3u);
+
+    // A group of segments all under the threshold has a batch with a net gain - eight segments six
+    // tenths full rewrite into five - but not one the threshold lets compaction take.
+    segment_set dense{segment_size};
+    for (size_t i = 0; i < 8; ++i) {
+        auto& desc = descs.emplace_back();
+        desc.reset(segment_size);
+        desc.on_write(records_per_segment * 6 / 10 * record_size, records_per_segment * 6 / 10);
+        dense.add_segment(desc);
+    }
+    BOOST_REQUIRE(select_compaction_batch(dense, segment_size, compaction_batch_limits{
+        .batch_cap = min_segments_per_compaction,
+    }));
+    BOOST_REQUIRE(!select_compaction_batch(dense, segment_size, compaction_batch_limits{
+        .batch_cap = min_segments_per_compaction,
+        .max_utilization = 0.5,
+    }));
+
+    // A threshold nothing is under leaves the group with no batch at all.
+    BOOST_REQUIRE(!select_compaction_batch(segments, segment_size, compaction_batch_limits{
+        .batch_cap = min_segments_per_compaction,
+        .max_utilization = 0.05,
+    }));
+
+    // The histogram is ordered by free space a bucket at a time, and inside the bucket the
+    // threshold cuts through the segments are in no particular order: a segment just over the
+    // threshold must not end the candidate set while segments under it share its bucket. At a
+    // threshold of a quarter - 98304 bytes free - the bucket spans 94207 to 102399.
+    segment_set straddling{segment_size};
+    auto add_with_free_space = [&] (segment_set& set, size_t free_space) {
+        auto& desc = descs.emplace_back();
+        desc.reset(segment_size);
+        const auto live = segment_size - free_space;
+        desc.on_write(live, live / record_size);
+        set.add_segment(desc);
+    };
+    add_with_free_space(straddling, 101000);
+    add_with_free_space(straddling, 100000);
+    // Added last, so that the heap hands it out first among its bucket.
+    add_with_free_space(straddling, 96000);
+    auto under = select_compaction_batch(straddling, segment_size, compaction_batch_limits{
+        .batch_cap = min_segments_per_compaction,
+        .max_utilization = 0.25,
+    });
+    BOOST_REQUIRE(under);
+    BOOST_REQUIRE_EQUAL(under->segments.size(), 2u);
+    for (const auto* desc : under->segments) {
+        BOOST_REQUIRE_GE(desc->free_space, 98304u);
+    }
+
+    // Fewer qualifying segments than the minimum batch is no batch, however cheap; at the minimum
+    // it is the batch it would have been.
+    BOOST_REQUIRE(!select_compaction_batch(segments, segment_size, compaction_batch_limits{
+        .batch_cap = min_segments_per_compaction,
+        .min_batch = 4,
+        .max_utilization = 0.5,
+    }));
+    auto enough = select_compaction_batch(segments, segment_size, compaction_batch_limits{
+        .batch_cap = min_segments_per_compaction,
+        .min_batch = 3,
+        .max_utilization = 0.5,
+    });
+    BOOST_REQUIRE(enough);
+    BOOST_REQUIRE(enough->score == under_half->score);
+
+    // One qualifying segment cannot reclaim anything on its own.
+    segment_set lonely{segment_size};
+    auto& desc = descs.emplace_back();
+    desc.reset(segment_size);
+    desc.on_write(record_size, 1);
+    lonely.add_segment(desc);
+    BOOST_REQUIRE(!select_compaction_batch(lonely, segment_size, compaction_batch_limits{
+        .batch_cap = min_segments_per_compaction,
+        .max_utilization = 0.5,
+    }));
+}
+
 SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_candidate_score_ranks_by_efficiency) {
     constexpr uint64_t segment_size = 128 * 1024;
 
