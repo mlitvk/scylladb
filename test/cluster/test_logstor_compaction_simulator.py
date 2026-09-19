@@ -45,6 +45,8 @@ OUT_OF_SPACE = "the disk ran out of segments"
 # group that holds little garbage. This is the case the marginal admission gate exists for.
 SKEWED_GROUPS = ["--groups", "16", "--group-skew", "2"]
 
+THRESHOLD = ["--controller", "threshold"]
+
 
 @pytest.fixture(scope="module")
 def simulator_path(build_mode):
@@ -282,6 +284,59 @@ async def test_marginal_admission_gate(simulator_path):
     assert refused > 0
 
 
+async def test_threshold_policy(simulator_path):
+    """Runs the threshold policy without a clock, where every batch under the threshold is compacted when it appears."""
+    report = await run_ok(simulator_path, [*SMALL_DISK, *THRESHOLD, "--utilization", "0.4"])
+    check_report(report, 0.4)
+    threshold, anchor, space_floor, ceiling = report_value(
+        report, r"policy\s+utilization threshold ([\d.]+) at (\d+) free, 1 at the space floor of (\d+), (.*)")
+    assert threshold == "0.5"
+    assert int(anchor) == 2 * int(space_floor)
+    assert ceiling == "constant above the anchor"
+
+    report = await run_ok(simulator_path, [*SMALL_DISK, *THRESHOLD, "--utilization", "0.4",
+            "--threshold-anchor", "0.15", "--threshold-ceiling", "0.3"])
+    check_report(report, 0.4)
+    assert report_value(report, r"policy\s+utilization threshold 0.5 at (\d+) free, .*, 0 at (\d+)") == (
+            str(round(0.15 * SEGMENTS)), str(round(0.3 * SEGMENTS)))
+
+
+async def test_utilization_threshold(simulator_path):
+    """Sweeps the threshold on a disk with room to spare, where space pressure does not relax it.
+
+    A segment is compacted only while less of it than the threshold is live. A lower threshold
+    compacts emptier segments, for less write amplification, and leaves more garbage in the
+    segments it does not compact.
+    """
+    output = await run_ok(simulator_path, [*SMALL_DISK, *THRESHOLD, "--threshold-ceiling", "0",
+            "--utilization", "0.4", "--csv", "--sweep", "utilization-threshold=0.3,0.5,0.7"])
+    rows = parse_csv(output)
+    assert [r["utilization-threshold"] for r in rows] == ["0.3", "0.5", "0.7"]
+    for r in rows:
+        assert float(r["victim u"]) <= float(r["utilization-threshold"]) + 0.01
+    wa_gc = [float(r["WA_gc"]) for r in rows]
+    effective_utilization = [float(r["U_eff"]) for r in rows]
+    assert wa_gc == sorted(wa_gc)
+    assert effective_utilization == sorted(effective_utilization)
+
+
+async def test_min_batch(simulator_path):
+    """Without a minimum batch, a job takes the few segments that just crossed the threshold."""
+    output = await run_ok(simulator_path, [*SMALL_DISK, *THRESHOLD, "--threshold-ceiling", "0",
+            "--utilization", "0.5", "--csv", "--sweep", "min-batch=1,0"])
+    segments_per_job = {r["min-batch"]: float(r["seg/job"]) for r in parse_csv(output)}
+    assert segments_per_job["1"] < 4
+    assert segments_per_job["0"] > 6
+
+
+async def test_threshold_ceiling(simulator_path):
+    """A ceiling lowers the threshold to zero as the free level rises to it, so a lower ceiling holds less free space."""
+    output = await run_ok(simulator_path, [*SMALL_DISK, *THRESHOLD, "--utilization", "0.4",
+            "--csv", "--sweep", "threshold-ceiling=0.25,0.5,0"])
+    free = [float(r["free%"]) for r in parse_csv(output)]
+    assert free == sorted(free)
+
+
 @pytest.mark.parametrize("args, error", [
     (["--groups", "0"], "a shard has at least one compaction group"),
     (["--jobs-per-group", "0"], "a group runs at least one compaction job at a time"),
@@ -292,8 +347,13 @@ async def test_marginal_admission_gate(simulator_path):
     (["--disk-size", "3X"], "unknown size suffix 'X'"),
     (["--sweep", "no-such-parameter=1"], "unknown parameter 'no-such-parameter'"),
     (["--sweep", "groups"], "a sweep is 'parameter=value,value,...', got 'groups'"),
+    (["--controller", "no-such-controller"], "unknown value 'no-such-controller'"),
+    (["--controller", "threshold", "--utilization-threshold", "1"], "the utilization threshold is a ratio in [0, 1)"),
+    (["--controller", "threshold", "--strategy", "absolute"], "the threshold policy runs the engine's own selection rule"),
+    (["--controller", "threshold", "--write-rate", "2M"], "a timed run of the threshold policy needs a rate controller"),
 ], ids=["no-groups", "no-jobs-per-group", "segment-above-histogram", "disk-smaller-than-file",
-        "disk-too-small", "unknown-strategy", "unknown-size-suffix", "unknown-sweep-parameter", "sweep-without-values"])
+        "disk-too-small", "unknown-strategy", "unknown-size-suffix", "unknown-sweep-parameter", "sweep-without-values",
+        "unknown-controller", "no-threshold", "threshold-with-other-rule", "timed-threshold"])
 async def test_bad_configuration(simulator_path, args, error):
     """Gives the simulator a configuration it cannot run. It must exit with an error that says why."""
     result = await run_simulator(simulator_path, args)

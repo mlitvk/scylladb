@@ -19,10 +19,11 @@
 //   - select_compaction_batch(), and with it the efficiency score, the batch extension tolerance and
 //     estimate_required_segments();
 //   - top_compaction_candidates, which ranks the groups;
-//   - make_free_segment_watermarks() and make_compaction_limits(), so that the free-segment target,
-//     the batch cap and the parallelism are derived per disk as they are in the engine;
-//   - auto_compaction_wanted(), which decides when compaction runs, and
-//     compaction_shares_pressure(), which the shares follow;
+//   - make_free_segment_watermarks(), make_compaction_limits(), compaction_space_floor() and
+//     compaction_space_pressure(), so that the free-segment target, the batch cap, the parallelism
+//     and the space floor are derived per disk as they are in the engine;
+//   - auto_compaction_wanted(), which decides when the free-segment target runs compaction, and
+//     compaction_shares_pressure(), which the shares follow under it;
 //   - the ondisk:: sizes and alignments, so that what a segment holds and what it wastes are real.
 //
 // What is modeled here, because the engine's version of it is IO or future bound: the primary index
@@ -37,10 +38,11 @@
 // laid out, and how they age. The device therefore writes one copy more per user byte than the
 // device write amplification reported below.
 //
-// Without --write-rate the simulation has no clock. Compaction runs whenever the free-segment level
-// asks for it and is taken to keep up, so what is measured is the steady state at the free level
-// the watermarks produce, and nothing about the dynamics. --free-band pins the free level, which is
-// how configurations that reclaim at different rates are compared at the same U_eff.
+// Without --write-rate the simulation has no clock. Compaction runs whenever the policy asks for it
+// and is taken to keep up, so what is measured is the steady state the policy produces - the free
+// level the relay's watermarks hold, or the population the utilization threshold leaves - and
+// nothing about the dynamics. --free-band pins the relay's free level, which is how configurations
+// that reclaim at different rates are compared at the same U_eff.
 //
 // With --write-rate the run has a clock. The workload is what time passes for: a user record
 // advances it by its own share of the write rate, compaction spends a bandwidth (--copy-bandwidth)
@@ -118,6 +120,15 @@ enum class value_size_kind {
     lognormal,
 };
 
+// What decides when compaction runs. `threshold` is the utilization threshold policy: a segment is
+// a candidate while its utilization is under --utilization-threshold, and compaction runs while
+// any group holds such a batch. `relay` is the free-segment target the engine holds - on below the
+// target, off above the stop watermark.
+enum class controller_kind {
+    relay,
+    threshold,
+};
+
 // Which prefix of the candidate segments a job takes. `efficiency` is the implemented rule and runs
 // the engine's own select_compaction_batch(); the other two are simulator-local reimplementations of
 // alternative rules, and exist to size what the implemented one buys.
@@ -175,6 +186,7 @@ struct sim_params {
     // write rate, generously enough that compaction can keep up at utilizations up to 0.75, so that
     // what limits it is the controller rather than the device.
     uint64_t copy_bandwidth = 0;
+    controller_kind controller = controller_kind::relay;
     // How much of that bandwidth follows the shares curve. 0 is the uncontended shard, where a
     // scheduling group's shares buy nothing because nothing else wants the CPU. 1 is full
     // contention, where the shares curve is the whole actuator.
@@ -182,6 +194,20 @@ struct sim_params {
     // Multiply the write rate by this half way through the measured run. The step response is what
     // says whether the loop is damped.
     double write_rate_step = 1;
+    // The threshold policy's one parameter: logstor_compaction_utilization_threshold. A fixed threshold
+    // caps the utilization a disk can run at, so the engine relaxes it with space pressure, and so
+    // does the simulator - what a run at a high utilization measures is what that relaxation costs.
+    double utilization_threshold = 0.5;
+    // Where on the free level the threshold applies and where it has fallen to zero, as fractions
+    // of the disk, 0 for the engine's defaults - an anchor at twice the space floor and no ceiling.
+    // The ceiling is the stiffness: none is a constant threshold, one just above the anchor holds
+    // the free level there, which is what the relay does, made continuous.
+    double threshold_anchor = 0;
+    double threshold_ceiling = 0;
+    // The fewest candidates a job is run on while there is no space pressure, 0 for the engine's
+    // effective_min_batch(). Under the threshold policy candidates arrive one at a time, so without
+    // a floor a job is two or three segments.
+    size_t min_batch = 0;
     // Where to write the run's time series, one row per controller period.
     std::string trace_path;
 
@@ -257,6 +283,11 @@ constexpr std::pair<std::string_view, value_size_kind> value_size_names[] = {
     {"fixed", value_size_kind::fixed},
     {"uniform", value_size_kind::uniform},
     {"lognormal", value_size_kind::lognormal},
+};
+
+constexpr std::pair<std::string_view, controller_kind> controller_names[] = {
+    {"relay", controller_kind::relay},
+    {"threshold", controller_kind::threshold},
 };
 
 constexpr std::pair<std::string_view, strategy_kind> strategy_names[] = {
@@ -361,12 +392,27 @@ const std::vector<param_desc>& all_params() {
         {"copy-bandwidth", "device bytes per second compaction may spend, 0 to derive from the write rate",
             [] (sim_params& p, const std::string& v) { p.copy_bandwidth = parse_size(v); },
             [] (const sim_params& p) { return fmt::format("{}", p.copy_bandwidth); }},
+        {"controller", "what decides when compaction runs: threshold or relay (the engine's)",
+            [] (sim_params& p, const std::string& v) { p.controller = parse_enum(v, controller_names); },
+            [] (const sim_params& p) { return std::string(enum_name(p.controller, controller_names)); }},
         {"shares-authority", "how much of the compaction bandwidth follows the shares curve, 0 for an uncontended shard",
             [] (sim_params& p, const std::string& v) { p.shares_authority = std::stod(v); },
             [] (const sim_params& p) { return fmt::format("{}", p.shares_authority); }},
         {"write-rate-step", "multiply the write rate by this half way through the measured run",
             [] (sim_params& p, const std::string& v) { p.write_rate_step = std::stod(v); },
             [] (const sim_params& p) { return fmt::format("{}", p.write_rate_step); }},
+        {"utilization-threshold", "a segment is compacted once less than this of it is live, under --controller threshold",
+            [] (sim_params& p, const std::string& v) { p.utilization_threshold = std::stod(v); },
+            [] (const sim_params& p) { return fmt::format("{}", p.utilization_threshold); }},
+        {"threshold-anchor", "fraction of the disk free at which the threshold applies as configured, 0 for twice the space floor",
+            [] (sim_params& p, const std::string& v) { p.threshold_anchor = std::stod(v); },
+            [] (const sim_params& p) { return fmt::format("{}", p.threshold_anchor); }},
+        {"threshold-ceiling", "fraction of the disk free above which only dead segments are compacted, 0 for none",
+            [] (sim_params& p, const std::string& v) { p.threshold_ceiling = std::stod(v); },
+            [] (const sim_params& p) { return fmt::format("{}", p.threshold_ceiling); }},
+        {"min-batch", "fewest candidate segments a job is run on under no space pressure, 0 for the engine's",
+            [] (sim_params& p, const std::string& v) { p.min_batch = std::stoul(v); },
+            [] (const sim_params& p) { return fmt::format("{}", p.min_batch); }},
         {"trace", "write the run's time series to this file, one row per controller period",
             [] (sim_params& p, const std::string& v) { p.trace_path = v; },
             [] (const sim_params& p) { return p.trace_path; }},
@@ -595,6 +641,8 @@ struct sim_result {
     size_t batch_cap = 0;
     size_t parallelism = 0;
     free_segment_watermarks watermarks{};
+    uint64_t space_floor = 0;
+    utilization_threshold_curve curve{};
     uint64_t keys = 0;
     uint64_t writes = 0;
     bool out_of_space = false;
@@ -718,6 +766,11 @@ class compaction_sim {
     sim_params _p;
     uint64_t _segment_count;
     free_segment_watermarks _watermarks;
+    // compaction_space_floor() for this disk: what the threshold policy derives its limits from and
+    // where its space pressure starts.
+    uint64_t _space_floor;
+    // The threshold as a function of the free level, from the parameters.
+    utilization_threshold_curve _curve;
     size_t _batch_cap;
     size_t _parallelism;
 
@@ -771,6 +824,9 @@ public:
         : _p(std::move(p))
         , _segment_count((_p.disk_size / _p.file_size) * (_p.file_size / _p.segment_size))
         , _watermarks(make_free_segment_watermarks(_segment_count, _p.trigger_threshold))
+        , _space_floor(compaction_space_floor(_segment_count))
+        , _curve(make_utilization_threshold_curve(_segment_count, _space_floor, _p.utilization_threshold,
+                _p.threshold_anchor, _p.threshold_ceiling))
         , _rng(_p.seed) {
         // segment_descriptor_hist indexes a fixed-size bucket array without checking its bounds, so
         // a segment larger than the histogram's maximum computes an out of range bucket for a fully
@@ -792,15 +848,31 @@ public:
         if (_p.max_jobs_per_group == 0) {
             throw std::invalid_argument("a group runs at least one compaction job at a time");
         }
+        if (threshold_policy()) {
+            if (!(_p.utilization_threshold >= 0 && _p.utilization_threshold < 1)) {
+                throw std::invalid_argument("the utilization threshold is a ratio in [0, 1)");
+            }
+            if (_p.strategy != strategy_kind::efficiency) {
+                throw std::invalid_argument("the threshold policy runs the engine's own selection rule");
+            }
+            if (_p.write_rate != 0) {
+                throw std::invalid_argument("a timed run of the threshold policy needs a rate controller");
+            }
+        }
         if (_p.free_band > 0) {
             _watermarks.high = std::min(_segment_count, _watermarks.low + _p.free_band);
         }
-        const auto limits = make_compaction_limits(_watermarks, _p.batch_cap);
+        // What the jobs in flight may hold: the engine's space floor under the threshold
+        // policy, and the free-segment target under the relay, as make_compaction_limits() derives
+        // it from the watermarks.
+        const auto budget = threshold_policy()
+                ? _space_floor
+                : std::max<uint64_t>(_watermarks.low, min_segments_per_compaction);
+        const auto limits = make_compaction_limits(budget, _p.batch_cap);
         _parallelism = _p.parallelism != 0 ? _p.parallelism : limits.auto_parallelism;
         // The batch cap follows the parallelism through the relation make_compaction_limits()
         // derives both from, so that overriding the parallelism to study one of them still spends
-        // the free-segment target on concurrency first and gives the rest to the batch.
-        const auto budget = std::max<uint64_t>(_watermarks.low, min_segments_per_compaction);
+        // the budget on concurrency first and gives the rest to the batch.
         _batch_cap = _p.parallelism != 0
                 ? std::clamp<uint64_t>(budget / _parallelism, min_segments_per_compaction,
                         std::max<uint64_t>(_p.batch_cap, min_segments_per_compaction))
@@ -827,6 +899,8 @@ public:
             .batch_cap = _batch_cap,
             .parallelism = _parallelism,
             .watermarks = _watermarks,
+            .space_floor = _space_floor,
+            .curve = _curve,
             .keys = _index.size(),
         };
 
@@ -883,6 +957,27 @@ private:
     // --- the clock ---
 
     bool timed() const noexcept { return _write_rate > 0; }
+    bool threshold_policy() const noexcept { return _p.controller == controller_kind::threshold; }
+
+    // The utilization threshold selection applies now. Under the threshold policy it is relaxed by
+    // space pressure; the relay has none, every segment is a candidate.
+    size_t current_min_batch() const noexcept {
+        if (!threshold_policy()) {
+            return 1;
+        }
+        const auto pressure = compaction_space_pressure(available_segments(write_source::user_write), _curve);
+        if (pressure > 0) {
+            return 1;
+        }
+        return _p.min_batch != 0 ? _p.min_batch : effective_min_batch(0);
+    }
+
+    double current_threshold() const noexcept {
+        if (!threshold_policy()) {
+            return 1;
+        }
+        return effective_utilization_threshold(available_segments(write_source::user_write), _curve);
+    }
 
     // What the shares controller would be asking for, as a fraction of its range: the level ramp of
     // the relay.
@@ -1136,6 +1231,8 @@ private:
     std::optional<sim_batch> select_batch_efficiency(sim_group& g) {
         auto batch = select_compaction_batch(g.segments, _p.segment_size, compaction_batch_limits{
             .batch_cap = _batch_cap,
+            .min_batch = current_min_batch(),
+            .max_utilization = current_threshold(),
             .extension_tolerance = _p.extension_tolerance,
         });
         if (!batch) {
@@ -1248,11 +1345,15 @@ private:
     // level asks for it. So what it measures is the steady state a policy produces, and nothing
     // about the dynamics.
     void poll_untimed() {
-        // `running` is the state of run_auto_compaction()'s fiber, not of the jobs it has in flight:
-        // once started it runs to the stop watermark, rather than stopping the moment the free level
-        // is back at the target.
+        // Under the threshold policy compaction runs while any group holds a batch under the
+        // threshold; without a clock that means every such batch is compacted the moment it appears,
+        // which is the population the policy leaves and the write amplification it costs, without
+        // the pacing. Under the relay `running` is the state of the driver's fiber, not of the jobs
+        // it has in flight: once started it runs to the stop watermark, rather than stopping the
+        // moment the free level is back at the target.
         bool running = false;
-        while (auto_compaction_wanted(running, available_segments(write_source::user_write), _watermarks)) {
+        while (threshold_policy()
+                || auto_compaction_wanted(running, available_segments(write_source::user_write), _watermarks)) {
             running = true;
             start_jobs();
             if (_jobs.empty()) {
@@ -1645,8 +1746,14 @@ void print_report(const sim_result& r) {
             format_bytes(p.disk_size), r.segment_count, format_bytes(p.segment_size));
     fmt::print("  groups         {}{}\n", p.groups,
             p.group_skew != 0 ? fmt::format(", skew {}", p.group_skew) : "");
-    fmt::print("  free target    {:.4g}% -> low {} high {}{}\n", p.trigger_threshold * 100,
-            r.watermarks.low, r.watermarks.high, p.free_band ? " (band pinned)" : "");
+    if (p.controller == controller_kind::threshold) {
+        fmt::print("  policy         utilization threshold {:.3g} at {} free, 1 at the space floor of {}, {}\n",
+                p.utilization_threshold, r.curve.anchor, r.space_floor,
+                r.curve.ceiling ? fmt::format("0 at {}", r.curve.ceiling) : "constant above the anchor");
+    } else {
+        fmt::print("  policy         relay on a free target of {:.4g}% -> low {} high {}{}\n", p.trigger_threshold * 100,
+                r.watermarks.low, r.watermarks.high, p.free_band ? " (band pinned)" : "");
+    }
     fmt::print("  compaction     batch cap {}, parallelism {}, tolerance {}, strategy {}\n",
             r.batch_cap, r.parallelism, p.extension_tolerance, enum_name(p.strategy, strategy_names));
     if (p.max_jobs_per_group > 1 || p.marginal_admission_efficiency > 0 || p.marginal_admission_ratio > 0) {
@@ -1913,6 +2020,11 @@ int self_test() {
         auto p = base();
         p.write_rate = 2 * 1024 * 1024;
         cases.push_back({"timed, the trigger's relay", p});
+    }
+    {
+        auto p = base();
+        p.controller = controller_kind::threshold;
+        cases.push_back({"the threshold policy, no clock", p});
     }
 
     bool failed = false;
