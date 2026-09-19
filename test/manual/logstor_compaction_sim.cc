@@ -154,6 +154,16 @@ struct sim_params {
     // Above 1 a job's inputs are reserved out of the candidate set when it starts, which is what
     // would let two jobs of one group pick disjoint batches.
     size_t max_jobs_per_group = 1;
+    // The least reclamation efficiency - segments reclaimed per segment-worth of data copied - a
+    // batch must have to be started while another job is already running. The best candidate is
+    // always admitted, so this bounds the marginal write amplification parallelism may buy at,
+    // rather than being able to stall compaction. 0 admits everything, which is what runs today.
+    double marginal_admission_efficiency = 0;
+    // The same gate expressed relative to the best candidate of the current ranking rather than as
+    // an absolute efficiency, so that it adapts to what the disk can offer instead of stalling
+    // compaction on a full disk where no batch clears an absolute floor. This is the gate the engine
+    // runs; 0 admits everything, which is what it did before it had one.
+    double marginal_admission_ratio = compaction_marginal_admission_ratio;
 
     // --- dynamics ---
     // User data bytes per second. 0 leaves the simulator without a clock, which measures the steady
@@ -300,9 +310,15 @@ const std::vector<param_desc>& all_params() {
         {"strategy", "candidate scoring rule: efficiency, absolute or random",
             [] (sim_params& p, const std::string& v) { p.strategy = parse_enum<strategy_kind>(v, strategy_names); },
             [] (const sim_params& p) { return std::string(enum_name(p.strategy, strategy_names)); }},
+        {"marginal-admission-ratio", "least efficiency, relative to the best candidate, a batch needs to run alongside another job",
+            [] (sim_params& p, const std::string& v) { p.marginal_admission_ratio = std::stod(v); },
+            [] (const sim_params& p) { return fmt::format("{}", p.marginal_admission_ratio); }},
         {"jobs-per-group", "compaction jobs one group may run at once",
             [] (sim_params& p, const std::string& v) { p.max_jobs_per_group = std::stoul(v); },
             [] (const sim_params& p) { return fmt::format("{}", p.max_jobs_per_group); }},
+        {"marginal-admission-efficiency", "least efficiency a batch needs to run alongside another job",
+            [] (sim_params& p, const std::string& v) { p.marginal_admission_efficiency = std::stod(v); },
+            [] (const sim_params& p) { return fmt::format("{}", p.marginal_admission_efficiency); }},
         {"workload", "key distribution: uniform, zipf or hot-cold",
             [] (sim_params& p, const std::string& v) { p.workload = parse_enum<workload_kind>(v, workload_names); },
             [] (const sim_params& p) { return std::string(enum_name(p.workload, workload_names)); }},
@@ -527,6 +543,7 @@ struct sim_stats {
     uint64_t segments_allocated = 0;
     uint64_t segments_freed = 0;
     uint64_t empty_candidate_scans = 0;
+    uint64_t batches_refused = 0;
 
     double victim_utilization_sum = 0;
     uint64_t victim_segments = 0;
@@ -719,6 +736,12 @@ class compaction_sim {
     std::vector<sim_job> _jobs;
     std::vector<sim_candidate> _pending_candidates;
     bool _in_compaction_poll = false;
+    // Set when the admission floor turned a candidate away, cleared when a job finishes: until then
+    // the answer cannot change, and re-ranking every group on every allocation is what would
+    // dominate the run.
+    bool _admission_blocked = false;
+    // What the relative admission gate measures a candidate against, from the last ranking.
+    std::optional<compaction_candidate_score> _admission_bar;
 
     uint64_t _live_bytes = 0;
     sim_stats _stats;
@@ -1265,17 +1288,22 @@ private:
     }
 
     void start_jobs() {
+        if (_admission_blocked && !_jobs.empty()) {
+            return;
+        }
         // The relay's fiber is either running or it is not; while it is not, nothing is submitted,
         // though what it already has in flight runs to completion.
         if (timed() && !_relay_running) {
             return;
         }
+        _admission_blocked = false;
         while (_jobs.size() < _parallelism) {
             if (_pending_candidates.empty()) {
                 _pending_candidates = rank_candidates(_parallelism);
                 if (_pending_candidates.empty()) {
                     return;
                 }
+                _admission_bar = marginal_admission_bar(_pending_candidates);
             }
             const auto candidate = _pending_candidates.back();
             _pending_candidates.pop_back();
@@ -1288,6 +1316,22 @@ private:
             auto batch = select_batch(g);
             if (!batch) {
                 continue;
+            }
+            // A job beyond the first buys throughput at the marginal write amplification of the
+            // batch it runs, which is not bounded by anything today. The candidates are ranked best
+            // first, so once one falls under the floor no later one clears it either.
+            const auto refused = !_jobs.empty()
+                    && ((_p.marginal_admission_efficiency > 0
+                                && batch->score.efficiency(_p.segment_size) < _p.marginal_admission_efficiency)
+                        || (_p.marginal_admission_ratio > 0 && _admission_bar
+                                && !batch->score.efficiency_at_least(*_admission_bar, _p.marginal_admission_ratio)));
+            if (refused) {
+                ++_stats.batches_refused;
+                // Nothing changes until a job finishes, so keep the candidate and stop looking
+                // rather than re-ranking every group on the next allocation.
+                _pending_candidates.push_back(candidate);
+                _admission_blocked = true;
+                return;
             }
             // The engine reads the inputs of a job in segment id order.
             std::ranges::sort(batch->segments);
@@ -1402,6 +1446,7 @@ private:
             }
         }
         --g.jobs_in_flight;
+        _admission_blocked = false;
     }
 
     // --- the workload ---
@@ -1604,8 +1649,9 @@ void print_report(const sim_result& r) {
             r.watermarks.low, r.watermarks.high, p.free_band ? " (band pinned)" : "");
     fmt::print("  compaction     batch cap {}, parallelism {}, tolerance {}, strategy {}\n",
             r.batch_cap, r.parallelism, p.extension_tolerance, enum_name(p.strategy, strategy_names));
-    if (p.max_jobs_per_group > 1) {
-        fmt::print("                 {} jobs per group\n", p.max_jobs_per_group);
+    if (p.max_jobs_per_group > 1 || p.marginal_admission_efficiency > 0 || p.marginal_admission_ratio > 0) {
+        fmt::print("                 {} jobs per group, marginal admission efficiency {}, ratio {}\n",
+                p.max_jobs_per_group, p.marginal_admission_efficiency, p.marginal_admission_ratio);
     }
     fmt::print("  workload       {}, {} keys, values {} ~{}\n",
             enum_name(p.workload, workload_names), r.keys,
@@ -1676,6 +1722,9 @@ void print_report(const sim_result& r) {
     fmt::print("  records rewritten {}, skipped {}\n", s.compaction_records_rewritten, s.compaction_records_skipped);
     if (s.empty_candidate_scans) {
         fmt::print("  scans that found no candidate with a net gain: {}\n", s.empty_candidate_scans);
+    }
+    if (s.batches_refused) {
+        fmt::print("  batches refused a second job slot by the admission floor: {}\n", s.batches_refused);
     }
 
     fmt::print("\n  executed batch size\n");
@@ -1852,6 +1901,13 @@ int self_test() {
         p.group_skew = 1.5;
         p.max_jobs_per_group = 4;
         cases.push_back({"four jobs per group, skewed groups", p});
+    }
+    {
+        auto p = base();
+        p.groups = 32;
+        p.group_skew = 1.5;
+        p.marginal_admission_efficiency = 1.0;
+        cases.push_back({"marginal admission floor, skewed groups", p});
     }
     {
         auto p = base();

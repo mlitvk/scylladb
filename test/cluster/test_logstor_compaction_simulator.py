@@ -41,6 +41,10 @@ TIMEOUT = 300
 
 OUT_OF_SPACE = "the disk ran out of segments"
 
+# A shard whose garbage is in a few of its groups, where a job beyond the first can only rewrite a
+# group that holds little garbage. This is the case the marginal admission gate exists for.
+SKEWED_GROUPS = ["--groups", "16", "--group-skew", "2"]
+
 
 @pytest.fixture(scope="module")
 def simulator_path(build_mode):
@@ -151,9 +155,10 @@ async def test_report(simulator_path):
     ["--groups", "8", "--group-skew", "1.5"],
     ["--groups", "8", "--group-skew", "1.5", "--jobs-per-group", "4"],
     ["--free-band", "1", "--batch-cap", "8", "--parallelism", "1"],
+    [*SKEWED_GROUPS, "--marginal-admission-efficiency", "1"],
     ["--segment-size", "64K", "--file-size", "1M"],
 ], ids=["zipf", "hot-cold-lognormal", "uniform-values", "absolute", "random", "skewed-groups",
-        "jobs-per-group", "pinned-band", "small-segments"])
+        "jobs-per-group", "pinned-band", "small-segments", "admission-floor"])
 async def test_configurations(simulator_path, args):
     """Runs the workloads, the selection rules and the compaction limits the simulator models."""
     report = await run_ok(simulator_path, [*SMALL_DISK, "--utilization", "0.6", *args])
@@ -256,6 +261,25 @@ async def test_extension_tolerance(simulator_path):
     report = await run_ok(simulator_path, [*SMALL_DISK, "--extension-tolerance", "0.5"])
     assert "tolerance 0.5," in report
     check_report(report, 0.75)
+
+
+async def test_marginal_admission_gate(simulator_path):
+    """Runs skewed groups with the gate off and at the engine's ratio.
+
+    The gate must refuse batches, and it must save write amplification.
+    """
+    output = await run_ok(simulator_path, [*SMALL_DISK, *SKEWED_GROUPS, "--csv",
+            "--sweep", "utilization=0.4,0.5", "--sweep", "marginal-admission-ratio=0,0.75"])
+    wa_gc = {(r["utilization"], r["marginal-admission-ratio"]): float(r["WA_gc"]) for r in parse_csv(output)}
+    for utilization in ("0.4", "0.5"):
+        assert wa_gc[(utilization, "0.75")] < wa_gc[(utilization, "0")]
+
+    # The default is the engine's ratio.
+    report = await run_ok(simulator_path, [*SMALL_DISK, *SKEWED_GROUPS, "--utilization", "0.5"])
+    check_report(report, 0.5)
+    assert "ratio 0.75" in report
+    refused = int(report_value(report, r"batches refused a second job slot by the admission floor: (\d+)")[0])
+    assert refused > 0
 
 
 @pytest.mark.parametrize("args, error", [
