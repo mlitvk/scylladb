@@ -3231,6 +3231,345 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_select_compaction_batch_threshold) {
     }));
 }
 
+// The backlog is read off the utilization histogram: the buckets entirely under the threshold
+// count, with what compacting them would free, the bucket the threshold cuts through counts pro
+// rata, and the lowest bucket counts at any threshold.
+SEASTAR_THREAD_TEST_CASE(test_logstor_reclaimable_backlog) {
+    utilization_histogram utilization{};
+    // Ten dead segments, four in the bucket just under a half, two just over it, one full.
+    utilization[0] = 10;
+    utilization[utilization_bucket_count / 2 - 1] = 4;
+    utilization[utilization_bucket_count / 2] = 2;
+    utilization[utilization_bucket_count - 1] = 1;
+
+    const auto half = reclaimable_backlog(utilization, 0.5);
+    BOOST_REQUIRE_CLOSE(half.candidate_segments, 14.0, 1e-9);
+    // The dead ones give back nearly all of themselves, the four under a half a little over half.
+    const double dead = 10 * (1 - 0.5 / utilization_bucket_count);
+    const double under_half = 4 * (1 - (utilization_bucket_count / 2 - 0.5) / utilization_bucket_count);
+    BOOST_REQUIRE_CLOSE(half.reclaimable_segments, dead + under_half, 1e-9);
+
+    // A threshold half way through the bucket over a half counts half of its two, at the mean
+    // utilization of the half it counts.
+    const double bucket = 1.0 / utilization_bucket_count;
+    const auto cut = reclaimable_backlog(utilization, 0.5 + bucket / 2);
+    BOOST_REQUIRE_CLOSE(cut.candidate_segments, 15.0, 1e-9);
+    BOOST_REQUIRE_CLOSE(cut.reclaimable_segments, dead + under_half + 1 * (1 - (0.5 + bucket / 4)), 1e-9);
+
+    // A threshold of one counts everything; a threshold of zero - only dead segments - still counts
+    // the lowest bucket, which is where the dead ones are.
+    const auto all = reclaimable_backlog(utilization, 1.0);
+    BOOST_REQUIRE_CLOSE(all.candidate_segments, 17.0, 1e-9);
+    BOOST_REQUIRE_GT(all.reclaimable_segments, half.reclaimable_segments);
+    const auto only_dead = reclaimable_backlog(utilization, 0.0);
+    BOOST_REQUIRE_CLOSE(only_dead.candidate_segments, 10.0, 1e-9);
+    BOOST_REQUIRE_CLOSE(only_dead.reclaimable_segments, dead, 1e-9);
+
+    // An empty shard has no backlog whatever the threshold.
+    BOOST_REQUIRE_EQUAL(reclaimable_backlog(utilization_histogram{}, 0.5).candidate_segments, 0.0);
+}
+
+namespace {
+
+// Drives a compaction_rate_controller through `ticks` periods with the same sample, the way the
+// engine's timer does. The histogram outlives the sample, which only refers to it.
+struct controller_bench {
+    utilization_histogram utilization{};
+    uint64_t available = 10000;
+    uint64_t space_floor = 200;
+    double threshold = 0.5;
+    // Fractions of a disk of 20000 segments: 0 for the defaults, an anchor at twice the space floor
+    // and no ceiling.
+    double anchor = 0;
+    double ceiling = 0;
+    uint64_t allocated_per_tick = 0;
+    uint64_t reclaimed_per_tick = 0;
+    double burst_cap = 32;
+    bool candidates_empty = false;
+    bool throttled = false;
+    static constexpr double dt = 0.25;
+
+    compaction_rate_controller::sample make_sample() const noexcept {
+        return compaction_rate_controller::sample{
+            .available_segments = available,
+            .curve = make_utilization_threshold_curve(20000, space_floor, threshold, anchor, ceiling),
+            .utilization = utilization,
+            .segments_allocated = allocated_per_tick,
+            .segments_reclaimed = reclaimed_per_tick,
+            .burst_cap = burst_cap,
+            .dt = dt,
+            .candidates_empty = candidates_empty,
+            .throttled = throttled,
+        };
+    }
+
+    void run(compaction_rate_controller& c, size_t ticks) const noexcept {
+        for (size_t i = 0; i < ticks; ++i) {
+            c.tick(make_sample());
+        }
+    }
+};
+
+} // anonymous namespace
+
+// With nothing under the threshold the commanded rate is the allocation rate, exactly: holding the
+// free level takes reclaiming what is allocated, no more, and the credit paces jobs at that rate.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_rate_controller_follows_the_write_rate) {
+    compaction_rate_controller controller;
+    // Nothing may run before the first tick has said what compaction should be doing.
+    BOOST_REQUIRE(!controller.can_afford(1));
+    BOOST_REQUIRE(!controller.bypassed());
+
+    controller_bench bench;
+    bench.allocated_per_tick = 10;
+    bench.run(controller, 8);
+    BOOST_REQUIRE(controller.enabled());
+    BOOST_REQUIRE_CLOSE(controller.allocation_rate(), 10 / controller_bench::dt, 1e-9);
+    BOOST_REQUIRE_CLOSE(controller.rate(), controller.allocation_rate(), 1e-9);
+    BOOST_REQUIRE_EQUAL(controller.backlog().candidate_segments, 0.0);
+    BOOST_REQUIRE_EQUAL(controller.space_pressure(), 0.0);
+    BOOST_REQUIRE_EQUAL(controller.utilization_threshold(), 0.5);
+    BOOST_REQUIRE(!controller.bypassed());
+
+    // Eight ticks of ten segments each is eighty segments of credit, capped at a batch between
+    // periods: the bucket holds a batch plus the last period's accrual, and what it could not hold
+    // is rate compaction did not spend.
+    BOOST_REQUIRE_CLOSE(controller.credit(), bench.burst_cap + 10, 1e-9);
+    BOOST_REQUIRE_GT(controller.unspent_rate(), 0.0);
+    // Nothing waited for credit and the bucket spilled, so the controller takes compaction to be
+    // unable to spend the rate it is given and the demand rises.
+    BOOST_REQUIRE_GT(controller.shares_demand(), 0.0);
+
+    // A batch is admitted on compaction_admission_credit at most and charged all it reclaims, so the
+    // second one here runs on debt, and the debt is what the next one waits for.
+    BOOST_REQUIRE(controller.can_afford(32));
+    controller.charge(32);
+    BOOST_REQUIRE_CLOSE(controller.credit(), 10, 1e-9);
+    BOOST_REQUIRE(controller.can_afford(32));
+    controller.charge(32);
+    BOOST_REQUIRE(!controller.can_afford(1));
+    // Another batch is affordable once the allocation has paid the debt off and the admission
+    // credit on top, and not before.
+    bench.run(controller, 2);
+    BOOST_REQUIRE(!controller.can_afford(1));
+    bench.run(controller, 1);
+    BOOST_REQUIRE_CLOSE(controller.credit(), double(compaction_admission_credit), 1e-9);
+    BOOST_REQUIRE(controller.can_afford(32));
+    BOOST_REQUIRE(controller.can_afford(2));
+
+    // The bucket owes at most a batch, however much was charged against it.
+    controller.charge(1000);
+    bench.run(controller, 1);
+    BOOST_REQUIRE_CLOSE(controller.credit(), -bench.burst_cap + 10, 1e-9);
+
+    // Spent as fast as it accrues, the bucket never spills and the demand stays where it is: at
+    // nothing, for a controller that has never been short.
+    controller = compaction_rate_controller{};
+    for (size_t i = 0; i < 40; ++i) {
+        bench.run(controller, 1);
+        controller.charge(10);
+    }
+    BOOST_REQUIRE_EQUAL(controller.unspent_rate(), 0.0);
+    BOOST_REQUIRE_EQUAL(controller.shares_demand(), 0.0);
+}
+
+// A backlog under the threshold is drained at `backlog / T_drain` on top of the allocation rate,
+// so a burst of garbage is worked off over the drain time rather than at once, and with no writes
+// at all compaction still runs.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_rate_controller_drains_the_backlog) {
+    controller_bench bench;
+    bench.utilization[0] = 600;   // dead segments
+    bench.utilization[3] = 200;   // a fifth full or so
+    bench.utilization[12] = 1000; // well above the threshold, not a candidate
+
+    compaction_rate_controller controller;
+    bench.run(controller, 4);
+    const auto backlog = reclaimable_backlog(bench.utilization, 0.5);
+    BOOST_REQUIRE_CLOSE(controller.backlog().candidate_segments, 800.0, 1e-9);
+    BOOST_REQUIRE_CLOSE(controller.backlog().reclaimable_segments, backlog.reclaimable_segments, 1e-9);
+    BOOST_REQUIRE_CLOSE(controller.rate(), backlog.reclaimable_segments / compaction_backlog_drain_time, 1e-9);
+
+    // Writes add to it rather than replacing it.
+    bench.allocated_per_tick = 10;
+    bench.run(controller, 1);
+    BOOST_REQUIRE_CLOSE(controller.rate(), 10 / controller_bench::dt + backlog.reclaimable_segments / compaction_backlog_drain_time, 1e-9);
+
+    // The drain time is what sets the pace.
+    compaction_rate_controller fast{compaction_rate_controller::tuning{.drain_time = 10}};
+    bench.allocated_per_tick = 0;
+    bench.run(fast, 1);
+    BOOST_REQUIRE_CLOSE(fast.rate(), backlog.reclaimable_segments / 10, 1e-9);
+    BOOST_REQUIRE_GT(fast.rate(), controller.rate());
+}
+
+// Below twice the space floor the threshold relaxes, at the space floor the throttle is off and the
+// shares demand is at its maximum, and above the band the free level has no say.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_rate_controller_space_pressure) {
+    controller_bench bench;
+    bench.utilization[0] = 8;
+    compaction_rate_controller controller;
+
+    bench.available = 3 * bench.space_floor;
+    bench.run(controller, 1);
+    BOOST_REQUIRE_EQUAL(controller.space_pressure(), 0.0);
+    BOOST_REQUIRE_EQUAL(controller.utilization_threshold(), bench.threshold);
+    BOOST_REQUIRE(!controller.bypassed());
+    BOOST_REQUIRE(!controller.can_afford(1000));
+
+    BOOST_REQUIRE_EQUAL(controller.min_batch(), min_segments_per_compaction);
+    bench.available = bench.space_floor + bench.space_floor / 2;
+    bench.run(controller, 1);
+    BOOST_REQUIRE_CLOSE(controller.space_pressure(), 0.5, 1e-9);
+    BOOST_REQUIRE_CLOSE(controller.utilization_threshold(), bench.threshold + (1 - bench.threshold) / 2, 1e-9);
+    // The minimum batch falls with the pressure rather than stepping to one at the anchor.
+    BOOST_REQUIRE_EQUAL(controller.min_batch(), min_segments_per_compaction / 2);
+    BOOST_REQUIRE(!controller.bypassed());
+    BOOST_REQUIRE_GE(controller.shares_demand(), 0.5);
+    // The relaxed threshold admits fuller segments into the backlog.
+    bench.utilization[10] = 5; // utilization [0.625, 0.6875), under a threshold of three quarters
+    bench.run(controller, 1);
+    BOOST_REQUIRE_CLOSE(controller.backlog().candidate_segments, 13.0, 1e-9);
+
+    bench.available = bench.space_floor;
+    bench.run(controller, 1);
+    BOOST_REQUIRE_EQUAL(controller.space_pressure(), 1.0);
+    BOOST_REQUIRE_EQUAL(controller.utilization_threshold(), 1.0);
+    BOOST_REQUIRE_EQUAL(controller.min_batch(), 1u);
+    BOOST_REQUIRE(controller.bypassed());
+    BOOST_REQUIRE(controller.can_afford(1000));
+    BOOST_REQUIRE_EQUAL(controller.shares_demand(), 1.0);
+    // Jobs run flat out while bypassed are charged, and the bucket owes none of it: otherwise
+    // compaction would come out of bypass stalled on the debt until the level fell back in.
+    controller.charge(1000);
+    bench.run(controller, 1);
+    BOOST_REQUIRE_GE(controller.credit(), 0.0);
+
+    // Back above the band the throttle is on again, owing nothing, and the demand decays rather
+    // than dropping: with a job waiting for credit it is the throttle that is holding compaction.
+    bench.available = 3 * bench.space_floor;
+    bench.throttled = true;
+    bench.run(controller, 1);
+    BOOST_REQUIRE(!controller.bypassed());
+    BOOST_REQUIRE_GE(controller.credit(), 0.0);
+    BOOST_REQUIRE_LT(controller.shares_demand(), 1.0);
+    BOOST_REQUIRE_GT(controller.shares_demand(), 0.9);
+
+    // With a ceiling the threshold keeps falling above the anchor, and the backlog shrinks with it:
+    // at the ceiling only dead segments are candidates, and the dead ones still are.
+    bench.anchor = 0.02;    // 400 segments
+    bench.ceiling = 0.1;    // 2000 segments
+    bench.utilization[0] = 8;
+    bench.utilization[10] = 0;
+    bench.utilization[4] = 5; // utilization [0.25, 0.3125): a candidate at a threshold of a half
+    bench.available = 400;
+    bench.run(controller, 1);
+    BOOST_REQUIRE_EQUAL(controller.utilization_threshold(), bench.threshold);
+    BOOST_REQUIRE_CLOSE(controller.backlog().candidate_segments, 13.0, 1e-9);
+    bench.available = 1200;
+    bench.run(controller, 1);
+    BOOST_REQUIRE_CLOSE(controller.utilization_threshold(), 0.25, 1e-9);
+    BOOST_REQUIRE_CLOSE(controller.backlog().candidate_segments, 8.0, 1e-9);
+    BOOST_REQUIRE_EQUAL(controller.space_pressure(), 0.0);
+    bench.available = 5000;
+    bench.run(controller, 1);
+    BOOST_REQUIRE_EQUAL(controller.utilization_threshold(), 0.0);
+    BOOST_REQUIRE_CLOSE(controller.backlog().candidate_segments, 8.0, 1e-9);
+}
+
+// The shares demand climbs only while compaction is resource-bound - credit spilling over the cap
+// although there is something to run - leaks slowly while compaction keeps up, and decays once the
+// throttle limits it or there is nothing to run, so that an idle or throttled shard sits at its
+// minimum shares.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_rate_controller_shares_demand) {
+    controller_bench bench;
+    bench.allocated_per_tick = 10;
+    compaction_rate_controller controller;
+
+    // Starved: asked for 40/s and spending none of it. The bucket fills to its cap in four ticks
+    // and spills the whole accrual from then on, so the demand climbs the range in the rise time
+    // once the smoothed spill has caught up.
+    bench.run(controller, 40);
+    const auto starved = controller.shares_demand();
+    BOOST_REQUIRE_GT(starved, 0.9);
+    BOOST_REQUIRE_CLOSE(controller.unspent_rate(), controller.rate(), 2);
+
+    // Spending what is asked for as it accrues: the demand is what makes compaction keep up, so it
+    // is not given up - it leaks, slowly, so that a demand higher than compaction needs is found out
+    // over the hold decay time rather than kept for good. The smoothed spill takes a few seconds to
+    // die down, so the leak over ten seconds is a little under what the time constant says.
+    for (size_t i = 0; i < 40; ++i) {
+        bench.run(controller, 1);
+        controller.charge(10);
+    }
+    const auto held = controller.shares_demand();
+    BOOST_REQUIRE_LT(held, starved);
+    BOOST_REQUIRE_GT(held, starved * std::exp(-10 / compaction_shares_hold_decay_time));
+
+    // Throttled: the throttle is what limits compaction now, so the shares are not being used, and
+    // the demand decays - even with the bucket spilling, where more CPU would change nothing.
+    const auto before = controller.shares_demand();
+    bench.throttled = true;
+    bench.run(controller, 8);
+    BOOST_REQUIRE_LT(controller.shares_demand(), before * std::exp(-2 / compaction_shares_hold_decay_time));
+    BOOST_REQUIRE_GT(controller.shares_demand(), 0.0);
+
+    // Nothing to run: the same.
+    bench.throttled = false;
+    bench.candidates_empty = true;
+    const auto before_empty = controller.shares_demand();
+    bench.run(controller, 8);
+    BOOST_REQUIRE_LT(controller.shares_demand(), before_empty);
+
+    // No write pressure and no backlog: the rate is zero, so nothing is starved and the demand
+    // decays to nothing.
+    bench.candidates_empty = false;
+    bench.allocated_per_tick = 0;
+    bench.run(controller, 800);
+    BOOST_REQUIRE_EQUAL(controller.rate(), 0.0);
+    BOOST_REQUIRE_LT(controller.shares_demand(), 1e-3);
+}
+
+// A threshold outside [0, 1) disables automatic compaction: no rate, no credit, no bypass whatever
+// the level, and the demand is dropped. The measurements keep running.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_rate_controller_disabled) {
+    controller_bench bench;
+    bench.allocated_per_tick = 10;
+    bench.utilization[0] = 100;
+    bench.available = 0;
+
+    for (double threshold : {1.0, -0.5, 1.5, std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::infinity()}) {
+        compaction_rate_controller controller;
+        bench.threshold = threshold;
+        bench.run(controller, 4);
+        BOOST_TEST_CONTEXT("threshold=" << threshold) {
+            BOOST_REQUIRE(!controller.enabled());
+            BOOST_REQUIRE_EQUAL(controller.rate(), 0.0);
+            BOOST_REQUIRE_EQUAL(controller.credit(), 0.0);
+            BOOST_REQUIRE(!controller.bypassed());
+            BOOST_REQUIRE(!controller.can_afford(1));
+            BOOST_REQUIRE_EQUAL(controller.shares_demand(), 0.0);
+            BOOST_REQUIRE_EQUAL(controller.backlog().candidate_segments, 0.0);
+            BOOST_REQUIRE_CLOSE(controller.allocation_rate(), 10 / controller_bench::dt, 1e-9);
+        }
+    }
+
+    // The edges of the range are valid: a threshold of zero compacts only dead segments.
+    compaction_rate_controller controller;
+    bench.threshold = 0.0;
+    bench.run(controller, 1);
+    BOOST_REQUIRE(controller.enabled());
+
+    // Disabling a running controller drops what it had.
+    bench.threshold = 0.5;
+    bench.available = 10000;
+    bench.run(controller, 8);
+    BOOST_REQUIRE_GT(controller.credit(), 0.0);
+    bench.threshold = 1.0;
+    bench.run(controller, 1);
+    BOOST_REQUIRE_EQUAL(controller.credit(), 0.0);
+    BOOST_REQUIRE(!controller.can_afford(1));
+}
+
 SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_candidate_score_ranks_by_efficiency) {
     constexpr uint64_t segment_size = 128 * 1024;
 

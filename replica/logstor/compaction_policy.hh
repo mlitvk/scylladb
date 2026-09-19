@@ -8,6 +8,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
@@ -17,6 +18,8 @@
 #include <ranges>
 #include <utility>
 #include <vector>
+
+#include "replica/logstor/segment_stats.hh"
 
 // How automatic compaction decides when to run, how much to take on at once, and which segments
 // to compact. None of it depends on how segments or compaction are implemented, so that tuning it
@@ -339,5 +342,184 @@ constexpr float compaction_shares_pressure_at_target = 1.0f / 3.0f;
 // is still in hand instead of at the point where writes stall: a workload that needs the maximum
 // shares must be able to settle somewhere that still leaves the write path room.
 float compaction_shares_pressure(uint64_t available_segments, free_segment_watermarks watermarks) noexcept;
+
+// What compaction could give back: the segments under the utilization threshold, and the net number
+// of segments compacting all of them would free, both read off a utilization histogram in O(buckets).
+// A bucket the threshold cuts through is taken to hold its segments uniformly, so the part under
+// the threshold counts pro rata - which is why the count is not an integer - and the lowest bucket
+// always counts in full: a segment under a sixteenth utilized is as good as dead, and the dead ones
+// have to be seen at any threshold, or a threshold of zero - the curve's ceiling - would report no
+// candidates while the disk holds dead segments. Both are estimates the rate controller spends as a
+// drain rate and the driver watches for change; what is selected is decided on the segments.
+struct compaction_backlog {
+    double candidate_segments{0};
+    double reclaimable_segments{0};
+};
+compaction_backlog reclaimable_backlog(const utilization_histogram& utilization, double threshold) noexcept;
+
+// How often the reclaim rate controller samples the shard.
+constexpr std::chrono::milliseconds compaction_rate_control_period{250};
+
+// The time constant the reclaimable backlog is drained over. Compaction's commanded rate is the
+// allocation rate plus this share of what is under the threshold, so a burst of garbage - a bulk
+// delete, a tablet leaving - is worked off exponentially with this time constant rather than in one
+// burst of jobs, and a backlog with no writes behind it still gets drained.
+constexpr double compaction_backlog_drain_time = 60.0;
+
+// The time constant the measured rates - the reclaim rate compaction delivers, and the part of the
+// commanded rate it leaves unspent - are smoothed over: the raw count of a period is a small
+// integer, and the unspent part is what the shares demand integrates. The allocation rate the
+// commanded rate is built from is deliberately *not* smoothed - the credit bucket integrates it, so
+// noise there cancels over a few periods while lag would not.
+constexpr double compaction_rate_measurement_time = 2.0;
+
+// The most credit a batch has to wait for before it is admitted, in reclaimed segments. A batch is
+// charged all it reclaims, so what it does not wait for it owes, and the debt is what paces the
+// next job; the cap bounds how long the best candidate - ranked by efficiency, so possibly a large
+// batch of dead segments - can hold the driver while smaller batches of other groups could run.
+constexpr size_t compaction_admission_credit = min_segments_per_compaction;
+
+// How fast the shares demand climbs while compaction is resource-bound - from nothing to the whole
+// range in this many seconds when it spends none of the rate it is given - and how fast it decays
+// once the throttle, not the shard, is what limits compaction, or there is nothing to run. Decay is
+// the slower of the two so that a demand which was needed is not given up at the first period the
+// throttle happens to engage in. While compaction keeps up the demand leaks at the third, much
+// slower, rate: what it has is at least what it needs, and the leak is how it finds out whether it
+// is more - the demand drifts down until a little of the rate goes unspent, and settles there.
+constexpr double compaction_shares_rise_time = 5.0;
+constexpr double compaction_shares_decay_time = 20.0;
+constexpr double compaction_shares_hold_decay_time = 120.0;
+
+// Paces automatic compaction and decides how much CPU to ask for it. The engine and
+// test/manual/logstor_compaction_sim.cc share it, so the simulated dynamics are the controller's own.
+//
+// What to compact is a per-segment rule - any segment under the utilization threshold - and
+// compaction runs continuously while any group holds such a batch. This controller decides how
+// fast. It commands a *net* reclaim rate, `n_in - n_out` per second,
+//
+//     R = A + B / T_drain
+//
+// the rate `A` at which segments compaction will have to reclaim are allocated, which is what holding
+// the free level takes, plus a slow drain of the reclaimable backlog `B`, which is what works off a
+// burst of garbage and what runs compaction when there are no writes. There is no setpoint on the
+// free level and so no error to integrate: the level is an outcome of the threshold, and stable,
+// since `d(free)/dt = R - A = B / T_drain >= 0` decays the backlog exponentially.
+//
+// The rate is spent through a credit bucket denominated in reclaimed segments: a job is submitted
+// once the bucket holds what its batch is estimated to reclaim, up to compaction_admission_credit,
+// and is charged all of it. The bucket carries at most a batch between periods, so an idle stretch
+// banks no more than one job and parallelism throttles itself - each job in flight needs its own
+// credit - and it owes at most a batch, so a job that ran on debt paces the next one and no more.
+//
+// Shares follow what the bucket says rather than the level. Shares are not a rate limiter - a group
+// at the minimum still gets the whole CPU when nothing competes for it - so they are the second,
+// slower loop, and the bucket is what tells the two apart: credit spilling over its cap while there
+// is something to run is rate compaction was given and could not spend, which is the one state more
+// CPU could change, and a job waiting for credit is compaction paced by the throttle, which more CPU
+// would not. A demand in [0, 1] climbs by the spilled fraction of the rate, decays while compaction
+// is credit-bound or has nothing to do, and leaks slowly while it keeps up, so that it settles at the
+// least shares that leave the rate all but spent rather than at the high-water mark of the last
+// transient. With no write pressure the demand decays to nothing and the scheduling group sits at
+// its minimum shares.
+//
+// The free level enters through the threshold curve, see utilization_threshold_curve: below the
+// anchor the threshold relaxes towards one and the shares demand is floored at the space pressure,
+// at the space floor the throttle is bypassed, since below it compaction is losing and the throttle
+// must not be the reason, and above the anchor the threshold falls as steeply as the curve is
+// configured to, which is what decides between a constant threshold and a held free level.
+class compaction_rate_controller {
+public:
+    // The time constants are parameters rather than only constants so that a simulation can sweep
+    // them against the real plant; the engine takes the defaults.
+    struct tuning {
+        double drain_time = compaction_backlog_drain_time;
+        double shares_rise_time = compaction_shares_rise_time;
+        double shares_decay_time = compaction_shares_decay_time;
+        double shares_hold_decay_time = compaction_shares_hold_decay_time;
+    };
+
+    compaction_rate_controller() = default;
+    explicit compaction_rate_controller(tuning t) noexcept : _tuning(t) {}
+
+    // One sampling period. The rates are given as the raw counts since the previous tick, since the
+    // controller is what smooths them.
+    struct sample {
+        uint64_t available_segments;
+        // The threshold as a function of the free level, from the configuration; a threshold outside
+        // [0, 1) disables automatic compaction along with the controller.
+        utilization_threshold_curve curve;
+        // The segments the shard's groups own, by utilization, which the backlog is read off.
+        const utilization_histogram& utilization;
+        // Segments allocated since the last tick that compaction will have to reclaim: the ones that
+        // join a group's segment set - the separator's output and streamed segments. Not the mixed
+        // segments the write path allocates, which the separator frees by reference count once it
+        // has copied their records out, and not compaction's own output, which is already netted
+        // out of the reclaim rate. Counting the mixed segments as well commands twice the rate
+        // compaction can deliver: the throttle then never engages and the shares climb for a
+        // deficit no CPU can close.
+        uint64_t segments_allocated;
+        // Segments reclaimed since the last tick, `n_in - n_out` over the jobs that finished.
+        uint64_t segments_reclaimed;
+        // The most credit the bucket may carry from one period into the next, in segments, and the
+        // most it may owe. One batch's worth, so that a batch is always eventually affordable, an
+        // idle stretch banks no more than one job, and a job run on debt delays no more than one.
+        double burst_cap;
+        double dt;
+        // Whether the last ranking found no batch with a net gain, and whether a job waited for
+        // credit since the last tick. Neither is a state more CPU would change, so both make the
+        // shares demand decay: the first because there is nothing to run, the second because the
+        // throttle, not the shard, is what compaction is waiting for.
+        bool candidates_empty;
+        bool throttled;
+    };
+
+    void tick(const sample&) noexcept;
+
+    // Whether a batch estimated to reclaim `reclaimed` segments may start now: the bucket holds
+    // what it reclaims, or compaction_admission_credit if that is less.
+    bool can_afford(size_t reclaimed) const noexcept {
+        return _bypassed || _credit >= double(std::min(reclaimed, compaction_admission_credit));
+    }
+    void charge(double segments) noexcept { _credit -= segments; }
+
+    // Whether the configured threshold enables automatic compaction at all.
+    bool enabled() const noexcept { return _enabled; }
+    // The commanded net reclaim rate, in segments per second.
+    double rate() const noexcept { return _rate; }
+    double credit() const noexcept { return _credit; }
+    double allocation_rate() const noexcept { return _alloc_rate; }
+    // The delivered net reclaim rate, smoothed.
+    double reclaim_rate() const noexcept { return _delivered_rate; }
+    // The part of the commanded rate compaction left unspent - credit that spilled over the cap -
+    // in segments per second, smoothed. Above zero with something to run is compaction starved of
+    // CPU or IO, and what the shares demand climbs by.
+    double unspent_rate() const noexcept { return _unspent_rate; }
+    const compaction_backlog& backlog() const noexcept { return _backlog; }
+    double space_pressure() const noexcept { return _pressure; }
+    // The threshold selection applies now: the curve at the current free level.
+    double utilization_threshold() const noexcept { return _threshold; }
+    // The fewest candidates a job is run on now, see effective_min_batch().
+    size_t min_batch() const noexcept { return effective_min_batch(_pressure); }
+    // How much of the range between the minimum and the maximum shares compaction asks for.
+    double shares_demand() const noexcept { return _demand; }
+    // Set when the level is at the space floor and the throttle is off altogether. Never before the
+    // first tick: an un-ticked controller has no rate to command, so it holds everything back rather
+    // than letting everything through.
+    bool bypassed() const noexcept { return _bypassed; }
+
+private:
+    tuning _tuning;
+    bool _enabled = false;
+    double _rate = 0;
+    double _credit = 0;
+    double _alloc_rate = 0;
+    double _delivered_rate = 0;
+    double _unspent_rate = 0;
+    compaction_backlog _backlog;
+    double _pressure = 0;
+    double _threshold = 1;
+    double _demand = 0;
+    bool _bypassed = false;
+};
 
 } // namespace replica::logstor
