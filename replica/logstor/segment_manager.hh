@@ -53,10 +53,22 @@ struct segment_manager_config {
     bool sparse_files = false;
     bool compaction_enabled = true;
     size_t max_segments_per_compaction = 32;
-    utils::updateable_value<double> trigger_compaction_threshold{0.05};
+    // A segment is a candidate for automatic compaction while its utilization is under this.
+    // Anything outside [0, 1) disables automatic compaction.
+    utils::updateable_value<double> compaction_utilization_threshold{0.5};
+    // The free level, as a fraction of the disk, at which that threshold applies, and the one above
+    // which only dead segments are compacted. 0 for twice the space floor, and for no
+    // ceiling, where the threshold is constant above the anchor - which is what a test gets, so
+    // that a tiny test disk is not one segment away from compacting nothing; the database default
+    // for the ceiling is a quarter of the disk. See utilization_threshold_curve.
+    utils::updateable_value<double> compaction_threshold_anchor{0};
+    utils::updateable_value<double> compaction_threshold_ceiling{0};
     seastar::scheduling_group compaction_sg;
     utils::updateable_value<float> compaction_static_shares;
-    utils::updateable_value<float> compaction_max_shares;
+    // The shares of the compaction scheduling group when compaction is idle or throttled, and when
+    // it is starved of CPU, see compaction_rate_controller.
+    utils::updateable_value<float> compaction_min_shares{50};
+    utils::updateable_value<float> compaction_max_shares{2000};
     seastar::scheduling_group separator_sg;
     seastar::scheduling_group split_compaction_sg;
 };

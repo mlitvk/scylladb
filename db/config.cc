@@ -1007,10 +1007,23 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     , logstor_sparse_files(this, "logstor_sparse_files", value_status::Used, false,
         "Create logstor data files as sparse files. When disabled, each file is preallocated and fully written with zeros, guaranteeing space is available and avoiding fragmentation. "
         "When enabled, the file is only extended to its nominal size, so unwritten regions consume no disk space. Useful for tests, where the disk space and I/O of formatting files is wasteful.")
-    , logstor_compaction_trigger_threshold(this, "logstor_compaction_trigger_threshold", liveness::LiveUpdate, value_status::Used, 0.05,
-        "Trigger automatic logstor compaction when the number of available segments drops below this fraction of the total number of logstor segments. A value of 0 disables the trigger threshold.")
+    , logstor_compaction_trigger_threshold(this, "logstor_compaction_trigger_threshold", value_status::Deprecated, 0.05,
+        "Deprecated and ignored. Automatic logstor compaction no longer holds a free-segment target; see logstor_compaction_utilization_threshold.")
+    , logstor_compaction_utilization_threshold(this, "logstor_compaction_utilization_threshold", liveness::LiveUpdate, value_status::Used, 0.5,
+        "A logstor segment is compacted once the fraction of it that holds live data falls below this, when the disk has logstor_compaction_threshold_anchor of its segments free. "
+        "Compaction runs continuously while any segment qualifies, paced to the write rate. The threshold is relaxed towards 1 as the free segments fall below the anchor, "
+        "and lowered towards 0 as they rise towards logstor_compaction_threshold_ceiling. Higher values reclaim space sooner at a higher write amplification. "
+        "A value of 0 compacts only segments with no live data. A value of 1 or more disables automatic compaction.")
+    , logstor_compaction_threshold_anchor(this, "logstor_compaction_threshold_anchor", liveness::LiveUpdate, value_status::Used, 0,
+        "The fraction of the logstor segments that has to be free for logstor_compaction_utilization_threshold to apply as configured. Below it compaction takes fuller segments, down to any segment with a net gain "
+        "when the free segments are down to the space floor. 0 puts the anchor at twice the space floor, about 6% of the disk.")
+    , logstor_compaction_threshold_ceiling(this, "logstor_compaction_threshold_ceiling", liveness::LiveUpdate, value_status::Used, 0.25,
+        "The fraction of the logstor segments free above which only dead segments are compacted. Between the anchor and this the threshold falls from its configured value to 0, so a lightly loaded disk spends its free space on cheaper compaction: "
+        "a ceiling just above the anchor holds the free segments at the anchor, at the lowest write amplification that allows, whatever the disk holds, and a ceiling far above it leaves the free space to the threshold. 0 for no ceiling, where the threshold stays constant above the anchor.")
+    , logstor_compaction_min_shares(this, "logstor_compaction_min_shares", liveness::LiveUpdate, value_status::Used, 50,
+        "CPU shares of the logstor compaction scheduling group while compaction is idle or keeping up with the write rate.")
     , logstor_compaction_max_shares(this, "logstor_compaction_max_shares", liveness::LiveUpdate, value_status::Used, 2000,
-        "Maximum CPU shares the logstor compaction controller gives the logstor compaction scheduling group, reached at full space pressure. ")
+        "Maximum CPU shares of the logstor compaction scheduling group, reached when compaction cannot keep up with the write rate or the disk is out of free segments.")
     , file_cache_size_in_mb(this, "file_cache_size_in_mb", value_status::Unused, 512,
         "Total memory to use for SSTable-reading buffers.")
     , memtable_flush_queue_size(this, "memtable_flush_queue_size", value_status::Unused, 4,

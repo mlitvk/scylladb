@@ -24,9 +24,9 @@
 //   - compaction_rate_controller, which paces compaction and asks for its CPU, and with it the
 //     utilization threshold, the reclaimable backlog and the shares demand - run rather than
 //     reimplemented, so that the simulated dynamics are the controller's own. The free-segment
-//     target, a relay on the level, is reimplemented here as --controller relay, so that the
-//     simulator keeps it as the baseline every controller is measured against whatever the
-//     engine runs;
+//     target the engine used to hold, a relay on the level, is reimplemented here as --controller
+//     relay, since the engine no longer has it and it is the baseline every controller is
+//     measured against;
 //   - the ondisk:: sizes and alignments, so that what a segment holds and what it wastes are real.
 //
 // What is modeled here, because the engine's version of it is IO or future bound: the primary index
@@ -126,11 +126,12 @@ enum class value_size_kind {
     lognormal,
 };
 
-// What decides when compaction runs. `threshold` is the utilization threshold policy: a segment is
-// a candidate while its utilization is under --utilization-threshold, compaction runs while any
-// group holds such a batch, and with a clock the engine's own compaction_rate_controller paces it -
-// to the allocation rate plus a drain of the backlog - and asks for its CPU. `relay` is the
-// free-segment target the engine holds - on below the target, off above the stop watermark.
+// What decides when compaction runs. `threshold` is the engine's policy: a segment is a candidate
+// while its utilization is under --utilization-threshold, compaction runs while any group holds
+// such a batch, and with a clock the engine's own compaction_rate_controller paces it - to the
+// allocation rate plus a drain of the backlog - and asks for its CPU. `relay` is the free-segment
+// target the engine used to hold - on below the target, off above the stop watermark - kept as the
+// baseline every controller is measured against.
 enum class controller_kind {
     relay,
     threshold,
@@ -145,11 +146,11 @@ enum class strategy_kind {
     random_victim,
 };
 
-// The free-segment target that drives automatic compaction in the engine, as a relay: on once the
-// available segments drop below `low`, off once they are back at `high`. The simulator has its own
-// copy, so that it keeps the relay as the baseline every controller is measured against whatever
-// the engine runs. `target_fraction` is the fraction of the disk the target is, floored and capped
-// as the engine's is; 0 disables it.
+// The free-segment target the engine used to drive automatic compaction with, as a relay: on once
+// the available segments drop below `low`, off once they are back at `high`. The engine replaced it
+// with a threshold on the utilization of a segment and a rate controller; it is kept here as the
+// baseline every controller is measured against. `target_fraction` is the fraction of the disk the
+// target is, floored and capped as the engine's was; 0 disables it.
 struct relay_watermarks {
     uint64_t low;
     uint64_t high;
@@ -172,8 +173,8 @@ bool relay_wants_compaction(bool running, uint64_t available_segments, relay_wat
     return available_segments < (running ? watermarks.high : watermarks.low);
 }
 
-// The shares ramp of the relay: 0 at the stop watermark, saturating at half the target, linear in
-// between. What a contended shard's compaction bandwidth follows under the relay.
+// The shares ramp that went with the relay: 0 at the stop watermark, saturating at half the target,
+// linear in between. What a contended shard's compaction bandwidth followed under the relay.
 double relay_shares_pressure(uint64_t available_segments, relay_watermarks watermarks) noexcept {
     if (available_segments >= watermarks.high) {
         return 0;
@@ -254,9 +255,9 @@ struct sim_params {
     // Where on the free level the threshold applies and where it has fallen to zero, as fractions
     // of the disk, 0 for the engine's defaults - an anchor at twice the space floor and no ceiling.
     // The ceiling is the stiffness: none is a constant threshold, one just above the anchor holds
-    // the free level there, which is what the relay does, made continuous.
+    // the free level there, which is what the relay did, made continuous.
     double threshold_anchor = 0;
-    double threshold_ceiling = 0;
+    double threshold_ceiling = 0.25;
     // The fewest candidates a job is run on while there is no space pressure, 0 for the engine's
     // effective_min_batch(). Under the threshold policy candidates arrive one at a time, so without
     // a floor a job is two or three segments.
@@ -463,7 +464,7 @@ const std::vector<param_desc>& all_params() {
         {"copy-bandwidth", "device bytes per second compaction may spend, 0 to derive from the write rate",
             [] (sim_params& p, const std::string& v) { p.copy_bandwidth = parse_size(v); },
             [] (const sim_params& p) { return fmt::format("{}", p.copy_bandwidth); }},
-        {"controller", "what decides when compaction runs: threshold or relay (the engine's)",
+        {"controller", "what decides when compaction runs: threshold (the engine's) or relay (the old target)",
             [] (sim_params& p, const std::string& v) { p.controller = parse_enum(v, controller_names); },
             [] (const sim_params& p) { return std::string(enum_name(p.controller, controller_names)); }},
         {"shares-authority", "how much of the compaction bandwidth follows the shares curve, 0 for an uncontended shard",
@@ -478,7 +479,7 @@ const std::vector<param_desc>& all_params() {
         {"threshold-anchor", "fraction of the disk free at which the threshold applies as configured, 0 for twice the space floor",
             [] (sim_params& p, const std::string& v) { p.threshold_anchor = std::stod(v); },
             [] (const sim_params& p) { return fmt::format("{}", p.threshold_anchor); }},
-        {"threshold-ceiling", "fraction of the disk free above which only dead segments are compacted, 0 for none",
+        {"threshold-ceiling", "fraction of the disk free above which only dead segments are compacted, 0 for none; the database default is 0.25",
             [] (sim_params& p, const std::string& v) { p.threshold_ceiling = std::stod(v); },
             [] (const sim_params& p) { return fmt::format("{}", p.threshold_ceiling); }},
         {"min-batch", "fewest candidate segments a job is run on under no space pressure, 0 for the engine's",
@@ -970,8 +971,7 @@ public:
             _watermarks.high = std::min(_segment_count, _watermarks.low + _p.free_band);
         }
         // What the jobs in flight may hold: the engine's space floor under the threshold
-        // policy, and the free-segment target under the relay, which the relay derives its limits
-        // from.
+        // policy, the free-segment target under the relay, which derived its limits from it.
         const auto budget = threshold_policy()
                 ? _space_floor
                 : std::max<uint64_t>(_watermarks.low, min_segments_per_compaction);

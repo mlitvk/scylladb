@@ -812,6 +812,90 @@ async def test_compaction(manager: ScyllaClusterManager):
             await manager.api.logstor_compaction(servers[0].ip_addr)
         await wait_for(segments_compacted, time.time() + 60)
 
+async def test_automatic_compaction_follows_the_utilization_threshold(manager: ScyllaClusterManager):
+    """
+    Automatic compaction is driven by a per-segment rule - a segment is compacted once less than
+    logstor_compaction_utilization_threshold of it is live - and paced by the reclaim rate controller,
+    rather than switched on below a free-segment target and off above a stop watermark. Overwrite a
+    small disk several times over and check that the loop is closed end to end: compaction runs
+    without being asked, the write path is never left without a segment, and once the writes stop
+    the backlog under the threshold is drained and the shares demand decays to nothing.
+
+    How smoothly the rate is actually held is not something a disk of 64 segments can show; that is
+    measured in test/manual/logstor_compaction_sim.cc instead.
+    """
+    disk_size_mb = 8
+    file_size_mb = 1
+    total_segments = disk_size_mb * 1024 * 1024 // segment_size
+
+    key_count = 500
+    value_size = 8000
+    # Enough overwrites to turn the disk over several times, so that reclaiming is the only way the
+    # writes can complete at all.
+    overwrites = 4
+
+    cmdline = ['--logger-log-level', 'logstor=debug', '--smp=1']
+    cfg = {
+        'logstor_disk_size_in_mb': disk_size_mb,
+        'logstor_file_size_in_mb': file_size_mb,
+        # A constant threshold above the anchor: on a disk of 64 segments the default ceiling sits a
+        # segment above the anchor, which is the free-level-holding end of the curve rather than the
+        # threshold this test is about. The curve itself is unit tested and simulated.
+        'logstor_compaction_threshold_ceiling': 0,
+        'experimental_features': ['logstor']
+    }
+    servers = await manager.servers_add(1, cmdline=cmdline, config=cfg)
+    server = servers[0]
+    cql = manager.get_cql()
+
+    async def get(name: str) -> float:
+        metrics = await manager.metrics.query(server.ip_addr)
+        value = metrics.get(f"scylla_logstor_sm_{name}")
+        assert value is not None, f"{name} is not exported"
+        return float(value)
+
+    async with new_test_keyspace(manager, "WITH tablets={'initial':1}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v text) WITH storage_engine = 'logstor'")
+
+        # The configured threshold applies while the disk is not short of segments.
+        assert await get("compaction_utilization_threshold") == pytest.approx(0.5)
+        assert await get("compaction_segments_reclaimed") == 0
+
+        stmt = cql.prepare(f"INSERT INTO {ks}.test (pk, v) VALUES (?, ?)")
+        for round in range(overwrites):
+            value = chr(ord('a') + round) * value_size
+            for i in range(key_count):
+                await cql.run_async(stmt, [i, value])
+            free_segments = await get("free_segments")
+            logger.info(f"round {round}: free_segments={free_segments} of {total_segments} "
+                        f"reclaimed={await get('compaction_segments_reclaimed')} "
+                        f"candidates={await get('compaction_candidate_segments')} "
+                        f"rate={await get('compaction_target_reclaim_rate')} "
+                        f"demand={await get('compaction_shares_demand')}")
+            assert free_segments >= 1, "the write path was left with no segment to write into"
+            assert free_segments <= total_segments
+
+        # Nothing asked for compaction, and the disk was turned over several times, so it ran on its
+        # own and gave segments back.
+        assert await get("compaction_segments_reclaimed") > 0
+
+        # With the writes over, whatever is under the threshold is drained - a group cannot reclaim
+        # from a single qualifying segment, so one may be left - and compaction goes idle: no rate
+        # commanded, and the shares demand decays to nothing.
+        async def drained():
+            candidates = await get("compaction_candidate_segments")
+            rate = await get("compaction_target_reclaim_rate")
+            demand = await get("compaction_shares_demand")
+            logger.info(f"draining: candidates={candidates} rate={rate} demand={demand}")
+            return candidates <= 1 and rate == 0 and demand < 0.05
+        await wait_for(drained, time.time() + 180)
+
+        # Everything written last is still there.
+        rows = await cql.run_async(f"SELECT pk, v FROM {ks}.test")
+        assert len(rows) == key_count
+        last = chr(ord('a') + overwrites - 1) * value_size
+        assert all(row.v == last for row in rows)
+
 async def test_drop_table(manager: ScyllaClusterManager):
     """
     Test that DROP TABLE works properly with logstor tables.

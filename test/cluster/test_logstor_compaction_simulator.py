@@ -292,7 +292,8 @@ async def test_threshold_policy(simulator_path):
         report, r"policy\s+utilization threshold ([\d.]+) at (\d+) free, 1 at the space floor of (\d+), (.*)")
     assert threshold == "0.5"
     assert int(anchor) == 2 * int(space_floor)
-    assert ceiling == "constant above the anchor"
+    # The ceiling defaults to the one of logstor_compaction_threshold_ceiling, a quarter of the disk.
+    assert ceiling == f"0 at {SEGMENTS // 4}"
 
     report = await run_ok(simulator_path, [*SMALL_DISK, *THRESHOLD, "--utilization", "0.4",
             "--threshold-anchor", "0.15", "--threshold-ceiling", "0.3"])

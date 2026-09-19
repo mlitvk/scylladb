@@ -69,6 +69,13 @@ Only step 4 writes to the disk - all other steps only update in-memory metadata.
 4. It reads the segments, finding all live records, and writing them into a write buffer. When the buffer is full it is flushed into a new segment, and for each recording updating the index location to the new location.
 5. After all live records are rewritten the old segments are freed.
 
+**Automatic compaction:**
+1. A segment is a candidate when its utilization (live record bytes / segment size) is under the utilization threshold, `logstor_compaction_utilization_threshold` (default 0.5).
+2. The threshold is a function of the number of free segments on the shard. It is 1 at the space floor (1/32 of the disk, at least two batches), the configured value at an anchor (`logstor_compaction_threshold_anchor`, default twice the space floor), and 0 at a ceiling (`logstor_compaction_threshold_ceiling`, default a quarter of the disk). Between these points it is linear. Below the anchor, a full disk compacts fuller segments. Above the anchor, a disk with free space compacts only emptier segments, which costs less write amplification.
+3. One driver per shard runs while a compaction group has a batch of candidates with a net gain. A reclaim rate controller paces the jobs at the allocation rate of the separator and streaming segments, plus the backlog under the threshold drained over 60 seconds. A job starts when the credit of the controller covers what its batch reclaims. At the space floor the throttle is off.
+4. The CPU shares of the compaction scheduling group are `logstor_compaction_min_shares` while compaction is idle or throttled, and increase to `logstor_compaction_max_shares` only while compaction cannot use the rate that the controller commands.
+5. A job that runs next to another job starts only if its batch reclaims at least 75% of what the best batch of the shard reclaims per byte copied.
+
 ## Usage
 
 ### Enabling Logstor

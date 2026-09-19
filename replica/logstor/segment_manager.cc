@@ -599,59 +599,41 @@ std::optional<file_id_t> file_manager::file_name_to_file_id(const std::string& f
     return std::nullopt;
 }
 
-// Maps compaction_shares_pressure() to CPU shares. The backlog is the pressure itself, so control
-// point inputs are in [0, 1]. The maximum output is logstor_compaction_max_shares.
-//
-// Each control point sits on an anchor of the pressure ramp:
-//
-//   - pressure 0, at or above automatic compaction's stop watermark: nothing to reclaim, so only
-//     explicitly submitted compaction runs, at the same floor the sstable controller uses;
-//   - pressure compaction_shares_pressure_at_target, at the free-segment target: the intended
-//     steady-state operating point;
-//   - pressure 1, once half the target has been consumed: compaction is losing against the write
-//     rate and gets the maximum.
-//
-// Shares therefore grow gently across the trigger's hysteresis band, where the target has already
-// been met, and six times faster below the target. The exact output at the target is not critical:
-// the loop settles at whatever shares match the write rate, and this constant only decides how far
-// below the target it settles.
+// Maps the rate controller's shares demand to CPU shares. The backlog is the demand itself, in
+// [0, 1], so the control points are its two ends: logstor_compaction_min_shares at no demand, where
+// compaction is idle or paced by the throttle, and logstor_compaction_max_shares at full demand,
+// where it is starved of CPU or the disk is at the space floor. Straight between the two,
+// since the demand already carries the shape - it is an integrator on the unspent rate, see
+// compaction_rate_controller - and both ends are live-updatable.
 class compaction_shares_controller : public backlog_controller {
 public:
-    static constexpr float idle_shares = 50.0f;
-    static constexpr float target_shares = 200.0f;
-    // Below this the scheduling group's shares stop being meaningful, so a cap this low is treated
+    // Below this the scheduling group's shares stop being meaningful, so a floor this low is treated
     // as a misconfiguration rather than as a choice to honour.
-    static constexpr float min_max_shares = 1.0f;
+    static constexpr float min_shares_floor = 1.0f;
 
-    compaction_shares_controller(scheduling_group sg, float static_shares, float max_shares,
+    compaction_shares_controller(scheduling_group sg, float static_shares, float min_shares, float max_shares,
             std::chrono::milliseconds interval, std::function<float()> current_backlog)
-        : backlog_controller(std::move(sg), interval, make_control_points(max_shares),
+        : backlog_controller(std::move(sg), interval, make_control_points(min_shares, max_shares),
                 std::move(current_backlog), static_shares) {
     }
 
-    void set_max_shares(float max_shares) {
-        _control_points = make_control_points(max_shares);
+    void set_shares_range(float min_shares, float max_shares) {
+        _control_points = make_control_points(min_shares, max_shares);
     }
 
 private:
-    // The ramp for a given cap, which is the only input: the ramp has no default of its own, so a
-    // controller always follows logstor_compaction_max_shares.
-    //
-    // The lower two points keep their constants, since the cap is meant to bound the peak rather
-    // than move the steady-state operating point. They only follow the cap down when keeping them
-    // would make the ramp non-monotone: scaling them is better than raising the configured cap back
-    // up, because the ramp then still responds to pressure instead of flattening into a fixed share
-    // count. The fractions are chosen to reproduce the constants exactly at any cap of 300 shares or
-    // more, so the coupling is invisible above the point where it is needed.
-    static std::vector<control_point> make_control_points(float max_shares) {
-        if (max_shares < min_max_shares) {
-            logstor_logger.warn("logstor_compaction_max_shares of {} is too low, using {}", max_shares, min_max_shares);
-            max_shares = min_max_shares;
+    static std::vector<control_point> make_control_points(float min_shares, float max_shares) {
+        if (min_shares < min_shares_floor) {
+            logstor_logger.warn("logstor_compaction_min_shares of {} is too low, using {}", min_shares, min_shares_floor);
+            min_shares = min_shares_floor;
         }
-        const float target = std::min(target_shares, max_shares * 2.0f / 3.0f);
+        if (max_shares < min_shares) {
+            logstor_logger.warn("logstor_compaction_max_shares of {} is below logstor_compaction_min_shares of {}, using the minimum",
+                    max_shares, min_shares);
+            max_shares = min_shares;
+        }
         return {
-                {0.0f, std::min(idle_shares, target / 4.0f)},
-                {compaction_shares_pressure_at_target, target},
+                {0.0f, min_shares},
                 {1.0f, max_shares},
         };
     }
@@ -662,11 +644,19 @@ public:
 
     struct compaction_config {
         bool compaction_enabled;
-        // Upper bound on the batch cap; the cap actually used is derived from the free-segment
-        // target by make_compaction_limits().
+        // Upper bound on the batch cap; the cap actually used is derived from the compaction
+        // space floor by make_compaction_limits().
         size_t max_segments_per_compaction;
+        // A segment is a candidate for automatic compaction while its utilization is under this,
+        // see compaction_rate_controller. Anything outside [0, 1) disables it.
+        utils::updateable_value<double> compaction_utilization_threshold;
+        // Where on the free level the threshold applies, and where it has fallen to zero, as
+        // fractions of the disk; 0 for the defaults. See utilization_threshold_curve.
+        utils::updateable_value<double> compaction_threshold_anchor;
+        utils::updateable_value<double> compaction_threshold_ceiling;
         seastar::scheduling_group compaction_sg;
         utils::updateable_value<float> compaction_static_shares;
+        utils::updateable_value<float> compaction_min_shares;
         utils::updateable_value<float> compaction_max_shares;
         seastar::scheduling_group separator_sg;
         seastar::scheduling_group split_compaction_sg;
@@ -700,6 +690,7 @@ private:
 
     compaction_shares_controller _shares_controller;
     utils::observer<float> _compaction_static_shares_observer;
+    utils::observer<float> _compaction_min_shares_observer;
     utils::observer<float> _compaction_max_shares_observer;
 
     struct group_compaction_state {
@@ -721,14 +712,57 @@ private:
     using group_compaction_state_map = absl::flat_hash_map<logstor_group*, std::unique_ptr<group_compaction_state>>;
     group_compaction_state_map _groups;
 
+    // The driver, run_auto_compaction(): started once, for the lifetime of the shard.
     shared_future<> _auto_compaction_completion{make_ready_future<>()};
-    // Sized for the static maximum; a run holds back the difference between it and the current
-    // limit for its duration, see run_auto_compaction().
+    // Sized for the static maximum; the driver holds back the difference between it and the derived
+    // parallelism, see run_auto_compaction().
     seastar::semaphore _auto_compaction_sem{max_auto_compaction_parallelism};
+    // Automatic jobs in flight. The semaphore cannot answer that, since the driver holds a unit
+    // while it works and holds back the ones the parallelism does not allow.
+    size_t _automatic_compactions_in_flight{0};
 
-    bool auto_compaction_active() const noexcept {
-        return !_auto_compaction_completion.available();
-    }
+    // How long the driver waits before it checks again without a signal. It is a safety net, not a
+    // poll: each event that can change what the driver waits for signals _compaction_wanted.
+    static constexpr auto driver_wait_timeout = std::chrono::seconds(10);
+    // What the driver is waiting for, and the condition variable it waits on. Only a controller
+    // tick can answer "no credit", and only a candidate appearing can answer "no candidates", so the
+    // tick signals for the one it can change.
+    enum class driver_wait {
+        nothing,
+        credit,
+        candidates,
+    };
+    driver_wait _driver_wait{driver_wait::nothing};
+    seastar::condition_variable _compaction_wanted;
+    // Whether the last ranking found no batch with a net gain, which the controller has to know: it
+    // is not a state more CPU could change.
+    bool _no_candidates{false};
+    // The segments under the threshold when the last ranking came back empty, as the backlog
+    // estimates them; a driver waiting for candidates is woken when that changes. The sentinel means
+    // "wake on anything".
+    static constexpr double no_empty_ranking = -1;
+    double _candidates_at_empty_ranking{no_empty_ranking};
+    // Whether a job waited for credit since the last tick.
+    bool _throttled_since_tick{false};
+
+    // The reclaim rate controller, ticking on its own timer rather than from the shares controller's
+    // backlog callback, which backlog_controller::adjust() does not call while compaction_static_shares
+    // pins the shares: pinning them must not silently disable rate control too.
+    compaction_rate_controller _rate_controller;
+    timer<lowres_clock> _rate_timer;
+    lowres_clock::time_point _last_rate_tick{};
+    uint64_t _last_segments_allocated{0};
+    uint64_t _last_segments_reclaimed{0};
+    // What jobs were charged when they started, cumulative, against what they actually gave back;
+    // the tick settles the difference.
+    uint64_t _reclaim_charged{0};
+    uint64_t _last_reclaim_charged{0};
+
+    // compaction_space_floor() for this disk, and the limits derived from it. The segment count and
+    // the configured batch bound are fixed for the lifetime of the segment manager, so both are
+    // computed once, in start().
+    uint64_t _space_floor{0};
+    compaction_limits _compaction_limits{};
 
 public:
     compaction_manager_impl(segment_manager_impl& sm, compaction_config cfg)
@@ -737,26 +771,38 @@ public:
         , _shares_controller(
                 _cfg.compaction_sg,
                 _cfg.compaction_static_shares.get(),
+                _cfg.compaction_min_shares.get(),
                 _cfg.compaction_max_shares.get(),
-                std::chrono::milliseconds(250),
+                compaction_rate_control_period,
                 [this] {
-                    return compaction_pressure();
+                    return float(_rate_controller.shares_demand());
                 }
             )
         , _compaction_static_shares_observer(_cfg.compaction_static_shares.observe([this] (float new_shares) {
             return _shares_controller.update_static_shares(new_shares);
         }))
+        , _compaction_min_shares_observer(_cfg.compaction_min_shares.observe([this] (float new_min_shares) {
+            logstor_logger.info("Updating logstor compaction min shares to {}", new_min_shares);
+            _shares_controller.set_shares_range(new_min_shares, _cfg.compaction_max_shares.get());
+        }))
         , _compaction_max_shares_observer(_cfg.compaction_max_shares.observe([this] (float new_max_shares) {
             logstor_logger.info("Updating logstor compaction max shares to {}", new_max_shares);
-            _shares_controller.set_max_shares(new_max_shares);
+            _shares_controller.set_shares_range(_cfg.compaction_min_shares.get(), new_max_shares);
         }))
+        , _rate_timer([this] { tick_rate_controller(); })
     {}
 
     future<> start();
     future<> stop();
 
     const stats& get_stats() const noexcept { return _stats; }
-    float compaction_pressure() const noexcept;
+    const compaction_rate_controller& rate_controller() const noexcept { return _rate_controller; }
+    size_t automatic_compactions_in_progress() const noexcept { return _automatic_compactions_in_flight; }
+    uint64_t space_floor() const noexcept { return _space_floor; }
+    const compaction_limits& limits() const noexcept { return _compaction_limits; }
+    // The threshold curve the configuration asks for now; every input is live-updatable, so it is
+    // built where it is used rather than cached.
+    utilization_threshold_curve threshold_curve() const noexcept;
 
     future<> flush_separator_buffer(separator_buffer&, logstor_group&) override;
     future<owned_write_buffer> allocate_separator_buffer() override;
@@ -769,38 +815,38 @@ public:
     future<> remove(logstor_group&) override;
     future<compaction_reenabler> disable_compaction(logstor_group&) override;
     compaction_reenabler disable_compaction_no_wait(logstor_group&) override;
+    // `limits` bound the batch the job picks: the automatic policy's, or anything with a net gain for
+    // a compaction that was asked for explicitly.
     future<> submit_normal_compaction(logstor_group&, compaction_batch_limits limits);
     future<> submit_split_compaction(logstor_group&, mutation_writer::classify_by_token_group, split_target_group) override;
 
-    void schedule_auto_compaction();
-
-    // Refreshes the cached free segment watermarks and the compaction limits derived from them.
-    // Called from start() and whenever trigger_compaction_threshold changes; the segment count and
-    // the configured batch bound are fixed for the lifetime of the segment manager, so the
-    // threshold is the only other input.
-    void refresh_free_segment_watermarks() noexcept;
-
 private:
+    void compute_compaction_limits() noexcept;
+    void tick_rate_controller() noexcept;
+    // Segments taken from the pool that compaction will have to reclaim, cumulative: the ones that
+    // join a group's segment set, which the separator and streaming write. Not the mixed segments
+    // normal writes take, which the separator frees once it has copied them out, and not
+    // compaction's own output. See compaction_rate_controller::sample::segments_allocated.
+    uint64_t reclaimable_segments_allocated() const noexcept;
 
-    // Cached result of make_free_segment_watermarks(). should_run_auto_compaction() calls
-    // get_free_segment_watermarks() on every segment allocation, so the cache avoids the same
-    // computation on each allocation.
-    free_segment_watermarks _free_segment_watermarks{};
-    compaction_limits _compaction_limits{};
-
-    const free_segment_watermarks& get_free_segment_watermarks() const noexcept {
-        return _free_segment_watermarks;
-    }
-
-    bool should_run_auto_compaction() noexcept;
+    future<> wait_for_compaction_work(driver_wait);
     future<> run_auto_compaction();
+    // Whether the marginal admission gate refuses `candidate`, a batch that would run next to the
+    // jobs in flight, against the best batch of its ranking. Counts and logs a refusal.
+    bool refuse_marginal_compaction(const compaction_candidate& candidate, const compaction_candidate_score& admission_bar);
+    // Charges the batch of `candidate` to the rate controller and submits its job, which holds
+    // `units` of the driver's semaphore until it finishes.
+    void start_automatic_compaction(compaction_candidate candidate, semaphore_units<> units);
 
     std::optional<compaction_candidate> select_segments_for_compaction(logstor_group&, const compaction_batch_limits&);
 
-    // What automatic compaction may take.
+    // What automatic compaction may take: the batch cap, and the threshold and the minimum batch
+    // the controller applies now.
     compaction_batch_limits automatic_batch_limits() const noexcept {
         return compaction_batch_limits{
             .batch_cap = _compaction_limits.batch_cap,
+            .min_batch = _rate_controller.min_batch(),
+            .max_utilization = _rate_controller.utilization_threshold(),
         };
     }
 
@@ -811,7 +857,12 @@ private:
             .batch_cap = _compaction_limits.batch_cap,
         };
     }
-    future<std::vector<compaction_candidate>> find_top_compaction_candidates(size_t);
+    // The best `max_candidates` groups by the batch each would run. A group already compacting is
+    // not ranked, and `_ranking_skipped_busy_group` records whether one was: an empty ranking then
+    // means the candidates are behind a job in flight rather than that the disk holds none, which
+    // the controller and the driver treat differently.
+    future<std::vector<compaction_candidate>> find_top_compaction_candidates(size_t max_candidates);
+    bool _ranking_skipped_busy_group{false};
 
     future<> submit_group_compaction(logstor_group&, std::function<future<>(group_compaction_state&)>, scheduling_group);
     future<> do_compaction(logstor_group&, const compaction_batch_limits&, abort_source&);
@@ -823,7 +874,20 @@ private:
 };
 
 future<> compaction_manager_impl::start() {
-    refresh_free_segment_watermarks();
+    compute_compaction_limits();
+    // Tick once now, over a nominal period, so that the controller's state - whether it is enabled,
+    // the threshold it applies, its gauges - is defined from the start rather than a period later.
+    _last_rate_tick = lowres_clock::now() - compaction_rate_control_period;
+    tick_rate_controller();
+    _rate_timer.arm_periodic(compaction_rate_control_period);
+    // The driver runs for the lifetime of the shard: what decides whether compaction runs now is
+    // whether any group holds a batch under the threshold and whether the controller has credit
+    // for it, and it decides that continuously rather than being switched on and off by the level.
+    _auto_compaction_completion = shared_future(with_scheduling_group(_cfg.compaction_sg, [this] {
+        return run_auto_compaction();
+    }).handle_exception([] (std::exception_ptr ep) {
+        logstor_logger.warn("Automatic logstor compaction failed: {}. Ignored", ep);
+    }));
     co_return;
 }
 
@@ -832,6 +896,8 @@ future<> compaction_manager_impl::stop() {
         co_return;
     }
     _admission_closed = true;
+    _rate_timer.cancel();
+    _compaction_wanted.broken();
 
     for (auto& [cg, state] : _groups) {
         state->as.request_abort();
@@ -1023,7 +1089,6 @@ class segment_manager_impl {
 
     utils::phased_barrier _writes_phaser{"logstor_sm_writes"};
 
-    utils::observer<double> _trigger_threshold_observer;
 
 public:
     static constexpr size_t block_alignment = ondisk::block_alignment;
@@ -1256,17 +1321,68 @@ private:
     friend class segment_stream_sink_impl;
 };
 
-float compaction_manager_impl::compaction_pressure() const noexcept {
-    return compaction_shares_pressure(_sm.available_segment_count(write_source::normal_write), get_free_segment_watermarks());
+void compaction_manager_impl::compute_compaction_limits() noexcept {
+    _space_floor = compaction_space_floor(_sm._max_segments.configured);
+    _compaction_limits = make_compaction_limits(_space_floor, _cfg.max_segments_per_compaction);
+
+    logstor_logger.debug("Compaction space floor {} segments, compaction parallelism {}, up to {} segments per compaction",
+            _space_floor, _compaction_limits.auto_parallelism, _compaction_limits.batch_cap);
 }
 
-void compaction_manager_impl::refresh_free_segment_watermarks() noexcept {
-    _free_segment_watermarks = make_free_segment_watermarks(_sm._max_segments.configured, _sm._cfg.trigger_compaction_threshold());
-    _compaction_limits = make_compaction_limits(_free_segment_watermarks, _cfg.max_segments_per_compaction);
+utilization_threshold_curve compaction_manager_impl::threshold_curve() const noexcept {
+    return make_utilization_threshold_curve(_sm._max_segments.configured, _space_floor,
+            _cfg.compaction_utilization_threshold(), _cfg.compaction_threshold_anchor(),
+            _cfg.compaction_threshold_ceiling());
+}
 
-    logstor_logger.debug("Free segment target {} (stop at {}), compaction parallelism {}, up to {} segments per compaction",
-            _free_segment_watermarks.low, _free_segment_watermarks.high,
-            _compaction_limits.auto_parallelism, _compaction_limits.batch_cap);
+uint64_t compaction_manager_impl::reclaimable_segments_allocated() const noexcept {
+    const auto& segments_get = _sm._segment_pool.get_stats().segments_get;
+    return segments_get[static_cast<size_t>(write_source::separator)]
+            + segments_get[static_cast<size_t>(write_source::streaming)];
+}
+
+void compaction_manager_impl::tick_rate_controller() noexcept {
+    const auto now = lowres_clock::now();
+    const auto dt = std::chrono::duration<double>(now - _last_rate_tick).count();
+    _last_rate_tick = now;
+
+    const auto allocated = reclaimable_segments_allocated();
+    const auto reclaimed = _stats.segments_reclaimed;
+
+    _rate_controller.tick({
+        .available_segments = _sm.available_segment_count(write_source::normal_write),
+        .curve = threshold_curve(),
+        .utilization = _sm._segment_stats.utilization,
+        .segments_allocated = allocated - _last_segments_allocated,
+        .segments_reclaimed = reclaimed - _last_segments_reclaimed,
+        .burst_cap = double(_compaction_limits.batch_cap),
+        .dt = dt,
+        .candidates_empty = _no_candidates,
+        .throttled = _throttled_since_tick || _driver_wait == driver_wait::credit,
+    });
+
+    // A job was charged what its batch was estimated to reclaim; this is the difference against
+    // what the jobs that finished actually gave back, refunded so that the credit stays denominated
+    // in segments the disk really got. Both are cumulative, so a job charged in one period and
+    // finished in another settles by itself.
+    const auto charged = _reclaim_charged - _last_reclaim_charged;
+    const auto delivered = reclaimed - _last_segments_reclaimed;
+    _rate_controller.charge(double(delivered) - double(charged));
+
+    _last_segments_allocated = allocated;
+    _last_segments_reclaimed = reclaimed;
+    _last_reclaim_charged = _reclaim_charged;
+    _throttled_since_tick = false;
+
+    // The bucket has been refilled, so a driver waiting for credit may be able to afford its
+    // candidate now; and a driver that found nothing to compact is told when the shard's segments
+    // under the threshold are not the ones it looked at, or when the controller is switched on.
+    if (_driver_wait == driver_wait::credit) {
+        _compaction_wanted.signal();
+    } else if (_driver_wait == driver_wait::candidates && _rate_controller.enabled()
+            && _rate_controller.backlog().candidate_segments != _candidates_at_empty_ranking) {
+        _compaction_wanted.signal();
+    }
 }
 
 compaction_manager_impl::group_compaction_state& compaction_manager_impl::get_group_state(logstor_group& cg) {
@@ -1313,8 +1429,12 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
     , _compaction_mgr(*this, compaction_manager_impl::compaction_config{
             .compaction_enabled = config.compaction_enabled,
             .max_segments_per_compaction = config.max_segments_per_compaction,
+            .compaction_utilization_threshold = config.compaction_utilization_threshold,
+            .compaction_threshold_anchor = config.compaction_threshold_anchor,
+            .compaction_threshold_ceiling = config.compaction_threshold_ceiling,
             .compaction_sg = config.compaction_sg,
             .compaction_static_shares = config.compaction_static_shares,
+            .compaction_min_shares = config.compaction_min_shares,
             .compaction_max_shares = config.compaction_max_shares,
             .separator_sg = config.separator_sg,
             .split_compaction_sg = config.split_compaction_sg
@@ -1347,11 +1467,6 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
             .max_cached = separator_flush_reserve,
       })
     , _separator_task_queue(separator_queue_depth)
-    , _trigger_threshold_observer(_cfg.trigger_compaction_threshold.observe([this] (double new_threshold) {
-            logstor_logger.debug("Compaction trigger threshold changed to {}", new_threshold);
-            _compaction_mgr.refresh_free_segment_watermarks();
-            _compaction_mgr.schedule_auto_compaction();
-      }))
     {
 
     if (_segments_per_file == 0) {
@@ -1425,6 +1540,38 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
                        sm::description("Counts number of output segments written by compaction.")),
         sm::make_counter("compaction_segments_reclaimed", _compaction_mgr.get_stats().segments_reclaimed,
                        sm::description("Counts the segments that compaction freed net: its input segments minus its output segments, for the jobs that finished.")),
+        sm::make_gauge("compaction_target_reclaim_rate", [this] { return _compaction_mgr.rate_controller().rate(); },
+                       sm::description("Net reclaim rate that the compaction rate controller commands, in segments per second: the allocation rate plus the drain of the reclaimable backlog.")),
+        sm::make_gauge("compaction_reclaim_rate", [this] { return _compaction_mgr.rate_controller().reclaim_rate(); },
+                       sm::description("Net reclaim rate that compaction delivers, in segments per second, smoothed. If it stays below the commanded rate, compaction does not have enough CPU, I/O or candidates.")),
+        sm::make_gauge("compaction_segment_alloc_rate", [this] { return _compaction_mgr.rate_controller().allocation_rate(); },
+                       sm::description("Number of segments per second, over the last control period, that the separator and streaming allocate. Compaction must reclaim these segments.")),
+        sm::make_gauge("compaction_rate_credit", [this] { return _compaction_mgr.rate_controller().credit(); },
+                       sm::description("Number of reclaimed segments of credit that compaction has not spent yet, negative after jobs ran on debt. Near zero, the throttle paces compaction. At the batch cap, compaction has nothing to reclaim or cannot run what it has.")),
+        sm::make_gauge("compaction_unspent_rate", [this] { return _compaction_mgr.rate_controller().unspent_rate(); },
+                       sm::description("Number of segments per second of the commanded rate that compaction did not use, smoothed: the credit that spilled over the cap. Above zero while there are candidates, compaction does not have enough CPU or I/O, and the shares demand increases.")),
+        sm::make_gauge("compaction_reclaimable_backlog", [this] { return _compaction_mgr.rate_controller().backlog().reclaimable_segments; },
+                       sm::description("Number of segments that compaction would free net if it compacted every segment under the utilization threshold.")),
+        sm::make_gauge("compaction_candidate_segments", [this] { return _compaction_mgr.rate_controller().backlog().candidate_segments; },
+                       sm::description("Number of segments under the utilization threshold, estimated from the utilization histogram. Automatic compaction takes these segments.")),
+        sm::make_gauge("compaction_utilization_threshold", [this] { return _compaction_mgr.rate_controller().utilization_threshold(); },
+                       sm::description("Utilization threshold that compaction applies now. A segment under it is a candidate. It is logstor_compaction_utilization_threshold at the anchor, and it increases to 1 below the anchor and decreases to 0 above it.")),
+        sm::make_gauge("compaction_space_pressure", [this] { return _compaction_mgr.rate_controller().space_pressure(); },
+                       sm::description("Space pressure, from 0 at the threshold anchor to 1 at the space floor, where the throttle is off.")),
+        sm::make_gauge("compaction_threshold_anchor", [this] { return _compaction_mgr.threshold_curve().anchor; },
+                       sm::description("Number of free segments at which the configured utilization threshold applies. Below it, the threshold increases to 1.")),
+        sm::make_gauge("compaction_threshold_ceiling", [this] { return _compaction_mgr.threshold_curve().ceiling; },
+                       sm::description("Number of free segments above which compaction takes only dead segments, or 0 if the threshold is constant above the anchor.")),
+        sm::make_gauge("compaction_shares_demand", [this] { return _compaction_mgr.rate_controller().shares_demand(); },
+                       sm::description("Fraction of the range from the minimum to the maximum compaction shares that compaction asks for: 0 when it is idle or throttled, and 1 when it cannot use its rate.")),
+        sm::make_gauge("compaction_space_floor", [this] { return _compaction_mgr.space_floor(); },
+                       sm::description("Number of free segments that compaction keeps for itself: what its jobs in flight may hold, and the free level at which space pressure is total.")),
+        sm::make_gauge("compaction_batch_cap", [this] { return _compaction_mgr.limits().batch_cap; },
+                       sm::description("Number of input segments that one automatic compaction job can take.")),
+        sm::make_gauge("compaction_parallelism", [this] { return _compaction_mgr.limits().auto_parallelism; },
+                       sm::description("Number of automatic compaction jobs that can run at the same time.")),
+        sm::make_gauge("automatic_compactions_in_progress", [this] { return _compaction_mgr.automatic_compactions_in_progress(); },
+                       sm::description("Number of automatic compaction jobs that run now.")),
         sm::make_counter("compaction_records_skipped", _compaction_mgr.get_stats().records_skipped,
                        sm::description("Counts number of records skipped during compaction.")),
         sm::make_counter("compaction_records_rewritten", _compaction_mgr.get_stats().records_rewritten,
@@ -1814,8 +1961,6 @@ future<seg_ptr> segment_manager_impl::allocate_segment() {
             co_return co_await make_segment(seg_id);
         }
 
-        _compaction_mgr.schedule_auto_compaction();
-
         // reuse freed segments
         if (!_free_segments.empty()) {
             auto seg_id = _free_segments.front();
@@ -1823,9 +1968,7 @@ future<seg_ptr> segment_manager_impl::allocate_segment() {
             co_return co_await make_segment(seg_id);
         }
 
-        // no free segments - wait for a segment to be freed.
-        // compaction might fail to free segments now, but can succeed later as data is freed.
-        // for now let's solve it by waiting with a timeout to re-trigger compaction periodically.
+        // No free segment. Compaction can free segments later, so wait and try again.
         try {
             co_await _segment_freed_cv.wait(std::chrono::seconds(5));
         } catch (seastar::broken_condition_variable&) {
@@ -2083,8 +2226,10 @@ compaction_manager_impl::select_segments_for_compaction(logstor_group& cg, const
 
 future<std::vector<compaction_manager_impl::compaction_candidate>>
 compaction_manager_impl::find_top_compaction_candidates(size_t max_candidates) {
-    top_compaction_candidates<compaction_candidate> best_candidates(max_candidates);
+    // The policy is read once per ranking, so that every group is ranked by the same rule.
     const auto limits = automatic_batch_limits();
+    top_compaction_candidates<compaction_candidate> best_candidates(max_candidates);
+    bool skipped_busy = false;
 
     std::vector<logstor_group*> group_snapshot;
     group_snapshot.reserve(_groups.size());
@@ -2101,7 +2246,15 @@ compaction_manager_impl::find_top_compaction_candidates(size_t max_candidates) {
         }
 
         auto& state = *it->second;
-        if (state.running() || state.compaction_disabled_counter > 0) {
+        if (state.running()) {
+            skipped_busy = true;
+            continue;
+        }
+        // A group with compaction disabled - being streamed, truncated, split - is not compaction
+        // working, and reading it as busy would have the shares demand climb for candidates nothing
+        // can run. It is skipped like a group without candidates: the fallback timeout re-ranks
+        // once it is enabled again.
+        if (state.compaction_disabled_counter > 0) {
             continue;
         }
 
@@ -2111,50 +2264,24 @@ compaction_manager_impl::find_top_compaction_candidates(size_t max_candidates) {
         }
     }
 
+    _ranking_skipped_busy_group = skipped_busy;
     co_return std::move(best_candidates).take();
 }
 
-bool compaction_manager_impl::should_run_auto_compaction() noexcept {
-    const auto running = auto_compaction_active();
-
-    if (_admission_closed) {
-        if (running) {
-            logstor_logger.debug("Stopping auto compaction: admission closed");
-        }
-        return false;
-    }
-
-    const auto available_segments = _sm.available_segment_count(write_source::normal_write);
-    const auto watermarks = get_free_segment_watermarks();
-
-    if (!auto_compaction_wanted(running, available_segments, watermarks)) {
-        if (running) {
-            logstor_logger.debug("Stopping auto compaction: available segments {} is above high watermark {}",
-                    available_segments, watermarks.high);
-        }
-        return false;
-    }
-
-    if (!running) {
-        logstor_logger.debug("Starting auto compaction: available segments {} is below the free segment target {}",
-                available_segments, watermarks.low);
-    }
-    return true;
-}
-
-void compaction_manager_impl::schedule_auto_compaction() {
-    if (can_submit_compaction() && should_run_auto_compaction() && !auto_compaction_active()) {
-        _auto_compaction_completion = shared_future(run_auto_compaction().handle_exception([] (std::exception_ptr ep) {
-            logstor_logger.warn("Automatic logstor compaction failed: {}. Ignored", ep);
-        }));
+future<> compaction_manager_impl::wait_for_compaction_work(driver_wait reason) {
+    _driver_wait = reason;
+    auto f = co_await coroutine::as_future(_compaction_wanted.wait(driver_wait_timeout));
+    _driver_wait = driver_wait::nothing;
+    if (f.failed()) {
+        // A timeout, or the condition variable broken by stop(); the loop re-checks either way.
+        f.ignore_ready_future();
     }
 }
 
 future<> compaction_manager_impl::run_auto_compaction() {
-    // The parallelism is snapshotted for the whole run. It only changes with the free-segment
-    // target, which is a rarely moved live-updatable setting, and holding back the difference to
-    // the semaphore's static size for the duration of the run is what lets the drain below wait
-    // for exactly the jobs this run submitted.
+    // The difference between the semaphore's static size and the parallelism the space floor
+    // allows, held for the lifetime of the driver: a split compaction must never queue behind
+    // automatic jobs, and the jobs in flight must never hold more than the space floor.
     const auto parallelism = _compaction_limits.auto_parallelism;
     auto held_back = co_await get_units(_auto_compaction_sem, max_auto_compaction_parallelism - parallelism);
 
@@ -2163,19 +2290,39 @@ future<> compaction_manager_impl::run_auto_compaction() {
     // produced `pending`.
     std::optional<compaction_candidate_score> admission_bar;
 
-    while (can_submit_compaction() && should_run_auto_compaction()) {
+    while (!_admission_closed) {
+        if (!can_submit_compaction() || !_rate_controller.enabled()) {
+            // Compaction is disabled, or the threshold is. As far as the controller is concerned
+            // that is the same as having nothing to reclaim.
+            pending.clear();
+            _no_candidates = true;
+            _candidates_at_empty_ranking = no_empty_ranking;
+            co_await wait_for_compaction_work(driver_wait::candidates);
+            continue;
+        }
+
         auto units = co_await get_units(_auto_compaction_sem, 1);
 
-        if (!can_submit_compaction() || !should_run_auto_compaction()) {
+        if (_admission_closed) {
             break;
         }
 
         if (pending.empty()) {
             pending = co_await find_top_compaction_candidates(parallelism);
             if (pending.empty()) {
-                co_await seastar::sleep(std::chrono::milliseconds(100));
+                // Either no group holds a batch under the threshold with a net gain, or every group
+                // that might is already compacting - on a shard with a single tablet, whenever a
+                // job is in flight. The controller has to know which: the first is not a state more
+                // CPU could change, the second is compaction working. Either way the driver waits,
+                // until the segments under the threshold are not the ones it has just looked at, or
+                // until a job finishes and gives its group back.
+                _no_candidates = !_ranking_skipped_busy_group;
+                _candidates_at_empty_ranking = _rate_controller.backlog().candidate_segments;
+                units.return_all();
+                co_await wait_for_compaction_work(driver_wait::candidates);
                 continue;
             }
+            _no_candidates = false;
             admission_bar = marginal_admission_bar(pending);
         }
 
@@ -2187,19 +2334,26 @@ future<> compaction_manager_impl::run_auto_compaction() {
             continue;
         }
 
-        // Whatever the fiber does not hold of the snapshotted parallelism is held by a job in
-        // flight, so a candidate that reaches here while the semaphore is short of units would run
-        // as a marginal job - one that buys throughput at the marginal write amplification of its
-        // own batch. With unequal groups that is arbitrarily bad: a job slot can only be filled by a
-        // group that is not already compacting, so a shard whose garbage sits in one tablet spends
-        // the rest of its parallelism rewriting groups that hold nothing worth reclaiming. A
-        // marginal job therefore has to keep up with the best batch the shard has to offer.
+        // The throttle, which is what makes compaction continuous and smooth instead of running
+        // flat out whenever a candidate exists. It paces a batch of fully dead segments like any
+        // other, even though that one copies nothing: what it costs is not the copying but the job.
+        // At the space floor the controller has the throttle off altogether.
+        if (!_rate_controller.can_afford(candidate.score.reclaimed())) {
+            _throttled_since_tick = true;
+            // A later candidate reclaiming less might be affordable sooner, but this one is the
+            // best, and what it waits for is bounded by compaction_admission_credit. Keep it for
+            // when the bucket has filled.
+            pending.push_back(std::move(candidate));
+            units.return_all();
+            co_await wait_for_compaction_work(driver_wait::credit);
+            continue;
+        }
+
+        // Whatever the fiber does not hold of the parallelism is held by a job in flight, so a
+        // candidate that reaches here while the semaphore is short of units would run as a marginal
+        // job, next to the jobs in flight.
         if (admission_bar && std::cmp_less(_auto_compaction_sem.available_units(), parallelism - 1)
-                && !candidate.score.efficiency_at_least(*admission_bar, compaction_marginal_admission_ratio)) {
-            ++_stats.batches_refused;
-            logstor_logger.debug("Refused a marginal compaction of table {}: efficiency {} against the best candidate's {}",
-                    candidate.group->table_id(), candidate.score.efficiency(_sm.get_segment_size()),
-                    admission_bar->efficiency(_sm.get_segment_size()));
+                && refuse_marginal_compaction(candidate, *admission_bar)) {
             // The ranking is best first, so no later candidate clears the bar either, and nothing
             // the bar is compared with changes until a job finishes and gives its inputs back.
             // Taking the rest of the parallelism is what waits for the jobs in flight; re-ranking
@@ -2210,15 +2364,49 @@ future<> compaction_manager_impl::run_auto_compaction() {
             continue;
         }
 
-        // The slot is released only once the job is done, which is what wakes this fiber up to
-        // submit the next candidate.
-        (void)submit_normal_compaction(*candidate.group, automatic_batch_limits()).handle_exception([] (std::exception_ptr ep) {
-            logstor_logger.warn("Automatic logstor compaction failed: {}. Ignored", ep);
-        }).finally([units = std::move(units)] {});
+        start_automatic_compaction(std::move(candidate), std::move(units));
     }
 
-    // Wait for submitted jobs to complete.
-    co_await get_units(_auto_compaction_sem, parallelism);
+    // Wait for the jobs still in flight, which is what makes this future the driver's completion.
+    held_back.return_all();
+    co_await get_units(_auto_compaction_sem, max_auto_compaction_parallelism);
+}
+
+bool compaction_manager_impl::refuse_marginal_compaction(const compaction_candidate& candidate,
+        const compaction_candidate_score& admission_bar) {
+    // A marginal job buys throughput at the marginal write amplification of its own batch. With
+    // unequal groups that is arbitrarily bad: a job slot can only be filled by a group that is not
+    // already compacting, so a shard whose garbage sits in one tablet spends the rest of its
+    // parallelism rewriting groups that hold nothing worth reclaiming. A marginal job therefore has
+    // to keep up with the best batch the shard has to offer.
+    if (candidate.score.efficiency_at_least(admission_bar, compaction_marginal_admission_ratio)) {
+        return false;
+    }
+    ++_stats.batches_refused;
+    logstor_logger.debug("Refused a marginal compaction of table {}: efficiency {} against the best candidate's {}",
+            candidate.group->table_id(), candidate.score.efficiency(_sm.get_segment_size()),
+            admission_bar.efficiency(_sm.get_segment_size()));
+    return true;
+}
+
+void compaction_manager_impl::start_automatic_compaction(compaction_candidate candidate, semaphore_units<> units) {
+    // Charged with what the batch is estimated to reclaim, which is what is known now; the next
+    // controller tick settles the difference against what the jobs actually gave back.
+    _rate_controller.charge(double(candidate.score.reclaimed()));
+    _reclaim_charged += candidate.score.reclaimed();
+
+    // The slot is released only once the job is done, which is what wakes the driver up to submit
+    // the next candidate.
+    ++_automatic_compactions_in_flight;
+    (void)submit_normal_compaction(*candidate.group, automatic_batch_limits()).handle_exception([] (std::exception_ptr ep) {
+        logstor_logger.warn("Automatic logstor compaction failed: {}. Ignored", ep);
+    }).finally([this, units = std::move(units)] {
+        --_automatic_compactions_in_flight;
+        // The group is free to be ranked again, and its inputs have been given back.
+        if (_driver_wait == driver_wait::candidates) {
+            _compaction_wanted.signal();
+        }
+    });
 }
 
 // A single buffer used by compaction for rewriting records into new segments in a single compaction group.
