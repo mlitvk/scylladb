@@ -45,7 +45,8 @@
 // Examples:
 //
 //   logstor_compaction_sim --utilization 0.75 --trigger-threshold 0.1
-//   logstor_compaction_sim --free-band 1 --utilization 0.85 --batch-cap 8
+//   logstor_compaction_sim --sweep trigger-threshold=0.03,0.05,0.08,0.1,0.15,0.2
+//   logstor_compaction_sim --free-band 1 --sweep utilization=0.75,0.85 --sweep batch-cap=8,16,32
 
 #include <seastar/core/align.hh>
 #include <seastar/core/app-template.hh>
@@ -134,6 +135,7 @@ struct sim_params {
     size_t batch_cap = 32;
     // Replaces the parallelism make_compaction_limits() derives. 0 keeps the derived one.
     size_t parallelism = 0;
+    double extension_tolerance = compaction_batch_extension_tolerance;
     strategy_kind strategy = strategy_kind::efficiency;
     // Compaction jobs one group may run at once. The engine serializes them per group, so a shard
     // whose garbage sits in few groups has to spend its parallelism on groups that hold little.
@@ -162,7 +164,7 @@ struct sim_params {
 
 // ---------------------------------------------------------------------------
 // Parameter registry: the one place that names, parses and prints a parameter, so that the command
-// line and the report of a run speak the same names.
+// line, --sweep and the report of a run all speak the same names.
 // ---------------------------------------------------------------------------
 
 uint64_t parse_size(const std::string& s) {
@@ -260,6 +262,9 @@ const std::vector<param_desc>& all_params() {
         {"parallelism", "compaction jobs in flight, 0 for the derived one",
             [] (sim_params& p, const std::string& v) { p.parallelism = std::stoul(v); },
             [] (const sim_params& p) { return fmt::format("{}", p.parallelism); }},
+        {"extension-tolerance", "how much efficiency a batch may give up in exchange for being larger",
+            [] (sim_params& p, const std::string& v) { p.extension_tolerance = std::stod(v); },
+            [] (const sim_params& p) { return fmt::format("{}", p.extension_tolerance); }},
         {"strategy", "candidate scoring rule: efficiency, absolute or random",
             [] (sim_params& p, const std::string& v) { p.strategy = parse_enum<strategy_kind>(v, strategy_names); },
             [] (const sim_params& p) { return std::string(enum_name(p.strategy, strategy_names)); }},
@@ -307,6 +312,15 @@ const std::vector<param_desc>& all_params() {
             [] (const sim_params& p) { return fmt::format("{}", p.seed); }},
     };
     return params;
+}
+
+const param_desc& find_param(const std::string& name) {
+    const auto& params = all_params();
+    const auto it = std::ranges::find(params, name, &param_desc::name);
+    if (it == params.end()) {
+        throw std::invalid_argument(fmt::format("unknown parameter '{}'", name));
+    }
+    return *it;
 }
 
 // ---------------------------------------------------------------------------
@@ -824,6 +838,7 @@ private:
     std::optional<sim_batch> select_batch_efficiency(sim_group& g) {
         auto batch = select_compaction_batch(g.segments, _p.segment_size, compaction_batch_limits{
             .batch_cap = _batch_cap,
+            .extension_tolerance = _p.extension_tolerance,
         });
         if (!batch) {
             return std::nullopt;
@@ -1273,7 +1288,7 @@ void print_report(const sim_result& r) {
     fmt::print("  free target    {:.4g}% -> low {} high {}{}\n", p.trigger_threshold * 100,
             r.watermarks.low, r.watermarks.high, p.free_band ? " (band pinned)" : "");
     fmt::print("  compaction     batch cap {}, parallelism {}, tolerance {}, strategy {}\n",
-            r.batch_cap, r.parallelism, compaction_batch_extension_tolerance, enum_name(p.strategy, strategy_names));
+            r.batch_cap, r.parallelism, p.extension_tolerance, enum_name(p.strategy, strategy_names));
     if (p.max_jobs_per_group > 1) {
         fmt::print("                 {} jobs per group\n", p.max_jobs_per_group);
     }
@@ -1359,6 +1374,121 @@ void print_report(const sim_result& r) {
     fmt::print("  segments allocated {}, freed {}\n", s.segments_allocated, s.segments_freed);
 }
 
+// The columns of the sweep table, which are what runs are compared by.
+struct sweep_column {
+    const char* name;
+    double (*value)(const sim_result&);
+};
+
+constexpr sweep_column sweep_columns[] = {
+    {"U", [] (const sim_result& r) { return r.mean_utilization(); }},
+    {"U_eff", [] (const sim_result& r) { return r.effective_utilization(); }},
+    {"U_sealed", [] (const sim_result& r) { return r.sealed_utilization(); }},
+    {"free%", [] (const sim_result& r) { return r.mean_free_fraction() * 100; }},
+    {"WA_gc", [] (const sim_result& r) { return r.wa_gc(); }},
+    {"dev WA", [] (const sim_result& r) { return r.device_wa(); }},
+    {"read/user", [] (const sim_result& r) { return r.read_per_user_byte(); }},
+    {"victim u", [] (const sim_result& r) { return r.mean_victim_utilization(); }},
+    {"seg/job", [] (const sim_result& r) { return r.segments_per_job(); }},
+    {"jobs", [] (const sim_result& r) { return double(r.stats.compaction_jobs); }},
+};
+
+void print_sweep_table(const std::vector<std::string>& swept, const std::vector<sim_result>& results, bool csv) {
+    std::vector<std::string> header(swept);
+    for (const auto& c : sweep_columns) {
+        header.emplace_back(c.name);
+    }
+
+    std::vector<std::vector<std::string>> rows;
+    for (const auto& r : results) {
+        std::vector<std::string> row;
+        for (const auto& name : swept) {
+            row.push_back(find_param(name).get(r.params));
+        }
+        for (const auto& c : sweep_columns) {
+            row.push_back(r.out_of_space ? "-" : fmt::format("{:.4g}", c.value(r)));
+        }
+        rows.push_back(std::move(row));
+    }
+
+    if (csv) {
+        fmt::print("{}\n", fmt::join(header, ","));
+        for (const auto& row : rows) {
+            fmt::print("{}\n", fmt::join(row, ","));
+        }
+        return;
+    }
+
+    std::vector<size_t> width;
+    for (size_t i = 0; i < header.size(); ++i) {
+        size_t w = header[i].size();
+        for (const auto& row : rows) {
+            w = std::max(w, row[i].size());
+        }
+        width.push_back(w);
+    }
+    auto print_row = [&] (const std::vector<std::string>& row) {
+        for (size_t i = 0; i < row.size(); ++i) {
+            fmt::print("{}{:>{}}", i ? "  " : "", row[i], width[i]);
+        }
+        fmt::print("\n");
+    };
+    print_row(header);
+    for (const auto& row : rows) {
+        print_row(row);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sweeps
+// ---------------------------------------------------------------------------
+
+struct sweep_axis {
+    std::string name;
+    std::vector<std::string> values;
+};
+
+sweep_axis parse_sweep(const std::string& spec) {
+    const auto eq = spec.find('=');
+    if (eq == std::string::npos) {
+        throw std::invalid_argument(fmt::format("a sweep is 'parameter=value,value,...', got '{}'", spec));
+    }
+    sweep_axis axis{.name = spec.substr(0, eq)};
+    find_param(axis.name);
+    std::string_view values(spec);
+    values.remove_prefix(eq + 1);
+    while (!values.empty()) {
+        const auto comma = values.find(',');
+        axis.values.emplace_back(values.substr(0, comma));
+        if (comma == std::string_view::npos) {
+            break;
+        }
+        values.remove_prefix(comma + 1);
+    }
+    if (axis.values.empty()) {
+        throw std::invalid_argument(fmt::format("the sweep of '{}' has no values", axis.name));
+    }
+    return axis;
+}
+
+std::vector<sim_params> expand_sweeps(const sim_params& base, const std::vector<sweep_axis>& axes) {
+    std::vector<sim_params> configs{base};
+    for (const auto& axis : axes) {
+        const auto& param = find_param(axis.name);
+        std::vector<sim_params> expanded;
+        expanded.reserve(configs.size() * axis.values.size());
+        for (const auto& config : configs) {
+            for (const auto& value : axis.values) {
+                auto p = config;
+                param.set(p, value);
+                expanded.push_back(std::move(p));
+            }
+        }
+        configs = std::move(expanded);
+    }
+    return configs;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1371,6 +1501,9 @@ int main(int argc, char** argv) {
     for (const auto& param : all_params()) {
         add(param.name, boost::program_options::value<std::string>(), param.description);
     }
+    add("sweep", boost::program_options::value<std::vector<std::string>>()->composing(),
+            "run every combination of 'parameter=value,value,...', may be repeated");
+    add("csv", "print the sweep table as csv");
 
     return app.run(argc, argv, [&app] {
         return async([&app] {
@@ -1382,7 +1515,32 @@ int main(int argc, char** argv) {
                 }
             }
 
-            print_report(compaction_sim(base).run());
+            std::vector<sweep_axis> axes;
+            if (opts.contains("sweep")) {
+                for (const auto& spec : opts["sweep"].as<std::vector<std::string>>()) {
+                    axes.push_back(parse_sweep(spec));
+                }
+            }
+
+            const auto configs = expand_sweeps(base, axes);
+            if (configs.size() == 1) {
+                print_report(compaction_sim(configs.front()).run());
+                return 0;
+            }
+
+            std::vector<sim_result> results;
+            results.reserve(configs.size());
+            for (size_t i = 0; i < configs.size(); ++i) {
+                fmt::print(stderr, "\rrunning {} of {} ...", i + 1, configs.size());
+                results.push_back(compaction_sim(configs[i]).run());
+            }
+            fmt::print(stderr, "\r                              \r");
+
+            std::vector<std::string> swept;
+            for (const auto& axis : axes) {
+                swept.push_back(axis.name);
+            }
+            print_sweep_table(swept, results, opts.contains("csv"));
             return 0;
         });
     });
