@@ -47,6 +47,7 @@
 //   logstor_compaction_sim --utilization 0.75 --trigger-threshold 0.1
 //   logstor_compaction_sim --sweep trigger-threshold=0.03,0.05,0.08,0.1,0.15,0.2
 //   logstor_compaction_sim --free-band 1 --sweep utilization=0.75,0.85 --sweep batch-cap=8,16,32
+//   logstor_compaction_sim --self-test
 
 #include <seastar/core/align.hh>
 #include <seastar/core/app-template.hh>
@@ -1440,6 +1441,92 @@ void print_sweep_table(const std::vector<std::string>& swept, const std::vector<
 }
 
 // ---------------------------------------------------------------------------
+// Self test
+// ---------------------------------------------------------------------------
+
+// Runs a few short simulations and checks what the model has to satisfy however it is parameterized:
+// the accounting invariants, which check_invariants() makes on every run, and the steady-state
+// identity that compaction reads what goes into the segments it compacts.
+int self_test() {
+    struct case_desc {
+        const char* name;
+        sim_params params;
+    };
+
+    auto base = [] {
+        sim_params p;
+        p.disk_size = 64 * 1024 * 1024;
+        p.writes = 400000;
+        return p;
+    };
+
+    std::vector<case_desc> cases;
+    cases.push_back({"uniform, one group", base()});
+    {
+        auto p = base();
+        p.groups = 8;
+        p.workload = workload_kind::zipf;
+        cases.push_back({"zipf, eight groups", p});
+    }
+    {
+        auto p = base();
+        p.value_size_dist = value_size_kind::lognormal;
+        p.workload = workload_kind::hot_cold;
+        cases.push_back({"hot-cold, lognormal values", p});
+    }
+    {
+        auto p = base();
+        p.free_band = 1;
+        p.strategy = strategy_kind::absolute;
+        p.batch_cap = 8;
+        cases.push_back({"absolute rule, pinned free level", p});
+    }
+    {
+        auto p = base();
+        p.groups = 32;
+        p.group_skew = 1.5;
+        p.max_jobs_per_group = 4;
+        cases.push_back({"four jobs per group, skewed groups", p});
+    }
+
+    bool failed = false;
+    for (const auto& c : cases) {
+        try {
+            const auto r = compaction_sim(c.params).run();
+            if (r.out_of_space) {
+                fmt::print("FAIL {}: ran out of space\n", c.name);
+                failed = true;
+                continue;
+            }
+            if (r.stats.compaction_jobs == 0) {
+                fmt::print("FAIL {}: compaction never ran\n", c.name);
+                failed = true;
+                continue;
+            }
+            // In steady state every byte written into a group's segments is eventually read by
+            // compaction, and the segments it reads are read whole, so the read side also carries
+            // the dead space they hold. The identity is therefore approximate.
+            const auto written = double(r.stats.compaction_data_bytes + r.stats.user_data_bytes);
+            const auto read = double(r.stats.compaction_bytes_read);
+            const auto ratio = written > 0 ? read / written : 0;
+            if (ratio < 0.7 || ratio > 1.6) {
+                fmt::print("FAIL {}: compaction read {:.3f} of what went into the segments,"
+                           " expected the two to be within half of each other\n", c.name, ratio);
+                failed = true;
+                continue;
+            }
+            fmt::print("ok   {}: WA_gc {:.3f}, U_eff {:.4f}, read/write {:.3f}\n",
+                    c.name, r.wa_gc(), r.effective_utilization(), ratio);
+        } catch (const std::exception& e) {
+            fmt::print("FAIL {}: {}\n", c.name, e.what());
+            failed = true;
+        }
+    }
+    fmt::print("{}\n", failed ? "self test FAILED" : "self test passed");
+    return failed ? 1 : 0;
+}
+
+// ---------------------------------------------------------------------------
 // Sweeps
 // ---------------------------------------------------------------------------
 
@@ -1504,10 +1591,15 @@ int main(int argc, char** argv) {
     add("sweep", boost::program_options::value<std::vector<std::string>>()->composing(),
             "run every combination of 'parameter=value,value,...', may be repeated");
     add("csv", "print the sweep table as csv");
+    add("self-test", "check the model's invariants over a few short runs and exit");
 
     return app.run(argc, argv, [&app] {
         return async([&app] {
             const auto& opts = app.configuration();
+            if (opts.contains("self-test")) {
+                return self_test();
+            }
+
             sim_params base;
             for (const auto& param : all_params()) {
                 if (opts.contains(param.name)) {
