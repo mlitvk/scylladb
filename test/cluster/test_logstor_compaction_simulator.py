@@ -337,6 +337,78 @@ async def test_threshold_ceiling(simulator_path):
     assert free == sorted(free)
 
 
+async def test_rate_controller(simulator_path, tmp_path):
+    """Runs the threshold policy with a clock. The engine's rate controller paces it.
+
+    In steady state compaction must deliver the rate the controller commands, and the time series
+    must show the controller's state.
+    """
+    trace = tmp_path / "trace.csv"
+    report = await run_ok(simulator_path, [*SMALL_DISK, *THRESHOLD, "--utilization", "0.6",
+            "--write-rate", str(WRITE_RATE), "--trace", str(trace)])
+    check_report(report, 0.6)
+    assert "controller threshold" in report
+    assert "write path stalled" not in report
+    delivered, commanded = map(float, report_value(
+        report, r"reclaim rate\s+([\d.]+) segments/s delivered, ([\d.]+) commanded"))
+    assert delivered == pytest.approx(commanded, rel=0.2)
+    throttled = float(report_value(report, r"periods throttled\s+([\d.]+)%")[0])
+    assert 0 <= throttled <= 100
+
+    rows = parse_csv(trace.read_text())
+    assert rows
+    space_floor = int(rows[0]["space_floor"])
+    assert sum(int(r["free_segments"]) for r in rows) / len(rows) > space_floor
+    for r in rows:
+        assert int(r["space_floor"]) == space_floor
+        assert 0 <= float(r["threshold"]) <= 1
+        assert float(r["backlog"]) >= 0
+        assert float(r["commanded_rate"]) >= 0
+        assert float(r["allocation_rate"]) >= 0
+
+
+async def test_rate_controller_through_a_step(simulator_path, tmp_path):
+    """Doubles the write rate half way. The commanded rate must follow the allocation rate up, without a stall."""
+    trace = tmp_path / "trace.csv"
+    report = await run_ok(simulator_path, [*SMALL_DISK, *THRESHOLD, "--utilization", "0.6",
+            "--write-rate", str(WRITE_RATE), "--write-rate-step", "2", "--trace", str(trace)])
+    assert "write path stalled" not in report
+    rows = parse_csv(trace.read_text())
+    quarter = len(rows) // 4
+    mean = lambda rows: sum(float(r["commanded_rate"]) for r in rows) / len(rows)
+    assert mean(rows[-quarter:]) > 1.5 * mean(rows[:quarter])
+
+
+async def test_rate_controller_parameters(simulator_path):
+    """Sweeps the controller's time constants, the contended shard and the old allocation count."""
+    args = [*SMALL_DISK, *THRESHOLD, "--utilization", "0.6", "--write-rate", str(WRITE_RATE), "--csv"]
+    for sweep in (["--sweep", "drain-time=5,60"],
+                  ["--sweep", "shares-rise-time=1,10", "--sweep", "shares-decay-time=5,40"],
+                  ["--sweep", "mixed-allocations=0,1"]):
+        for r in parse_csv(await run_ok(simulator_path, [*args, *sweep])):
+            assert float(r["stall s"]) == 0
+            assert int(r["jobs"]) > 0
+            assert 0 <= float(r["shares"]) <= 1
+
+    # On a contended shard the bandwidth follows the shares, so the controller asks for more of them.
+    rows = parse_csv(await run_ok(simulator_path, [*args, "--sweep", "shares-authority=0,1"]))
+    shares = {r["shares-authority"]: float(r["shares"]) for r in rows}
+    assert shares["1"] > shares["0"]
+    assert all(float(r["stall s"]) == 0 for r in rows)
+
+    report = await run_ok(simulator_path, [*SMALL_DISK, *THRESHOLD, "--utilization", "0.6",
+            "--write-rate", str(WRITE_RATE), "--mixed-allocations", "1"])
+    assert "mixed allocations counted" in report
+
+
+async def test_controllers_compared(simulator_path):
+    """Runs both controllers with a clock. The relay holds its free-segment target, which the threshold does not need."""
+    output = await run_ok(simulator_path, [*SMALL_DISK, "--write-rate", str(WRITE_RATE), "--utilization", "0.4",
+            "--csv", "--sweep", "controller=relay,threshold"])
+    free = {r["controller"]: float(r["free%"]) for r in parse_csv(output)}
+    assert free["threshold"] > free["relay"]
+
+
 @pytest.mark.parametrize("args, error", [
     (["--groups", "0"], "a shard has at least one compaction group"),
     (["--jobs-per-group", "0"], "a group runs at least one compaction job at a time"),
@@ -350,10 +422,9 @@ async def test_threshold_ceiling(simulator_path):
     (["--controller", "no-such-controller"], "unknown value 'no-such-controller'"),
     (["--controller", "threshold", "--utilization-threshold", "1"], "the utilization threshold is a ratio in [0, 1)"),
     (["--controller", "threshold", "--strategy", "absolute"], "the threshold policy runs the engine's own selection rule"),
-    (["--controller", "threshold", "--write-rate", "2M"], "a timed run of the threshold policy needs a rate controller"),
 ], ids=["no-groups", "no-jobs-per-group", "segment-above-histogram", "disk-smaller-than-file",
         "disk-too-small", "unknown-strategy", "unknown-size-suffix", "unknown-sweep-parameter", "sweep-without-values",
-        "unknown-controller", "no-threshold", "threshold-with-other-rule", "timed-threshold"])
+        "unknown-controller", "no-threshold", "threshold-with-other-rule"])
 async def test_bad_configuration(simulator_path, args, error):
     """Gives the simulator a configuration it cannot run. It must exit with an error that says why."""
     result = await run_simulator(simulator_path, args)

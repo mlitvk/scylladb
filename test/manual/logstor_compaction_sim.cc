@@ -24,6 +24,9 @@
 //     and the space floor are derived per disk as they are in the engine;
 //   - auto_compaction_wanted(), which decides when the free-segment target runs compaction, and
 //     compaction_shares_pressure(), which the shares follow under it;
+//   - compaction_rate_controller, which paces compaction and asks for its CPU, and with it the
+//     utilization threshold, the reclaimable backlog and the shares demand - run rather than
+//     reimplemented, so that the simulated dynamics are the controller's own;
 //   - the ondisk:: sizes and alignments, so that what a segment holds and what it wastes are real.
 //
 // What is modeled here, because the engine's version of it is IO or future bound: the primary index
@@ -58,6 +61,9 @@
 //   logstor_compaction_sim --utilization 0.75 --trigger-threshold 0.1
 //   logstor_compaction_sim --sweep trigger-threshold=0.03,0.05,0.08,0.1,0.15,0.2
 //   logstor_compaction_sim --free-band 1 --sweep utilization=0.75,0.85 --sweep batch-cap=8,16,32
+//   logstor_compaction_sim --write-rate 100M --controller threshold --trace threshold.csv
+//   logstor_compaction_sim --write-rate 100M --controller threshold --sweep utilization=0.5,0.7,0.85
+//   logstor_compaction_sim --write-rate 100M --sweep controller=relay,threshold
 //   logstor_compaction_sim --self-test
 
 #include <seastar/core/align.hh>
@@ -121,9 +127,10 @@ enum class value_size_kind {
 };
 
 // What decides when compaction runs. `threshold` is the utilization threshold policy: a segment is
-// a candidate while its utilization is under --utilization-threshold, and compaction runs while
-// any group holds such a batch. `relay` is the free-segment target the engine holds - on below the
-// target, off above the stop watermark.
+// a candidate while its utilization is under --utilization-threshold, compaction runs while any
+// group holds such a batch, and with a clock the engine's own compaction_rate_controller paces it -
+// to the allocation rate plus a drain of the backlog - and asks for its CPU. `relay` is the
+// free-segment target the engine holds - on below the target, off above the stop watermark.
 enum class controller_kind {
     relay,
     threshold,
@@ -160,6 +167,12 @@ struct sim_params {
     size_t parallelism = 0;
     double extension_tolerance = compaction_batch_extension_tolerance;
     strategy_kind strategy = strategy_kind::efficiency;
+    // Report the mixed segment the write path allocates for every group segment to the rate
+    // controller as well, as the engine did before it counted only the segments compaction has to
+    // reclaim. The mixed segments themselves are not modeled - the separator frees them without
+    // compaction, so they cost the controller nothing but the double count - which is what this
+    // knob reproduces, so that its effect on the controller can be measured.
+    bool mixed_allocations = false;
     // Compaction jobs one group may run at once. The engine serializes them per group, so a shard
     // whose garbage sits in few groups has to spend its parallelism on groups that hold little.
     // Above 1 a job's inputs are reserved out of the candidate set when it starts, which is what
@@ -188,8 +201,8 @@ struct sim_params {
     uint64_t copy_bandwidth = 0;
     controller_kind controller = controller_kind::relay;
     // How much of that bandwidth follows the shares curve. 0 is the uncontended shard, where a
-    // scheduling group's shares buy nothing because nothing else wants the CPU. 1 is full
-    // contention, where the shares curve is the whole actuator.
+    // scheduling group's shares buy nothing because nothing else wants the CPU - which is the case
+    // the throttle exists for. 1 is full contention, where the shares curve is the whole actuator.
     double shares_authority = 0;
     // Multiply the write rate by this half way through the measured run. The step response is what
     // says whether the loop is damped.
@@ -208,6 +221,11 @@ struct sim_params {
     // effective_min_batch(). Under the threshold policy candidates arrive one at a time, so without
     // a floor a job is two or three segments.
     size_t min_batch = 0;
+    // The rate controller's time constants, 0 for the ones the engine ships: how long the backlog
+    // under the threshold is drained over, and how fast the shares demand climbs and decays.
+    double drain_time = 0;
+    double shares_rise_time = 0;
+    double shares_decay_time = 0;
     // Where to write the run's time series, one row per controller period.
     std::string trace_path;
 
@@ -250,6 +268,16 @@ uint64_t parse_size(const std::string& s) {
         throw std::invalid_argument(fmt::format("unknown size suffix '{}'", suffix));
     }
     return static_cast<uint64_t>(value * multiplier);
+}
+
+bool parse_bool(const std::string& s) {
+    if (s == "1" || s == "true" || s == "yes" || s == "on") {
+        return true;
+    }
+    if (s == "0" || s == "false" || s == "no" || s == "off") {
+        return false;
+    }
+    throw std::invalid_argument(fmt::format("'{}' is not a boolean", s));
 }
 
 template <typename Enum, size_t N>
@@ -350,6 +378,9 @@ const std::vector<param_desc>& all_params() {
         {"marginal-admission-efficiency", "least efficiency a batch needs to run alongside another job",
             [] (sim_params& p, const std::string& v) { p.marginal_admission_efficiency = std::stod(v); },
             [] (const sim_params& p) { return fmt::format("{}", p.marginal_admission_efficiency); }},
+        {"mixed-allocations", "report the write path's mixed segments to the rate controller too, as the engine once did",
+            [] (sim_params& p, const std::string& v) { p.mixed_allocations = parse_bool(v); },
+            [] (const sim_params& p) { return fmt::format("{}", int(p.mixed_allocations)); }},
         {"workload", "key distribution: uniform, zipf or hot-cold",
             [] (sim_params& p, const std::string& v) { p.workload = parse_enum<workload_kind>(v, workload_names); },
             [] (const sim_params& p) { return std::string(enum_name(p.workload, workload_names)); }},
@@ -413,6 +444,15 @@ const std::vector<param_desc>& all_params() {
         {"min-batch", "fewest candidate segments a job is run on under no space pressure, 0 for the engine's",
             [] (sim_params& p, const std::string& v) { p.min_batch = std::stoul(v); },
             [] (const sim_params& p) { return fmt::format("{}", p.min_batch); }},
+        {"drain-time", "seconds the rate controller drains the backlog under the threshold over, 0 for the shipped one",
+            [] (sim_params& p, const std::string& v) { p.drain_time = std::stod(v); },
+            [] (const sim_params& p) { return fmt::format("{}", p.drain_time); }},
+        {"shares-rise-time", "seconds the shares demand takes to climb its range when starved, 0 for the shipped one",
+            [] (sim_params& p, const std::string& v) { p.shares_rise_time = std::stod(v); },
+            [] (const sim_params& p) { return fmt::format("{}", p.shares_rise_time); }},
+        {"shares-decay-time", "the shares demand's decay time constant in seconds, 0 for the shipped one",
+            [] (sim_params& p, const std::string& v) { p.shares_decay_time = std::stod(v); },
+            [] (const sim_params& p) { return fmt::format("{}", p.shares_decay_time); }},
         {"trace", "write the run's time series to this file, one row per controller period",
             [] (sim_params& p, const std::string& v) { p.trace_path = v; },
             [] (const sim_params& p) { return p.trace_path; }},
@@ -523,8 +563,8 @@ struct sim_segment {
 // write path is filling for it, which belongs to the group only once it is sealed.
 class sim_group {
 public:
-    explicit sim_group(uint64_t segment_size)
-        : segments(segment_size)
+    sim_group(uint64_t segment_size, segment_stats* shard_stats)
+        : segments(segment_size, shard_stats)
         , open_buffer(segment_size) {
     }
 
@@ -555,6 +595,9 @@ struct sim_job {
     size_t next_input = 0;
     compaction_candidate_score score;
     sim_write_buffer output;
+    // Output segments this job sealed, so that what it actually reclaimed - which is what the rate
+    // controller is paced by - is known rather than estimated.
+    size_t outputs = 0;
 
     sim_job(sim_group& g, std::vector<uint32_t> in, compaction_candidate_score s, uint64_t segment_size)
         : group(&g)
@@ -609,6 +652,8 @@ struct sim_stats {
     uint64_t level_max = 0;
     double pressure_sum = 0;
     double pressure_sq_sum = 0;
+    double commanded_rate_sum = 0;
+    uint64_t throttled_ticks = 0;
     // Virtual seconds the measured window covered, and how many of them the write path spent
     // waiting for a segment compaction had not freed yet.
     double elapsed = 0;
@@ -697,8 +742,14 @@ struct sim_result {
         const auto mean = mean_pressure();
         return std::sqrt(std::max(0.0, stats.pressure_sq_sum / double(stats.tick_samples) - mean * mean));
     }
+    double mean_commanded_rate() const noexcept {
+        return stats.tick_samples ? stats.commanded_rate_sum / double(stats.tick_samples) : 0;
+    }
     double reclaim_rate() const noexcept {
         return stats.elapsed > 0 ? double(stats.compaction_segments_reclaimed) / stats.elapsed : 0;
+    }
+    double throttled_fraction() const noexcept {
+        return stats.tick_samples ? double(stats.throttled_ticks) / double(stats.tick_samples) : 0;
     }
 
     double segments_per_job() const noexcept {
@@ -729,10 +780,6 @@ public:
     out_of_space_error() : std::runtime_error("the disk ran out of segments") {}
 };
 
-// How often the engine's shares controller samples the free level, as segment_manager.cc sets it.
-// A timed run ticks at the same period.
-constexpr std::chrono::milliseconds shares_control_period{250};
-
 // How many turns the driver is given per controller period. The controller decides once a period,
 // but the work a period's worth of bandwidth buys has to be spread over it: spend it all at the
 // tick and the free level moves in steps of a period's reclaim, which is a sampling artifact that
@@ -754,6 +801,12 @@ struct trace_row {
     double time;
     double level;
     double pressure;
+    double commanded_rate;
+    double reclaim_rate;
+    double allocation_rate;
+    double credit;
+    double threshold;
+    double backlog;
     double write_rate;
     size_t jobs;
 };
@@ -777,6 +830,9 @@ class compaction_sim {
     std::vector<segment_descriptor> _descs;
     std::vector<sim_segment> _segments;
     std::deque<uint32_t> _free_segments;
+    // The shard-wide statistics every group's set accounts into, which the controller reads its
+    // backlog off. Declared ahead of the groups so that it outlives the sets accounting into it.
+    segment_stats _shard_stats;
     std::vector<std::unique_ptr<sim_group>> _groups;
 
     // The primary index: where the record of a key is, or nothing while the key has none.
@@ -789,6 +845,9 @@ class compaction_sim {
     std::vector<sim_job> _jobs;
     std::vector<sim_candidate> _pending_candidates;
     bool _in_compaction_poll = false;
+    // Whether the last ranking left a group out for being busy, so that an empty ranking is known to
+    // be that rather than a disk with nothing to reclaim - see find_top_compaction_candidates().
+    bool _ranking_skipped_busy_group = false;
     // Set when the admission floor turned a candidate away, cleared when a job finishes: until then
     // the answer cannot change, and re-ranking every group on every allocation is what would
     // dominate the run.
@@ -811,9 +870,20 @@ class compaction_sim {
     double _next_tick = 0;
     double _measure_start = 0;
     bool _measuring = false;
+    // The engine's own controller, which is what a timed run is here to measure.
+    compaction_rate_controller _rate_controller{compaction_rate_controller::tuning{
+        .drain_time = _p.drain_time > 0 ? _p.drain_time : compaction_backlog_drain_time,
+        .shares_rise_time = _p.shares_rise_time > 0 ? _p.shares_rise_time : compaction_shares_rise_time,
+        .shares_decay_time = _p.shares_decay_time > 0 ? _p.shares_decay_time : compaction_shares_decay_time,
+    }};
     // Whether the relay's driver fiber is running, which is the state auto_compaction_wanted() takes
     // and which only a timed run has to remember across polls.
     bool _relay_running = false;
+    // What the controller is told at the end of the period it covers.
+    uint64_t _tick_allocated = 0;
+    uint64_t _tick_reclaimed = 0;
+    bool _tick_candidates_empty = false;
+    bool _tick_throttled = false;
     std::vector<trace_row> _trace;
 
     std::mt19937 _rng;
@@ -855,9 +925,6 @@ public:
             if (_p.strategy != strategy_kind::efficiency) {
                 throw std::invalid_argument("the threshold policy runs the engine's own selection rule");
             }
-            if (_p.write_rate != 0) {
-                throw std::invalid_argument("a timed run of the threshold policy needs a rate controller");
-            }
         }
         if (_p.free_band > 0) {
             _watermarks.high = std::min(_segment_count, _watermarks.low + _p.free_band);
@@ -886,7 +953,7 @@ public:
         }
         _groups.reserve(_p.groups);
         for (size_t i = 0; i < _p.groups; ++i) {
-            _groups.push_back(std::make_unique<sim_group>(_p.segment_size));
+            _groups.push_back(std::make_unique<sim_group>(_p.segment_size, &_shard_stats));
         }
         _stats.batch_size_hist.resize(_batch_cap + 1);
         build_dataset();
@@ -958,14 +1025,18 @@ private:
 
     bool timed() const noexcept { return _write_rate > 0; }
     bool threshold_policy() const noexcept { return _p.controller == controller_kind::threshold; }
+    bool paced() const noexcept { return timed() && threshold_policy(); }
 
-    // The utilization threshold selection applies now. Under the threshold policy it is relaxed by
-    // space pressure; the relay has none, every segment is a candidate.
+    // The utilization threshold selection applies now. Under the threshold policy that is the
+    // controller's, relaxed by space pressure, or the same computed directly for a run without a
+    // clock; the relay has none, every segment is a candidate.
     size_t current_min_batch() const noexcept {
         if (!threshold_policy()) {
             return 1;
         }
-        const auto pressure = compaction_space_pressure(available_segments(write_source::user_write), _curve);
+        const auto pressure = timed()
+                ? _rate_controller.space_pressure()
+                : compaction_space_pressure(available_segments(write_source::user_write), _curve);
         if (pressure > 0) {
             return 1;
         }
@@ -976,22 +1047,28 @@ private:
         if (!threshold_policy()) {
             return 1;
         }
+        if (timed()) {
+            return _rate_controller.utilization_threshold();
+        }
         return effective_utilization_threshold(available_segments(write_source::user_write), _curve);
     }
 
-    // What the shares controller would be asking for, as a fraction of its range: the level ramp of
-    // the relay.
+    // What the shares controller would be asking for, as a fraction of its range: the rate
+    // controller's demand under the threshold policy, the level ramp under the relay.
     double shares_fraction() const noexcept {
+        if (threshold_policy()) {
+            return _rate_controller.shares_demand();
+        }
         return compaction_shares_pressure(available_segments(write_source::user_write), _watermarks);
     }
 
     static double controller_period() noexcept {
-        return std::chrono::duration<double>(shares_control_period).count();
+        return std::chrono::duration<double>(compaction_rate_control_period).count();
     }
 
     // What the device gives compaction now. With no shares authority it is the whole bandwidth
-    // whatever the shares, which is the uncontended shard: a scheduling group's shares buy nothing
-    // when nothing else wants the CPU. With authority it follows the
+    // whatever the shares, which is the uncontended shard the throttle exists for: a scheduling
+    // group's shares buy nothing when nothing else wants the CPU. With authority it follows the
     // shares instead, so that what the controller asks for is what buys compaction its bandwidth.
     double compaction_bandwidth() const noexcept {
         if (_p.shares_authority <= 0) {
@@ -1016,10 +1093,28 @@ private:
     }
 
     void controller_tick() {
-        _next_tick += controller_period();
+        const auto period = controller_period();
+        _next_tick += period;
+        if (threshold_policy()) {
+            _rate_controller.tick({
+                .available_segments = available_segments(write_source::user_write),
+                .curve = _curve,
+                .utilization = _shard_stats.utilization,
+                .segments_allocated = _tick_allocated * (_p.mixed_allocations ? 2 : 1),
+                .segments_reclaimed = _tick_reclaimed,
+                .burst_cap = double(_batch_cap),
+                .dt = period,
+                .candidates_empty = _tick_candidates_empty,
+                .throttled = _tick_throttled,
+            });
+        }
         if (_measuring) {
             sample_tick();
         }
+        _tick_allocated = 0;
+        _tick_reclaimed = 0;
+        _tick_candidates_empty = false;
+        _tick_throttled = false;
     }
 
     void sample_tick() {
@@ -1033,11 +1128,21 @@ private:
         _stats.level_max = std::max(_stats.level_max, available);
         _stats.pressure_sum += pressure;
         _stats.pressure_sq_sum += pressure * pressure;
+        _stats.commanded_rate_sum += _rate_controller.rate();
+        if (_tick_throttled) {
+            ++_stats.throttled_ticks;
+        }
         if (!_p.trace_path.empty()) {
             _trace.push_back(trace_row{
                 .time = _now,
                 .level = level,
                 .pressure = pressure,
+                .commanded_rate = _rate_controller.rate(),
+                .reclaim_rate = _rate_controller.reclaim_rate(),
+                .allocation_rate = _rate_controller.allocation_rate(),
+                .credit = _rate_controller.credit(),
+                .threshold = _rate_controller.utilization_threshold(),
+                .backlog = _rate_controller.backlog().reclaimable_segments,
                 .write_rate = _write_rate,
                 .jobs = _jobs.size(),
             });
@@ -1052,10 +1157,13 @@ private:
         if (!out) {
             throw std::runtime_error(fmt::format("cannot write the trace to '{}'", _p.trace_path));
         }
-        out << "time,free_segments,shares,write_rate,jobs\n";
+        out << "time,free_segments,space_floor,shares,commanded_rate,reclaim_rate,allocation_rate,"
+               "credit,threshold,backlog,write_rate,jobs\n";
         for (const auto& row : _trace) {
-            out << fmt::format("{:.3f},{},{:.4f},{:.0f},{}\n",
-                    row.time, uint64_t(row.level), row.pressure, row.write_rate, row.jobs);
+            out << fmt::format("{:.3f},{},{},{:.4f},{:.3f},{:.3f},{:.3f},{:.3f},{:.4f},{:.1f},{:.0f},{}\n",
+                    row.time, uint64_t(row.level), _space_floor, row.pressure, row.commanded_rate,
+                    row.reclaim_rate, row.allocation_rate, row.credit, row.threshold, row.backlog,
+                    row.write_rate, row.jobs);
         }
     }
 
@@ -1083,6 +1191,9 @@ private:
         _segments[id].records.clear();
         _descs[id].reset(_p.segment_size);
         ++_stats.segments_allocated;
+        if (src != write_source::compaction) {
+            ++_tick_allocated;
+        }
         return id;
     }
 
@@ -1314,8 +1425,10 @@ private:
     // same top-k helper.
     std::vector<sim_candidate> rank_candidates(size_t max_candidates) {
         top_compaction_candidates<sim_candidate> best(max_candidates);
+        _ranking_skipped_busy_group = false;
         for (const auto& g : _groups) {
             if (g->jobs_in_flight >= _p.max_jobs_per_group) {
+                _ranking_skipped_busy_group = true;
                 continue;
             }
             if (auto batch = select_batch(*g)) {
@@ -1367,7 +1480,7 @@ private:
     }
 
     // With a clock compaction spends a bandwidth, and what it may start is the controller's
-    // decision: the relay's watermarks.
+    // decision: the relay's watermarks, or the rate controller's credit.
     void poll_timed() {
         const auto dt = _now - _last_drive;
         _last_drive = _now;
@@ -1376,8 +1489,10 @@ private:
         // owe the next period a burst of what it did not do in the last ones.
         _copy_budget = std::min(_copy_budget + bandwidth * dt, bandwidth * controller_period());
 
-        _relay_running = auto_compaction_wanted(_relay_running,
-                available_segments(write_source::user_write), _watermarks);
+        if (!threshold_policy()) {
+            _relay_running = auto_compaction_wanted(_relay_running,
+                    available_segments(write_source::user_write), _watermarks);
+        }
 
         while (_copy_budget > 0) {
             start_jobs();
@@ -1394,7 +1509,7 @@ private:
         }
         // The relay's fiber is either running or it is not; while it is not, nothing is submitted,
         // though what it already has in flight runs to completion.
-        if (timed() && !_relay_running) {
+        if (timed() && !threshold_policy() && !_relay_running) {
             return;
         }
         _admission_blocked = false;
@@ -1402,6 +1517,12 @@ private:
             if (_pending_candidates.empty()) {
                 _pending_candidates = rank_candidates(_parallelism);
                 if (_pending_candidates.empty()) {
+                    // No group holds a batch under the threshold with a net gain, which the
+                    // controller has to know: it is not a state more CPU could change. Unless the
+                    // groups that might are busy, which is compaction working.
+                    if (!_ranking_skipped_busy_group) {
+                        _tick_candidates_empty = true;
+                    }
                     return;
                 }
                 _admission_bar = marginal_admission_bar(_pending_candidates);
@@ -1434,6 +1555,19 @@ private:
                 _admission_blocked = true;
                 return;
             }
+            // The throttle paces what is submitted, a batch of fully dead segments included: what
+            // such a batch costs is not the copying but the job. At the space floor the controller
+            // has the throttle off altogether.
+            if (paced() && !_rate_controller.can_afford(batch->score.reclaimed())) {
+                _tick_throttled = true;
+                // Nothing changes until the bucket fills, and the candidate is still the best one.
+                _pending_candidates.push_back(candidate);
+                return;
+            }
+            if (paced()) {
+                _rate_controller.charge(double(batch->score.reclaimed()));
+            }
+
             // The engine reads the inputs of a job in segment id order.
             std::ranges::sort(batch->segments);
             ++g.jobs_in_flight;
@@ -1509,6 +1643,8 @@ private:
         }
     }
 
+    // Writes what the job's buffer holds into a fresh segment of its group and moves the index onto
+    // it, counting the segment as one of the job's outputs.
     void flush_output(sim_job& job) {
         if (!job.output.has_data()) {
             return;
@@ -1530,6 +1666,7 @@ private:
         }
         job.group->segments.add_segment(_descs[seg_id]);
         job.output.reset();
+        ++job.outputs;
         ++_stats.compaction_segments_out;
     }
 
@@ -1538,16 +1675,33 @@ private:
         // compaction_buffer::close() flushes whatever is left as a partly filled segment, which is
         // the output residual every job leaves behind.
         flush_output(job);
+        size_t freed = 0;
         for (const auto id : job.inputs) {
             if (_p.max_jobs_per_group == 1) {
                 g.segments.remove_segment(_descs[id]);
             }
             if (_descs[id].ref_count == 0) {
                 free_segment(id);
+                ++freed;
             }
         }
+        settle_credit(job, freed);
         --g.jobs_in_flight;
         _admission_blocked = false;
+    }
+
+    // A job is charged what its batch was estimated to reclaim when it starts, since that is all
+    // that is known then; what it actually reclaimed settles the difference, so that the credit
+    // stays denominated in segments the disk really got back. That count is also the delivered rate
+    // the controller measures itself against.
+    void settle_credit(const sim_job& job, size_t freed) {
+        const auto actual = double(freed) - double(job.outputs);
+        if (paced()) {
+            _rate_controller.charge(actual - double(job.score.reclaimed()));
+        }
+        if (actual > 0) {
+            _tick_reclaimed += static_cast<uint64_t>(actual);
+        }
     }
 
     // --- the workload ---
@@ -1765,13 +1919,16 @@ void print_report(const sim_result& r) {
             enum_name(p.value_size_dist, value_size_names), format_bytes(p.value_size));
     fmt::print("  writes         {}, {:.0f}% warm-up, seed {}\n", r.writes, p.warmup * 100, p.seed);
     if (r.timed()) {
-        fmt::print("  dynamics       {}/s written, {}/s to compaction{}{}\n",
+        fmt::print("  dynamics       {}/s written, {}/s to compaction{}, controller {}{}\n",
                 format_bytes(p.write_rate),
                 format_bytes(p.copy_bandwidth != 0
                         ? p.copy_bandwidth
                         : uint64_t(double(p.write_rate) * default_copy_bandwidth_ratio)),
                 p.shares_authority > 0 ? fmt::format(" at shares authority {}", p.shares_authority) : "",
-                p.write_rate_step != 1 ? fmt::format(", write rate x{} half way", p.write_rate_step) : "");
+                enum_name(p.controller, controller_names),
+                fmt::format("{}{}",
+                        p.write_rate_step != 1 ? fmt::format(", write rate x{} half way", p.write_rate_step) : "",
+                        p.mixed_allocations ? ", mixed allocations counted" : ""));
     } else {
         fmt::print("  dynamics       none: no clock, compaction is taken to keep up\n");
     }
@@ -1803,7 +1960,9 @@ void print_report(const sim_result& r) {
                 s.level_min, s.level_max);
         fmt::print("  shares             mean {:.3f}, sd {:.3f} of the range between the minimum and the maximum\n",
                 r.mean_pressure(), r.pressure_stddev());
-        fmt::print("  reclaim rate       {:.2f} segments/s delivered\n", r.reclaim_rate());
+        fmt::print("  reclaim rate       {:.2f} segments/s delivered, {:.2f} commanded\n",
+                r.reclaim_rate(), r.mean_commanded_rate());
+        fmt::print("  periods throttled  {:.1f}%\n", r.throttled_fraction() * 100);
         if (s.stall_seconds > 0) {
             fmt::print("  write path stalled {:.2f}s waiting for a segment\n", s.stall_seconds);
         }
@@ -2026,6 +2185,24 @@ int self_test() {
         p.controller = controller_kind::threshold;
         cases.push_back({"the threshold policy, no clock", p});
     }
+    {
+        // At the base utilization the threshold's ceiling has been passed and the level sits in the
+        // pressure band, and after the step the device cannot keep up under any controller; the step
+        // response is measured where the threshold holds unrelaxed and the device has room.
+        auto p = base();
+        p.utilization = 0.6;
+        p.write_rate = 2 * 1024 * 1024;
+        p.controller = controller_kind::threshold;
+        p.write_rate_step = 2;
+        cases.push_back({"timed, the threshold controller through a step", p});
+    }
+    {
+        auto p = base();
+        p.write_rate = 2 * 1024 * 1024;
+        p.controller = controller_kind::threshold;
+        p.shares_authority = 1;
+        cases.push_back({"timed, the threshold controller on a contended shard", p});
+    }
 
     bool failed = false;
     for (const auto& c : cases) {
@@ -2053,10 +2230,10 @@ int self_test() {
                 failed = true;
                 continue;
             }
-            // A timed run has to hold the free level near the target, or the clock is driving
-            // something other than the controller under test, and it must not have starved the
-            // write path.
-            if (r.timed()
+            // A timed relay run has to hold the free level near the target, or the clock is driving
+            // something other than the controller under test; a timed threshold run has no target,
+            // but it must not have starved the write path.
+            if (r.timed() && c.params.controller == controller_kind::relay
                     && (r.mean_level() < double(r.watermarks.low) / 2
                         || r.mean_level() > 2 * double(r.watermarks.low))) {
                 fmt::print("FAIL {}: the free level settled at {:.1f} against a target of {}\n",
