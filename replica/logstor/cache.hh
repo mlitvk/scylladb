@@ -28,6 +28,9 @@ static_assert(std::is_nothrow_move_constructible_v<single_row_partition>);
 
 // An evictable node holding the cached partition of one primary_index_entry, as a
 // single_row_partition. The cache admits a single_row_partition, so the shape comes with the type.
+// The row is counted in the shared tracker's rows but not linked in its LRU: the cache evicts a
+// partition as a whole. An upgrade converts the row and neither adds nor drops it, so what an
+// entry counts for does not change while it is cached.
 //
 // Lives inside the shared cache tracker's LSA region. When the shared LSA
 // reclaimer needs memory it calls on_evicted(), which:
