@@ -519,6 +519,9 @@ public:
         return guarded_location{.location = it->entry().location, .guard = start_read()};
     }
 
+    // Admits the partition a read found at `read_location` to the cache, unless the index no longer
+    // points there: the key was overwritten or erased while the record was being read, and what was
+    // read is stale.
     bool populate_cache(const primary_index_key& key, record_location read_location, const schema_ptr& schema, const partition_key& pk,
             const single_row_partition& partition) const {
         if (!reads_cache()) {
@@ -527,6 +530,7 @@ public:
 
         auto it = find_key(key);
         if (it == _partitions.end() || it->entry().location != read_location) {
+            _cache_tracker->on_mispopulate();
             return false;
         }
 
