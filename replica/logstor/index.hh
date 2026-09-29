@@ -220,8 +220,8 @@ class primary_index final {
 
     // Non-owning pointer to the cache tracker, which is null when the cache is not set up.
     cache_tracker* _cache_tracker = nullptr;
-    // The caching option of the table, which controls only lookups and populates. Evicts depend
-    // only on `_cache_tracker`, so a partition that stays cached while this is false stays correct.
+    // The caching option of the table, which controls only lookups and populates. Invalidations do
+    // not depend on it, so a partition that stays cached while this is false stays correct.
     bool _cache_enabled = false;
     // Set by the first populate, so that drain_cache() does not scan an index that never had a
     // cached partition. When it is true, `_cache_tracker` is set.
@@ -286,7 +286,7 @@ public:
     ~primary_index() {
         with_allocator(_region.allocator(), [this] {
             _entries.clear_and_dispose([this] (primary_index_entry* e) noexcept {
-                evict_cached_partition(*e);
+                invalidate_cached_partition(*e);
             });
         });
     }
@@ -340,8 +340,8 @@ public:
                 if (cmp(i->_e, new_entry) > 0) {
                     return {insert_result::superseded, std::make_optional(i->_e)};
                 }
-                // Overwriting with newer data: evict the stale cached partition.
-                evict_cached_partition(*i);
+                // Overwriting with newer data: the cached partition is stale.
+                invalidate_cached_partition(*i);
                 auto old_entry = std::exchange(i->_e, new_entry);
                 space_accounting_on_record_freed(old_entry.location);
                 space_accounting_on_record_added(new_entry.location);
@@ -665,7 +665,7 @@ public:
     future<> drain_cache() {
         if (_cache_used) {
             auto scan = this->scan();
-            while (scan.next_batch(default_scan_batch_size, [this] (const scanned_entry& e) { evict_cached_partition(e._e); })) {
+            while (scan.next_batch(default_scan_batch_size, [this] (const scanned_entry& e) { invalidate_cached_partition(e._e); })) {
                 co_await coroutine::maybe_yield();
             }
         }
@@ -687,9 +687,9 @@ public:
     }
 
 private:
-    void evict_cached_partition(const primary_index_entry& e) noexcept {
+    void invalidate_cached_partition(const primary_index_entry& e) noexcept {
         if (e._cached_entry) {
-            _cache_tracker->evict(e);
+            _cache_tracker->invalidate(e);
         }
     }
 
@@ -720,7 +720,7 @@ private:
     // Evicts the cached partition of an entry that the tree erases, and frees its record in the
     // accounting.
     void dispose_entry(primary_index_entry* e) noexcept {
-        evict_cached_partition(*e);
+        invalidate_cached_partition(*e);
         space_accounting_on_record_freed(e->_e.location);
         --_key_count;
     }
