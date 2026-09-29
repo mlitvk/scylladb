@@ -434,7 +434,9 @@ public:
 
     // Admits `partition`, which the caller read from `location`, to the cache, if the entry of `key`
     // still holds `location`. Returns false if the index does not read the cache or the entry holds
-    // another location. The caller must hold a read guard from before the lookup that gave `location`.
+    // another location. In the second case, the key was overwritten or erased while the record was
+    // read, so what was read is stale, and the cache counts a mispopulation. The caller must hold a
+    // read guard from before the lookup that gave `location`.
     // Without the guard, the segment of `location` can be freed, and a newer record of the key can
     // get the same location, so that the cache would link the older partition to the newer record.
     bool populate_cache(const index_read_guard&, const primary_index_key& key, record_location location, const schema_ptr& schema,
@@ -445,6 +447,7 @@ public:
 
         auto e = find_entry_at(key, location);
         if (!e) {
+            _cache_tracker->on_mispopulate();
             return false;
         }
         _cache_used = true;

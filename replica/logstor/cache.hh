@@ -130,6 +130,11 @@ public:
     // partition already.
     void populate(const primary_index_entry&, const schema_ptr& schema, const partition_key& key, const single_row_partition& partition);
 
+    // A read that could not populate the cache, since what it read became stale while it did.
+    void on_mispopulate() noexcept {
+        _shared_tracker.on_mispopulate();
+    }
+
     // The hit path of a read: touches the LRU, counts a hit or a miss, upgrades the entry in place,
     // and hands out the partition with its key. A reader turns the partition into fragments without
     // a mutation in between. The partition is copied with single_row_partition::copy(s, columns).
