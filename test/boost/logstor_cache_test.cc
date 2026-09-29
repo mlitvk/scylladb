@@ -237,6 +237,32 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_cache_counts_the_rows_of_cached_partitions
     BOOST_REQUIRE_EQUAL(stats.row_removals + stats.row_evictions, 4);
 }
 
+// A read admits what it read only if the index still points where it read it from. When the key was
+// overwritten, erased or moved by compaction in the meantime, what it read may be stale, so it
+// leaves the cache alone and counts a mispopulation.
+SEASTAR_THREAD_TEST_CASE(test_logstor_cache_counts_a_stale_read_as_a_mispopulation) {
+    auto schema = make_logstor_schema();
+    shared_logstor_cache cache;
+    primary_index index(noop_space_accounting, &cache.logstor_tracker);
+    const auto& stats = cache.shared_tracker.get_stats();
+
+    auto key = make_primary_index_key(*schema, "pk0");
+    const auto read_entry = make_index_entry(1, 0, 10, 1);
+    BOOST_REQUIRE(!index.insert(key, read_entry).previous_entry);
+    BOOST_REQUIRE(index.update_record_location(key, read_entry.location, make_index_entry(2, 0, 10, 1).location));
+
+    const auto m = make_mutation(schema, "pk0", "v0");
+    const auto partition = to_single_row_partition(mutation(m));
+    BOOST_REQUIRE(!index.populate_cache(key, read_entry.location, schema, m.key(), partition));
+    BOOST_REQUIRE_EQUAL(stats.mispopulations, 1);
+    BOOST_REQUIRE_EQUAL(stats.partition_insertions, 0);
+
+    BOOST_REQUIRE(index.erase(key, make_index_entry(2, 0, 10, 1).location));
+    BOOST_REQUIRE(!index.populate_cache(key, read_entry.location, schema, m.key(), partition));
+    BOOST_REQUIRE_EQUAL(stats.mispopulations, 2);
+    BOOST_REQUIRE_EQUAL(stats.partition_insertions, 0);
+}
+
 SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_drain_cache_preserves_index_entries) {
     auto schema = make_logstor_schema();
     shared_logstor_cache cache;
