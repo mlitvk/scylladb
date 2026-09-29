@@ -116,6 +116,10 @@ public:
     void on_partition_miss() noexcept;
     void on_partition_eviction() noexcept;
     void on_row_eviction() noexcept;
+    // A row inserted into or removed from the cache without linking it in or unlinking it from
+    // the LRU, for a cache that evicts whole partitions: the logstor cache.
+    void on_row_insert() noexcept;
+    void on_row_remove() noexcept;
     void on_row_hit() noexcept;
     void on_dummy_row_hit() noexcept;
     void on_row_miss() noexcept;
@@ -147,9 +151,20 @@ public:
 cache_tracker* get_current_cache_tracker() noexcept;
 
 inline
-void cache_tracker::remove(rows_entry& entry) noexcept {
+void cache_tracker::on_row_insert() noexcept {
+    ++_stats.row_insertions;
+    ++_stats.rows;
+}
+
+inline
+void cache_tracker::on_row_remove() noexcept {
     --_stats.rows;
     ++_stats.row_removals;
+}
+
+inline
+void cache_tracker::remove(rows_entry& entry) noexcept {
+    on_row_remove();
     if (entry.is_linked()) {
         _lru.remove(entry);
     }
@@ -157,15 +172,13 @@ void cache_tracker::remove(rows_entry& entry) noexcept {
 
 inline
 void cache_tracker::insert(rows_entry& entry) noexcept {
-    ++_stats.row_insertions;
-    ++_stats.rows;
+    on_row_insert();
     _lru.add(entry);
 }
 
 inline
 void cache_tracker::insert(rows_entry& more_recent, rows_entry& entry) noexcept {
-    ++_stats.row_insertions;
-    ++_stats.rows;
+    on_row_insert();
     _lru.add_before(more_recent, entry);
 }
 
