@@ -197,6 +197,46 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_cache_invalidation_and_evict
     BOOST_REQUIRE(index.empty());
 }
 
+// A cached partition counts its row, if it has one, in the shared tracker's rows - a partition that
+// is a tombstone alone has none - and the row leaves the count with the partition, whichever way it
+// goes: invalidated by an overwrite or an erase, evicted, or drained with the rest of the cache.
+SEASTAR_THREAD_TEST_CASE(test_logstor_cache_counts_the_rows_of_cached_partitions) {
+    auto schema = make_logstor_schema();
+    shared_logstor_cache cache;
+    primary_index index(noop_space_accounting, &cache.logstor_tracker);
+    const auto& stats = cache.shared_tracker.get_stats();
+
+    std::vector<primary_index_key> keys;
+    for (int i = 0; i < 5; ++i) {
+        keys.push_back(make_primary_index_key(*schema, format("pk{}", i)));
+        BOOST_REQUIRE(!index.insert(keys.back(), make_index_entry(1, i * 10, 10, 1)).previous_entry);
+    }
+    for (int i = 0; i < 4; ++i) {
+        populate(index, keys[i], make_mutation(schema, format("pk{}", i), "v"));
+    }
+    auto deleted = make_mutation(schema, "pk4", "v");
+    deleted.partition() = mutation_partition(*schema);
+    deleted.partition().apply(tombstone(api::timestamp_type(2), gc_clock::now()));
+    populate(index, keys[4], deleted);
+    BOOST_REQUIRE_EQUAL(stats.partitions, 5);
+    BOOST_REQUIRE_EQUAL(stats.rows, 4);
+    BOOST_REQUIRE_EQUAL(stats.row_insertions, 4);
+
+    BOOST_REQUIRE(index.insert(keys[0], make_index_entry(2, 0, 10, 2)).inserted());
+    BOOST_REQUIRE(index.erase(keys[1], make_index_entry(1, 10, 10, 1).location));
+    BOOST_REQUIRE_EQUAL(stats.rows, 2);
+    BOOST_REQUIRE_EQUAL(stats.row_removals, 2);
+
+    BOOST_REQUIRE(evict_one(cache));
+    BOOST_REQUIRE_EQUAL(stats.partition_evictions, 1);
+    BOOST_REQUIRE_EQUAL(stats.rows + stats.row_evictions, 2);
+
+    index.drain_cache().get();
+    BOOST_REQUIRE_EQUAL(stats.partitions, 0);
+    BOOST_REQUIRE_EQUAL(stats.rows, 0);
+    BOOST_REQUIRE_EQUAL(stats.row_removals + stats.row_evictions, 4);
+}
+
 SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_drain_cache_preserves_index_entries) {
     auto schema = make_logstor_schema();
     shared_logstor_cache cache;
