@@ -211,8 +211,8 @@ class primary_index final {
 
     // Non-owning pointer to the cache tracker, which is null when the cache is not set up.
     cache_tracker* _cache_tracker = nullptr;
-    // The caching option of the table, which controls only lookups and populates. Evicts depend
-    // only on `_cache_tracker`, so a partition that stays cached while this is false stays correct.
+    // The caching option of the table, which controls only lookups and populates. Invalidations do
+    // not depend on it, so a partition that stays cached while this is false stays correct.
     bool _cache_enabled = false;
     // Set by the first populate, so that drain_cache() does not scan an index that never had a
     // cached partition. When it is true, `_cache_tracker` is set.
@@ -265,7 +265,7 @@ public:
         with_allocator(_tree_allocator, [this] {
             _entries.clear_and_dispose([this] (primary_index_entry* e) noexcept {
                 if (e->_cached_entry) {
-                    _cache_tracker->evict(*e);
+                    _cache_tracker->invalidate(*e);
                 }
             });
         });
@@ -304,9 +304,9 @@ public:
         auto i = _entries.lower_bound(key, primary_index_key_cmp{}, hint);
         if (hint.match) {
             if (cmp(i->_e, new_entry) <= 0) {
-                // Overwriting with newer data: evict the stale cached partition.
+                // Overwriting with newer data: the cached partition is stale.
                 if (i->_cached_entry) {
-                    _cache_tracker->evict(*i);
+                    _cache_tracker->invalidate(*i);
                 }
                 auto old_entry = i->_e;
                 i->_e = std::move(new_entry);
@@ -614,7 +614,7 @@ public:
     future<> drain_cache() {
         if (_cache_used) {
             auto scan = this->scan();
-            while (scan.next_batch(default_scan_batch_size, [this] (const scanned_entry& e) { _cache_tracker->evict(e._e); })) {
+            while (scan.next_batch(default_scan_batch_size, [this] (const scanned_entry& e) { _cache_tracker->invalidate(e._e); })) {
                 co_await coroutine::maybe_yield();
             }
         }
@@ -659,7 +659,7 @@ private:
     // accounting.
     void dispose_entry(primary_index_entry* e) noexcept {
         if (e->_cached_entry) {
-            _cache_tracker->evict(*e);
+            _cache_tracker->invalidate(*e);
         }
         space_accounting_on_record_freed(e->_e.location);
         --_key_count;
