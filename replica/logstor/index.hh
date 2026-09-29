@@ -358,9 +358,7 @@ private:
         return [this] (primary_index_entry* e) noexcept {
             with_allocator(standard_allocator(), [this, e] () noexcept {
                 if (_cache_tracker) {
-                    try {
-                        _cache_tracker->evict(*e);
-                    } catch (...) {}
+                    _cache_tracker->invalidate(*e);
                 }
                 space_accounting_on_record_freed(e->_e.location);
             });
@@ -433,7 +431,7 @@ public:
             auto scan = this->scan();
             while (auto batch = scan.next_batch(1024)) {
                 for (const auto& pie : batch->entries) {
-                    _cache_tracker->evict(pie.get());
+                    _cache_tracker->invalidate(pie.get());
                 }
                 co_await coroutine::maybe_yield();
             }
@@ -563,9 +561,9 @@ public:
         auto i = _partitions.lower_bound(key, primary_index_key_cmp{}, hint);
         if (hint.match) {
             if (cmp(i->_e, new_entry) <= 0) {
-                // Overwriting with newer data: evict the stale cached partition.
+                // Overwriting with newer data: the cached partition is stale.
                 if (_cache_tracker) {
-                    _cache_tracker->evict(*i);
+                    _cache_tracker->invalidate(*i);
                 }
                 auto old_entry = i->_e;
                 i->_e = std::move(new_entry);

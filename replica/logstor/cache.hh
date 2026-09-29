@@ -119,7 +119,9 @@ class cache_tracker {
 public:
     explicit cache_tracker(::cache_tracker& shared_tracker);
 
-    void evict(const primary_index_entry&);
+    // Removes the cached partition of the entry, if it has one: the entry's key was overwritten or
+    // erased, or the index is giving up what it has in the cache.
+    void invalidate(const primary_index_entry&) noexcept;
 
     // Admits a copy of `partition`, of the key `key` under `schema`, unless the entry holds a
     // partition already.
