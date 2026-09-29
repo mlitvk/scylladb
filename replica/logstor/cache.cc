@@ -37,7 +37,11 @@ void cached_partition_entry::upgrade(schema_ptr schema) {
 void cached_partition_entry::on_evicted() noexcept {
     // Every eviction runs with the current tracker set - the region's reclaimer,
     // evict_from_lru_shallow() and clear() all set it - which rows_entry::on_evicted() relies on too.
-    get_current_cache_tracker()->on_partition_eviction();
+    auto& tracker = *get_current_cache_tracker();
+    if (_partition.row) {
+        tracker.on_row_eviction();
+    }
+    tracker.on_partition_eviction();
     // Destroy and free this object using the LSA allocator that allocated it.
     current_allocator().destroy(this);
 }
@@ -61,6 +65,9 @@ void cache_tracker::invalidate(const primary_index_entry& pie) noexcept {
 
     with_allocator(allocator(), [&] {
         auto& e = *pie._cached_entry;
+        if (e.partition().row) {
+            _shared_tracker.on_row_remove();
+        }
         get_lru().remove(e);
         current_allocator().destroy(&e);
         _shared_tracker.on_partition_remove();
@@ -122,6 +129,9 @@ void cache_tracker::populate(const primary_index_entry& pie, const schema_ptr& s
             }
             auto* e = current_allocator().construct<cached_partition_entry>(schema, key, partition, pie._cached_entry);
             get_lru().add(*e);
+            if (e->partition().row) {
+                _shared_tracker.on_row_insert();
+            }
             _shared_tracker.on_partition_insert();
         });
     });
