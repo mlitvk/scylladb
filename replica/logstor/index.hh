@@ -326,8 +326,8 @@ private:
     // Mutable so that logically-const methods can call non-const methods on the
     // tracker (touch, insert) for LRU accounting.
     mutable cache_tracker* _cache_tracker = nullptr;
-    // The caching option of the table, which controls only lookups and populates. Evicts depend
-    // only on `_cache_tracker`, so a partition that stays cached while this is false stays correct.
+    // The caching option of the table, which controls only lookups and populates. Invalidations do
+    // not depend on it, so a partition that stays cached while this is false stays correct.
     bool _cache_enabled = false;
     // Set by the first populate, so that drain_cache() does not scan an index that never had a
     // cached partition. When it is true, `_cache_tracker` is set.
@@ -364,9 +364,7 @@ private:
         return [this] (primary_index_entry* e) noexcept {
             with_allocator(standard_allocator(), [this, e] () noexcept {
                 if (e->_cached_entry) {
-                    try {
-                        _cache_tracker->evict(*e);
-                    } catch (...) {}
+                    _cache_tracker->invalidate(*e);
                 }
                 space_accounting_on_record_freed(e->_e.location);
             });
@@ -448,7 +446,7 @@ public:
             auto scan = this->scan();
             while (auto batch = scan.next_batch(1024)) {
                 for (const auto& pie : batch->entries) {
-                    _cache_tracker->evict(pie.get());
+                    _cache_tracker->invalidate(pie.get());
                 }
                 co_await coroutine::maybe_yield();
             }
@@ -579,9 +577,9 @@ public:
         auto i = _partitions.lower_bound(key, primary_index_key_cmp{}, hint);
         if (hint.match) {
             if (cmp(i->_e, new_entry) <= 0) {
-                // Overwriting with newer data: evict the stale cached partition.
+                // Overwriting with newer data: the cached partition is stale.
                 if (i->_cached_entry) {
-                    _cache_tracker->evict(*i);
+                    _cache_tracker->invalidate(*i);
                 }
                 auto old_entry = i->_e;
                 i->_e = std::move(new_entry);
