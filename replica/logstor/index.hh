@@ -337,6 +337,9 @@ public:
             logalloc::reclaim_lock lock(_region);
             i = _entries.lower_bound(key, primary_index_key_cmp{}, hint);
             if (hint.match) {
+                // On equal timestamps the later write wins here, while recovery prefers the record in
+                // the higher-sequence segment; the two can disagree, see
+                // test_logstor_recovery_loses_an_equal_timestamp_overwrite.
                 if (cmp(i->_e, new_entry) > 0) {
                     return {insert_result::superseded, std::make_optional(i->_e)};
                 }
