@@ -2,21 +2,36 @@
 
 ## Status
 
-Design document. Gate 2 (local no-resurrection) currently has **two candidate
-mechanisms** under evaluation:
+Design document, reviewed against the code on 2026-10-01: branch `logstor_gc`
+(master at 1fc937a62f) and the parallel branch `logstor_recovery1`, whose
+discard/recovery work this design now builds on (see
+[Interaction with the discard work](#interaction-with-the-discard-work-logstor_recovery1)).
+The GC branch is to be rebased onto `logstor_recovery1` before implementation.
 
-- the **sequence reclaim-frontier** plus monotone **horizons** (detailed in
-  [Gate 2](#gate-2--local-no-resurrection) below);
+Gate 2 (local no-resurrection) has **three candidate mechanisms**:
+
+- the **sequence reclaim-frontier** plus monotone **horizons** — the
+  recommended base, detailed in [Gate 2](#gate-2--local-no-resurrection).
+  This revision replaces its global external horizon with a per-entry
+  re-clamp and closes the in-flight-copy hole by the publish-before-free rule
+  the discard work wrote down;
+- the **purge journal** — a per-key durable purge record filtered at
+  recovery, the per-key form of `logstor_recovery1`'s erase watermark. It
+  decouples drop latency from frontier progress and is the recommended
+  extension once the base works (see [Purge journal](#gate-2-candidate-2--purge-journal));
 - **mark-and-sweep verification** — a read-only scan of all scannable
-  segments plus a write barrier (see
-  [Alternative Gate 2](#alternative-gate-2--mark-and-sweep-verification)).
+  segments plus a write barrier. Kept for the record (see
+  [Mark-and-sweep](#gate-2-candidate-3--mark-and-sweep-verification)); no
+  longer recommended, since the purge journal removes forced rewriting at a
+  lower cost.
 
 Everything outside Gate 2 — GC metadata (Stage A), Gate 1, the two-gate rule,
-TTL handling — is common to both. The durable liveness checkpoint remains a
-future improvement (see [Alternatives](#alternatives-considered)); in either
-mechanism nothing new is persisted and GC state is recomputed at recovery.
+TTL handling — is common to all three. In the base nothing new is persisted
+and GC state is recomputed at recovery; the journal is the one candidate that
+persists per-key state.
 
-Remaining minor open items are listed at the [end](#open-questions).
+What this review settled and what stays open is listed at the
+[end](#settled-in-the-review-of-2026-10-01).
 
 ## Problem
 
@@ -44,59 +59,113 @@ one `log_record` (a `record_value`, the encoded partition without its key
 and table, plus a `record_header{key, timestamp, table}`). The in-memory `primary_index`
 holds **exactly one live `index_entry{location, timestamp}` per key**.
 
-Relevant behaviors (see `replica/logstor/`):
+Relevant behaviors (see `replica/logstor/`; the facts below were checked
+against the code, and the ones marked *recovery1* describe the
+`logstor_recovery1` branch):
 
-- **A delete is just a write.** `logstor::write` inserts the new record; on
-  overwrite it calls `free_record(prev)`. The record timestamp is the live
-  row-marker timestamp or, for a delete, the partition tombstone timestamp
-  (`extract_logstor_record_timestamp`). Nothing in the header distinguishes a
-  tombstone from a live record.
+- **A delete is just a write.** `logstor::write` builds the record, waits for
+  the write buffer to report it durable, then calls `primary_index::insert`;
+  on overwrite the index itself frees the previous record through
+  `space_accounting_subscriber::on_free_record`. The record timestamp is the
+  live row-marker timestamp or, for a delete, the partition tombstone
+  timestamp (`extract_logstor_record_timestamp`). The on-disk header
+  (`ondisk.hh`: token, timestamp, table id, key — hand-encoded, not IDL) has
+  nothing that distinguishes a tombstone from a live record.
 - **Conflict resolution is record-level LWW.** `primary_index::insert` keeps
-  the entry with the higher timestamp. A write that loses (e.g. a late or
-  backdated write) is still written physically and then freed
-  (`free_record(new_loc)`).
-- **`free_record` frees accounting, not bytes.** It increases
+  the entry with the higher timestamp; on a tie the *new* entry wins, whereas
+  recovery prefers the higher segment sequence — the equal-timestamp gap
+  documented in `logstor_discard.md`. A write that loses (a late or backdated
+  write) is still written physically and is then **never accounted**:
+  `logstor::write` ignores the insert outcome, the bytes stay in the segment
+  counted as free space, and no `on_free_record` runs. The same holds for a
+  relocation copy whose `update_record_location` fails. Such records are
+  *stale copies* exactly like freed ones, but the per-segment accounting does
+  not know about them.
+- **`on_free_record` frees accounting, not bytes.** It increases
   `segment_descriptor.free_space`; the record bytes physically remain in the
   segment until the segment is rewritten or reused.
-- **`free_segment` frees the slot, not the disk.** A segment freed by
-  compaction goes back to the free list with its on-disk content intact and
-  fully scannable. Only `discard_segments` (table drop) invalidates the
-  header block on disk today.
+- **`free_segment` frees the slot, not the disk.** Its precondition is
+  `record_bytes == 0 && ref_count == 0`. The slot goes back to
+  `_free_segments` with its on-disk content intact and fully scannable; new
+  slots are allocated first and the free list is FIFO, so a freed slot can
+  stay scannable for a long time. Only the erase path
+  (*recovery1*: `discard_group_segments`, formerly `discard_segments`)
+  zeroes a segment's first block. *recovery1* writes the two rules that make
+  freeing safe at `free_segment`: **P3, publish before free** — whoever frees
+  a segment because it copied its records elsewhere has made the copies
+  index-visible and drained readers first; **P2, erase implies a watermark**.
 - **Compaction keeps everything the index points to.** `do_compaction`
-  rewrites every record for which `index.is_record_alive()` is true and skips
-  freed ones. A tombstone/expired record is still the live index entry, so it is
-  rewritten forever. Segment selection is utilization-based; tombstones count as
-  live data.
-- **Recovery rebuilds the index by scanning all physical records**, keeping the
-  max `(timestamp, segment_seq, offset)` per key. Freed-but-physical records are
-  re-scanned; the live one wins only because it has the highest timestamp.
-  Segments freed (but not reused) before a crash are re-scanned too.
-- **`segment_seq`** is a monotonic per-shard sequence assigned to a segment when
-  it starts (`allocate_segment_seq`). All buffers in a mixed segment carry the
-  segment's seq; `scan_segment` stops at the first buffer whose seq differs
-  from the segment's first buffer, so a *reused* segment's stale tail is
-  unreachable. Streamed-in segments get a **fresh local seq**
-  (`streamed_segment_rewriter` rewrites the chunk header).
+  rewrites every record for which `index.is_record_alive()` is true at
+  header time and skips the rest. A tombstone/expired record is the live
+  entry, so it is rewritten forever. Segment selection is utilization-based;
+  tombstones count as live data. The copier holds a `segment_ref` on every
+  source segment until each copy's `update_record_location` has run and
+  pending reads have drained (P3).
+- **The separator copies every record of a mixed buffer, alive or not.**
+  User writes land in the shared mixed active segment; the separator task
+  (queued under `_writes_phaser`, holding the segment's ref) buffers a copy
+  of each record in its group's separator buffer, and the buffer's flush
+  writes them into a full segment of the group and calls
+  `update_record_location` for each — whose result it ignores. A copy of a
+  record that was overwritten meanwhile is therefore a stale copy in a
+  fresh, high-seq segment. Buffers flush when full, when the segment switch
+  finds them older than 5% of the disk in sequences
+  (`flush_all_separator_buffers(seq)`), and on erase/stop; a cold group's
+  buffer can hold a record for a long time.
+- **Recovery rebuilds the index by scanning all slots of all files**,
+  keeping the max `(timestamp, segment_seq, offset)` per key
+  (`cmp_with_seq`). Stale copies are re-scanned and lose only because a
+  newer record exists. *recovery1*: `rebuild_index(index_resolver,
+  erase_watermarks)` drops, at scan time and before insertion, records
+  covered by an erase watermark and records whose token has no group on the
+  shard; both are counted as tripwire metrics.
+- **`segment_seq`** is a monotonic per-shard sequence
+  (`_next_segment_seq`), assigned to a segment when it is taken out of the
+  segment pool (`get_segment`), so every seq issued so far is
+  `<= _next_segment_seq − 1` and anything written from now on gets a higher
+  one. It lives only in `writeable_segment` and in recovery's local vector;
+  the descriptor does not keep it. All chunks of a mixed segment carry the
+  segment's seq; `scan_segment` stops at the first invalid header and at
+  the first chunk whose seq differs from the first chunk's, so a *reused*
+  slot's stale tail is unreachable. Streamed-in segments get a fresh local
+  seq (`streamed_segment_rewriter`); *recovery1* writes their first block
+  last, so an aborted transfer leaves no valid header.
 - **Files are opened with `O_DSYNC`** — a completed DMA write is durable.
+- *recovery1*: **every chunk header carries a CRC of its body**
+  (`body_crc`; the header grew to 32 bytes, format version stays 1: logstor
+  is in development and old stores are simply unreadable). `scan_segment`
+  reads a chunk's body whole and checks it before delivering a record, so a torn
+  chunk — a crash mid-write, or a scan racing an append — is rejected
+  rather than parsed.
+- **Bytes land before the index call, on every path.** The write buffer
+  reports a record durable before `logstor::write` inserts it (the buffer's
+  gate is held until every insert of the buffer ran, so `await_pending_writes()`
+  drains the inserts too); the copiers write the copy before
+  `update_record_location`; `load_segment` writes the segment before
+  `scan_slot` inserts each record.
 
 ### How traditional (LSM) storage does it
 
 In the LSM engine, physical removal of tombstones and expired data happens
 only when compaction rewrites sstables. Every fragment that flows through a
 compacting reader is processed by the **mutation compactor**
-(`compact_mutation_state` in `mutation/mutation_compactor.hh`, instantiated as
-`compact_for_compaction` by `compaction/compaction.cc`). Each tombstone it
-encounters — partition tombstone, range tombstone, row tombstone, dead
-cell/marker — is tested by `can_purge_tombstone()`
-(`mutation/mutation_compactor.hh:273`), which is the conjunction of the two
-gates below. The same compactor class also runs at query time
-(`compact_for_query`), where it only *hides* dead/expired data from results;
-purging is exclusive to `compact_for_sstables::yes` mode.
+(`compact_mutation_state` in `mutation/mutation_compactor.hh:168`,
+instantiated as `compact_for_compaction` by `compaction/compaction.cc`).
+Each tombstone it encounters — partition tombstone, range tombstone, row
+tombstone, dead cell/marker — is tested by `can_purge_tombstone()`
+(`mutation_compactor.hh:280`), which is the conjunction of the two gates
+below. The same compactor class also runs at query time
+(`compact_for_query`), where `can_gc` is just `is_gc_enabled()`: tombstones
+past `gc_before` are *hidden* from results with no Gate 2 check, and nothing
+is purged. The row cache has a read-time purge path of its own
+(`db/cache_mutation_reader.hh:202`, with its own `gc_before`/`can_gc` fed
+by `table::get_max_purgeable_fn_for_cache_underlying_reader`); physical
+purge otherwise happens in `compact_for_sstables::yes` mode only.
 
 #### Gate 1 — grace (`gc_before`)
 
 The grace gate is `deletion_time < gc_before` (`satisfy_grace_period`,
-`mutation_compactor.hh:270`). `gc_before` is computed per partition key by
+`mutation_compactor.hh:276`). `gc_before` is computed per partition key by
 `tombstone_gc_state::get_gc_before_for_key(schema, dk, query_time)`
 (`tombstone_gc.cc:155`), according to the table's `tombstone_gc` mode
 (`tombstone_gc_options.hh`):
@@ -120,16 +189,20 @@ The grace gate is `deletion_time < gc_before` (`satisfy_grace_period`,
   overwrites (purging a tombstone the moment it appears in compaction).
 - **`disabled`** — `gc_before = time_point::min()`; never purge.
 
-The repair history is populated at the end of repair
-(`shared_tombstone_gc_state::update_repair_time` /
-`batch_update_repair_time`, called from `repair/row_level.cc:2653,3838`),
-persisted in `system.repair_history` so it survives restarts, and reloaded on
-boot. Pending updates flush together with commitlog cleanup records
-(`flush_pending_repair_time_update`, `tombstone_gc.cc:273`).
+The repair history is populated at the end of a repair
+(`repair_update_system_table_handler` → `update_repair_time`,
+`repair/row_level.cc:2659`) and reloaded at boot in a batch
+(`repair_service::load_history` → `batch_update_repair_time`,
+`row_level.cc:3930`); tablet repairs go through
+`insert_pending_repair_time_update` (`replica/tablets.cc:879`) and
+`flush_pending_repair_time_update` (`tombstone_gc.cc:273`), which flushes
+together with a commitlog cleanup record. It is persisted in
+`system.repair_history`.
 
-**The commitlog clamp.** Every mode's result passes through `check_min`
+**The commitlog clamp.** Every mode's result except the trivially minimal
+ones (`disabled`, and `no_gc`) passes through `check_min`
 (`tombstone_gc.cc:148`), which caps `gc_before` at the commitlog's
-`min_gc_time` for the table (wired in `main.cc:2102`). This prevents purging
+`min_gc_time` for the table (wired in `main.cc:2122`). This prevents purging
 a tombstone while writes it shadows could still be **replayed from the
 commitlog** after a crash — replay would resurrect them once the tombstone is
 gone. This is the LSM engine's own local no-resurrection-on-recovery guard,
@@ -144,19 +217,20 @@ whole-sstable expiry (below). `cheap_to_get_gc_before()`
 (`tombstone_gc.cc:141`) tells the compactor whether Gate 1 is cheap for this
 table (everything except `repair` mode); the compactor orders the two gates
 accordingly to avoid needless bloom-filter checks
-(`mutation_compactor.hh:277`).
+(`mutation_compactor.hh:284`).
 
 #### Gate 2 — no-resurrection (`max_purgeable`)
 
 Dropping a tombstone must not un-hide older data in sstables/memtables that
 are **not** part of this compaction. For each partition key, compaction
 computes a `max_purgeable` bound (`get_max_purgeable_timestamp`,
-`compaction/compaction.cc:200`): the minimum **live-data timestamp** among
+`compaction/compaction.cc:197`): the minimum **live-data timestamp** among
 data sources outside the compacting set that may contain the key:
 
 - **memtables**: `min_memtable_live_timestamp()`, consulted only if the
-  memtable actually contains the key and holds data older than the compacting
-  sstables' max timestamp (`compaction.cc:243`);
+  memtable actually contains the key and holds data no newer than the
+  compacting sstables' max timestamp (`compaction.cc:240`), and unless
+  `skip_memtable_for_tombstone_gc()` says otherwise;
 - **overlapping non-compacting sstables**: selected by token overlap
   (`sstable_set::incremental_selector`), filtered by a **bloom-filter** key
   check; each contributes its `min_live_timestamp` from the sstable's
@@ -167,26 +241,29 @@ data sources outside the compacting set that may contain the key:
 A tombstone is then purgeable iff `tombstone.timestamp <
 max_purgeable.timestamp` — no possibly-shadowed data older than the tombstone
 exists elsewhere (`max_purgeable::can_purge`,
-`compaction/compaction_garbage_collector.hh:35`, `compaction.cc:90`). Two
+`compaction/compaction_garbage_collector.hh:35`, `compaction.cc:95`). Two
 refinements:
 
 - **Shadowable tombstones** (from materialized-view updates) compare against
   the minimum live *row-marker* timestamp instead of the minimum live cell
-  timestamp (`compaction.cc:220`; issues #20423/#20424 explain why dead data
-  does not count).
-- An **expiry-threshold elision**: if the tombstone was already expired when
-  the outside data sources were created, all their writes arrived after the
-  tombstone expired, and the timestamp-overlap check can be skipped
-  (`compaction_garbage_collector.hh:82`).
+  timestamp (`compaction.cc:217`; issue #20424). Only live data counts:
+  purgeable tombstones that shadow *dead* data outside the compacting set may
+  still be purged (issue #20423 explains why dead memtable data does not
+  count).
+- An **expiry-threshold elision** exists in `max_purgeable`
+  (`compaction_garbage_collector.hh:82`): if the tombstone was already expired
+  when the outside data sources were created, the timestamp check can be
+  skipped. Compaction never sets it; only the row cache's read-time path does
+  (`memtable_list::get_max_purgeable`, `replica/database.cc:2129`).
 
-Only live data counts — purgeable tombstones that shadow *dead* data outside
-the compacting set may still be purged. The per-key result is cached per
-partition in the compactor (`_max_purgeable_regular/_shadowable`,
-`mutation_compactor.hh:342`). Purge failures are attributed in
-`tombstone_purge_stats` (blocked by memtable vs. by other sstables —
-`mutation_compactor.hh:299`), exported as metrics. A config option
-(`gc_check_only_compacting_sstables`) can restrict the check to the compacting
-set for setups that guarantee non-overlap.
+The per-key result is cached per partition in the compactor
+(`_max_purgeable_regular/_shadowable`, `mutation_compactor.hh:172`). Purge
+failures are attributed in `tombstone_purge_stats` (blocked by memtable vs.
+by other sstables — `mutation_compactor.hh:308`), exported as metrics. A
+major compaction can restrict the check to the compacting set
+(`compaction_descriptor::gc_check_only_compacting_sstables`, set from the
+REST parameter `consider_only_existing_data`; it also disables the commitlog
+clamp) for setups that guarantee non-overlap.
 
 #### TTL expiry
 
@@ -194,12 +271,13 @@ TTL is entirely **lazy** — nothing is scheduled when data is written:
 
 - A live cell optionally carries `(expiry, ttl)` in its on-disk/in-memory
   representation (`mutation/atomic_cell.hh:70`); a `row_marker` carries the
-  same (`mutation/mutation_partition.hh:551`). The logical **deletion time of
+  same (`mutation/mutation_partition.hh:550`). The logical **deletion time of
   an expired cell is `expiry − ttl`** — i.e. as if it was deleted when
   written (`atomic_cell.hh:271`, `mutation_partition.hh:604`), so the grace
   period effectively counts from the write.
-- **Reads hide expired data on the fly**: `cell.has_expired(query_time)` makes
-  the cell behave as dead during query-time compaction; no storage is touched.
+- **Reads hide expired data on the fly**: `cell.has_expired(query_time)`
+  (`expiry <= now`) makes the cell behave as dead during query-time
+  compaction; no storage is touched.
 - **Compaction converts and purges** in `row::compact_and_expire`
   (`mutation/mutation_partition.cc:1621`): an expired cell is either purged
   immediately (if both gates pass for `tombstone{timestamp, expiry − ttl}`) or
@@ -219,20 +297,22 @@ dedicated triggers beyond size/tiering heuristics:
 - **Per-sstable statistics** written at sstable creation: `min_timestamp` /
   `max_timestamp`, `max_local_deletion_time` (max deletion/expiry time of any
   tombstone or cell), and `estimated_tombstone_drop_time` — a histogram of
-  tombstone deletion times.
+  tombstone deletion times (`sstables/types.hh:317`).
 - **Droppable-ratio trigger**: `sstable::estimate_droppable_tombstone_ratio`
-  (`sstables/sstables.cc:1584`) integrates that histogram up to the sstable's
-  range `gc_before`. Strategies (`worth_dropping_tombstones`,
+  (`sstables/sstables.cc:1569`) integrates that histogram up to the
+  optimistic `max_gc_before` of the sstable's token range, over the estimated
+  cell count. Strategies (`worth_dropping_tombstones`,
   `compaction/compaction_strategy.cc:61`) submit a single-sstable "tombstone
-  compaction" when the ratio exceeds `tombstone_threshold` (default 0.2) —
+  compaction" when the ratio reaches `tombstone_threshold` (default 0.2) —
   but only if the sstable is older than `tombstone_compaction_interval`
   (default 1 day) to avoid repeatedly rewriting an sstable whose tombstones
-  cannot be purged yet. STCS, TWCS, and ICS all use this as a fallback when
-  no regular compaction is pending (`size_tiered_compaction_strategy.cc:244`,
-  `time_window_compaction_strategy.cc:404`,
-  `incremental_compaction_strategy.cc:248`).
+  cannot be purged yet. STCS, TWCS and LCS use this as a fallback when no
+  regular compaction is pending (`size_tiered_compaction_strategy.cc:269`,
+  `time_window_compaction_strategy.cc:412`,
+  `leveled_compaction_strategy.cc:54`); ICS has a per-run variant of its own
+  (`incremental_compaction_strategy.cc:272`).
 - **Whole-sstable drop**: `get_fully_expired_sstables`
-  (`compaction/compaction.cc:2246`) finds compacting sstables with
+  (`compaction/compaction.cc:2300`) finds compacting sstables with
   `max_local_deletion_time < gc_before` — everything in them is expired
   tombstones/TTL data past grace — and whose timestamp range cannot shadow
   older data in overlapping sstables. These are **deleted outright without
@@ -251,7 +331,8 @@ whole-sstable drop.
 |---|---|---|
 | Identify a record as tombstone/expiring cheaply | per-cell flags + sstable metadata | none — header has no kind/deletion_time; must deserialize |
 | Grace gate (`gc_before`, repair-aware) | `tombstone_gc_state` | not wired in |
-| No-resurrection gate | `max_purgeable` overlap check | N/A locally (one version per key), but freed-but-physical records + recovery-by-scan create a different resurrection risk |
+| No-resurrection gate | `max_purgeable` overlap check | N/A locally (one version per key), but stale physical copies + recovery-by-scan create a different resurrection risk |
+| Durable record that data is dead | sstable deletion; commitlog cleanup records | erase watermarks per token range (*recovery1*); nothing per key |
 | Physically drop a tombstone | compaction purge | impossible — always rewritten |
 | TTL expiry -> reclaim | lazy convert + purge | expired rows hidden at read but kept forever |
 | GC-driven compaction trigger | droppable-ratio + interval | utilization-based only |
@@ -266,7 +347,9 @@ whole-sstable drop.
   **Gate 2 (local no-resurrection)** — recovery-by-scan cannot re-insert an
   older physical copy of the key.
 - Gate 2 is implemented with a **reclaim frontier** `F` over segment sequences
-  plus monotone **horizons** that bound where stale copies can physically live.
+  plus monotone **horizons** that bound where stale copies can physically
+  live; the [purge journal](#gate-2-candidate-2--purge-journal) can later
+  decouple drops from frontier progress.
 - Dropping is done by two cooperating mechanisms: a background **GC sweep**
   over the in-memory index (reclaims index memory promptly and converts the
   record into dead bytes for normal compaction), and an opportunistic **drop in
@@ -289,45 +372,74 @@ allocation-free) classify the record:
 - for `expiring`: `expiry` and `deletion_time` (see [TTL](#ttl-expiry) for the
   exact rules when components carry different TTLs).
 
-**Local-time clamp.** For GC-gating purposes the stored times are clamped to
+**Local-time clamp.** For GC-gating purposes the stored time is clamped to
 the node-local wall clock at insert:
 `gc_time = max(deletion_time_or_expiry, gc_clock::now())`. This makes the
 grace period count from when *this node learned* of the delete, which is
-essential for Gate 2 correctness under client-backdated timestamps
-(`USING TIMESTAMP`) — see the threat analysis below. It only ever delays GC,
-never advances it. The unclamped `deletion_time` is stored too (it is what the
-converted tombstone carries semantically).
+what Gate 2 needs under client-backdated timestamps (`USING TIMESTAMP`) — see
+the threat analysis below. It only ever delays GC, never advances it. The
+clamped `gc_time` is what goes to disk and what recovery rebuilds the index
+from: re-clamping at boot would restart the grace period after every
+restart. The unclamped `deletion_time` is stored too (it is what a converted
+tombstone carries semantically), and a re-clamp *during* the tombstone's life
+is part of the Gate 2 mechanism (below).
 
-**On-disk** (`record_header` in `idl/logstor.idl.hh`, buffer `version`
-bump in `ondisk.hh`): add `kind` and the two time fields (absent/0 for `live`
-records; 32-bit `gc_clock` seconds, as in the sstable format). The on-disk
-format may change freely; backward compatibility is not maintained.
+**On-disk.** `record_header` is logstor's own encoding in `ondisk.hh`
+(`write_record_header` / `read_record_header`, a 32-byte fixed part
+followed by the key); there is no IDL for it. Append a 16-byte fixed block:
+`kind` (1 byte, 3 padding), `gc_time`, `deletion_time`, `expiry` (32-bit
+seconds each, `gc_clock::as_int32`, as the sstable format stores deletion
+times; zero for `live` records).
+Per the decision taken in `logstor_recovery1`, the format version stays 1
+while logstor is in development: a store written before the change is not
+readable after it, and nothing streams between the two. On a ~1.3 KB record
+this is +1.2%; if that matters, `kind` fits in the upper 16 bits of
+`record_frame_header::key_size` (keys are at most 65535 bytes) and the two semantic
+times are only needed for `expiring` records, which brings it to 8 bytes at
+the price of a kind-dependent layout.
 
-**In-memory** (`index_entry` in `types.hh`): add `kind` (2 bits) and a single
-32-bit `gc_time` field:
+**In-memory.** The layouts today are `index_entry` = `record_location` (12
+bytes) + `timestamp` (8) = 24 bytes with 4 bytes of padding, and
+`primary_index_entry` = key (a 16-byte `dht::token` plus the 16-byte hash)
++ `index_entry` (24) + cache slot (8) + a flags byte = 65, padded to 72. So:
 
-- `deletion` → clamped `deletion_time`;
-- `expiring` → clamped `expiry`.
+- `gc_time` (32-bit, `gc_clock::as_int32`) goes into `index_entry`'s
+  padding — 24 bytes stay 24;
+- `kind` (2 bits) goes into `primary_index_entry`'s flags byte (5 spare
+  bits) — 72 bytes stay 72.
 
-One field suffices for both kinds because using `expiry` in the Gate 1
+`insert` and `update_record_location` take the GC info as a small struct
+next to the `index_entry`, and a `static_assert` pins both sizes. Per-key
+memory growth: zero.
+
+One time field suffices for both kinds because using `expiry` in the Gate 1
 comparison is *conservative* for expiring records: `deletion_time = expiry −
 ttl <= expiry`, so `expiry < gc_before ⟹ deletion_time < gc_before`. The
 sweep therefore waits "grace after expiry" instead of "grace after logical
 deletion" — safe, and the exact `deletion_time` remains available from the
-on-disk header when compaction converts the record. Pack the new fields into
-the existing `index_entry`/`primary_index_entry` padding where possible; the
-per-key memory budget for this feature is ≤ 8 bytes and should be measured.
+on-disk header when compaction converts the record.
 
 **Per-segment accounting** (`segment_descriptor` in `compaction.hh`): add
 
-- `seq` — the segment's sequence, kept in memory (needed by the frontier; also
-  set during recovery from the scanned headers);
-- `gc_bytes` — bytes of live `deletion` + `expiring` records in the segment
-  (maintained on write and on free; the free path knows the record kind from
-  the index entry being freed);
-- `min_gc_time` — minimum clamped gc_time among records written to the
-  segment. Not adjusted on free (a conservative lower bound is fine — it is
-  only a triggering heuristic, never a correctness input).
+- `seq` — the segment's sequence, set at `get_segment` and by recovery from
+  the scanned headers. Needed by the frontier, and also by the
+  equal-timestamp fix planned in `logstor_discard.md`, so it lands first as
+  shared groundwork;
+- `gc_bytes` — bytes of live `deletion` + `expiring` records in the segment;
+- `min_gc_time` — minimum `gc_time` among records written to the segment.
+  Not adjusted on free (a conservative lower bound is fine — it is only a
+  triggering heuristic, never a correctness input);
+- `has_stale` — whether the segment holds any stale copy: set by
+  `on_free_record` and by the three **loser sites** (a superseded `insert`,
+  a failed `update_record_location` in the separator and in compaction).
+  Today a loser is never accounted at all, so `free_space` alone cannot tell
+  a fully-live segment; this flag is what the effective-frontier refinement
+  and the skip-fully-live scan reduction need.
+
+The accounting hooks need the record kind on the free path:
+`space_accounting_subscriber::on_add_record/on_free_record` gain the kind
+(the index has the entry at every call site — the disposer, the overwrite
+branch of `insert`, `update_record_location`).
 
 ### The two-gate purge rule
 
@@ -344,11 +456,11 @@ pass:
 - **Gate 2 — Local no-resurrection.** Guarantees that dropping the tombstone
   cannot cause recovery to resurrect an older physical copy of the same key.
 
-After both gates pass, the drop itself is: `index.erase(key, loc)` +
-`free_record(loc)` (both synchronous — no yield between the gate check and the
-erase). The disposer path evicts any cached mutation. The freed bytes are then
-reclaimed by normal compaction. Note that `free_record` **must** be called so
-the segment's `record_bytes` accounting reaches zero before `free_segment`.
+After both gates pass, the drop itself is `index.erase(key, loc)`: the
+entry's disposer already calls `on_free_record` (so the segment's
+`record_bytes` accounting moves towards zero for `free_segment`) and evicts
+any cached mutation. It is synchronous — no yield between the gate check and
+the erase. The freed bytes are then reclaimed by normal compaction.
 
 If, after a purge, a write for the key arrives with an older timestamp, it
 wins (there is nothing to shadow it). This matches traditional post-purge LWW
@@ -360,29 +472,34 @@ semantics and is inherent to tombstone GC, not a defect of this design.
 
 Recovery rebuilds the index by scanning **all scannable segments** and keeping
 the max-timestamp record per key. If tombstone `R` of key `K` is physically
-dropped while an older, freed-but-physical copy `R'` of `K` is still
-*scannable*, recovery re-inserts `R'` — a resurrection. "Scannable" includes
-segments freed by compaction but not yet reused (their content is intact) —
-only reuse (seq-mismatch stops the scan) or explicit header invalidation makes
-a segment unscannable.
+dropped while an older *stale copy* `R'` of `K` (freed, or never accounted)
+is still *scannable*, recovery re-inserts `R'` — a resurrection. "Scannable"
+includes segments freed by compaction but not yet reused (their content is
+intact) — only reuse (seq-mismatch stops the scan) or explicit header
+invalidation makes a segment unscannable. (*recovery1*'s erase watermarks
+make some scannable records unrecoverable; this design conservatively keeps
+reasoning about scannability.)
 
 Every path that writes a record and then loses a liveness check produces
-freed-physical copies, and they can land in **arbitrarily high-seq segments**:
+stale copies, and they can land in **arbitrarily high-seq segments**:
 
 1. **Normal overwrite** — the previous record is freed in place. Its segment
    may have a *higher* seq than the overwriting record's segment (the separator
    may have just moved it into a fresh full segment).
-2. **Separator** — moves a just-written record into a new full segment, then
-   frees it if the key was overwritten meanwhile.
-3. **Compaction / split compaction** — write-then-check; losers freed in a
-   fresh output segment.
+2. **Separator** — copies *every* record of a mixed buffer into a fresh full
+   segment, including records overwritten since; the copy of an overwritten
+   record is stale on arrival (`update_record_location` fails).
+3. **Compaction / split compaction** — write-then-check; losers left
+   unaccounted in a fresh output segment. The recovery path that separates
+   a mixed segment's live records is the same window.
 4. **Late/backdated direct writes** — a write that loses LWW to the live entry
    (hinted-handoff replay, retries, client `USING TIMESTAMP`) is written
    physically into the active segment — at **any** time, including long after
-   the key became a tombstone and passed grace.
+   the key became a tombstone and passed grace — and the separator then
+   copies it once more (source 2).
 5. **Streaming / restore ingest** — a peer's segment is loaded
    (`load_segment`); records that lose to the local index become
-   freed-physical copies in a fresh-seq local segment, at any time.
+   stale copies in a fresh-seq local segment, at any time.
 6. **In-flight copies** — a separator/compaction copy of a pre-delete value
    may *land* (complete its write) after the delete was applied to the index,
    and — with backdated deletes — even after the delete passes Gate 1.
@@ -399,28 +516,38 @@ Per-shard state (all in `segment_manager`; segment seqs are per-shard):
   (an ordered structure over `segment_descriptor::seq`).
   `F = min(scannable seqs) − 1` (`F = max allocated seq` when empty).
   To make freed segments leave the set, **invalidate the on-disk header when a
-  segment is freed** (same 4K-zero write `discard_segments` already does;
-  files are `O_DSYNC` so completion ⇒ durable). A segment's seq leaves the
-  scannable set — and `F` may advance — only after its invalidation write
-  completes.
+  segment is freed** — the 4K-zero write `discard_group_segments` already
+  does, files are `O_DSYNC` so completion ⇒ durable. `free_segment` is
+  synchronous and `noexcept` (it runs from `segment_ref`'s release path), so
+  it hands the slot to an **invalidation queue** instead of to
+  `_free_segments`; a background fiber zeroes the first block, then removes
+  the seq from the scannable set and pushes the slot onto the free list.
+  Invalidating *before* the slot is reusable keeps the invalidation write
+  from racing a new incarnation's header, and gives the simplest invariant:
+  a slot is scannable iff it is allocated with a valid header or queued for
+  invalidation. Slots recovery puts on the free list and that still carry a
+  valid header are invalidated the same way at boot, in the background and
+  rate-limited; until then their seqs stay in the set. The erase path's
+  zeroing merges into this queue.
 - **Snapshot ring.** Periodically (config: `gc_snapshot_period`, default
   ~1 min) append `(t = gc_clock::now(), H_t = max allocated seq)`. The ring is
   bounded (e.g. 64 entries) by merging the oldest entries. After recovery the
   ring starts empty; the first snapshot's `H` covers everything on disk at
-  boot.
-- **External horizon `H_ext`.** A monotone per-shard value, bumped to the
-  *current max allocated seq* whenever an event may have produced a
-  freed-physical copy of a key whose live entry is a tombstone:
-  - a completion frees the record it just wrote (`logstor::write` loser
-    branch, separator completion, compaction `rewrite_record` loser) **and**
-    the winning index entry has `kind == deletion`;
-  - a streamed/restored segment is loaded (`load_segment`) — unconditionally;
-  - recovery completes (initialize `H_ext = max recovered seq`; this is
-    subsumed by the empty snapshot ring but keeps the invariant uniform).
-
-  Bumping to "current max allocated seq" avoids needing the exact seq of the
-  segment just written to; it is monotone and cheap
-  (`_next_segment_seq − 1`).
+  boot. In `repair` mode a snapshot also keeps a reference to the table's
+  repair-history map as of `t` (it is copy-on-write), so that `gc_before(t)`
+  can be evaluated later.
+- **Re-clamp on a loser** (replaces the *external horizon* `H_ext` of the
+  previous revision). Whenever an index call for `K` loses to a live entry
+  whose `kind == deletion` — a superseded `insert` (user write, or a record
+  of a streamed/restored segment inserted by `load_segment`), or a failed
+  `update_record_location` (separator, compaction, split, recovery
+  separation) — set the winning entry's
+  `gc_time = max(gc_time, gc_clock::now())`. The loser's bytes are in a
+  segment with `seq <= max allocated seq at that moment`, and the re-clamp
+  makes every qualifying snapshot younger than that moment, which is all
+  the drop rule needs (proof below). This is per entry, so a burst of late
+  writes to deleted keys delays only those keys, whereas `H_ext` stalled
+  every drop on the shard until `F` caught up with the present.
 
 **Drop rule.** Tombstone `T` (key `K`, clamped `gc_time`) may be dropped iff
 there exists a snapshot `(t, H_t)` with:
@@ -428,53 +555,79 @@ there exists a snapshot `(t, H_t)` with:
 ```
 gc_time < gc_before(t)          (Gate 1 evaluated at snapshot time t)
 and  F >= H_t                   (everything scannable at snapshot time is gone)
-and  F >= H_ext                 (no unreclaimed racy copies)
 ```
 
 In `timeout` mode `gc_before(t) = t − gc_grace(table)`, so this reduces to a
 per-table **purge bound**: `purge_before = max{ t − grace : H_t <= F }`,
 recomputed when `F` advances; a tombstone is droppable iff
-`gc_time < purge_before && F >= H_ext`. Both checks are O(1) per record.
+`gc_time < purge_before`. One comparison per record.
+
+The argument needs `gc_before(t) <= t` in every mode, which holds: a repair
+time is in the past, `immediate` uses `t` itself.
 
 #### Correctness argument
 
-Claim: at drop time, every scannable freed-physical copy `R'` of `K` lies in a
-segment with `seq <= max(H_t, H_ext) <= F`, hence is *not* scannable —
-contradiction; so no such copy exists and recovery cannot resurrect `K`.
+Claim: at drop time, every scannable stale copy `R'` of `K` lies in a
+segment with `seq <= H_t <= F`, hence is *not* scannable — contradiction; so
+no such copy exists and recovery cannot resurrect `K`.
 
-Case analysis on when `R'` was freed, relative to `T`'s index insert:
+Let `i` be the time of `T`'s insert and `max_seq(x)` the highest seq
+allocated by time `x`. Case analysis on `R'`'s index call, relative to `i`:
 
-- **Freed before `T`'s insert.** `R'` was physically written before it was
-  freed, so `seq(R') <= max_seq(T-insert)`. The clamp guarantees
-  `gc_time >= local insert time`, and the chosen snapshot has
-  `t > gc_time + grace >= insert time`, so `H_t = max_seq(t) >=
-  max_seq(T-insert) >= seq(R')`. (Without the clamp, a backdated
-  `deletion_time` would let a snapshot *older than the insert* satisfy Gate 1
-  — the hole in sources 4–6 above.)
-- **Freed after `T`'s insert, winner is `T`.** The freeing completion saw a
-  `deletion`-kind winner and bumped `H_ext >= seq(R')` before returning; the
-  drop check reads `H_ext` in the same reactor task as the erase, so either
-  the bump is visible (drop blocked until `F` catches up) or the copy was
-  freed after the drop — impossible, since after the erase the index has no
-  entry for `K` and a late write now *wins* (post-purge LWW, see above).
-- **Freed after `T`'s insert, winner is a newer non-tombstone `W`.** Then `T`
-  is no longer the live entry and will never be dropped (it was itself freed).
-  If `W` is later deleted by a new tombstone `T'`, all these copies were freed
-  before `T'`'s insert — first case applies to `T'`.
-- **Streamed/restored segments** may carry a tombstone that becomes the live
-  entry while local pre-existing copies of the key were freed at load time;
-  the unconditional `H_ext` bump on `load_segment` covers all local segments
-  existing at that moment.
+- **Lost before `i`** (an older value overwritten by `T`, or a loser to that
+  value). `R'` was physically written before it lost, so
+  `seq(R') <= max_seq(i)`. The clamp gives `gc_time >= i`; the chosen
+  snapshot has `gc_before(t) > gc_time`, hence `t > i` and
+  `H_t = max_seq(t) >= max_seq(i) >= seq(R')`. (Without the clamp a
+  backdated `deletion_time` would let a snapshot *older than the insert*
+  satisfy Gate 1 — the hole in sources 4–6 above.)
+- **Lost after `i` to `T` itself** — a late write, a streamed record, or a
+  copy of the pre-delete value that landed after `i`. The losing call ran at
+  some time `j > i` with `seq(R') <= max_seq(j)`, saw a `deletion`-kind
+  winner and re-clamped `gc_time >= j`, so every qualifying snapshot has
+  `t > j` and `H_t >= seq(R')`. The drop check and the erase run in one
+  reactor task, as does the losing call with its re-clamp, so one of the two
+  orders holds: the re-clamp is visible to the check (drop blocked until `F`
+  catches up), or the erase ran first. In the latter case, if the call is an
+  `insert`, it finds no entry and `R'` *wins* — post-purge LWW, accepted. If
+  it is `update_record_location`, the copier still holds a reference on
+  `R'`'s **source** segment (P3: publish before free), and the source holds a
+  pre-delete record of `K`, so it has `seq <= max_seq(i) <= H_t <= F` — but
+  `F >= H_t` says that segment was already freed and invalidated, which
+  cannot happen while it is referenced. So a copy of a pre-delete value
+  cannot land after the drop: this is where the frontier relies on the
+  copiers holding their sources until the copies are published.
+- **Lost after `i` to a newer non-tombstone `W`.** Then `T` is no longer the
+  live entry and will never be dropped (it was itself freed). If `W` is
+  later deleted by a new tombstone `T'`, all these copies lost before `T'`'s
+  insert — the first case applies to `T'`.
+
+**Copies of the tombstone itself.** A relocation of `T` (compaction or
+separator) started before the drop may land after it; its
+`update_record_location` finds no entry and, today, would leave a scannable
+orphan copy of `T` that recovery re-inserts. That is harmless in itself —
+the tombstone comes back and is dropped again — except when a post-purge
+write older than `T` arrived in between: the runtime shows that write, the
+restarted node shows the tombstone. To keep the runtime and recovery in
+agreement, **a copier whose update finds no entry re-inserts a
+`deletion`-kind copy** (it has the header, hence the kind); the re-inserted
+tombstone shadows the late write exactly as recovery would, and the sweep
+drops it again later. A `live`-kind orphan cannot occur under this
+mechanism (previous case) and is asserted against.
+
+**Equal timestamps.** Duplicates of `T` at the same timestamp resolve by
+`(segment_seq, offset)` as in normal recovery and can at worst re-insert the
+tombstone. A same-timestamp *overwrite* of `T` by a live value is the gap
+`logstor_discard.md` documents, independent of GC.
 
 Crash consistency: the drop becomes durable only when `T`'s segment stops
 being scannable (invalidated or reused) — which happens strictly after the
-drop, which happens strictly after all `seq <= max(H_t, H_ext)` segments were
-durably invalidated (that is what `F >= …` means, and `F` only advances on
+drop, which happens strictly after all `seq <= H_t` segments were durably
+invalidated (that is what `F >= H_t` means, and `F` only advances on
 completed `O_DSYNC` invalidation writes). A crash at any intermediate point
-re-inserts `T` at recovery — benign; it will be re-dropped. After recovery the
-snapshot ring and `H_ext` are re-initialized conservatively, so GC resumes
-only after a full frontier pass — an accepted cost of not persisting GC state
-(see Alternatives).
+re-inserts `T` at recovery — benign; it will be re-dropped. After recovery
+the snapshot ring is empty, so GC resumes only after a full frontier pass —
+an accepted cost of not persisting GC state (see Alternatives).
 
 #### Frontier liveness — forced compaction
 
@@ -488,13 +641,19 @@ horizon, rewrite the lowest-seq scannable segments at a bounded rate (config:
 
 - The task locates a segment's group via `segment_descriptor::owner` and
   reuses the normal compaction path (rewriting a fully-live segment simply
-  copies it forward with a fresh seq).
+  copies it forward with a fresh seq). A segment in the free list or the
+  invalidation queue is not rewritten; it leaves the set by invalidation.
 - Mixed segments awaiting separation can hold the frontier back; nudge them
   with `flush_separator(seq)`.
-- Worst-case write amplification is one full-disk rewrite per GC cycle; the
-  bandwidth knob bounds the cost and stretches the cycle. The
-  "effective frontier" refinement (Alternatives) removes most of this cost
-  later by letting `F` skip fully-live segments.
+- Worst-case write amplification is one full-disk rewrite per GC cycle, i.e.
+  `disk_size / max(grace, disk_size / gc_frontier_bandwidth)` of forced
+  writes — small for the default 10-day grace, large for short grace on a
+  cold disk, where the bandwidth knob stretches drop latency instead. The
+  **effective frontier** (Alternatives) removes the cost for fully-live
+  segments; the [purge journal](#gate-2-candidate-2--purge-journal) removes
+  it from the drop latency altogether.
+- A time-series workload (inserts with TTL, no overwrites) is the best case:
+  the oldest segments expire whole, passing them is a free-without-rewrite.
 
 ### Drop mechanisms
 
@@ -503,16 +662,16 @@ Two cooperating consumers of the drop rule:
 1. **GC sweep (primary).** A periodic per-shard fiber iterates each logstor
    table's `primary_index` gently (chunked, re-lookup after yield — same
    pattern as `erase_range_gently`). For entries with
-   `kind != live && gc_time < purge_before && F >= H_ext`: erase + free +
-   count. This reclaims **index memory** promptly and turns the record into
-   dead bytes that utilization-based compaction picks up naturally — no
-   GC-aware segment selection is needed for basic operation. Existing races
-   are already handled: compaction's `update_record_location` fails for erased
-   keys and frees its copy; in-flight reads hold `_reads_phaser`, and segment
-   freeing already awaits pending reads.
+   `kind != live && gc_time < purge_before`: erase + count. This reclaims
+   **index memory** promptly and turns the record into dead bytes that
+   utilization-based compaction picks up naturally — no GC-aware segment
+   selection is needed for basic operation. Existing races are already
+   handled: compaction's `update_record_location` fails for erased keys (and
+   re-inserts a tombstone copy, above); in-flight reads hold an `index_read_guard`,
+   and segment freeing already awaits pending reads.
 2. **Drop in compaction (opportunistic).** In `do_compaction`'s header
    callback, a record that `is_record_alive` but passes the drop rule (using
-   the on-disk header's kind/gc_time) is erased + freed and *not* rewritten
+   the on-disk header's kind/gc_time) is erased and *not* rewritten
    (`want_data::no`). The check-and-erase is synchronous within the callback.
    This avoids pointlessly copying droppable tombstones forward during normal
    and frontier compaction.
@@ -580,10 +739,11 @@ entries and bytes; utilization does the rest). Two triggers are still needed:
 
 Counters/gauges (per shard): tombstones dropped (sweep / compaction), expired
 records dropped/converted, bytes reclaimed by GC, current `F`, max allocated
-seq, `H_ext`, per-table purge bound age (`now − purge_before`), pending
-`gc_bytes`, frontier-task bytes rewritten, sweep iterations/duration.
-`purge bound age` and `max_seq − F` are the two health signals that show GC
-falling behind.
+seq, invalidation queue depth, re-clamps (by loser site), orphan tombstone
+copies re-inserted, per-table purge bound age (`now − purge_before`),
+pending `gc_bytes`, frontier-task bytes rewritten, sweep
+iterations/duration. `purge bound age` and `max_seq − F` are the two health
+signals that show GC falling behind.
 
 ### Configuration
 
@@ -596,18 +756,140 @@ falling behind.
 - Gate 1 uses the existing per-table schema (`gc_grace_seconds`,
   `tombstone_gc` mode); no new per-table options.
 
-## Alternative Gate 2 — mark-and-sweep verification
+## Gate 2 candidate 2 — purge journal
+
+The per-key form of `logstor_recovery1`'s erase watermark. Where the frontier
+proves that no stale copy of `K` is scannable by *destroying* everything old
+enough to hold one, the journal makes stale copies **unrecoverable by
+filtering**: a durable record `(table, key, S)` tells recovery to drop every
+record of `K` found in a chunk with `segment_seq <= S`, exactly as a
+watermark does for a token range. Gate 1, the metadata, the two-gate rule and
+the TTL design are unchanged; the drop happens as soon as Gate 1 passes, and
+frontier progress only bounds the journal's size.
+
+### Cycle
+
+A per-shard fiber, periodically:
+
+1. **Switch the active segment.** From here on every user write lands in a
+   segment with a seq above `S := (new active seq) − 1`. One pool pop, as the
+   erase protocol does after every erase.
+2. **Drain.** `await_pending_writes()` — every write to a segment `<= S` has
+   made its index call (the buffer gate covers the inserts) — and
+   `await_relocations()` (a per-shard phased barrier held over every
+   copy window: from the copier's liveness check to its
+   `update_record_location`; see below). Now every physical record with
+   `seq <= S` has had its index call, and every copy in flight has been
+   published or has failed.
+3. **Mark.** Walk the index gently; entries with `kind != live && gc_time <
+   gc_before(now)` are candidates `(key, location)`, in chunks.
+4. **Erase.** For each candidate of the chunk, synchronously: re-check the
+   whole drop condition — the entry still matches `(key, location)` *and*
+   Gate 1 still holds for its current `gc_time` (a loser may have re-clamped
+   it since the mark) — and `index.erase(key, location)`. Collect the
+   erased keys.
+5. **Journal.** Append the chunk's `(table, key, S)` entries to the per-shard
+   journal file and wait for the write (`O_DSYNC`). Only then move to the
+   next chunk.
+
+The erase comes before the append on purpose. In the other order a late
+write that loses to `T` between the append and the erase would re-clamp `T`,
+the erase would rightly skip it, and the journal would still say that `T`'s
+record is dead at the next recovery — while the runtime keeps it. Erasing
+first, the append only ever records drops that happened; a crash between
+the two brings the tombstone back at recovery (its record has `seq <= S`
+and no entry filters it), which is benign.
+
+Steps 3–5 may take as long as they like: what step 2 established — that the
+index is the truth for every record with `seq <= S` — stays true, because
+sequences are monotone and nothing writes into a segment `<= S` again.
+
+### Why it is safe
+
+Let `T` of `K` be erased in step 4 with journal entry `(K, S)` durable in
+step 5. Any stale copy `R'` of `K` either has `seq <= S` — filtered at
+recovery — or `seq > S`. A record with `seq > S` was written after step 1, so
+its index call is either a user write or a streamed record — if it loses to
+`T` before the erase it re-clamps `T` and step 4 skips `T` (no journal entry,
+`T` stays); if it runs after the erase it wins, post-purge LWW, consistent
+with recovery since it is not filtered — or a relocation copy. A relocation
+copy with `seq > S` that is stale is a copy of a record that was live at its
+liveness check and lost before its update: if it lost to `T`, the update
+re-clamped `T` and step 4 skips it; if the update ran after the erase, the
+copy started after the drain of step 2, so its source record was live after
+the drain — the only live record of `K` then is `T` itself, and the copy is
+a tombstone copy that the copier re-inserts (the orphan rule above). A copy
+of a *pre-delete* value in flight across the drop is excluded by the drain:
+its window started before step 2 and was awaited there.
+
+The separator is the one copier whose window is long: a record sits in a
+group's buffer until the buffer flushes, possibly for days on a cold group,
+and today the buffer copies records that are already dead. The journal
+therefore needs the **liveness check at flush**: before a separator buffer
+is written out, records that are no longer alive at their source location
+are dropped from it, so that the copy window starts at the flush and is
+bounded by one segment write — which is what makes `await_relocations()`
+cheap. This is a change to `separator_buffer`'s flush and an improvement in
+its own right (overwritten-before-separation records are no longer copied).
+
+A crash between steps 4 and 5 re-inserts the erased tombstones at recovery,
+with every stale copy dominated as before the cycle. What that window does
+not preserve is a write older than `T` that arrived after the erase and won
+at runtime: after the restart the returned tombstone shadows it again. That
+is the post-purge-LWW class of write within one I/O of the purge, and it is
+accepted.
+
+### Retirement and the file
+
+An entry `(K, S)` is dead weight once no scannable record of `K` with
+`seq <= S` exists. Two ways to know:
+
+- **Frontier**: once `F >= S` every segment `<= S` is unscannable. The
+  scannable set and invalidate-on-free are needed for this; the forced
+  compaction task is not on the drop's critical path anymore and runs only
+  when the journal exceeds its cap (`gc_journal_max_entries`), so cold
+  segments are rewritten only when the journal actually needs them gone.
+- **Retirement scan**: a header-only read of every scannable segment;
+  entries without a sighting retire. No barrier is needed — a new record of
+  `K` with `seq <= S` can never appear — which is what makes this scan
+  trivially safe where mark-and-sweep's needs a write barrier. It depends on
+  *recovery1*'s body CRC to read open and reused segments safely.
+
+Entries are appended in `S` order, so retirement by frontier is a head
+pointer; the file is a per-shard append-only log next to the segment files
+(`ls_{shard}-Purge.db`: a header with magic and version, entries of
+`table id, token, key hash, S` with a CRC per batch), loaded into a hash set
+at recovery before the scan and probed once per scanned record in
+`scan_slot`, next to the watermark check. Its maximum `S` feeds the recovered
+`_next_segment_seq` like the watermarks' does (Invariant Q of
+`logstor_discard.md`). Recovery-time memory is one hash entry per unretired
+purge — the reason for the cap; with the frontier retiring entries this is
+bounded by the frontier lag, and with the scan by one scan period.
+
+### What it changes in the comparison
+
+Drop latency becomes `grace + one cycle` regardless of the disk's age
+structure; no forced rewriting is on the critical path; nothing touches the
+write hot path (the phaser is held by copiers only). Its costs are the
+journal — a new durable artifact, an append per drop, a hash set at recovery
+— the liveness check at separator flush, and the relocation phaser. The
+frontier's scannable set and invalidation stay as the retirement engine
+(or are replaced by the retirement scan).
+
+## Gate 2 candidate 3 — mark-and-sweep verification
 
 An alternative implementation of Gate 2 only. Gate 1, the GC metadata, the
 two-gate purge rule, post-purge LWW semantics, and the TTL design are
 unchanged; what differs is *how* we establish that no stale physical copy of
-the key can be resurrected by recovery.
+the key can be resurrected by recovery. Kept for the record; the purge
+journal reaches the same "no forced rewriting" at a lower cost, and this
+section's corrections are noted inline.
 
 ### Principle
 
 The frontier proves no stale copy of `K` is scannable by **destroying
 history**: a tombstone may be dropped only after every segment old enough to
-hold a stale copy has durably left the scannable set (`F >= max(H_t, H_ext)`).
+hold a stale copy has durably left the scannable set (`F >= H_t`).
 That is an inductive invariant, and its price is forced compaction — cold
 segments must be *rewritten* for `F` to pass them.
 
@@ -621,29 +903,32 @@ The "ensure no old records can be written past some point" requirement does
 **not** need a write fence. Backdated writes are legitimate at any time
 (client `USING TIMESTAMP`, hints, streaming), so they cannot be rejected.
 Instead they are *detected*: the physical bytes of every record land before
-its index call, every index mutation funnels through exactly two functions
-(`primary_index::insert` and `primary_index::update_record_location`), and
-while a cycle is active each such call for a candidate key simply **cancels
-the candidate** — the drop is deferred to a later cycle. This is the
-snapshot-at-the-beginning barrier of concurrent GC literature, applied to
-physical record copies.
+its index call, every call that makes the index point at a record goes
+through exactly two functions (`primary_index::insert` and
+`primary_index::update_record_location`), and while a cycle is active each
+such call for a candidate key simply **cancels the candidate** — the drop is
+deferred to a later cycle. This is the snapshot-at-the-beginning barrier of
+concurrent GC literature, applied to physical record copies.
 
 ### GC cycle
 
 A per-shard background fiber runs cycles:
 
-1. **Arm the barrier** (below).
-2. **Roll the write path**: `await_pending_writes()` plus a separator flush
-   (`flush_all_separator_buffers`), so that every record whose index call
-   predates the barrier is durable in a segment with `seq <= S0`. Record
-   `S0 = max allocated seq`. Note the roll does **not** seal everything: a
-   writeable segment may stay open with room, holding pre-arm records and
-   still receiving appends — and it must be swept (`seq <= S0`). Scanning an
-   actively-appended segment is safe by this argument: a buffer not yet
-   durable when the scan reads it contains only records whose index calls
-   have not run yet, so those records are covered by the barrier (Case B of
-   the proof) rather than by the sweep. The simpler alternative — force-close
-   open segments at roll, at a small space cost — is an open decision.
+1. **Arm the barrier** (below) and record `S0 = max allocated seq`.
+2. **Roll** — corrected in this review: no flush is needed. Every record
+   whose index call predates arming had its bytes durable before that call,
+   in a segment whose seq was issued before arming, hence `<= S0`. The
+   separator buffers hold copies that are not physical yet; their updates
+   run after arming and are caught by the barrier. What remains is that the
+   sweep must read every scannable segment `<= S0` including the **open
+   active segment**, which keeps receiving appends: with *recovery1*'s body
+   CRC, a chunk the scan reads while it is being written fails the check and
+   the scan stops there; the records in it have not made their index calls
+   (bytes first), so the barrier covers them. Without the CRC this scan could
+   deliver stale bytes of a reused slot (S6 of `logstor_discard.md`), so the
+   CRC is a hard dependency. Force-closing the active segment at arming
+   (one pool pop) is the simpler alternative if scanning an open segment
+   proves awkward.
 3. **Mark**: iterate the `primary_index` gently (chunked, the
    `erase_range_gently` pattern). Every entry with
    `kind != live && gc_time < gc_before(now)` becomes a **candidate**
@@ -658,22 +943,28 @@ A per-shard background fiber runs cycles:
 5. **Quiesce**: with the barrier still armed, drain in-flight relocations
    (separator and compaction writes started before the sweep ended), so that
    every physical record existing at this point has made its index call.
+   The separator's long buffering window makes this a forced flush of every
+   separator buffer unless the liveness check at flush (journal section) is
+   in place.
 6. **Drop**: for each surviving candidate whose index entry still matches
-   `(key, location)`: `index.erase` + `free_record`, synchronous per entry,
-   chunked with yields (the barrier keeps cancelling not-yet-dropped
-   candidates during the yields).
+   `(key, location)`: `index.erase`, synchronous per entry, chunked with
+   yields (the barrier keeps cancelling not-yet-dropped candidates during
+   the yields).
 7. Disarm the barrier, discard the table.
 
 ### The write barrier
 
-Every mutation of the primary index goes through exactly two functions, and
-they are the only hooks needed:
+Every call that makes the primary index point at a record goes through
+exactly two functions, and they are the only hooks needed (`erase` and
+`clear` also mutate the index, but they remove entries and create no
+records):
 
 - `primary_index::insert` — user writes (`logstor::write` completion),
   recovery-style inserts, and streamed/restored segments (`load_segment`
-  populates the index via `recover_segment`);
+  populates the index via `scan_slot`);
 - `primary_index::update_record_location` — compaction, separator, and split
-  compaction relocations (the three call sites in `segment_manager.cc`).
+  compaction relocations (the call sites in `segment_manager.cc`, including
+  the recovery path that separates a mixed segment).
 
 While armed: if the key is in the candidate table, cancel the candidate.
 Cancellation is deliberately coarse — *any* touch of a candidate key cancels
@@ -688,18 +979,18 @@ How each source of old records maps onto the hooks:
   it loses LWW to the candidate tombstone it has just become a stale copy —
   and that very `insert` call is the cancellation signal. If it *wins*, the
   tombstone is overwritten and freed, and the candidate is invalid anyway
-  (the drop step re-verifies `(key, location)`).
+  (the drop step re-verifies `(key, location)`). Either way the separator
+  copies the record again later, and that update cancels once more.
 - **Migration / streaming / restore.** `load_segment` writes the segment
-  locally with a fresh seq, then populates the index via `recover_segment`,
+  locally with a fresh seq, then populates the index via `scan_slot`,
   which calls `insert` **per record** — each record concerning a candidate
   key cancels it. There is no bulk path that makes bytes scannable without
   per-record index calls.
 - **Compaction / separator / split-compaction copies** announce themselves
   through `update_record_location`.
 - **Records that arrived before the barrier was armed** are covered not by
-  the barrier but by the roll + sweep: their index calls predate arming, so
-  their bytes lie in sealed segments with `seq <= S0`, all of which the
-  sweep reads.
+  the barrier but by the sweep: their bytes lie in segments with
+  `seq <= S0`, all of which the sweep reads.
 
 **Hot-path cost.** One branch per index mutation when idle; one hash probe
 while a cycle runs. Since scans are long, a cycle is active most of the time
@@ -732,19 +1023,19 @@ codebase (to be preserved, and asserted in review, by any future write path):
   index call second*: the write buffer persists the record before
   `logstor::write`'s continuation calls `insert`; compaction/separator write
   the copy before calling `update_record_location`; `load_segment` writes
-  the segment before `recover_segment` inserts each record. No path creates
+  the segment before `scan_slot` inserts each record. No path creates
   scannable bytes silently — this closure property is what makes two hooks
   exhaustive.
 - **F2 — choke point.** `primary_index::insert` and
-  `primary_index::update_record_location` are the only functions that mutate
-  the primary index.
+  `primary_index::update_record_location` are the only functions that make
+  the index point at a record.
 
 ### Invariants
 
 1. **Announcement** (F1 + F2): every physical record's bytes land before its
-   index call, and every index call passes through one of the two hooks.
-2. **Roll**: after step 2 of the cycle, every record whose index call
-   happened before arming resides in a sealed segment with `seq <= S0`.
+   index call, and every such call passes through one of the two hooks.
+2. **Sealing**: every record whose index call happened before arming resides
+   in a segment with `seq <= S0`.
 3. **Sweep coverage**: the sweep reads every scannable segment with
    `seq <= S0` — compaction groups *and* the free list. Supporting lemma:
    the sweep observes a superset of what any future recovery could observe
@@ -754,13 +1045,13 @@ codebase (to be preserved, and asserted in review, by any future write path):
    lemma is the implementation's weakest link and gets its own tests.
 4. **Barrier**: from arming to disarm, any index call for a candidate key
    cancels the candidate; the drop re-checks cancellation and performs
-   gate-check + erase + `free_record` synchronously, with no yield.
+   gate-check + erase synchronously, with no yield.
 5. **Quiesce**: at drop time, every *relocation copy* physically present has
    already executed its `update_record_location` (in-flight separator and
    compaction writes started before the sweep ended are drained, barrier
    still armed).
 6. **Domination** (pre-existing recovery invariant, preserved): whenever a
-   freed-physical record of `K` is scannable, the live index entry for `K`
+   stale record of `K` is scannable, the live index entry for `K`
    dominates it under the recovery comparator.
 
 ### Correctness proof outline
@@ -775,7 +1066,7 @@ the traditional engine after a tombstone purge.
 scannable at recovery. By invariant 1, `R'` has an index call. Trichotomy on
 when that call executed:
 
-- **Case A — before arming.** By invariant 2, `R'` lies sealed in a segment
+- **Case A — before arming.** By invariant 2, `R'` lies in a segment
   with `seq <= S0`; by invariant 3 the sweep saw its header — key `K` at a
   location other than `loc` — and cancelled `T`. Contradiction with `T`
   being dropped.
@@ -785,14 +1076,13 @@ when that call executed:
   - *`R'` is a relocation copy written before `D`* — excluded by invariant 5:
     its index call was drained before the drop, placing it in Case B. (This
     is the one race the quiesce step exists for: without it,
-    `update_record_location` would run after the erase, fail, and free the
-    copy — a scannable record of `K` with no live entry, i.e. a
+    `update_record_location` would run after the erase, fail, and leave
+    the copy — a scannable record of `K` with no live entry, i.e. a
     resurrection.)
   - *`R'` is a relocation copy started after the sweep* — relocations copy
     only records live at copy time; the only live record of `K` is `T`
     itself (the drop re-verified `(key, loc)`), so `R'` is a copy of the
-    tombstone. Resurrecting it re-inserts `T` — benign, re-dropped next
-    cycle.
+    tombstone. The copier re-inserts it (orphan rule); recovery agrees.
   - *`R'`'s `insert` runs after `D`* — the late hint / backdated write /
     streamed record: `insert` finds either no entry for `K`, in which case
     `R'` **wins** and becomes the live entry — not a stale copy, and
@@ -832,9 +1122,8 @@ structural cost of the approach versus the frontier's O(1) state.
   any candidate key other than the candidate's own record (one live entry per
   key). This is the same observation as the *effective frontier* refinement,
   but here it is purely an I/O saving — the correctness carrier remains
-  scan + barrier. It requires accurate per-segment accounting of
-  never-inserted loser records (today a losing write is simply never added,
-  so `free_space` alone does not identify fully-live segments).
+  scan + barrier. It requires the `has_stale` accounting of never-inserted
+  losers (Stage A).
 - **Invalidate-on-free (optional).** Zeroing a freed segment's header (as the
   frontier design mandates) is *optional* here and only shrinks the scan set;
   freed-but-intact segments are otherwise scanned like recovery would scan
@@ -856,250 +1145,227 @@ completed sweep. Between cycles, compaction keeps copying droppable
 tombstones forward — cheap once deletes are slim, but a real difference for
 payload-bearing tombstones until slim deletes ship.
 
-### Comparison with the frontier
+### Risks specific to mark-and-sweep
 
-| Dimension | Frontier + horizons | Mark-and-sweep |
-|---|---|---|
-| Proof shape | inductive: everything old is durably unscannable | direct: scanned everything, saw nothing; barrier keeps it true |
-| Extra writes | forced compaction of all segments below the horizon; 4K invalidation per freed segment | none |
-| Extra reads | none beyond forced compaction | header scan of scannable segments per cycle |
-| A 95%-live cold segment | must be **rewritten** for `F` to pass it | merely **read** |
-| Drop latency after grace | until `F` passes the pre-grace horizon (compaction-bandwidth-bound) | one mark+scan cycle (read-bandwidth-bound) |
-| Drop granularity | continuous as `F` advances; plus opportunistic drop in compaction | batch at end of each cycle; no drop-in-compaction |
-| Per-shard GC state | O(1): `F`, snapshot ring, `H_ext`, scannable set | candidate table (~32 B/candidate, capped); big backlogs need several cycles |
-| Write hot path | untouched (`H_ext` bump on loser completions only) | branch + hash probe per index mutation while a cycle runs |
-| Coupling | GC progress tied to compaction (frontier task, separator nudge, invalidate-on-free ordering) | self-contained fiber; two index hooks + recovery's scan path |
-| Crash | recompute; GC resumes after a full frontier pass | stateless; aborted cycle restarts |
-| Failure modes | `F` stuck behind cold/mixed segments; WA spikes | scan bandwidth; candidate cap; churn-cancel starvation |
-
-The decisive cost difference is the fourth row. Under the frontier, *any*
-scannable segment below the horizon must be rewritten — including cold
-segments that are 95% live and that utilization-based compaction would never
-touch; the effective-frontier refinement exempts only *fully*-live segments.
-Under steady scattered overwrites nearly every old segment has some freed
-records, so a frontier pass approaches a full-disk **rewrite** while a
-mark-and-sweep cycle approaches a full-disk **read** — cheaper at the device
-level, no flash wear, no free-space consumption, and easily rate-limited
-without starving GC (read bandwidth is far easier to provision than
-compaction write bandwidth).
-
-The frontier's structural advantages are the O(1) memory (no cap, no
-multi-cycle backlog draining under mass deletes), continuous rather than
-batched drops, the opportunistic drop-in-compaction path, and an untouched
-write hot path.
-
-Starvation differs in kind: the frontier can be *stuck* (a cold segment holds
-`F` back indefinitely without the frontier task); mark-and-sweep can only be
-*deferred per key* (a candidate whose key keeps getting touched — e.g. its
-tombstone keeps being relocated by compaction — is cancelled each cycle;
-updating the candidate's location on `update_record_location` instead of
-cancelling removes the common case).
-
-### Revised implementation plan (mark-and-sweep)
-
-Compared with the frontier plan: Stage A shrinks in role but stays — on-disk
-`kind`/`gc_time` no longer feed a drop-in-compaction decision, their only
-remaining consumer is recovery (rebuilding index metadata without
-deserializing mutations); `segment_descriptor::seq` is needed early (the
-sweep enumerates the scan set by `seq <= S0`), while `gc_bytes`/`min_gc_time`
-move out of the critical path to TTL triggering. Stage B is replaced by the
-phases below; Stages C and D are unchanged. Not needed at all: scannable
-set, `F`, snapshot ring, `H_ext`, frontier task, invalidate-on-free (the
-latter optionally kept later as a scan-set reduction).
-
-Each step is independently mergeable, changes no behavior until S7's final
-sub-step, and carries its own verification. The three riskiest components
-(scan coverage, quiesce completeness, hot-path cost) ship first, dormant and
-individually verifiable.
-
-**Phase 0 — groundwork (zero behavior change):**
-
-- **S1. Online scrubber.** The sweep built as a standalone diagnostic:
-  enumerate scannable segments (compaction groups **and** the free list,
-  with pin/skip reuse handling), header-only rate-limited scan
-  (`scan_segment` with `want_data::no`), no GC logic. Also adds
-  `segment_descriptor::seq`. *Verify:* recovery-equivalence test (the online
-  scan observes a superset of what an offline recovery scan of the same disk
-  sees — invariant 3's lemma); a verification mode checking the domination
-  invariant (every live index entry's location is seen; every other sighting
-  of a key is dominated by its live entry). Yields a permanent
-  scrub/consistency tool regardless of the Gate 2 decision.
-- **S2. Relocation phaser (quiesce primitive).** Wrap every physical-copy →
-  `update_record_location` window (compaction, separator, split compaction)
-  in a per-shard phased barrier; expose `await_relocations()`. *Verify:*
-  unit test with injected completion delays; a debug assertion that
-  `update_record_location` is never called outside the phaser — turning
-  "did we enumerate all windows?" into a runtime check instead of a review
-  question.
-- **S3. Barrier skeleton.** Armed-flag + probe call sites in `insert` /
-  `update_record_location` with a pluggable consumer (initially a counter).
-  *Verify:* write-path microbenchmark armed vs. disarmed against a synthetic
-  candidate table — producing the hot-path cost number the mechanism
-  decision partly hangs on, before any GC code exists.
-
-**Phase 1 — metadata (Stage A, trimmed):**
-
-- **S4. On-disk metadata.** `kind` + `deletion_time` + `expiry` in
-  `record_header` with the local-time clamp; buffer `version` bump;
-  write-path classification. *Verify:* serialization round-trip;
-  classification tests (live / delete / expiring / mixed-TTL / backdated →
-  clamp).
-- **S5. Index metadata.** `kind` (2 bits) + 32-bit `gc_time` in
-  `index_entry`, populated on write and on recovery (from the S4 header
-  fields). *Verify:* recovery rebuild tests; per-key memory-budget
-  measurement (target: fit in existing padding).
-
-**Phase 2 — GC assembly:**
-
-- **S6. Candidate table.** Pure data structure: key-hash keying,
-  cancel-on-collision safety, memory cap, cancellation metrics by source.
-  Fully unit-testable in isolation.
-- **S7. Cycle fiber — dry-run first.** Wire roll → mark (chunked index walk,
-  Gate 1 in `timeout` mode) → sweep (S1) → quiesce (S2) → **report**:
-  log/metric the would-drop survivors without erasing anything. *Verify:*
-  production-like stress with survivors cross-checked against ground truth
-  (full-data audit in tests). Only then enable the actual erase +
-  `free_record` behind `logstor_gc_enabled`. Config: `gc_scan_bandwidth`,
-  `gc_candidate_limit`, cycle period.
-- **S8. Resurrection kill-suite.** Error-injection kills at every cycle
-  stage, recover, assert the key stays deleted; backdated write during the
-  sweep; relocation straddling the drop; `load_segment` mid-cycle;
-  candidate-cap overflow across cycles; table drop / `discard_segments`
-  mid-cycle. Written against the drop-rule *interface*, so it survives a
-  Gate 2 mechanism switch.
-
-**Phase 3 — TTL** (C1–C4 as in the main plan; the `gc_bytes`/`min_gc_time`
-accounting lands with C4). **Phase 4 — repair-aware grace** (Stage D,
-unchanged).
-
-### Risks
-
-1. **Roll semantics (open segments).** The roll flushes buffers but does not
-   seal open writeable segments, which hold pre-arm records, keep receiving
-   appends, and must be swept. Safety of scanning them rests on the
-   not-yet-durable-buffer argument in the cycle description (step 2); the
-   force-close alternative trades a little space for a simpler invariant.
-   Decide before S1.
-2. **Quiesce completeness is enumerative.** A missed relocation window is a
-   silent resurrection path. S2's phaser plus the runtime assertion is the
-   structural fix; the assertion is mandatory, not a nice-to-have.
-3. **Cancellation storms.** A compaction that rewrites a tombstone-dense
+1. **Quiesce completeness is enumerative.** A missed relocation window is a
+   silent resurrection path. A relocation phaser with a debug assertion that
+   `update_record_location` is never called outside it turns "did we
+   enumerate all windows?" into a runtime check.
+2. **Cancellation storms.** A compaction that rewrites a tombstone-dense
    segment mid-cycle relocates many candidates and cancels them all — GC
    starves precisely on the segments most worth reclaiming, and relocation
    is the *common* touch of a cold tombstone (far more common than backdated
-   writes). Updating the candidate's location on `update_record_location`
-   instead of cancelling is therefore a likely requirement, not just a
-   refinement (the old location becomes a freed copy of the tombstone
-   itself, whose resurrection is benign).
-4. **Long armed windows.** Cycle duration is scan-bound; on large disks the
+   writes). The separator copying dead records adds a cancellation per
+   overwritten-before-separation record. Updating the candidate's location
+   on `update_record_location` instead of cancelling, and the liveness check
+   at flush, are therefore likely requirements, not refinements.
+3. **Long armed windows.** Cycle duration is scan-bound; on large disks the
    barrier is armed for hours, so the hot-path probe is effectively
-   permanent and cancellation exposure grows with cycle length. S3's early
-   measurement and the per-source cancellation metrics decide whether a
-   bloom prefilter and the cancel→update change are needed.
-5. **Candidate memory.** The cap means mass-delete backlogs drain over
-   several cycles, each a full scan; needs a dedicated stress test (S8) and
-   sizing guidance for `gc_candidate_limit`.
-6. **Gate 1 timing** (no risk, for completeness): candidates are gated at
-   mark time; `gc_before` is monotone, so mark-time evaluation only
-   under-selects — never unsafe.
+   permanent and cancellation exposure grows with cycle length.
+4. **Candidate memory.** The cap means mass-delete backlogs drain over
+   several cycles, each a full scan.
 
-### Open questions (mark-and-sweep)
+## Comparison of the Gate 2 candidates
 
-- Roll semantics: force-close open segments vs. the open-segment scan
-  argument (risk 1) — decide before S1.
-- Measured hot-path cost of the barrier probe on the write path; whether a
-  bloom prefilter is needed (S3 answers this).
-- Candidate cap default and behavior under mass-delete backlogs (cycles to
-  drain vs. scan cost).
-- Free-list scan vs. reuse coordination (pin the segment during its scan, or
-  skip and rely on the barrier).
-- Per-segment accounting for never-inserted losers, needed by the
-  skip-fully-live optimization.
+| Dimension | Frontier + horizons | Purge journal | Mark-and-sweep |
+|---|---|---|---|
+| Proof shape | inductive: everything old is durably unscannable | filter: everything old is unrecoverable by seq; drain makes the index the truth for `seq <= S` | direct: scanned everything, saw nothing; barrier keeps it true |
+| Extra writes | forced compaction of all segments below the horizon; 4K invalidation per freed segment | journal append per drop; invalidation per freed segment (retirement); forced compaction only past the journal cap | none |
+| Extra reads | none beyond forced compaction | none (frontier retirement) or a header scan per retirement period | header scan of scannable segments per cycle |
+| A 95%-live cold segment | must be **rewritten** for `F` to pass it | untouched until the journal needs it retired | merely **read** |
+| Drop latency after grace | until `F` passes the pre-grace horizon (compaction-bandwidth-bound) | one cycle (drain + index walk) | one mark+scan cycle (read-bandwidth-bound) |
+| Drop granularity | continuous as `F` advances; plus drop in compaction | batch per cycle; drop in compaction possible with a deferred journal append | batch at end of each cycle; no drop in compaction |
+| Persistent state | none | journal file (per-key entries until retired) | none |
+| Per-shard memory | O(1): `F`, ring, scannable set | journal hash set at recovery only | candidate table (~32 B/candidate, capped) |
+| Write hot path | untouched (re-clamp on losers only) | untouched (phaser held by copiers) | branch + hash probe per index mutation while a cycle runs |
+| Coupling | GC progress tied to compaction (frontier task, separator nudge, invalidate-on-free ordering) | drain per cycle: active-segment switch, write phaser, relocation phaser, liveness check at separator flush | two index hooks + recovery's scan path + quiesce |
+| Crash | recompute; GC resumes after a full frontier pass | journal is the truth; nothing to recompute | stateless; aborted cycle restarts |
+| Failure modes | `F` stuck behind cold/mixed segments; WA spikes | journal cap reached (drops pause); recovery memory | scan bandwidth; candidate cap; churn-cancel starvation |
+| Depends on `logstor_recovery1` | rebase only | watermark file pattern, scan-time filter, Invariant Q; CRC for the retirement scan | body CRC for scanning open/reused segments |
+
+The frontier is the smallest complete mechanism and its machinery (segment
+`seq`, scannable set, invalidate-on-free, the re-clamp) is also the journal's
+retirement engine, so the journal is a strict extension rather than a
+replacement. Mark-and-sweep's unique costs — the write-path probe, the
+candidate table, cancellation storms, a barrier armed for hours — buy nothing
+the journal does not buy more cheaply once the erase-watermark pattern exists.
+
+## Interaction with the discard work (`logstor_recovery1`)
+
+`logstor_recovery1` (design in `logstor_discard.md`, Phases 0–3
+implemented, not merged as of this review) changes the recovery model this
+design reasons about. What it provides and what it changes here:
+
+- **Rebase.** `logstor_gc` and `logstor_recovery1` fork from the same
+  master; the GC work builds on the recovery branch. This document describes
+  the code as of that branch.
+- **Erase watermarks** (`erase_watermarks.{hh,cc}`, file `ls_{shard}-Erase.db`,
+  `segment_manager::erase()`): a durable `(table, token range, S)` filtered
+  at scan time before insertion; the recovered `_next_segment_seq` stays
+  above every watermark (Invariant Q); watermarks are GC'd at recovery by the
+  minimum seq present and by table existence. The purge journal is the
+  per-key instance of this pattern and reuses the file, filter and Invariant
+  Q idioms; the erase protocol's "drain, then `S = _next_segment_seq − 1`,
+  erase, then switch the active segment" is the journal cycle's drain in
+  range form — the erase can pick `S` before switching because it pauses the
+  table's writes, the journal has no pause and switches first.
+- **`discard_segments` is gone**; the erase path's `discard_group_segments`
+  still zeroes the first block of the group's emptied segments. The frontier
+  needs that zeroing on *every* free — "Option A", which the discard design
+  considered and deferred as unnecessary for erase correctness. The two do
+  not conflict: the invalidation queue here does the zeroing for both.
+- **Rules P2 and P3** at `free_segment` and the three copiers. P3 (publish
+  before free: the copier holds its sources until the copies are
+  index-visible) is what closes the in-flight-copy case of the frontier's
+  proof; it was implicit before and is now written where the code relies on
+  it. Any new copier — the frontier task reuses compaction, the slim-tombstone
+  rewrite lives in compaction — inherits it.
+- **Body CRC and header-last streaming.** A torn or racing chunk is rejected
+  by the scan, which is what makes an online header scan of open or reused
+  segments safe: a hard dependency of mark-and-sweep and of the journal's
+  retirement scan, and what the online scrubber tool needs.
+- **Recovery-equivalence harness** (`recovery_divergence()` in
+  `test/lib/logstor_test_utils.hh`, `rebuild_index_from_disk(index_resolver)`):
+  rebuilds an index from disk through the recovery code and diffs it against
+  the live one. It is the oracle for GC's resurrection suite: after every GC
+  scenario (and after every injected kill), the rebuilt index must equal the
+  live one — dropped keys absent, everything else in place. The journal
+  adds its filter to `rebuild_index` the way the watermarks did.
+- **Records without a local group are dropped at recovery** and counted; a
+  `full` segment straddling two local groups is separated per record. GC
+  does not change this.
+- **The equal-timestamp gap** (a same-timestamp overwrite lost at recovery
+  when the separator has moved the older copy above the active segment) is
+  independent of GC: the drop rule reasons about *any* stale copy regardless
+  of the comparator. The planned fix wants the segment sequence in
+  `segment_descriptor`, which Stage A adds; it should land as one change.
+- **Erase during GC.** An erase (cleanup, truncate, drop) fences writes and
+  stops the copiers of its groups; the sweep may keep erasing keys of the
+  range meanwhile, which `index.erase(range)` would remove anyway, and a
+  journal append for an erased key is harmless (the watermark covers the
+  key too). Drop-in-compaction is off while compaction is disabled for the
+  erase.
+- **"Scannable" vs "recoverable".** A record covered by a watermark is
+  scannable but not recoverable. This design keeps reasoning about
+  scannability, which is conservative.
 
 ## Alternatives considered
 
-- **Durable liveness checkpoint** (previously "candidate 2b"): persist an
-  index/segment-liveness manifest; recovery replays only newer segments, so
-  freed records are never re-scanned and Gate 2 holds by construction.
-  Strictly stronger and also a recovery-speed improvement, but a much larger
-  artifact (checkpoint format, crash consistency, replay). Deferred; the
-  frontier machinery remains useful with it (frontier trivially equals the
-  checkpoint barrier).
-- **Purged-tombstone journal**: on drop, append `(key, timestamp)` to a small
-  per-shard journal consulted at recovery; journal entries retire once
-  `F >= H`. Decouples index-memory reclamation from frontier progress
-  (tombstones leave the index immediately after grace). Middle ground between
-  the frontier and the checkpoint; adds a new on-disk artifact. Revisit if
-  frontier latency proves painful in practice.
-- **Effective frontier** (refinement of the chosen design): let `F` skip
-  scannable segments that contain **zero freed records** — a fully-live
-  segment cannot contain a stale copy of any key (all its records are the
-  unique live versions). Records freed later always have a newer live version
-  at freeing time, and tombstone winners bump `H_ext`, so per-drop-time
-  evaluation stays sound. This removes most forced-compaction write
-  amplification for cold live data. Planned as a follow-up once the basic
-  frontier is validated by stress tests, since it weakens the very simple
-  "everything old is gone" invariant.
+- **Durable liveness checkpoint**: persist an index/segment-liveness
+  manifest; recovery replays only newer segments, so stale records are never
+  re-scanned and Gate 2 holds by construction. Strictly stronger and also a
+  recovery-speed improvement, but a much larger artifact (checkpoint format,
+  crash consistency, replay). Deferred; the frontier machinery remains useful
+  with it (frontier trivially equals the checkpoint barrier).
+- **Effective frontier** (refinement of the frontier): at drop time, ignore
+  scannable segments that hold **no stale copy at all** (`has_stale` clear):
+  a fully-live segment cannot contain a stale copy of any key. It must be
+  evaluated per drop, not kept as a monotone counter: a cold segment that was
+  fully live when the frontier passed it may gain its first stale copy later
+  (an overwrite of one of its keys) and then hold a pre-delete value of a key
+  deleted later still — so `F_eff = min{seq : scannable and has_stale} − 1`,
+  which can move backwards. It depends on the loser accounting of Stage A
+  (a losing write leaves a stale copy without any free). This removes most
+  forced-compaction write amplification for cold live data. A further step
+  — passing a segment by a header scan that records its stale keys, and
+  rewriting only when there are too many — is the scan-to-pass hybrid; not
+  planned.
+- **Global external horizon `H_ext`** (previous revision): a per-shard
+  monotone seq bumped on every loser to a tombstone and on every
+  `load_segment`. Replaced by the per-entry re-clamp, which is equivalent
+  for correctness and does not stall every drop on the shard.
 - **Persisting `F`/snapshots**: lets GC resume immediately after restart
   instead of waiting for a fresh frontier pass. Pure optimization with crash-
-  consistency cost; deferred.
+  consistency cost; deferred. The purge journal makes it moot for drop
+  latency.
 
 ## Implementation plan
 
-This staged plan implements Gate 2 with the **frontier** mechanism. If the
-**mark-and-sweep** alternative is chosen instead, Stage B here is superseded
-by the [revised plan](#revised-implementation-plan-mark-and-sweep) in the
-alternative section (Stages A, C, D remain, with Stage A trimmed as
-described there).
-
 Stages are independently mergeable; tombstone GC (B) and TTL (C) are
-independent after A. Each stage lands with its metrics and tests.
+independent after A. Each stage lands with its metrics and tests, and every
+resurrection test uses `recovery_divergence()` as its oracle.
 
-### Stage A — GC metadata foundation
+### Stage A — groundwork and GC metadata
 
-- **A1. On-disk metadata.** `kind` + `deletion_time` + `expiry` in
-  `record_header` (IDL) with the local-time clamp; buffer `version` bump;
-  write-path classification (`extract_logstor_record_timestamp` grows into a
-  `classify_record` returning timestamp + gc info). Recovery/compaction/
-  separator pass the fields through unchanged (`log_record_bytes_writer`
-  already preserves header bytes).
-- **A2. Index metadata.** `kind` (2 bits) + 32-bit `gc_time` in `index_entry`,
-  populated on write and on recovery; memory-budget check; kind-aware cache
-  eviction hook for future conversion.
-- **A3. Segment accounting.** `seq`, `gc_bytes`, `min_gc_time` in
-  `segment_descriptor`, maintained on write/free and rebuilt in recovery;
-  gauges.
+- **A0. Shared groundwork.** `segment_descriptor::seq` (set at
+  `get_segment`, rebuilt by recovery) — also what the equal-timestamp fix of
+  `logstor_discard.md` needs; the three loser sites report the loser's
+  location (`has_stale`) and expose the winning entry to the caller; the
+  space-accounting interface carries the record kind.
+- **A1. On-disk metadata.** `kind` + `gc_time` + `deletion_time` + `expiry`
+  in the `ondisk.hh` record header with the local-time clamp; write-path
+  classification (`extract_logstor_record_timestamp` grows into a
+  `classify_record` returning timestamp + gc info). Recovery, compaction and
+  the separator pass the fields through unchanged (`log_record_bytes_writer`
+  already preserves header bytes). No version bump (see above).
+- **A2. Index metadata.** `gc_time` in `index_entry`'s padding, `kind` in
+  `primary_index_entry`'s flags; populated on write and on recovery; sizes
+  pinned by `static_assert`; kind-aware cache eviction hook for future
+  conversion.
+- **A3. Segment accounting.** `gc_bytes`, `min_gc_time`, `has_stale` in
+  `segment_descriptor`, maintained on write/free/lose and rebuilt in
+  recovery; gauges.
 - **Tests:** header serialization round-trip; classification (live delete /
   expiring / mixed-TTL / backdated timestamps → clamp); accounting under
-  write/overwrite/free/recovery.
+  write/overwrite/free/lose/recovery.
 
-### Stage B — tombstone GC (timeout mode)
+### Stage B — tombstone GC (timeout mode, frontier)
 
-- **B1. Scannable set + frontier.** Track seqs of scannable segments;
-  invalidate-on-free (shared helper with `discard_segments`); `F` advances on
-  completed invalidation; recovery rebuilds the set from scanned headers
-  (including segments that end up in the free list — invalidate those during
-  recovery). Metrics: `F`, `max_seq`.
-- **B2. Horizons.** Snapshot ring; `H_ext` bumps at the three loser-completion
-  sites (winner-kind check via the index), in `load_segment`, and at recovery
-  end; per-table purge bound.
+- **B1. Scannable set + frontier.** Track seqs of scannable segments; the
+  invalidation queue and fiber (shared with `discard_group_segments`); `F`
+  advances on completed invalidation; recovery rebuilds the set from scanned
+  headers and queues the free-list slots for invalidation. Metrics: `F`,
+  `max_seq`, queue depth.
+- **B2. Horizons.** Snapshot ring; re-clamp at the three loser sites (winner
+  kind from the entry); per-table purge bound.
 - **B3. Drop paths.** GC sweep fiber (chunked index iteration, drop rule,
-  erase + free); opportunistic drop in `do_compaction`/`do_split_compaction`
-  header callbacks; config knobs; drop/reclaim metrics.
+  erase); opportunistic drop in `do_compaction`/`do_split_compaction` header
+  callbacks; the orphan-tombstone re-insert in the copiers' update failure
+  path; config knobs; drop/reclaim metrics.
 - **B4. Frontier task.** Forced lowest-seq compaction, rate-limited;
-  separator nudge; pending-GC estimate to avoid idle rewriting.
+  separator nudge; pending-GC estimate to avoid idle rewriting; the
+  effective frontier (needs `has_stale`).
 - **Tests:**
   - unit: write→delete→grace→sweep drops entry and bytes; Gate 1 boundary;
-    Gate 2 blocks until frontier passes; purge bound math.
-  - resurrection (the critical suite): delete, GC, **kill at every stage**
-    (before/after invalidation of old segments, before/after tombstone-segment
-    free) via error injection, recover, assert the key stays deleted. Repeat
-    with a freed old copy parked in a high-seq segment (separator/compaction
-    loser), with a backdated delete, and with a late losing write after grace.
+    Gate 2 blocks until frontier passes; purge bound math; re-clamp on a
+    late loser delays the drop.
+  - resurrection (the critical suite, on `recovery_divergence()`): delete,
+    GC, **kill at every stage** (before/after invalidation of old segments,
+    before/after tombstone-segment free) via error injection, recover, assert
+    the key stays deleted. Repeat with a stale old copy parked in a high-seq
+    segment (separator/compaction loser), with a backdated delete, with a
+    late losing write after grace, and with a relocation of the tombstone
+    straddling the drop (orphan re-insert).
   - streaming interplay: stream in a segment with an old copy while a local
-    tombstone is pending drop; assert `H_ext` defers the drop; kill + recover.
+    tombstone is pending drop; assert the re-clamp defers the drop; kill +
+    recover.
   - liveness: cold fully-live segments + deletes → frontier task advances `F`
-    and GC completes within the bandwidth budget.
+    and GC completes within the bandwidth budget; effective frontier skips
+    them.
+- **Exit measurement:** drop latency after grace and forced-rewrite bytes on
+  a cold-disk-with-scattered-deletes stress run decide whether Stage B' is
+  needed before Stage C.
+
+### Stage B' — purge journal (extension)
+
+- **B'1. Relocation phaser.** Held over every copy window (compaction,
+  split, separator flush, recovery separation) with a debug assertion that
+  `update_record_location` never runs outside one; `await_relocations()`.
+- **B'2. Liveness check at separator flush.** Drop records no longer alive
+  at their source before the buffer is written out.
+- **B'3. Journal file and recovery filter.** Append-only per-shard file;
+  hash set loaded before the scan; filter in `scan_slot` next to the
+  watermark check; Invariant Q extended; retirement by `F` with a head
+  pointer; `gc_journal_max_entries` pausing drops at the cap; the frontier
+  task demoted to a cap-driven backstop.
+- **B'4. Cycle fiber**, replacing the sweep's drop rule with the
+  switch–drain–mark–journal–erase cycle; dry-run mode first (report
+  would-drop survivors without erasing).
+- **Tests:** the resurrection suite unchanged (it is written against the
+  drop-rule interface); kills between erase and journal append; a late loser
+  between mark and erase leaves the tombstone in place and unjournaled; a
+  post-purge older write survives restart; a relocation of a pre-delete value straddling
+  the drain; journal cap reached; journal GC at recovery for dropped tables.
 
 ### Stage C — TTL
 
@@ -1120,29 +1386,51 @@ independent after A. Each stage lands with its metrics and tests.
 
 ### Stage D — repair-aware grace
 
-- Wire `tombstone_gc_state` / `get_gc_before_for_key` into snapshots (per-table
-  `gc_before` captured at snapshot time) and the sweep; support
-  `repair`/`immediate`/`disabled`; cluster test with repair-mode GC.
+- Wire `tombstone_gc_state` / `get_gc_before_for_key` into snapshots (the
+  repair-history map as of snapshot time, copy-on-write) and the sweep;
+  support `repair`/`immediate`/`disabled`; cluster test with repair-mode GC.
 
 ### Stage E — optional follow-ups
 
-- Effective frontier (skip fully-live segments).
 - Slim *user* deletes (write deletes header-only from the start).
-- Purged-tombstone journal or durable liveness checkpoint (also a
-  recovery-speed win); persist `F`/snapshots.
+- Online scrubber: the header-only scan with the domination check, useful
+  as a consistency tool regardless of the Gate 2 mechanism.
+- Durable liveness checkpoint (also a recovery-speed win).
+
+## Settled in the review of 2026-10-01
+
+- **Gate 2 mechanism:** frontier + horizons as the base, purge journal as
+  the extension if Stage B's measured drop latency or forced-rewrite cost is
+  unacceptable; mark-and-sweep is not pursued.
+- **`H_ext` replaced** by the per-entry re-clamp; `load_segment` needs no
+  special case (its inserts go through the same loser site).
+- **In-flight copies of pre-delete values** are covered by P3 under the
+  frontier and by the drain under the journal; **in-flight copies of the
+  tombstone itself** are re-inserted by the copier, so runtime and recovery
+  agree even when a post-purge older write arrived meanwhile.
+- **Invalidate-on-free** runs through a queue before the slot is reusable;
+  recovery's free-list slots are invalidated in the background.
+- **Metadata layout:** zero per-key memory growth (`gc_time` in
+  `index_entry`'s padding, `kind` in the flags byte; the entry stays 72
+  bytes); 16 bytes per record on disk, no version bump;
+  `segment_descriptor::seq` shared with the equal-timestamp fix.
+- **The clamped `gc_time` goes to disk**, so a restart does not restart
+  grace.
+- **The drop is one call**, `index.erase(key, loc)`; the disposer frees.
+- **Effective frontier** is evaluated per drop and needs loser accounting.
+- **Dependencies on `logstor_recovery1`** are listed above; the GC branch is
+  rebased onto it, and `recovery_divergence()` is the test oracle.
 
 ## Open questions
 
-- **Which Gate 2 mechanism** — frontier + horizons vs. mark-and-sweep
-  verification (see the [alternative
-  section](#alternative-gate-2--mark-and-sweep-verification) and its
-  comparison table). The main trade: forced-compaction write amplification
-  and compaction coupling (frontier) vs. full-disk read cycles, a capped
-  candidate table, and a write-path barrier probe (mark-and-sweep).
-- Exact packing of `kind`/`gc_time` in `index_entry` vs. the
-  `primary_index_entry` flag bits — decide when measuring the memory budget
-  (target: fit in existing padding).
-- Defaults for `gc_frontier_bandwidth` and sweep/snapshot periods — pick after
-  the Stage B stress runs.
+- Exact defaults for `gc_frontier_bandwidth`, `gc_snapshot_period`,
+  `gc_sweep_period` — pick after the Stage B stress runs.
 - Whether the empty-payload slim tombstone can replace payload-bearing deletes
   everywhere without read-path regressions (Stage C decision point).
+- Whether to pack the on-disk GC block to 8 bytes (kind in `key_size`'s high
+  bits, kind-dependent time fields) — decide with the record-overhead
+  measurements in hand.
+- Journal cap default and recovery-time memory sizing, if Stage B' is
+  built; whether retirement should be frontier-driven or scan-driven.
+- Whether the liveness check at separator flush (B'2) should land earlier,
+  as a write-amplification improvement independent of GC.
