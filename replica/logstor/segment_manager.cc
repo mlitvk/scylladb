@@ -1601,9 +1601,18 @@ future<seg_ptr> segment_manager_impl::allocate_segment() {
     }
 }
 
+// Gives a segment back for reuse. Nothing on disk changes: its records stay where they are until
+// the segment is written over, and recovery reads them like any other. Two rules keep that safe,
+// and this is where they meet:
+// - publish before free: whoever frees a segment because it copied its records elsewhere -
+//   the separator, compaction, a split - has made the copies reachable, pointed the index at them,
+//   and waited for the readers of the old locations, before it gets here. Recovery then finds a
+//   newer copy of every record left in the segment.
+// - erase implies a watermark: whoever frees a segment because it erased its records has
+//   persisted a watermark covering them first, and waited for the readers of the erased
+//   locations, see erase().
+// Either way, no record left in the segment is one recovery would keep.
 void segment_manager_impl::free_segment(log_segment_id segment_id) noexcept {
-    // Before freeing a segment, ensure there are no ongoing operations that use
-    // locations in this segment. See for example `await_pending_reads`.
     logstor_logger.trace("Free segment {}", segment_id);
 
     // This runs on the release path of segment_ref (including from its destructor), so it must
@@ -2270,7 +2279,9 @@ future<> compaction_manager_impl::do_compaction(logstor_group& cg, compaction_ba
 
     logstor_logger.debug("Compaction complete: in {} out {}", compaction_segments_in, compaction_segments_out);
 
-    // wait for read operations that use the old locations
+    // Publish before free (see free_segment()): the copies are in their segments and the index
+    // points at them, so what is left is to let the readers of the old locations finish. Only then
+    // can the sources go.
     co_await index.await_pending_reads();
     co_await utils::get_local_injector().inject("logstor_compaction_wait_before_remove_segments", utils::wait_for_message(std::chrono::seconds{60}));
 
@@ -2379,8 +2390,8 @@ future<> compaction_manager_impl::do_split_compaction(logstor_group& src, mutati
 
         _stats.bytes_read += nonempty_segments.size() * _sm.get_segment_size();
 
-        // All records are safely written to new segments in src.
-        // Await pending reads before freeing the source segments.
+        // Publish before free (see free_segment()): all records are in new segments of src and the
+        // index points at them; let the readers of the old locations finish before the sources go.
         co_await index.await_pending_reads();
 
         // Remove and free the source segments of this batch.
@@ -2464,7 +2475,9 @@ future<> compaction_manager_impl::flush_separator_buffer(separator_buffer& buf, 
         co_await when_all_succeed(updates.begin(), updates.end());
         co_await buf.close();
 
-        // wait for read operations that use the old locations before freeing the old segments
+        // Publish before free (see free_segment()): the segment is written and the index updated
+        // above; let the readers of the old locations finish before the buffer's release frees the
+        // source segments.
         co_await cg.logstor_index().await_pending_reads();
     }());
 
