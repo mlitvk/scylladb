@@ -688,6 +688,9 @@ public:
         partitions_type::bound_hint hint;
         auto i = _partitions.lower_bound(key, primary_index_key_cmp{}, hint);
         if (hint.match) {
+            // On equal timestamps the later write wins here, while recovery prefers the record in
+            // the higher-sequence segment; the two can disagree, see
+            // test_logstor_recovery_loses_an_equal_timestamp_overwrite.
             if (cmp(i->_e, new_entry) <= 0) {
                 // Overwriting with newer data: evict the stale cached partition.
                 if (i->_cached_entry) {

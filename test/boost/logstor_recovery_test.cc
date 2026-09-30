@@ -778,9 +778,49 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_recovery_honors_an_erase) {
     assert_that(*actual).is_equal_to(after);
 }
 
+// An overwrite that carries the same timestamp as the record it replaces, written after the
+// separator moved that record out of the shared mixed segment, is kept by the live index and lost
+// at recovery, which prefers the moved copy for its higher segment sequence. Until the gap is
+// closed, this asserts the divergence, so that it is known to be there and the fix is known to
+// close it.
+SEASTAR_THREAD_TEST_CASE(test_logstor_recovery_loses_an_equal_timestamp_overwrite) {
+    auto schema = make_kv_schema("cf");
+    tmpdir dir;
+
+    test_store store(dir);
+    auto& ls = store.ls();
+    test_recovery_catalog no_tables;
+    ls.do_recovery(no_tables).get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+    auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+
+    // Moved into a segment of the group, above the active mixed segment in sequence.
+    write_to_full_segment(ls, cg, make_kv_mutation(schema, "pk0", "v1", api::timestamp_type(1)));
+    require_recovery_matches(ls, schema->id(), cg.logstor_index());
+
+    // Left in the active mixed segment.
+    auto overwrite = make_kv_mutation(schema, "pk0", "v2", api::timestamp_type(1));
+    ls.write(overwrite, write_target(&cg, {}), db::no_timeout).get();
+    ls.flush_to_separator().get();
+
+    auto actual = read_mutation(ls, schema, cg.logstor_index(), overwrite.decorated_key(), schema->full_slice()).get();
+    BOOST_REQUIRE(actual);
+    assert_that(*actual).is_equal_to(overwrite);
+
+    null_space_accounting accounting;
+    const auto rebuilt = rebuild_index_from_disk(ls, schema->id(), accounting);
+    BOOST_REQUIRE(entries_of(cg.logstor_index()) != entries_of(*rebuilt));
+}
+
 // A fixed pseudo-random mix of writes and overwrites, with timestamps that do not follow the write
 // order so that writes lose to earlier ones and ties happen, interleaved with separator flushes,
-// compactions and an erase.
+// compactions and an erase. The check runs after a final separator flush, which moves every record
+// still in a mixed segment to a group segment above the earlier ones. That decides a tie in arrival
+// order on both sides, so this test does not see the equal-timestamp gap, see
+// test_logstor_recovery_loses_an_equal_timestamp_overwrite.
 SEASTAR_THREAD_TEST_CASE(test_logstor_recovery_reproduces_index_under_mixed_workload) {
     auto schema = make_kv_schema("cf");
     tmpdir dir;
