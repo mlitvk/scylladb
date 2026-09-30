@@ -37,6 +37,37 @@ object-storage IO path — is settled.
 1/2, the on-disk-snapshot options are lettered A/B/C, and the replica-selection
 options are R1–R4.)
 
+**Reviewed 2026-10-01** against master `6e4f4fa3be`, the `logstor_recovery1`
+branch and the `logstor_gc` design. Newly **resolved** by that review, each
+detailed in the section named:
+
+- a **dedicated backup RPC verb** for logstor rather than reusing
+  `backup_snapshot_sstables` — the logstor request carries different
+  parameters and needs a response ("Stage 1 — Backup", 1c);
+- **replica selection at backup time** from the current tablet map, with an
+  ownership check on the receiving node and a bounded re-selection on failure;
+  the snapshot-time tablet rows are only the tablet list ("Stage 1", 1b, 1d);
+- **retry idempotency**: a pack key is never overwritten (it carries a
+  per-attempt UUID) and the node deletes its own metadata rows for the tablet
+  before writing new ones ("Backup unit and object packaging", "Phase 1 risks"
+  item 1);
+- the **previous manifest for dedup is named in the request**
+  (`dedup_from`), not discovered ("Segment identity and deduplication");
+- the **content hash is a 128-bit hash over the segment payload** (everything
+  after the chunk header), with the chunk header's `crc` and `body_crc` as
+  the integrity check on restore; `segment_seq` is not part of the identity;
+- every **seq-based rule** — the stage 4 read skip and the stage 6 repair
+  watermark — needs a **durable per-shard watermark that feeds the recovered
+  sequence counter**, because `_next_segment_seq` is not persisted and a
+  restart can reissue seqs (Invariant Q of `logstor_discard.md`);
+- **logstor needs a real on-disk format version before backup ships**: the
+  in-development "no version bump" policy is fine for a local store and wrong
+  for long-lived backup artifacts;
+- stage 0 and everything after it are **built on `logstor_recovery1`**.
+
+Interactions with the discard and tombstone-GC work are collected in
+"Dependencies and interactions with other logstor work".
+
 Separately, this document records two **live defects** that exist today,
 independent of backup: `auto_snapshot` on `DROP`/`TRUNCATE` silently protects
 nothing for logstor tables, and **tablet repair on a logstor table is a silent
@@ -294,7 +325,7 @@ backup/restore:
   "On-disk snapshot".
 - **Disk capacity is a fixed segment count, not filesystem space.**
   `logstor_disk_size_in_mb` fixes `_max_segments` per shard
-  (`segment_manager.cc:1329`). Holding a segment therefore consumes allocation
+  (`segment_manager.cc:1280`). Holding a segment therefore consumes allocation
   capacity that the write path needs, not just bytes on disk.
 - **Full segments are self-describing.** The **separator** rewrites mixed
   segments into **full** segments, each belonging to a single table and token
@@ -302,9 +333,17 @@ backup/restore:
   `last_token` (`replica/logstor/segment_io.hh:24`, `ondisk.hh`). A full segment
   is therefore a self-contained, range-tagged, 128 KiB unit — a natural backup
   unit.
-- **`segment_seq`** is a monotonic per-segment sequence assigned at seal
-  (`ondisk.hh`), used for recovery tie-breaking. It is **node-local** and is
-  reassigned by the streaming rewriter on the destination node.
+- **`segment_seq`** is a monotonic **per-shard** sequence assigned at seal
+  (`allocate_segment_seq`, stored in the chunk header, `ondisk.hh`), used for
+  recovery tie-breaking. It is reassigned by the streaming rewriter on the
+  destination. It is **not persisted**: recovery restarts the counter one past
+  the highest seq it can still see on disk, so a seq whose segment was freed
+  and forgotten before a restart can be reissued for different bytes unless a
+  durable watermark holds the counter up — Invariant Q of
+  `logstor_discard.md` (`logstor_recovery1`), which that branch enforces for
+  erase watermarks and which every seq-based rule in this document must
+  enforce for its own watermark. Nothing here may assume "a seq is never
+  reused" without that.
 
 ### Logstor already has the required primitives
 
@@ -312,7 +351,7 @@ Logstor built snapshot/stream primitives for tablet migration; they are exactly
 what backup/restore needs.
 
 **Backup source — `table::take_logstor_snapshot(token_range)`**
-(`replica/table.cc:1641`):
+(`replica/table.cc:1681`):
 
 - Flushes the separator first (`sg->flush_separator()`), so every segment in the
   range is a per-table **full** segment.
@@ -321,23 +360,26 @@ what backup/restore needs.
   `segment_snapshot{segment_id, seg_ref, source}`
   (`replica/logstor/segment_manager.hh:86`) exposes a lazy
   `input_stream<char>` over the segment (`make_snapshot`,
-  `segment_manager.cc:2590`).
+  `segment_manager.cc:2800`).
 - The `segment_ref` pins block segment **reuse/free**, not compaction. This is
   precisely how tablet streaming holds segments while sending them to peers
-  (`streaming/stream_blob.cc:771`). Note that this precedent does **not** by
+  (`streaming/stream_blob.cc:786`). Note that this precedent does **not** by
   itself justify holding pins across a long, throttled object-storage upload —
   see the pin cost analysis under "On-disk snapshot".
 
 **Restore sink — `table::create_logstor_segment_sink`**
-(`replica/table.cc:1654`):
+(`replica/table.cc:1696`):
 
 - Allocates a fresh local segment and returns a `segment_stream_sink`
   (`segment_manager.hh:92`). Bytes written to its `output()` stream go through a
   `streamed_segment_rewriter` (`segment_io.hh:75`) that reassigns the segment's
   **local** seq; `close()` runs `load_segment` which re-indexes the records into
   the table's `primary_index` and reattaches the segment to its compaction group
-  (`segment_manager.cc:2711`, `:2737`).
-- This is the receive half of tablet streaming (`stream_blob.cc:218`).
+  (`segment_manager.cc:2941`, `:2950`). On `logstor_recovery1` the rewriter
+  writes the segment's first block **last**, from `close()`, so an ingested
+  segment is either whole or invisible to recovery — a restore interrupted
+  mid-segment leaves nothing half-indexed.
+- This is the receive half of tablet streaming (`stream_blob.cc:220`).
 
 So the design is essentially: **splice each segment snapshot's `input_stream`
 source into `object_storage_client::make_upload_sink` for backup, and
@@ -349,7 +391,7 @@ manifest/metadata layer that describes segments by token range.
 | Capability | SSTable path | Logstor today |
 |---|---|---|
 | Enumerate a table's durable units for a token range | snapshot dir + `parse_path` | `take_logstor_snapshot(range)` (exists, used only for streaming) |
-| Stable unit identity for dedup | `sstable_id` (immutable) | none — segment ids recycled; needs `segment_seq` + content hash |
+| Stable unit identity for dedup | `sstable_id` (immutable) | none — segment ids recycled and seqs not durable across restarts; needs a content hash |
 | Snapshot as an on-disk artifact | hard links (`filesystem_storage::snapshot`) | none — files are mutable in place, so a hard link is naming only, never isolation; needs pinning (segment- or file-granular), a copy, or upload from the in-memory snapshot |
 | Upload a unit to object storage | `object_storage_client::upload_file(path)` | reuse via `make_upload_sink` + segment `input_stream` |
 | Download + ingest a unit | `attach_sstable` | `create_logstor_segment_sink` + rewriter (exists) |
@@ -426,16 +468,33 @@ single tablet preserves per-tablet restore granularity).
 Object key layout:
 
 ```
-{prefix}/{table_id}/{tablet_id}/pack-{tag}-{pack_seq}
-refs/snapshot-{tag}/{table_id}/{tablet_id}/pack-{pack_seq}     (marker)
+{prefix}/{table_id}/{tablet_id}/pack-{attempt}-{pack_seq}
+{prefix}/{table_id}/{tablet_id}/refs/snapshot-{tag}/pack-{attempt}-{pack_seq}   (marker)
 ```
+
+`prefix` is `sstables_location(dst.prefix, table)` (`cluster_backup.cc:53`),
+which does **not** include the snapshot name — all backups of a table to one
+destination share it, which is what lets a manifest re-reference another
+backup's packs. `attempt` is a UUID the node generates per backup RPC.
 
 Pack keys are deliberately **not content-addressed**: the key must be chosen
 before the upload sink opens (segments are appended as the snapshot cursor is
 drained, so the pack's content is unknown up front), and dedup is per-segment
 via the manifest (below), so a content hash in the key would buy nothing.
-Re-uploading the same key on a retried backup of the same tag is an idempotent
-overwrite.
+
+A pack key is **never overwritten**. A retried backup of the same tag runs
+with a fresh `attempt`, writes new packs, and leaves the earlier attempt's
+packs as orphans for GC; any metadata row or manifest entry that still points
+into an earlier pack points at exactly the bytes it was written against. (The
+first draft overwrote `pack-{tag}-{seq}` on retry; a stale row from the first
+attempt would then have located a different segment's bytes at its offset.)
+
+Markers mirror the sstable path (`cluster_backup.cc:461`, which writes
+`refs/snapshot-{tag}/{gen}` under the sstable's own prefix): the marker lives
+next to the pack it references and names the pack's **full** key. A backup
+that re-references a pack of an earlier backup writes its marker next to that
+older pack, so a pack is deletable exactly when its `refs/` listing is empty
+and reference-aware GC needs no manifest parsing.
 
 Each contained segment is described in the manifest/metadata by
 `{object_key, offset, length, segment_seq, content_hash, first_token,
@@ -479,7 +538,7 @@ size — no reframing of the on-disk chunk format is required.
 
 | Aspect | Option 1 (per-segment) | Option 2 (packed) |
 |---|---|---|
-| Object key | `seg-{seq}-{hash}` | `pack-{tag}-{pack_seq}` + per-segment offset/length |
+| Object key | `seg-{seq}-{hash}` | `pack-{attempt}-{pack_seq}` + per-segment offset/length |
 | Manifest/metadata per segment | object key only (offset 0, full length) | object key **+ offset + length** |
 | Upload worker | one sink per segment | one sink per pack; append segments, record offsets |
 | Restore reader | whole-object GET → sink | whole-pack GET + split → sinks (default); ranged GET optional |
@@ -513,26 +572,36 @@ Deduplication across incremental backups is in scope for v1. SSTable dedup keys
 on the immutable `sstable_id`; logstor cannot, because segment ids are recycled
 and segment content is mutable. Instead:
 
-- **Identity = `segment_seq` + content hash.** `segment_seq` is monotonic and
-  never reused on a node, so it is stable for the lifetime of a segment on the
-  source node. The **content hash** (CRC/xxhash over the segment buffer bytes;
-  the per-buffer CRC already present in the `chunk_header` may be reusable to
-  avoid a second pass) guards against any seq ambiguity and provides
-  verification.
-- **Dedup is manifest-based, not probe-based.** Before uploading a tablet, the
-  node loads the **previous backup's manifest** for the table from the bucket —
-  deliberately *not* the `system_distributed` rows, which carry a 3-day TTL
-  while the manifest is durable in object storage — and builds a
+- **Identity = content hash**, a 128-bit hash (xxh3-128) over the segment's
+  **payload region** — everything after the chunk header: the segment header
+  and the records. On `logstor_recovery1` the chunk header's `crc` covers the
+  segment header and `body_crc` covers the records. Excluding the chunk header, whose `segment_seq`
+  changes on every rewrite, means a segment that compaction copies forward
+  record-for-record (the GC design's frontier task does this to cold,
+  fully-live segments; a one-input compaction does it too) keeps its identity
+  and still dedups. The two 32-bit CRCs are the **integrity check** on
+  restore, not the identity: at ~41k segments per tablet the birthday bound on
+  32 bits is far too weak. `segment_seq` is recorded per entry (the seq-based
+  filters below use it) but is not part of the identity, because it is not
+  durable across restarts (see "How logstor stores data").
+- **Dedup is manifest-based, not probe-based.** The backup request names the
+  earlier backup(s) to dedup against (`dedup_from`: one or more snapshot tags
+  at the same destination; the coordinator passes it through from the REST
+  call, and the node reads each `manifest.json` at
+  `snapshot_meta_location(prefix, table, tag)`) — deliberately *not* the
+  `system_distributed` rows, which carry a 3-day TTL while the manifest is
+  durable in object storage, and not a bucket listing, which would have to
+  guess. From them the node builds a
   `content_hash → {object_key, offset, length}` map. A segment whose hash is in
   the map is **re-referenced**: its entry in the new manifest points into the
   existing pack object and nothing is uploaded or probed for it. Only segments
   with unseen hashes are appended to the current pack. This keeps dedup exactly
   per-segment under packing with **zero per-segment HEAD requests**; the
   per-unit `object_exists` probing the sstable path uses
-  (`cluster_backup.cc:517`) would cost one round-trip per 128 KiB segment,
-  ~41k HEADs per 5 GiB tablet. Pack uploads are retried by overwriting the same
-  key (idempotent), so no `object_exists` probing is needed anywhere on the
-  backup path.
+  (`cluster_backup.cc:479`) would cost one round-trip per 128 KiB segment,
+  ~41k HEADs per 5 GiB tablet. A retried pack upload writes a **new** key
+  (per-attempt UUID) rather than overwriting, so no `object_exists` probing
+  is needed anywhere on the backup path.
 - **GC consequence:** because a manifest may reference packs uploaded by
   earlier backups, deleting an old backup must retain any of its pack objects
   still referenced by a newer manifest — backup GC is reference-aware, which is
@@ -548,25 +617,48 @@ to log-structured storage, not a defect.
 Manifest-based dedup avoids re-*uploading* unchanged segments, but each backup
 still **reads** every segment of the tablet — a full 1× disk pass — just to
 compute hashes. The follow-up that removes this cost rests on one fact: on a
-given node, `(segment_id, segment_seq)` identifies content. The seq is assigned
-at seal and never reused, and a sealed full segment's bytes never change until
-the segment is freed (reuse assigns the id a new seq). So the node records the
-maximum seq covered by a backup, and on the next backup **skips reading** any
-segment whose `(segment_id, segment_seq)` appears in the previous backup's
-metadata with `seq <= watermark`, carrying the old manifest entry forward
-verbatim. Only segments sealed since the last backup are read and hashed.
-(Learning a segment's seq without the full read requires either keeping the seq
-in the in-memory descriptor or a header-only read — still ~32× less IO than the
-128 KiB segment.) This turns incremental backup IO from O(tablet size) into
-O(churn), which is what makes frequent periodic backups viable on large,
-mostly-cold tables.
+given **shard**, `(segment_id, segment_seq)` identifies content **as long as
+the sequence counter never goes backwards**. The seq is assigned at seal, and
+a sealed full segment's bytes never change until the segment is freed (reuse
+assigns the id a new seq). So the node records the maximum seq covered by a
+backup, and on the next backup **skips reading** any segment whose
+`(segment_id, segment_seq)` appears in the previous backup's metadata with
+`seq <= watermark`, carrying the old manifest entry forward verbatim. Only
+segments sealed since the last backup are read and hashed. This turns
+incremental backup IO from O(tablet size) into O(churn), which is what makes
+frequent periodic backups viable on large, mostly-cold tables.
 
-Requirements: the coordinator's tablet → replica choice must be **sticky**
-across backups (Phase 1 already picks the primary replica deterministically),
-with a full read-and-hash fallback whenever it is not — hash-based dedup still
-works after a replica switch, it just costs the full read. The Phase 1 metadata
-already carries `segment_seq` per entry, so nothing in the v1 format forecloses
-this.
+Requirements:
+
+- **A durable backup watermark.** `_next_segment_seq` is not persisted;
+  recovery restarts it one past the highest seq still on disk, so after a
+  restart a slot can be reissued a seq that the previous backup recorded for
+  different bytes, and the skip would carry a wrong entry forward — silent
+  backup corruption. The watermark `{table, range, max seq covered}` must
+  therefore be persisted per shard and folded into the recovered
+  `_next_segment_seq`, exactly what `logstor_recovery1` does for erase
+  watermarks (Invariant Q in `logstor_discard.md`). Generalize its
+  `ls_{shard}-Erase.db` into a small per-shard **seq-watermark store** with a
+  kind column — erase, backup, repair (stage 6) — rather than a second file.
+  The store is a file next to the segment files, not a system table, for the
+  same reason the erase watermarks are: logstor recovery runs before the
+  database is up, and the boost tests run logstor without one.
+- **The seq without a full read.** `segment_descriptor::seq` (GC design,
+  stage A0, shared groundwork with the equal-timestamp fix) is the right
+  source; a header-only read (one 4 KiB block, ~32× less IO than the segment)
+  is the fallback, and it is safe on `logstor_recovery1` because the body CRC
+  and seq check reject a slot reused underneath the read.
+- **Key the skip on the shard, not the node.** Seqs are per shard; an
+  intranode migration streams the tablet's segments to the new shard with
+  fresh seqs, and the old `(segment_id, seq)` pairs mean nothing there. The
+  manifest entry needs the shard (or a per-shard watermark generation) next to
+  the seq.
+- **Sticky replica choice.** The coordinator's tablet → replica choice must be
+  the same as last time (Phase 1 picks deterministically from the current
+  tablet map), with a full read-and-hash fallback whenever it is not —
+  hash-based dedup still works after a replica switch, it just costs the full
+  read. The Phase 1 metadata already carries `segment_seq` per entry, so
+  nothing in the v1 format forecloses this.
 
 ### Replica selection and the repaired/unrepaired question
 
@@ -641,10 +733,10 @@ The observation that collapses R1: **`segment_seq` already encodes "sealed
 before / after a point in time", and sealed segments are immutable.** No
 classes, no compaction changes, no format changes:
 
-- There is **no cluster-wide watermark**. `segment_seq` is node-local, so each
-  replica `r` records its **own** watermark `W_r` — the highest seq it has
-  sealed for that tablet on its own shard — when a tablet repair round starts
-  on it. `W_r` is only ever compared against `r`'s own segment seqs; watermark
+- There is **no cluster-wide watermark**. `segment_seq` is per shard, so each
+  replica `r` records its **own** watermark `W_r` — simply the shard's
+  `_next_segment_seq - 1` at the moment a tablet repair round starts on it, so
+  that every segment sealed afterwards has `seq > W_r`. `W_r` is only ever compared against `r`'s own segment seqs; watermark
   values are never exchanged or compared across nodes. The only cross-node
   identifier is the **round identity** (the tablet's `repair_time` / repair
   task id from the tablet map), stored alongside `W_r`. When the tablet map
@@ -697,13 +789,18 @@ sstable path degrades to when repair never runs.
   Incremental repair for logstor, if it ever exists, changes nothing here.
 - **The watermark record:** written at round start as
   `{table, tablet, round-id, W_r}` (per shard — a tablet lives on one shard
-  per node). At backup time a record is usable iff its round-id matches the
-  tablet's last completed round per the tablet map; failed rounds never match,
-  and the next round overwrites the record.
+  per node) into the per-shard seq-watermark store of stage 4, **not** a
+  system table: it has to be readable by logstor recovery before the database
+  is up, because it must feed the recovered `_next_segment_seq` (Invariant Q).
+  Without that, a restart that rolls the counter back below `W_r` lets
+  post-round segments be sealed with `seq <= W_r`, and the delta then
+  **under-includes** — the one failure mode this scheme must never have. At
+  backup time a record is usable iff its round-id matches the tablet's last
+  completed round per the tablet map; failed rounds never match, and the next
+  round overwrites the record.
 - **Cheap seq visibility:** enumerating "segments with `seq > W_r`" wants the
-  seq without reading 128 KiB — the same requirement as the stage 4
-  `segment_seq`-watermark read skip (seq in the in-memory descriptor or a
-  header-only read), so the two features share it.
+  seq without reading 128 KiB — `segment_descriptor::seq` from the GC design's
+  stage A0, the same requirement as the stage 4 read skip.
 - **Invalidation → full contribution:** no watermark for the last completed
   round (the replica joined after it via migration/rebuild — its streamed
   segments carry fresh local seqs anyway), intranode migration since the
@@ -779,11 +876,28 @@ the primary index resolves each key to the max-timestamp record on insert
   real divergence to document.
 - **Tombstones.** Today logstor never purges tombstone records — a delete is
   an ordinary record that remains the key's live version indefinitely — so
-  merging replicas cannot resurrect deleted data. If tombstone GC is ever
-  added to logstor compaction, it must be repair-aware (the moral equivalent
-  of repair-based tombstone GC) **before** multi-source restore remains safe:
-  purging a tombstone on one replica while another still holds the shadowed
-  write would resurrect that write in the merged restore.
+  merging replicas cannot resurrect deleted data. The tombstone GC design
+  (`docs/dev/logstor_gc.md`, branch `logstor_gc`) changes that, and its Gate 1
+  in `repair` mode is the repair-aware grace this bullet used to ask for: a
+  tombstone is purged only after a repair that started after it, so every
+  replica has applied it. Two residual exposures remain. (a) `timeout` mode
+  purges after `gc_grace_seconds` whether or not repair ran, and a replica
+  that missed the delete then contributes the shadowed write — the classic
+  "repair within gc_grace" requirement, which now also applies to what a
+  multi-source restore merges; same as the sstable path. (b) Replicas purge
+  independently, so between the master's purge and a delta replica's, a
+  *stale copy* of the shadowed write that a separator or compaction race left
+  in one of the delta replica's `seq > W_r` segments (GC threat sources 2–3)
+  is contributed without the tombstone that shadowed it. Gate 2 guarantees no
+  such copy survives on the replica once *it* purges, so the window is the
+  purge skew between replicas. The fix, if the window matters when stage 6 is
+  planned: in delta mode, skip a record whose key's live index entry on the
+  contributing replica is a deletion-kind entry at another location. That
+  filter is safe where general liveness filtering is not (see the A3 chase
+  variant): a tombstone in the index means every older version of the key was
+  dead at snapshot time by definition, and the tombstone itself reaches the
+  backup from the master or from the replica's own `seq > W_r` set. Decide
+  with the GC work landed.
 
 #### Decision
 
@@ -814,23 +928,25 @@ Four facts decide this section; all of them differ from the SSTable model.
 
 1. **The disk budget is a fixed segment count, not filesystem space.**
    `_max_segments = disk_size / file_size * segments_per_file`
-   (`segment_manager.cc:1329`) and `available_segment_count()` = free list +
-   segment pool + never-yet-allocated segments (`:1104`). A pinned SSTable
+   (`segment_manager.cc:1280`) and `available_segment_count()` = free list +
+   segment pool + never-yet-allocated segments (`:1101`). A pinned SSTable
    snapshot merely occupies disk; a pinned logstor segment **subtracts from a
    fixed allocation pool**. When that pool empties, `allocate_segment()` blocks
-   in a 5-second retry loop (`:1748`) — i.e. a write stall.
+   in a 5-second retry loop (`:1770`) — i.e. a write stall.
 2. **A pin is `segment_descriptor::ref_count`; compaction honours it but does
-   not account for it.** `make_segment_ref` (`:1148`) bumps `ref_count`;
+   not account for it.** `make_segment_ref` (`:1145`) bumps `ref_count`;
    compaction does `ss.remove_segment(desc); if (desc.ref_count == 0)
-   free_segment(...)` (`:2198`, `:2305`). Compacting a pinned segment therefore
+   free_segment(...)` (`:2324`, `:2437`). Compacting a pinned segment therefore
    removes it from the group, rewrites its live records into **new** segments,
    and frees **nothing**.
 3. **Compaction's candidate scoring is blind to pins.**
-   `select_segments_for_compaction` (`:1964`) scores candidates by
-   `reclaimed() = n_in - n_out` estimated from live bytes only. It cannot tell
-   that a pinned input will not be reclaimed.
+   `select_compaction_batch` (`compaction.cc:109`, called from
+   `select_segments_for_compaction`) scores every prefix of the group's
+   segments by `reclaimed() = n_in - n_out` estimated from live bytes only.
+   It cannot tell that a pinned input will not be reclaimed.
 4. **Data files are mutable in place, so a hard link is not a snapshot.**
-   `segment_id → (file_id, offset)` is a fixed arithmetic mapping (`:1200`) and
+   `segment_id → (file_id, offset)` is a fixed arithmetic mapping
+   (`segment_id_to_file_location`) and
    reusing a segment id overwrites that file region. A hard link shares the
    inode, so writes through the original path are immediately visible through
    the link. Hard-linking a logstor data file provides **naming**, never
@@ -851,27 +967,30 @@ on-disk snapshot directory.
 
 ##### Pin cost analysis (why naive Option A is not enough)
 
-*Static cost is modest.* A 5 GiB tablet (`default_target_tablet_size`,
+*Static cost is not modest.* A 5 GiB tablet (`default_target_tablet_size`,
 `service/tablet_allocator_fwd.hh:16`) is ~40,960 segments; on a shard with
-128 GiB of logstor disk that is ~4% of the segment pool — survivable against the
-20% `logstor_compaction_trigger_threshold_percent`.
+128 GiB of logstor disk that is ~4% of the segment pool — most of the 5% free
+pool that the default `logstor_compaction_trigger_threshold` (0.05,
+`db/config.cc:1010`) makes compaction maintain. One pinned tablet already puts
+the shard into flat-out compaction.
 
 *The dynamic cost is a positive feedback loop.* Pinning lowers
 `available_segment_count`, which:
 
-- pushes `should_run_auto_compaction()` (`:1252`) below the low watermark, so
+- pushes `should_run_auto_compaction()` (`:2073`) below the low watermark, so
   auto compaction starts;
-- raises `compaction_pressure()` (`:1218`), so compaction CPU shares ramp up;
+- raises `compaction_pressure()` (`:1215`), so compaction CPU shares ramp up;
 - causes compaction to pick segments from the pinned group, believe it will
   reclaim `n_in - n_out`, rewrite their live data into **new** segments, and
   reclaim **zero**;
 - therefore lowers `available_segment_count` by `n_out`, raising pressure again
-  and keeping the `while (should_run_auto_compaction())` loop (`:1299`) running.
+  and keeping the `while (should_run_auto_compaction())` loop (`:2119`) running.
 
 A backup can thus trigger a compaction storm that burns IO and CPU at escalating
 shares while making free space strictly *worse*. Worst-case extra consumption
 during one tablet's backup is that tablet's live data rewritten — another ~4% of
-the shard, so ~8% total against a 20% headroom, for a single tablet.
+the shard, so ~8% total against a 5% free pool, for a single tablet: a write
+stall.
 
 *The dangerous multiplier is concurrency.* The coordinator fans out one RPC per
 tablet (see the Phase 1 plan); nothing in the flow bounds how many tablets a
@@ -896,9 +1015,10 @@ an intrusive refcount instead of two heap `std::function`s.
 
 ##### Improvements to Option A (in value order)
 
-- **A1 — Make compaction pin-aware.** In `select_segments_for_compaction`
-  (`segment_manager.cc:1964`), skip descriptors whose `ref_count` exceeds the
-  group's own reference, or at minimum score them as `reclaimed = 0`. Compacting
+- **A1 — Make compaction pin-aware.** In `select_compaction_batch`
+  (`compaction.cc:109`), skip descriptors that carry a snapshot pin
+  (`external_ref_count > 0`, see the stage 0 document), or at minimum score
+  them as `reclaimed = 0`. Compacting
   a pinned segment is always pure loss: it reclaims nothing and consumes output
   segments. A small, local change that removes the feedback loop at its root.
   **It is needed by every option below, and it also benefits tablet streaming,
@@ -924,15 +1044,15 @@ an intrusive refcount instead of two heap `std::function`s.
   > pending, pin the original segment instead of letting it go.**
 
   Mechanically this is small. The free loop in `do_compaction`
-  (`segment_manager.cc:2192`) is `ss.remove_segment(desc); if (desc.ref_count ==
+  (`segment_manager.cc:2324`) is `ss.remove_segment(desc); if (desc.ref_count ==
   0) _sm.free_segment(seg_id);`, `remove_segment` decrements
-  (`compaction.hh:205`), and the loop is synchronous — no yields between removal
+  (`compaction.hh:300`), and the loop is synchronous — no yields between removal
   and free. A hook running just before it that calls `make_segment_ref` on any
   pending segment leaves `ref_count` at 1 after removal: the segment is detached
   from its group but **stays allocated with its bytes untouched**. The consumer
   reads it later via `create_segment_input_stream`, which is a plain file-region
   read needing no group. On release, `ref_count` reaches 0 and `free_segment`
-  runs; its `record_bytes == 0` assertion (`:1765`) holds because compaction
+  runs; its `record_bytes == 0` assertion (`:1791`) holds because compaction
   already rewrote the live records and the index updates fired `on_free_record`
   for every old location.
 
@@ -978,7 +1098,7 @@ an intrusive refcount instead of two heap `std::function`s.
   pending set rather than pinning the input. It keeps pinning at one segment
   even under heavy compaction and never grows the pinned set — but it provides
   only the **weaker** invariant, because compaction filters by *current*
-  liveness (`is_record_alive`, `segment_manager.cc:2170`):
+  liveness (`is_record_alive`, `segment_manager.cc:2299`):
 
   > Key K is live at snapshot time in pending segment S. K is overwritten during
   > the operation and the new version lands in a segment outside the snapshot
@@ -1001,8 +1121,8 @@ an intrusive refcount instead of two heap `std::function`s.
   The chase also has a cost rescue-pin does not: the pending set can **grow**
   (compaction takes 8 segments of which 3 are pending and emits 5 outputs → net
   +2), so it needs a hard chase budget for termination rather than relying on
-  the `n_out < n_in` rule (`:2008`), which split compaction re-processing its own
-  output does not respect.
+  the `n_out < n_in` rule of the prefix score, which split compaction
+  re-processing its own output does not respect.
 
   **Therefore:** rescue-pin is the default and only policy needed. The chase is
   retained here as an opt-in mode for a consumer that both tolerates the weaker
@@ -1036,7 +1156,7 @@ an intrusive refcount instead of two heap `std::function`s.
   is materialized rather than tracked. Rescue-pin is what makes Option A correct
   for backup in the meantime.
 - **A4 — Scoped compaction disable.** Hold `disable_compaction(cg)`
-  (`compaction.hh:328`) for a group, with a hard timeout. Its primary role is as
+  (`compaction.hh:503`) for a group, with a hard timeout. Its primary role is as
   **rescue-pin's budget escalation step** (above), where the window is bounded by
   drain rate rather than by the whole upload. It also remains available as a
   standalone stopgap if A3 slips: compaction of a fully pinned group accomplishes
@@ -1059,7 +1179,8 @@ implementation detail.
 
 1. Add a file-granular allocation mode: a writer can reserve a whole file's run
    of `segments_per_file` contiguous segment ids. This is a contained change to
-   the free-list / `_next_new_segment_id` allocator (`:1716`).
+   the free-list / `_next_new_segment_id` allocator (`allocate_segment`,
+   `:1732`).
 2. At snapshot time, for each of the tablet's files: if the file is **already
    entirely owned by this group and fully live**, take it as-is. Otherwise run a
    compaction whose output goes into freshly reserved whole files.
@@ -1170,42 +1291,63 @@ Mirror `cluster_backup_task`, branching for logstor.
 
 **Coordinator (`cluster_backup_task::do_backup`, shard 0):**
 
-1. Reuse the existing per-DC/rack/tablet ownership selection. For each tablet,
-   pick **one replica** to back up (Option R3). Logstor segments are
-   per-replica physical artifacts with independent layouts/seqs, so there is
-   no cross-replica sstable-id dedup. Note this is **weaker** than the sstable
-   path's repaired/unrepaired dedup, which additionally includes every
-   replica's unrepaired sstables: the logstor backup is one replica's view,
-   and writes that replica missed are absent. See "Replica selection and the
+1. Take the tablet list from the snapshot-time rows, but the **replicas from
+   the current tablet map** at backup time. For each tablet, pick **one
+   replica** to back up (Option R3), deterministically (the first replica in
+   the tablet map's replica order, so it is sticky across backups as long as
+   the tablet does not move). Logstor segments are per-replica physical
+   artifacts with independent layouts/seqs, so there is no cross-replica
+   sstable-id dedup. Note this is **weaker** than the sstable path's
+   repaired/unrepaired dedup, which additionally includes every replica's
+   unrepaired sstables: the logstor backup is one replica's view, and writes
+   that replica missed are absent. See "Replica selection and the
    repaired/unrepaired question" for the analysis and for the stage 6 plan
-   (Option R2) that restores the union guarantee.
-2. Fan out the existing `backup_snapshot_sstables` RPC
-   (`idl/snapshot_backup.idl.hh:20`) to the chosen node per tablet, carrying
-   `{table_id, tablet_id, token_range, endpoint, bucket, prefix, snapshot_tag}`.
+   (Option R2) that restores the union guarantee. Why not the snapshot-time
+   replica: the logstor snapshot is fused into the backup RPC (see "Key
+   architectural decision"), so a node that held the tablet at snapshot time
+   but not at backup time has nothing to enumerate — with the sstable path it
+   would still have the hard links. If the tablet count changed since the
+   snapshot rows were written, fail the backup: the rows no longer describe
+   the table.
+2. Fan out a **new** `backup_logstor_segments` RPC to the chosen node per
+   tablet, carrying `{table_id, tablet_id, token_range, endpoint, bucket,
+   prefix, snapshot_tag, pack_size, dedup_from}`; it returns the attempt id
+   and the count of segments described. A node that no longer owns the range
+   fails the RPC (see below); the coordinator re-reads the tablet map and
+   re-selects, a bounded number of times, before failing the backup.
 3. Collect the reported segment sets and write a per-destination
    `manifest.json` (extended schema below) via `make_upload_sink`.
 
-**Receiving node — add a logstor branch in `db::snapshot::backup_sstables`
-(`cluster_backup.cc:386`):**
+**Receiving node — a logstor handler next to `db::snapshot::backup_sstables`
+(`cluster_backup.cc:349`):**
 
-1. `auto segs = co_await table.take_logstor_snapshot(req.token_range);`
-   (Option A). This flushes the separator, so every segment is a per-table full
-   segment tagged with `table_id` + token range.
+0. Check that this node is a replica of the tablet in the local tablet map
+   and that no migration of it is in transition; otherwise fail the RPC. A
+   migration that starts *during* the backup ends in the group's erase, which
+   aborts the cursor (stage 0) and fails the RPC the same way.
+1. Delete this node's `system_distributed` rows for the tablet's range and
+   this tag (a retry of a failed attempt), then
+   `auto cursor = co_await table.make_logstor_snapshot_cursor(req.token_range);`
+   (stage 0). This flushes the separator, so every segment is a per-table full
+   segment tagged with `table_id` + token range, and enumerates ids without
+   pinning.
 2. Upload the segments, packed into tablet-scoped pack objects (the default;
    `pack_size = segment_size` degenerates to one object per segment):
-   - Load the previous backup's manifest for the table (if any) and build the
-     `content_hash → {object_key, offset, length}` dedup map.
-   - For each `segment_snapshot`: read it and compute the content hash. On a
-     dedup-map hit, **re-reference** the existing object in the metadata and
+   - Load the manifests named by `dedup_from` (if any) and build the
+     `content_hash → {object_key, offset, length}` dedup map. A load failure
+     degrades to "upload everything".
+   - Drain the cursor. For each segment: read it, verify both CRCs, compute
+     the content hash over the payload. On a dedup-map hit, **re-reference**
+     the existing object in the metadata, write the marker next to it, and
      upload nothing. On a miss, append the segment's bytes to the current
-     `make_upload_sink(pack_object)`, recording its running `offset`/`length`,
-     and roll to a new pack when `pack_size` is reached.
+     `make_upload_sink(pack-{attempt}-{pack_seq})`, recording its running
+     `offset`/`length`, and roll to a new pack when `pack_size` is reached.
    - Either way, throttled by the existing `backup_scheduling_group` /
      `backup_io_throughput_mb_per_sec` and dir/s3 semaphores; write the `refs/…`
-     marker per pack and record per-segment metadata (`{object_key, offset,
-     length, segment_seq, content_hash, first_token, last_token}`) in
-     `system_distributed`.
-3. Release the snapshot (drop `seg_ref`s), same teardown as streaming.
+     marker per completed pack and record per-segment metadata
+     (`{object_key, offset, length, segment_seq, content_hash, first_token,
+     last_token}`) in `system_distributed`.
+3. Destroy the cursor (drops any rescued pins), same teardown as streaming.
 
 Non-logstor tables keep the existing SSTable code path unchanged.
 
@@ -1220,7 +1362,7 @@ branching for logstor.
    `storage_service::restore_tablets` → topology coordinator issues per-tablet
    `restore_tablet` RPCs (orchestration unchanged).
 2. **Per-tablet download on the owning node — logstor branch in
-   `download_tablet_sstables` (`sstables_loader.cc:959`):**
+   `download_tablet_sstables` (`sstables_loader.cc:970`):**
    - Look up segment metadata rows whose token range overlaps the tablet; each
      row carries `{object_key, offset, length}`.
    - Group the segment entries by `object_key` and download each pack **once**
@@ -1234,7 +1376,10 @@ branching for logstor.
      The `streamed_segment_rewriter` reassigns the local seq and
      `load_segment` re-indexes into the table's
      `primary_index` and reattaches to the compaction group — exactly the
-     existing tablet-stream receive path (`stream_blob.cc:218`).
+     existing tablet-stream receive path (`stream_blob.cc:220`). The rewriter
+     writes the first block last (`logstor_recovery1`), so an interrupted
+     segment is invisible to recovery, and the chunk's `crc` and `body_crc`
+     are checked on the way in.
    - The segment header's `table_id`/token range route it to the right
      shard/tablet (reuse the streaming routing).
    - Update per-segment download status in metadata.
@@ -1268,21 +1413,119 @@ The same schema serves the degenerate per-segment case (`offset=0`,
 pack from an earlier backup), and the later `segment_seq`-watermark read skip —
 no format change is needed for any of them.
 
+## Dependencies and interactions with other logstor work
+
+Two branches change the ground this design stands on. Neither invalidates the
+design; both are recorded here so their effects are not rediscovered.
+
+### `logstor_recovery1` — erase watermarks, body CRC, header-last streaming
+
+Design in `logstor_discard.md`; Phases 0–3
+implemented, not merged as of this review. **Stage 0 and everything after it
+build on this branch**, not on master.
+
+- **Teardown.** `discard_segments` is gone; tablet cleanup, truncate and drop
+  go through `erase()` → `discard_group_segments`, which persists an erase
+  watermark `{table, range, seq}` first and leaves a referenced segment to its
+  references. The stage 0 abort hook attaches there
+  (`logstor_segment_snapshots.md`, "Group teardown"); a truncate or a tablet
+  migration racing a backup fails that tablet's backup cleanly.
+- **Invariant Q (sequence dominance).** `_next_segment_seq` is not persisted;
+  recovery sets it from the highest seq still on disk, plus every persisted
+  watermark. Every seq-based rule in this document — the stage 4 read skip and
+  the stage 6 repair watermark — is unsound without a persisted watermark that
+  feeds the counter, and both are now specified that way, through a
+  generalized per-shard seq-watermark store (kinds: erase, backup, repair).
+- **Body CRC and header-last commit.** The chunk header grew to 32 bytes with
+  `body_crc` over the records, and its `crc` covers the segment header too; the
+  streamed-segment rewriter writes block 0 last from `close()`. For backup: the
+  two CRCs are the integrity check of every segment read and every segment
+  restored, and the content hash is defined over the bytes after the chunk
+  header, which they cover. For restore: an
+  interrupted ingest is invisible to recovery. Format version stays 1 there,
+  by decision — see "Format versioning" below.
+- **Recovery-equivalence harness** (`recovery_divergence()` in
+  `test/lib/logstor_test_utils.hh`): the oracle for "restart after restore
+  rebuilds the identical index" in the test plan.
+- **Equal-timestamp overwrites** are an open gap there (a same-timestamp
+  overwrite can be lost at recovery); the fix it plans — a comparator on
+  timestamp, then record content, then seq/offset — would also make the
+  multi-source restore tie rule deterministic (see "Multi-source merge
+  caveats").
+
+### `logstor_gc` — tombstone GC and TTL
+
+Design in `docs/dev/logstor_gc.md` on that branch, design only, to be built on
+`logstor_recovery1`.
+
+- **Pins hold the GC frontier.** Gate 2's frontier `F` is the lowest seq of
+  any scannable segment; a pinned or rescued segment is scannable and A1 keeps
+  the frontier task from rewriting it. Every pin therefore holds tombstone GC
+  back on its shard for as long as it is held — for a throttled object-storage
+  upload with whole-tablet pinning, minutes to hours per tablet, serially.
+  The stage 0 cursor bounds it to the consumed segment plus the rescued set;
+  A2's budget bounds the rescued set. The GC design's purge journal
+  (candidate 2) removes the dependence of drops on `F`. **Input to the GC
+  design's Stage B exit decision:** backup duration is a reason to prefer the
+  journal, or at least the effective frontier.
+- **The frontier task rewrites cold segments**, which is the data content-hash
+  dedup lives on. With the plain frontier every fully-live segment on the
+  shard is copied forward once per GC cycle (bounded by `gc_frontier_bandwidth`
+  and grace); with the effective frontier fully-live segments are skipped, and
+  with the journal cold segments are rewritten only when the journal needs
+  them gone. Defining the content hash over the payload (not the chunk
+  header) keeps a record-for-record rewrite dedupable, so the plain frontier
+  costs backup a re-*read* of rewritten cold data, not a re-upload. A second
+  input to the same GC decision.
+- **`segment_descriptor::seq`** (GC stage A0) is the cheap seq the stage 4
+  read skip and the stage 6 delta filter want. Do not build a header-only read
+  path for it; depend on A0.
+- **`has_stale`** on the descriptor (stage A3) tells whether a segment holds
+  any dead record. A delta replica could contribute `has_stale == false`
+  segments verbatim and apply the deletion-kind filter only to the rest — an
+  optimization of the stage 6 mitigation, not a requirement.
+- **Tombstone purge and multi-source restore:** see "Multi-source merge
+  caveats". Restoring a purged tombstone (a rescued original may still hold
+  one) is harmless; restoring a shadowed write without its tombstone is the
+  hazard, and it is bounded as described there.
+- **On-disk record header grows by 16 bytes** (kind, `gc_time`,
+  `deletion_time`, `expiry`) with no version bump. A backup taken before that
+  change is unreadable after it — see "Format versioning".
+- **TTL:** expired records restore as `expiring` records past their expiry;
+  reads hide them (GC stage C1) and the sweep reclaims them. No backup-side
+  handling.
+
+### Format versioning
+
+`logstor_recovery1` and `logstor_gc` both change the on-disk layout under
+`ondisk.hh`'s `current_version = 1`, by the explicit decision that while
+logstor is in development an old store is simply unreadable. That is the right
+call for a node-local store and the wrong one for backups, which are
+long-lived artifacts restored into future builds: a manifest that says
+"version 1" would describe three incompatible layouts. **Before stage 1
+ships**, logstor needs a real format version (bumped on every layout change,
+with restore refusing a mismatch), and the manifest carries it per segment
+entry — `kind` and `format_version` next to `segment_seq`. Restore into a
+build whose reader does not accept the recorded version fails at manifest
+parse time, not after ingesting garbage. Backward-compatible reading of older
+versions is a separate decision; refusing loudly is the minimum.
+
 ## Change list (files / seams)
 
 **Reuse unchanged:** `object_storage_client`
-(`upload_file`/`make_upload_sink`/`make_download_source`/`object_exists`),
+(`upload_file`/`make_upload_sink`/`make_download_source`),
 `storage_manager::get_endpoint_client`, task-manager modules (`snapshot`,
-`sstables_loader`), REST endpoints `/storage_service/tablets/backup` &
-`/tablets/restore`, topology-coordinator restore orchestration,
-`backup_snapshot_sstables` / `restore_tablet` RPCs, `take_logstor_snapshot`,
-`create_logstor_segment_sink`.
+`sstables_loader`), topology-coordinator restore orchestration, the
+`restore_tablet` RPC, `create_logstor_segment_sink`; the stage 0 snapshot
+cursor. The REST endpoints `/storage_service/tablets/backup` & `/tablets/restore`
+stay, with two new optional backup parameters (`pack_size`, `dedup_from`).
 
 **Modify:**
 
-- `replica/database.cc` (`truncate_table_on_all_shards`) — **stage 0a**: skip the
-  automatic snapshot for logstor tables with a warning, instead of silently
-  producing an empty one. Independent of everything else here.
+- `replica/database.cc` (`truncate_table_on_all_shards`, guards at
+  `:3121-3127`) — **stage 0a**: skip the automatic snapshot for logstor tables
+  with a warning, instead of silently producing an empty one. Independent of
+  everything else here.
 - `db/snapshot-ctl.cc` — **stage 0a**: reject an explicitly named logstor table in
   `take_column_family_snapshot`; warn and skip logstor tables in keyspace/cluster
   wide snapshots.
@@ -1291,11 +1534,16 @@ no format change is needed for any of them.
   tables in keyspace-wide repairs; do not advance
   `repair_time`/`sstables_repaired_at` for skipped tables. See "Existing defect
   — tablet repair is silently a no-op for logstor".
-- `db/snapshot/cluster_backup.cc` — logstor branch in the receiving-node
-  `backup_sstables`; coordinator per-tablet single-replica selection for
-  logstor; manifest emission includes segments; the pack-assembly loop (append
-  segments into one `make_upload_sink`, track offsets) and the
-  previous-manifest dedup map.
+- `idl/snapshot_backup.idl.hh` — a new verb `backup_logstor_segments(table_id,
+  tag, endpoint, bucket, prefix, tablet_id, first_token, last_token, pack_size,
+  dedup_from)` returning `{attempt_id, segment_count}`. The sstable verb stays
+  as is (its `sstable_ids`/`use_move` mean nothing for logstor, and it returns
+  nothing).
+- `db/snapshot/cluster_backup.cc` — a logstor handler next to the
+  receiving-node `backup_sstables` (ownership check, own-row cleanup, cursor
+  drain, pack assembly, dedup map, markers, rows); coordinator per-tablet
+  single-replica selection for logstor from the current tablet map with
+  bounded re-selection; manifest emission includes segments.
 - `sstables_loader.cc` — logstor branch in `download_tablet_sstables` and
   manifest-population (`process_manifest` /
   `populate_snapshot_sstables_from_manifests`) to read segment entries; group
@@ -1304,12 +1552,16 @@ no format change is needed for any of them.
   `object_key`/`offset`/`length`) + kind.
 - `db/snapshot_types.hh`, `db/system_distributed_keyspace.{hh,cc}` — segment
   metadata rows (incl. `offset`/`length`).
-- `replica/logstor/segment_manager.{hh,cc}` — expose a content hash for a
-  segment snapshot (compute during `make_snapshot` or via a helper); optionally
-  an object-friendly stable id. Also: **A1** pin-aware candidate selection in
-  `select_segments_for_compaction`; **A2** pinned-segment admission semaphore;
-  **A3** cursor-based `make_snapshot` plus the rescue-pin eviction hook in
-  `do_compaction` / `do_split_compaction`.
+- `replica/logstor/segment_manager.{hh,cc}` — a read-and-describe helper for a
+  pinned segment (read into memory, verify both CRCs, parse the header, hash
+  the payload); **A2** pinned-segment admission semaphore. **A1**, the cursor
+  and the rescue hook land in stage 0 (`logstor_segment_snapshots.md`).
+- `replica/logstor/erase_watermarks.{hh,cc}` (`logstor_recovery1`) —
+  generalized into the per-shard seq-watermark store with a kind column, for
+  the stage 4 backup watermark and the stage 6 repair watermark; both feed
+  `_next_segment_seq` at recovery.
+- `replica/logstor/ondisk.hh` — a real format version, recorded per manifest
+  entry (see "Format versioning").
 - `sstables/object_storage_client.{hh,cc}` — **no changes needed** for the
   default whole-pack-GET-and-split strategy. Only the optional ranged-GET
   optimization needs a `make_download_source` variant (or `make_readable_file`
@@ -1317,9 +1569,10 @@ no format change is needed for any of them.
 - Optionally a thin `table::` helper to restore-ingest a single downloaded
   segment stream (wrap `create_logstor_segment_sink` + copy), to keep
   `sstables_loader.cc` clean.
-- A `pack_size` backup parameter (default e.g. 32 MiB; `segment_size`
-  degenerates to one object per segment) threaded through the REST/RPC backup
-  request.
+- `pack_size` (default e.g. 32 MiB; `segment_size` degenerates to one object
+  per segment) and `dedup_from` (earlier snapshot tags at the same
+  destination) backup parameters, threaded through the REST call and the new
+  RPC.
 
 **Add (only if Option B is chosen):** for **B-share**, a file-granular segment
 allocator (reserve a whole file's contiguous id run), a "dense file" predicate
@@ -1334,10 +1587,11 @@ Either way, wire into `snapshot_ctl::take_snapshot`.
 targets `make_upload_sink` instead of a `writeable_segment`, with the index
 update suppressed.
 
-**Add (stage 6, Option R2):** a node-local watermark table
-(`{table, tablet, round-id, seq_watermark}`) written at tablet-repair round
-start and validated at backup time against the tablet map's last completed
-round; a delta mode in the backup request so a non-master replica enumerates
+**Add (stage 6, Option R2):** a repair-kind record
+(`{table, tablet, round-id, seq_watermark}`) in the per-shard seq-watermark
+store, written at tablet-repair round start, fed into the recovered
+`_next_segment_seq`, and validated at backup time against the tablet map's
+last completed round; a delta mode in the backup request so a non-master replica enumerates
 only `seq > W_r` segments (a seq filter on the snapshot cursor, plus cheap
 segment-seq visibility shared with the stage 4 read skip); coordinator
 master/delta fan-out per tablet. Requires logstor tablet repair (full repair
@@ -1356,7 +1610,7 @@ the second ever does.
 ### Step 1 (first, small) — warn and skip instead of pretending
 
 Add a third guard in `truncate_table_on_all_shards`
-(`replica/database.cc:3110-3116`), alongside the existing `auto_snapshot` and
+(`replica/database.cc:3121-3127`), alongside the existing `auto_snapshot` and
 `is_local_type()` ones and following the same shape:
 
 ```cpp
@@ -1375,15 +1629,17 @@ Why skip rather than let the empty snapshot be created:
 - The operator gets the same signal, in the same log line format, as the already
   handled object-storage case.
 - The `DROP TABLE` path inherits it automatically, since it routes through the
-  same function (`replica/database.cc:1416-1419`).
+  same function (`replica/database.cc:1419-1422`).
 
 Two consequences to check when implementing:
 
-- `with_snapshot` also drives `should_flush` (`replica/database.cc:3156`), so
+- `with_snapshot` also drives `should_flush` (`replica/database.cc:3161`), so
   the table takes `cf.clear()` instead of `cf.flush()`. That is the intended and
   cheaper behavior — there is nothing to preserve — but confirm `clear()` is
   correct for a logstor table's memtables. The unconditional
-  `cf.flush_separator()` (`:3182`) is unaffected.
+  `cf.flush_separator()` (`:3190`) is unaffected. On `logstor_recovery1`
+  truncate is an erase path (`table::truncate_logstor()`, with a write pause);
+  the guard sits in front of it unchanged.
 - `truncate_request_timeout` is documented as being long specifically to allow
   the auto snapshot to complete (`db/config.cc:1138`); no change is needed, but
   logstor truncates will now be faster than the timeout suggests.
@@ -1432,7 +1688,7 @@ with B-copy's properties, not `nodetool snapshot`'s:
   the file-granular allocator and no-reuse pinning — that is B-share, not a sink
   swap.
 - **`listsnapshots` accounting degrades.** The `number_of_links == 1` test that
-  distinguishes a snapshot's exclusive size from its total (`replica/table.cc:4364`)
+  distinguishes a snapshot's exclusive size from its total (`replica/table.cc:4472`)
   is meaningless for copies: `live == total` always, so every snapshot costs its
   full size.
 - **It cannot feed the backup.** Copying produces fresh bytes and therefore fresh
@@ -1456,8 +1712,11 @@ not as an increment on Phase 1.
 > commit breakdown below, which is kept here as the summary of *why* backup depends
 > on stage 0. Where the two differ, the dedicated document is correct — notably: it
 > splits the work into seven commits rather than six, drops the compaction-output
-> plumbing (0.2 below) because only the rejected chase variant needs it, and adds a
-> commit for the group-teardown abort.
+> plumbing (0.2 below) because only the rejected chase variant needs it, adds a
+> commit for the group-teardown abort (which on `logstor_recovery1` hooks
+> `erase()`, not `discard_segments`), rescues without allocating, and puts A1
+> in `select_compaction_batch` (`compaction.cc`), where candidate selection now
+> lives. Line numbers below are from an older tree.
 
 **A1 and A3 are not backup features.** They fix a pin-cost problem that logstor
 has *today*, in tablet streaming: `tablet_stream_files_handler`
@@ -1642,15 +1901,19 @@ artifact, so a logstor segment enumerated at snapshot time may be compacted away
 before upload.
 
 Phase 1 therefore **fuses** enumeration and upload on the owning node: the
-segment set is materialized (via `take_logstor_snapshot`, which pins segments)
-**inside** the node-side backup RPC handler and uploaded immediately, then the
-pins are released. The coordinator no longer pre-selects per-segment ids; it
-selects, per tablet, one replica to back up and hands it the tablet's token
-range. Consequences, to be documented as **known limitations**:
+segment set is enumerated (via the stage 0 snapshot cursor, which pins one
+segment at a time and rescues what compaction would free) **inside** the
+node-side backup RPC handler and uploaded immediately, then the cursor is
+destroyed. The coordinator no longer pre-selects per-segment ids; it selects,
+per tablet, one replica to back up **from the tablet map at backup time** and
+hands it the tablet's token range. Consequences, to be documented as **known
+limitations**:
 
 - No "snapshot now, back up later" for logstor (the backup request does the
   snapshot). `snapshot_keyspace` on a logstor table only records
-  keyspace/table/tablet/node metadata, not segments.
+  keyspace/table/tablet/node metadata, not segments — and the node list it
+  records is not what the backup uses; replicas are re-read from the tablet
+  map when the backup runs, because a tablet may have moved in between.
 - Point-in-time consistency is **per tablet at its upload moment**, not a global
   instant. For key-value, single-version-per-key data this preserves logical
   correctness (each key's latest value wins by timestamp on restore), matching
@@ -1667,24 +1930,25 @@ Add the ability to describe a segment without a second disk pass:
   whole segment from the `segment_snapshot.source` `input_stream` into a
   `temporary_buffer`, then: (a) parses the on-disk header
   (`replica/logstor/segment_io.hh:read_segment_info` / `ondisk.hh`) to obtain
-  `segment_seq`, `table`, `first_token`, `last_token`; (b) computes a
-  `content_hash` (xxhash/CRC32) over the buffer; (c) checks the hash against
-  the previous-manifest dedup map — on a hit, re-references the old object and
+  `segment_seq`, `records_size`, `table`, `first_token`, `last_token`, and
+  verifies the header `crc` and `body_crc`; (b) computes the `content_hash`
+  (xxh3-128) over the same payload bytes; (c) checks the hash against the
+  previous-manifest dedup map — on a hit, re-references the old object and
   uploads nothing; on a miss, appends the buffer to the current pack's
   `make_upload_sink`, recording `offset`/`length`. Hashing before appending is
   what lets a re-referenced segment cost one 128 KiB read and nothing else.
   Peak memory ≈ `concurrency × 128 KiB` plus the in-flight pack sink buffers,
   bounded by `sstables_manager::dir_semaphore()` as the existing SSTable path
   does (`cluster_backup.cc:504`).
-- **Object key** (`sstables::object_name`, mirroring `cluster_backup.cc:491`):
-  `{prefix}/{table_id}/{tablet_id}/pack-{tag}-{pack_seq}` and a
-  `refs/snapshot-{tag}/{table_id}/{tablet_id}/pack-{pack_seq}` marker. Pack
-  keys are not content-addressed (the key must exist before the sink opens;
-  dedup is per-segment via the manifest), and a retried backup of the same tag
-  overwrites the same keys idempotently.
-- Optional later optimization: reuse the per-buffer CRC already in
-  `ondisk::chunk_header` instead of a second hash pass — verify it covers the
-  full segment payload before relying on it.
+- **Object key** (`sstables::object_name`, mirroring `cluster_backup.cc:472`):
+  `{prefix}/{table_id}/{tablet_id}/pack-{attempt}-{pack_seq}` and a
+  `{prefix}/{table_id}/{tablet_id}/refs/snapshot-{tag}/pack-{attempt}-{pack_seq}`
+  marker next to it. Pack keys are not content-addressed (the key must exist
+  before the sink opens; dedup is per-segment via the manifest) and are never
+  overwritten: `attempt` is a per-RPC UUID, so a retry writes fresh packs.
+- The chunk header's `crc` and `body_crc` (`logstor_recovery1`) are 32-bit
+  integrity checks, not a dedup identity; they and the 128-bit hash are
+  computed in the one pass over the in-memory buffer.
 
 ### Metadata schema (stage 1)
 
@@ -1697,11 +1961,15 @@ work unchanged. Concretely, when the node records an uploaded segment it fills a
   identity across nodes/backups → enables dedup and restore matching). Reserve
   a fixed marker in the derived UUID (e.g. a fixed version/variant nibble
   pattern) so a segment row can never collide with or be mistaken for a real
-  sstable id even if the `kind` column is lost or unread;
+  sstable id even if the `kind` column is lost or unread. The row's clustering
+  key is `(first_token, sstable_id)` (`db/system_distributed_keyspace.cc:225`),
+  so a retried attempt that produces the same segment overwrites its own row,
+  and only segments that disappeared between attempts leave stale rows — which
+  the handler's own-row cleanup removes;
 - `first_token` / `last_token` = from the segment header;
-- `toc_name` = the object key basename (`pack-{tag}-{pack_seq}`); `prefix` = the
-  object prefix — together with `offset`/`length` they locate the segment bytes
-  for the logstor download path;
+- `toc_name` = the object key basename (`pack-{attempt}-{pack_seq}`); `prefix`
+  = the object prefix — together with `offset`/`length` they locate the segment
+  bytes for the logstor download path;
 - `data_size` = segment length (`index_size` = 0 for Phase 1);
 - `tablet_id`, `node`, `state`, `downloaded` = as today.
 
@@ -1721,90 +1989,112 @@ metadata plumbing; **deferred** — the pseudo-sstable reuse is the Phase 1 choi
 ### Stage 1 — Backup
 
 **1a. Snapshot-time metadata (logstor branch in
-`database::snapshot_table_on_all_shards`, `replica/table.cc:4130`).**
+`database::snapshot_table_on_all_shards`, `replica/table.cc:4260`).**
 Today the `ssc` callback is invoked only when `tablets` is non-empty, and
-`tablets` is derived by iterating **sstables** (`table.cc:4185`) — so for a
+`tablets` is derived by iterating **sstables** (`table.cc:4318`) — so for a
 logstor table (no sstables) no metadata is written at all. Add: when
 `t.uses_logstor()`, enumerate tablets directly from the tablet map
 (`erm->get_token_metadata().tablets().get_tablet_map(s->id())`, as at
-`table.cc:4182`) to build `snapshot_tablet_entry`s, and invoke `ssc` with
+`table.cc:4315`) to build `snapshot_tablet_entry`s, and invoke `ssc` with
 `snapshot_entries{ .sstables = {}, .tablets = <all tablets> }`. This makes
-`insert_snapshot_entries` (`db/system_distributed_keyspace.cc:1160`) write the
+`insert_snapshot_entries` (`db/system_distributed_keyspace.cc:1173`) write the
 node + tablet rows the coordinator needs. The local snapshot dir may be created
 empty or skipped (the `local_snapshot_writer` already handles an empty sstable
 set). Populate each tablet entry's `repair_time`/`repaired_at` from
-`tablet_info` exactly as the sstable path does (`table.cc:4219-4221`) — free,
+`tablet_info` exactly as the sstable path does (`table.cc:4325-4330`) — free,
 and it records the per-tablet consistency point in metadata and manifest
-(see Option R3).
+(see Option R3). Record the tablet count too, so the coordinator can detect a
+count change before it fans out.
 
-**1b. Coordinator (logstor branch in `cluster_backup_task::do_backup`,
-`db/snapshot/cluster_backup.cc:117`).** Detect logstor via the table schema.
-Replace the sstable-selection/repaired-dedup block (`cluster_backup.cc:207-308`)
-with: read `get_snapshot_tablets` and `get_snapshot_nodes`; for each tablet pick
-**one** replica node deterministically (Phase 1: the tablet's first/primary
-replica from the tablet map), and send it the backup RPC with the tablet's
-`first_token`/`last_token` and an **empty** `sstable_ids`. Manifest generation
-(`cluster_backup.cc:321-363`) then reads the segment rows the nodes wrote
-(`get_snapshot_sstables`) and emits them under a `sstables`/`segments` list plus
-the existing `tablets`/`nodes` lists.
+**1b. Coordinator (logstor branch in `do_cluster_backup`,
+`db/snapshot/cluster_backup.cc:61`).** Detect logstor via the table schema.
+Replace the per-node sstable-selection/repaired-dedup block
+(`cluster_backup.cc:163-252`) — which for a logstor table would find no
+sstable rows and send nothing — with: read `get_snapshot_tablets` for the
+tablet list, check the tablet count against the current tablet map (fail if
+it changed), and for each tablet pick **one** replica deterministically from
+the **current** tablet map (its first replica), then send it the
+`backup_logstor_segments` RPC with the tablet's `first_token`/`last_token`,
+`pack_size` and `dedup_from`. On an ownership failure from the node, re-read
+the map and re-select, at most a few times per tablet. Manifest generation
+(`cluster_backup.cc:254-310`) then reads the segment rows the nodes wrote
+(`get_snapshot_sstables`) and emits them under a `sstables`/`segments` list
+plus the existing `tablets`/`nodes` lists, where `nodes` is the set of nodes
+that actually served the RPCs.
 
-**1c. RPC.** Reuse the existing verb
-`backup_snapshot_sstables` (`idl/snapshot_backup.idl.hh:20`) unchanged: it
-already carries `table_id, tag, endpoint, bucket, prefix, first_token,
-last_token, sstable_ids, use_move`. For logstor the coordinator passes the
-tablet range and empty `sstable_ids`; the handler branches on
-`table.uses_logstor()`. (A dedicated verb is optional cleanup, not required.)
+**1c. RPC.** A **dedicated** verb `backup_logstor_segments` in
+`idl/snapshot_backup.idl.hh`, next to `backup_snapshot_sstables`
+(`:20`): `{table_id, tag, endpoint, bucket, prefix, tablet_id, first_token,
+last_token, pack_size, dedup_from}` → `{attempt_id, segment_count}`. Reusing
+the sstable verb was the first draft, but it carries `sstable_ids` and
+`use_move` that mean nothing here, lacks `pack_size` and `dedup_from`, and
+returns nothing, so the coordinator could not learn the attempt id or a
+count; a new verb is also the natural home for the stage 6 delta flag. Old
+nodes do not know the verb — acceptable while logstor is a development
+feature, but the coordinator should check the cluster feature that guards
+logstor backup before fanning out.
 
-**1d. Receiving node (logstor branch in `db::snapshot::backup_sstables`,
-`cluster_backup.cc:386`).** When `cf.uses_logstor()`:
+**1d. Receiving node (a logstor handler next to `db::snapshot::backup_sstables`,
+`cluster_backup.cc:349`).** When `cf.uses_logstor()`:
 
-0. Acquire the **A2** pinned-segment admission semaphore, so a node never has
-   more than a configured fraction of `_max_segments` pinned across concurrent
-   tablet backups. Size the acquisition against the stage 0 **rescue budget plus
+0. Verify ownership: this node is a replica of `tablet_id` in the local
+   tablet map and the tablet is not in transition; otherwise fail the RPC
+   with a distinguishable error so the coordinator re-selects. Acquire the
+   **A2** pinned-segment admission semaphore, so a node never has more than a
+   configured fraction of `_max_segments` pinned across concurrent tablet
+   backups. Size the acquisition against the stage 0 **rescue budget plus
    in-flight segments**, *not* against the tablet's segment count: with the
-   cursor, steady-state pinning is one segment per tablet backup, so reserving a
-   tablet's worth would over-reserve massively and defeat the point of A3.
-1. `auto cursor = co_await cf.make_logstor_snapshot_cursor(
+   cursor, steady-state pinning is one segment per tablet backup, so reserving
+   a tablet's worth would over-reserve massively and defeat the point of A3.
+1. Delete this node's `snapshot_sstables` rows for this tag and the tablet's
+   token range (`get_snapshot_sstables` by range, filter `node == self`,
+   delete by `(first_token, sstable_id)`): on a first attempt there are none;
+   on a retry this is what keeps segments that disappeared between attempts
+   out of the manifest. Then
+   `auto cursor = co_await cf.make_logstor_snapshot_cursor(
    dht::token_range{first_token, last_token});` — flushes the separator (all
    segments become full, range-tagged) and enumerates segment ids without
    pinning them. Rescue-pin (stage 0) guarantees no record live at this instant
    is lost even though the segments are unpinned.
-2. Load the previous backup's manifest for this table from the bucket (if any)
-   and build the `content_hash → {object_key, offset, length}` dedup map.
+2. Load the manifests named by `dedup_from` (if any) and build the
+   `content_hash → {object_key, offset, length}` dedup map. A load failure
+   logs and degrades to "upload everything".
 3. Drain the cursor (the snapshot is taken on the owning shard; read and hash
    ahead of the pack upload, bounded by `dir_semaphore()`). For each segment:
-   read fully into memory, parse header, compute `content_hash`; on a dedup-map
-   hit, record the re-referenced `{object_key, offset, length}`; on a miss,
-   append the buffer to the current pack's `make_upload_sink`
-   (`pack-{tag}-{pack_seq}`), recording the running `offset`/`length`, and roll
-   to a new pack at `pack_size`; either way write the `snapshot_sstable_entry`
-   (pseudo-segment) via `insert_snapshot_sstables`; then drop that segment's
-   pin. Write the `refs/…` marker per completed pack.
-4. Destroy the cursor (unregisters and drops any rescued pins) and release the
-   admission semaphore.
+   read fully into memory, parse the header, verify both CRCs, compute
+   `content_hash` over the payload; on a dedup-map hit, record the
+   re-referenced `{object_key, offset, length}` and write this backup's marker
+   next to that pack; on a miss, append the buffer to the current pack's
+   `make_upload_sink` (`pack-{attempt}-{pack_seq}`), recording the running
+   `offset`/`length`, and roll to a new pack at `pack_size`; either way write
+   the `snapshot_sstable_entry` (pseudo-segment) via
+   `insert_snapshot_sstables`; then drop that segment's pin. Write the
+   `refs/…` marker per completed pack. A cursor abort (erase, rescue cap) fails
+   the RPC; packs already uploaded are orphans for GC.
+4. Destroy the cursor (unregisters and drops any rescued pins), release the
+   admission semaphore, and return `{attempt_id, segment_count}`.
 
 Reuses the existing per-endpoint client (`get_endpoint_client`), abort wiring,
 and `backup_scheduling_group` / `backup_io_throughput_mb_per_sec` throttling.
 
-Independently of the above, apply **A1** in
-`select_segments_for_compaction` so a pinned segment is never selected as a
-compaction candidate (or is scored as reclaiming nothing). Without it, a backup
-under space pressure drives a compaction storm that reclaims zero segments while
-consuming new ones.
+**A1** (pin-aware candidate selection in `select_compaction_batch`) is a stage
+0 prerequisite, not a Phase 1 item: without it, a backup under space pressure
+drives a compaction storm that reclaims zero segments while consuming new ones.
 
 ### Stage 2 — Restore
 
 **2a. Manifest population (logstor branch in `process_manifest`,
-`sstables_loader.cc:1134`).** Parse the segment entries (with `segment_seq`,
-`offset`, `length`, `kind`) and `insert_snapshot_sstable` them as pseudo-sstable
-rows (state `remote`), exactly like the current sstable loop but carrying the
-extra fields. `restore_tablets` (`sstables_loader.cc:1366`),
+`sstables_loader.cc:1146`).** Parse the segment entries (with `segment_seq`,
+`offset`, `length`, `kind`, `format_version`) and `insert_snapshot_sstable`
+them as pseudo-sstable rows (state `remote`), exactly like the current sstable
+loop but carrying the extra fields; refuse a `format_version` this build does
+not read. `restore_tablets` (`sstables_loader.cc:1415`),
 `tablet_restore_task_impl`, `alter_table_with_tablet_hints`, the topology
 coordinator restore transition, and the `restore_tablet` RPC
-(`sstables_loader.cc:904`) are **engine-agnostic and unchanged**.
+(`sstables_loader.cc:909`) are **engine-agnostic and unchanged**.
 
 **2b. Per-tablet download (logstor branch in
-`sstables_loader::download_tablet_sstables`, `sstables_loader.cc:959`).** The
+`sstables_loader::download_tablet_sstables`, `sstables_loader.cc:970`).** The
 range lookup (`get_snapshot_sstables` by tablet token range) and the
 `downloaded == no` filtering are reused. When `table.uses_logstor()`, replace the
 `get_sstables_from_object_store` + `download_sstable` + `attach_sstable` block
@@ -1812,13 +2102,13 @@ with a logstor ingest loop:
 
 1. Determine the target shard from the transition info:
    `trinfo->pending_replica->shard` (as file-streaming restore does at
-   `service/storage_service.cc:5426`).
+   `service/storage_service.cc:5599`).
 2. Group the tablet's segment entries by object key (a manifest may reference
    packs from earlier backups — they are ordinary keys). For each pack, on that
    shard: open `client->make_download_source(object_name(bucket, prefix,
    toc_name))` once (whole-pack GET) and walk it in `offset` order; for each
    contained segment, create a sink via
-   `table::create_logstor_segment_sink(db)` (`replica/table.cc:1654`) and copy
+   `table::create_logstor_segment_sink(db)` (`replica/table.cc:1696`) and copy
    that segment's `length` bytes into the sink's `output()` stream; `close()`
    runs `load_segment`, which re-indexes into
    the tablet's `primary_index` and reattaches the segment to its compaction
@@ -1858,25 +2148,29 @@ needed for Phase 1.
 | File | Change |
 |---|---|
 | `replica/table.cc` (`snapshot_table_on_all_shards`) | logstor branch: enumerate tablets from the tablet map and invoke `ssc` with empty sstables + all tablets |
-| `db/snapshot/cluster_backup.cc` (`do_backup`) | logstor branch: per-tablet single-replica selection; send RPC with token range + empty `sstable_ids`; manifest emits segment entries |
-| `db/snapshot/cluster_backup.cc` (`backup_sstables`) | logstor branch: snapshot cursor, read-into-memory + hash, previous-manifest dedup, pack-assembly upload, metadata row; release pins |
-| `db/snapshot_types.hh` | add `segment_seq`, `offset`, `length`, `kind` to `snapshot_sstable_entry` |
-| `idl/snapshot_backup.idl.hh` / serializers | extend `snapshot_sstable_entry` serialization for the new fields (verb signature unchanged) |
+| `db/snapshot/cluster_backup.cc` (`do_cluster_backup`) | logstor branch: tablet-count check; per-tablet single-replica selection from the current tablet map; `backup_logstor_segments` RPC with token range, `pack_size`, `dedup_from`; bounded re-selection; manifest emits segment entries |
+| `db/snapshot/cluster_backup.cc` (logstor handler) | ownership check; own-row cleanup; snapshot cursor; read-into-memory + CRCs + hash; `dedup_from` manifests; pack assembly under `pack-{attempt}-{seq}`; markers; metadata rows; returns attempt id |
+| `db/snapshot_types.hh` | add `segment_seq`, `offset`, `length`, `kind`, `format_version` to `snapshot_sstable_entry` |
+| `idl/snapshot_backup.idl.hh` / serializers | new `backup_logstor_segments` verb; extend `snapshot_sstable_entry` serialization for the new fields |
 | `db/system_distributed_keyspace.{hh,cc}` | add the new columns to the `snapshot_sstables` schema and to insert/read helpers |
 | `db/snapshot/manifest.{hh,cc}` | add `segment_seq`/`offset`/`length`/`kind` to `sstable_info` (or a `segments` list) |
 | `sstables_loader.cc` (`process_manifest`) | parse and persist the new segment fields |
 | `sstables_loader.cc` (`download_tablet_sstables`) | logstor branch: group entries by pack, whole-pack `make_download_source` split by `offset`/`length` → `create_logstor_segment_sink` on `pending_replica->shard`; `download_logstor_segment` helper |
-| `replica/logstor/segment_manager.{hh,cc}` | expose content hash + header fields for a `segment_snapshot` (or a read-into-memory helper); **A2** pinned-segment semaphore. **A1** and the **A3** rescue-pin cursor land in stage 0 |
+| `replica/logstor/segment_manager.{hh,cc}` | read-and-describe helper for a pinned segment (header fields, CRCs, payload hash); **A2** pinned-segment semaphore. **A1** and the **A3** rescue-pin cursor land in stage 0 |
+| `replica/logstor/ondisk.hh` | a real format version (see "Format versioning") |
 | tests | `test/boost/tablet_aware_restore_test.cc` (logstor variant) + logstor unit tests |
 
 ### Phase 1 risks and unresolved issues
 
-1. **Durability tension (resolved by fusing, but with caveats).** Because the
-   segment set is materialized at upload time, an aborted/retried cluster backup
-   re-snapshots and may produce a *different* segment set (compaction moved on).
-   Dedup by `content_hash` limits re-upload, but the manifest reflects the last
-   successful node run. Ensure the coordinator reads segment rows **after** each
-   node finishes; make node backup idempotent.
+1. **Durability tension (resolved by fusing, with the retry rules).** Because
+   the segment set is enumerated at upload time, an aborted/retried cluster
+   backup re-snapshots and may produce a *different* segment set (compaction
+   moved on). Dedup by `content_hash` limits re-upload. Two rules make the
+   retry safe: a pack key is never overwritten (per-attempt UUID), so a row
+   from an earlier attempt always locates the bytes it was written against;
+   and the handler deletes its own rows for the tablet before writing, so
+   segments that disappeared between attempts do not linger in the manifest.
+   The coordinator reads segment rows only after every node has returned.
 2. **Which replica per tablet.** Phase 1 picks the primary replica. If
    replicas diverge, the restored copy is that replica's view — writes the
    replica missed are absent, which the sstable path's repaired/unrepaired
@@ -1911,10 +2205,11 @@ needed for Phase 1.
    it in metrics and docs so operators aren't surprised. Trigger a source-side
    compaction/separator flush before large backups if needed.
 7. **`content_hash` → `sstable_id` derivation.** Must be collision-resistant and
-   deterministic; use a 128-bit hash mapped into the UUID, with a reserved
-   marker (e.g. a fixed version/variant nibble pattern) so a segment row can
-   never clash with or be mistaken for a real sstable id in mixed (non-logstor)
-   manifests, even if the `kind` column is lost or unread.
+   deterministic; use the 128-bit payload hash mapped into the UUID, with a
+   reserved marker (e.g. a fixed version/variant nibble pattern) so a segment
+   row can never clash with or be mistaken for a real sstable id in mixed
+   (non-logstor) manifests, even if the `kind` column is lost or unread. The
+   32-bit CRCs are not a substitute.
 8. **Consistency-level / TTL.** Segment rows reuse the 3-day `snapshot_sstables`
    TTL (`SNAPSHOT_SSTABLES_TTL_SECONDS`); confirm it's long enough for large
    restores and consistent with backup semantics.
@@ -1938,6 +2233,18 @@ needed for Phase 1.
     no retained manifest references it (the `refs/…` markers track this).
     A dedup-map load failure must degrade to "upload everything", never fail
     the backup.
+12. **Format versioning.** Logstor's on-disk layout changes without a version
+    bump today (`logstor_recovery1`, `logstor_gc`). A backup is a long-lived
+    artifact; before stage 1 ships, logstor needs a real format version and
+    the manifest records it per entry, so a restore into an incompatible build
+    fails at manifest parse time. See "Format versioning".
+13. **Tablet moved between snapshot and backup.** The logstor snapshot is
+    fused into the backup RPC, so a node that held the tablet at snapshot time
+    but not at backup time has nothing to enumerate. The coordinator selects
+    replicas from the current tablet map, the node checks ownership and fails
+    the RPC otherwise, and the coordinator re-selects a bounded number of
+    times. A migration that starts mid-backup erases the source group, which
+    aborts the cursor and fails the RPC the same way.
 
 ## Testing
 
@@ -1959,7 +2266,17 @@ needed for Phase 1.
   contains segments from more than one tablet.
 - **Correctness under churn:** backup concurrent with writes/compaction (pins
   hold; no resurrection of freed records); restart-after-restore recovery scan
-  rebuilds the identical index.
+  rebuilds the identical index (`recovery_divergence()` on
+  `logstor_recovery1` is the oracle).
+- **Retry:** fail a node's backup RPC part way (injection after the first
+  pack), compact so the segment set changes, retry the same tag; assert no
+  pack key was overwritten, the manifest holds only the second attempt's
+  entries plus valid re-references, and restore from it is correct.
+- **Tablet moved:** migrate a tablet between the snapshot call and the backup
+  call; assert the backup still completes (re-selection) and that a node asked
+  for a range it does not own fails the RPC rather than returning an empty
+  segment set. Truncate a table mid-backup; assert the tablet backup fails
+  rather than uploading erased records.
 - **Pin cost / space pressure:** back up a large tablet while the shard is near
   the compaction trigger threshold and assert that (a) `available_segment_count`
   does not fall monotonically for the duration, (b) compaction does not run on
@@ -2018,8 +2335,8 @@ can land in parallel with any of them.
   assumed to land; stage 6 depends on it.
 - **Stage 0 — Pin-cost containment in logstor, streaming first:** **A1**
   pin-aware compaction candidacy and **A3** the rescue-pin snapshot cursor,
-  landed as standalone logstor changes with tablet streaming
-  (`stream_blob.cc:770`) as the first consumer. Fixes a problem logstor has
+  landed as standalone logstor changes on top of `logstor_recovery1` with
+  tablet streaming (`stream_blob.cc:775`) as the first consumer. Fixes a problem logstor has
   today and is independently shippable; because rescue-pin provides the strong
   invariant, the same machinery serves backup unchanged.
 - **Stage 1 — Backup:** segment identity + hashing; snapshot-time tablet/node
@@ -2038,8 +2355,9 @@ can land in parallel with any of them.
 - **Stage 4 (optional) — Incremental-backup optimizations:** the
   `segment_seq`-watermark read skip (skip reading segments already covered by
   the previous backup on a sticky replica — turns incremental backup IO into
-  O(churn); see "Incremental enumeration"); ranged-GET restore for sparse
-  partial restores.
+  O(churn); see "Incremental enumeration"), which needs the per-shard
+  seq-watermark store feeding `_next_segment_seq` and
+  `segment_descriptor::seq`; ranged-GET restore for sparse partial restores.
 - **Stage 5 (optional) — Option B on-disk snapshot** for `nodetool snapshot`
   parity / decoupled uploads, if needed. This is also what turns stage 0a's
   warning back into a real protective snapshot on DROP/TRUNCATE (step 2 of
@@ -2055,9 +2373,10 @@ can land in parallel with any of them.
   start; backup then takes everything from the per-tablet master replica and
   only `seq > W_r` segments from the others, restoring the sstable path's
   "every write present on any replica" guarantee at churn-bounded extra cost.
-  Comprises the node-local watermark table, the delta mode in the backup
-  request, cheap segment-seq visibility (shared with stage 4), and the
-  multi-source restore caveats. See "Replica selection and the
+  Comprises the repair-kind record in the per-shard seq-watermark store, the
+  delta mode in the backup request, `segment_descriptor::seq` (shared with
+  stage 4), the deletion-kind filter for delta replicas once tombstone GC
+  exists, and the multi-source restore caveats. See "Replica selection and the
   repaired/unrepaired question".
 
 ## Risks / open items
@@ -2085,13 +2404,16 @@ can land in parallel with any of them.
 - **A3 correctness hinges on the eviction hook.** Enumerating segments without
   pins and without a hook silently drops records. The hook must cover split
   compaction's slow path too, which is why the pending registry is keyed by
-  segment id at shard level rather than per group. Rescue-pin gives the strong
+  segment id at shard level rather than per group; group teardown
+  (`erase()` on `logstor_recovery1`) aborts the snapshot instead. Rescue-pin gives the strong
   invariant (*every record live at snapshot time is consumed at least once*) and
   is correct for backup; the optional chase variant gives only the weaker
   union-with-the-write-path invariant and is **streaming-only**.
-- **Group teardown is the one eviction rescue-pin cannot answer.**
-  `discard_segments` destroys data deliberately, and hard-asserts
-  `ref_count == 1`; an active snapshot must be serialized against or aborted.
+- **Group teardown is the one eviction rescue-pin must not answer.** On
+  master `discard_segments` requires `ref_count == 1`; on `logstor_recovery1`
+  `erase()` leaves referenced segments to their references but zeroes the
+  pending unpinned ones. Either way the records are being erased, so the
+  snapshot is aborted, not rescued.
 - **B-share hinges on the "link dense files as-is" rule:** without it, every
   backup rewrites the whole tablet and dedup drops to zero.
 - **Hard links are not snapshots here.** Logstor data files are mutable in place
@@ -2125,15 +2447,31 @@ can land in parallel with any of them.
   scope here; full repair suffices) is stage 6's hard prerequisite and what
   makes any repair-freshness gating meaningful.
 - **Multi-source restore semantics (stage 6 / R4):** same-timestamp conflicts
-  resolve by ingest order in the primary index rather than by CQL value
-  reconciliation — a narrow but real divergence from the sstable restore
-  path. And logstor currently never purges tombstone records (no resurrection
-  risk today); if tombstone GC is ever added, it must become repair-aware
-  before multi-source merge stays safe.
+  resolve by ingest order in the primary index (`primary_index::insert`
+  replaces on `<=`) rather than by CQL value reconciliation — a narrow but real
+  divergence from the sstable restore path, which the content-based tie rule
+  planned in `logstor_discard.md` would remove. Tombstone GC
+  (`logstor_gc`) makes the tombstone caveat real: `repair`-mode Gate 1 is the
+  repair-aware grace, `timeout` mode has the usual "repair within gc_grace"
+  exposure, and the purge-skew stale-copy window has the deletion-kind delta
+  filter as its fix — see "Multi-source merge caveats".
+- **Seq counter is not durable.** `_next_segment_seq` is rebuilt at recovery
+  from what is on disk, so a seq can be reissued after a restart unless a
+  persisted watermark feeds the counter (Invariant Q). Both the stage 4 read
+  skip and the stage 6 repair watermark are specified with such a watermark in
+  the per-shard seq-watermark store; neither may be built without it.
 - **`segment_seq` watermark (follow-up):** each backup reads the whole tablet
   once to compute hashes even when little changed; the watermark read skip
   ("Incremental enumeration") removes this, but depends on sticky replica
-  selection and on the previous backup's metadata being available — it needs a
-  robust fallback to the full read-and-hash pass.
-- **Content hash source:** confirm the cheapest place to compute it; the
-  per-buffer CRC in the `chunk_header` may be reusable to avoid a second pass.
+  selection, on a per-shard key, and on the previous backup's metadata being
+  available — it needs a robust fallback to the full read-and-hash pass.
+- **Content hash:** resolved — xxh3-128 over the payload region (the segment
+  header and the records, which `crc` and `body_crc` cover), computed in the
+  same pass as the CRC checks; the CRCs are the integrity check only.
+- **Format versioning:** logstor's on-disk layout changes without a version
+  bump today; backup needs a real version recorded per manifest entry before
+  stage 1 ships. See "Format versioning".
+- **GC frontier vs pins:** every pinned or rescued segment holds the tombstone
+  GC frontier on its shard while held; the cursor and A2 bound it, and the GC
+  design's purge journal removes the dependence. Recorded as an input to the
+  GC design's Stage B decision.
