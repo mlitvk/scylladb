@@ -862,17 +862,17 @@ LOGSTOR_NODE_OPTS = [
 ]
 
 # Partitions of the dataset, which is what sizes it against the pool above. A row of
-# ./conf/logstor.yaml is ~1 KiB of values and measures ~1.9 KiB as a record, since a
-# record carries the description of the schema along with the frozen mutation. Every one
-# of the three RF=3 nodes holds the whole dataset, so the live bytes of the cluster come
-# to 3 * LOGSTOR_ROWS * 1.9 KiB against the 3 * 2 * LOGSTOR_DISK_SIZE_IN_MB of pool that
-# its six shards have between them - 0.83 GiB of 1.5 GiB, or 55%. The training mix deletes
-# one partition for every six it inserts, which settles that at ~6/7 of what was
-# populated, leaving the run at about half a pool.
-LOGSTOR_ROWS = 150000
+# ./conf/logstor.yaml is ~1 KiB of values and measures ~1.43 KiB as a record, the rest
+# being the record header and the serialization of the partition. Every one of the three
+# RF=3 nodes holds the whole dataset, so the live bytes of the cluster come to
+# 3 * LOGSTOR_ROWS * 1.43 KiB against the 3 * 2 * LOGSTOR_DISK_SIZE_IN_MB of pool that
+# its six shards have between them - 0.86 GiB of 1.5 GiB, or 57%. The training mix deletes
+# one partition for every six it inserts, and the tombstone a delete leaves is ~0.1 KiB,
+# which settles that at ~6/7 of what was populated, leaving the run at about half a pool.
+LOGSTOR_ROWS = 210000
 
-# Operations of the training workload. The dataset leaves ~45% of the pool free, which the
-# workload has to overwrite before compaction starts at all - a tenth of this run - and
+# Operations of the training workload. The dataset leaves ~42% of the pool free, which the
+# workload has to overwrite before compaction starts at all - an eighth of this run - and
 # what is left of it then runs against a pool that compaction is holding at ~92% in use.
 LOGSTOR_TRAIN_OPS = 2600000
 
