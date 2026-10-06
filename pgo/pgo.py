@@ -950,12 +950,16 @@ async def report_logstor_state(addrs: list[str], phase: str) -> None:
     segments = m["scylla_logstor_sm_segments_in_use"] + m["scylla_logstor_sm_free_segments"]
     capacity = segments * 128 * 1024
     live = m["scylla_logstor_sm_live_record_bytes"]
+    records = m["scylla_logstor_sm_live_record_count"]
+    # The mean size of a record is what LOGSTOR_ROWS is derived from. It is the size of a
+    # row of ./conf/logstor.yaml after populating, and lower once the training deletes have
+    # replaced some of the rows by tombstones.
     training_logger.info(
         f"logstor {phase}:"
         f" pool {capacity/2**30:.2f} GiB in {segments:.0f} segments,"
         f" {live/2**30:.2f} GiB live ({100*live/capacity if capacity else 0:.1f}% of the pool),"
         f" {m['scylla_logstor_sm_segments_in_use']/segments*100 if segments else 0:.1f}% of the segments in use,"
-        f" {m['scylla_logstor_sm_live_record_count']:.0f} records"
+        f" {records:.0f} records of {live/records if records else 0:.0f} B"
     )
     training_logger.info(
         f"logstor {phase}:"
