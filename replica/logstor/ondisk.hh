@@ -108,6 +108,9 @@ struct field<utils::UUID> {
 template <>
 struct field<table_id> : projected_field<utils::UUID, &table_id::uuid> {};
 
+template <>
+struct field<table_schema_version> : projected_field<utils::UUID, &table_schema_version::uuid> {};
+
 // api::timestamp_type is an alias, so it cannot have its own field<>, and fixed_serializer encodes
 // it as int64_t.
 static_assert(std::is_same_v<api::timestamp_type, int64_t>, "The timestamp must be of the on-disk type");
@@ -194,13 +197,14 @@ struct record_frame_header : fixed_layout {
 static_assert(max_key_size == std::numeric_limits<decltype(record_frame_header::key_size)>::max(),
         "record_frame_header::key_size must hold every key size up to max_key_size");
 
-// A record header starts with the token, the timestamp and the table id, as four little-endian
-// 64-bit words. The partition key follows them, in key_size bytes of its internal representation:
+// A record header starts with the token, the timestamp, the table id and the schema version, as six
+// little-endian 64-bit words. The partition key follows them, in key_size bytes of its internal
+// representation:
 //
-//   0         8             16                    32                  32 + key_size
-//   +---------+-------------+---------------------+-------------------+
-//   |  token  |  timestamp  |      table id       |   partition key   |
-//   +---------+-------------+---------------------+-------------------+
+//   0         8             16           32                 48                 48 + key_size
+//   +---------+-------------+------------+------------------+-------------------+
+//   |  token  |  timestamp  |  table id  |  schema version  |   partition key   |
+//   +---------+-------------+------------+------------------+-------------------+
 //
 // The fixed fields come first so that they are at constant offsets. The key is the only variable
 // part, and the record_frame_header before the record header holds the key size.
@@ -208,6 +212,7 @@ struct record_header_fixed : fixed_layout {
     dht::token token;
     api::timestamp_type timestamp;
     table_id table;
+    table_schema_version schema_version;
 };
 
 // These constants are the on-disk sizes, which fixed_size calculates from the fields of each type.
@@ -290,6 +295,7 @@ void write_record_header(Output& out, const record_header& h) {
         .token = h.key.token(),
         .timestamp = h.timestamp,
         .table = h.table,
+        .schema_version = h.schema_version,
     });
     for (bytes_view frag : fragment_range(managed_bytes_view(h.key.key().representation()))) {
         out.write(reinterpret_cast<const char*>(frag.data()), frag.size());
@@ -305,6 +311,7 @@ inline record_header read_record_header(bytes_view header) {
         .key = dht::decorated_key(fixed.token, partition_key::from_bytes(header.substr(record_header_fixed_size))),
         .timestamp = fixed.timestamp,
         .table = fixed.table,
+        .schema_version = fixed.schema_version,
     };
 }
 

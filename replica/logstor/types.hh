@@ -14,6 +14,7 @@
 #include "replica/logstor/segment_types.hh"
 #include "bytes_ostream.hh"
 #include "mutation/timestamp.hh"
+#include "schema/schema_fwd.hh"
 
 namespace replica::logstor {
 
@@ -55,6 +56,7 @@ struct record_header {
     dht::decorated_key key;
     api::timestamp_type timestamp;
     table_id table;
+    table_schema_version schema_version;
 
     // The key as the primary index knows it. Compaction and recovery derive it from the header,
     // since a record carries the partition key itself and never its hash.
@@ -66,7 +68,8 @@ struct record_header {
         return key.token() == other.key.token()
             && key.key().representation() == other.key.key().representation()
             && timestamp == other.timestamp
-            && table == other.table;
+            && table == other.table
+            && schema_version == other.schema_version;
     }
 };
 
