@@ -58,6 +58,7 @@ inline replica::logstor::log_record make_log_record(schema_ptr schema, sstring p
             .key = m.decorated_key(),
             .timestamp = ts,
             .table = schema->id(),
+            .schema_version = schema->version(),
         },
         .value = replica::logstor::encode_record_value(m),
     };
