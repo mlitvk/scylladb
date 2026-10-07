@@ -239,10 +239,10 @@ is durable but whose body was only partly written.
 A record frame holds one record and has these parts, in this order:
 
 - the **frame header**, which gives the sizes of the parts that follow and the flags of the record.
-- the **record header**, which holds the token, the timestamp, the table and the partition key.
-- the **record value**, which is the encoded partition. The value also holds the schema version
-  that the record was written under and the column mapping of that version, so that logstor can
-  decode the record after an `ALTER TABLE`.
+- the **record header**, which holds the token, the timestamp, the table, the schema version and the
+  partition key.
+- the **record value**, which is the encoded partition. The value also holds the column mapping of
+  the schema version of the record, so that logstor can decode the record after an `ALTER TABLE`.
 - zero padding to a multiple of `ondisk::record_alignment`.
 
 The value of a record is encoded and decoded by `encode_record_value()` and `decode_record_value()`
