@@ -232,7 +232,7 @@ Each record within the chunk is stored as a record frame:
 
 ```
 record_frame_header  (8 bytes)
-record_header        (32 + key_size bytes)
+record_header        (48 + key_size bytes)
 record_value         (value_size bytes)
 zero_padding         -- to align to record_alignment (8 bytes)
 ```
@@ -265,18 +265,18 @@ Written by `ondisk::write_record_header()`. The fixed fields come first, at cons
 | 0      | 8          | `token`     | Raw token number of the partition key. |
 | 8      | 8          | `timestamp` | `api::timestamp_type` — timestamp used for conflict resolution. |
 | 16     | 16         | `table`     | `table_id` (UUID) — the table this record belongs to, written as its most significant and then its least significant 64-bit half. |
-| 32     | `key_size` | `key`       | The partition key in its internal representation (`partition_key::representation()`). |
+| 32     | 16         | `schema_version` | The version of the table's schema the record was written under, written like the table id. |
+| 48     | `key_size` | `key`       | The partition key in its internal representation (`partition_key::representation()`). |
 
 **Record Value** (`record_value`):
 
 The `value_size` bytes immediately following the record header are the encoded partition. They are opaque to everything but `encode_record_value()` and `decode_record_value()` in `replica/logstor/record_value.hh`: compaction, the separator and segment streaming copy a value as it is.
 
-The encoding is written and read in `replica/logstor/record_value.cc`, behind `encode_record_value()` and `decode_record_value()`. It is a `canonical_mutation` stripped of what the record header already carries, the table id and the partition key, with the remaining parts each written by the serializer `canonical_mutation` uses for it:
+The encoding is written and read in `replica/logstor/record_value.cc`, behind `encode_record_value()` and `decode_record_value()`. It is a `canonical_mutation` stripped of what the record header already carries, the table id, the partition key and the schema version, with the remaining parts each written by the serializer `canonical_mutation` uses for it:
 
 | Offset | Size       | Field                | Description |
 |--------|------------|----------------------|-------------|
-| 0      | 16         | `schema_version`     | The version of the schema the record was written under, as its most significant and then its least significant 64-bit half. |
-| 16     | variable   | `column_mapping`     | The columns of that schema version, IDL-serialized. A read under the same schema version steps over it; a read under another version uses it to map the record's columns onto the schema's, so a record stays readable after an `ALTER TABLE`. It is stored in the record because the schema history in the system tables keeps superseded versions only for a while. |
+| 0      | variable   | `column_mapping`     | The columns of the schema version in the header, IDL-serialized. A read under the same schema version steps over it; a read under another version uses it to map the record's columns onto the schema's, so a record stays readable after an `ALTER TABLE`. It is stored in the record because the schema history in the system tables keeps superseded versions only for a while. |
 |        | variable   | `mutation_partition` | The partition, IDL-serialized as `mutation_partition_serializer` writes it. |
 
 The value has no frame or size of its own: `value_size` gives its size.

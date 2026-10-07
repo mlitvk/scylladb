@@ -79,6 +79,7 @@ log_record make_log_record(schema_ptr schema, sstring pk, sstring value, api::ti
             .key = m.decorated_key(),
             .timestamp = ts,
             .table = schema->id(),
+            .schema_version = schema->version(),
         },
         .value = encode_record_value(m),
     };
@@ -595,6 +596,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_header_round_trip) {
         .key = m.decorated_key(),
         .timestamp = api::timestamp_type(0x0f0e0d0c0b0a0908),
         .table = table_id(utils::UUID(int64_t(0x1122334455667788), int64_t(0x99aabbccddeeff00))),
+        .schema_version = table_schema_version(utils::UUID(int64_t(0x2132435465768798), int64_t(0xa9bacbdcedfe0f10))),
     };
     // The representation is the key bytes plus their length prefix.
     const auto key_size = header.key.key().representation().size();
@@ -696,6 +698,7 @@ record_header make_header(const mutation& m, api::timestamp_type ts) {
         .key = m.decorated_key(),
         .timestamp = ts,
         .table = m.schema()->id(),
+        .schema_version = m.schema()->version(),
     };
 }
 
@@ -711,13 +714,6 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_value_round_trip) {
     auto value = encode_record_value(m);
     assert_that(decode_record_value(value, schema, make_header(m, ts))).is_equal_to(m);
     BOOST_REQUIRE_LT(value.size(), canonical_mutation(m).representation().size());
-
-    // The value starts with the schema version, most significant half first. That is what a
-    // read under the same schema compares against, and a decoder that got the halves in the
-    // wrong order would still decode correctly, only through the converting path.
-    auto in = ser::as_input_stream(value.representation());
-    BOOST_REQUIRE_EQUAL(ser::serializer<int64_t>::read(in), schema->version().uuid().get_most_significant_bits());
-    BOOST_REQUIRE_EQUAL(ser::serializer<int64_t>::read(in), schema->version().uuid().get_least_significant_bits());
 
     // A partition tombstone alone, with no row.
     mutation deleted(schema, m.decorated_key());
@@ -1928,6 +1924,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_rejects_torn_chunk) {
                     .key = m.decorated_key(),
                     .timestamp = api::timestamp_type(first_ts + i),
                     .table = schema->id(),
+                    .schema_version = schema->version(),
                 },
                 .value = encode_record_value(m),
             }));

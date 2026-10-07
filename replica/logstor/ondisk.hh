@@ -259,20 +259,22 @@ static constexpr size_t record_frame_header_size = ser::serializer<record_frame_
 static_assert(chunk_header_size % record_alignment == 0, "Chunk header size must be aligned by record_alignment");
 static_assert(segment_header_size % record_alignment == 0, "Segment header size must be aligned by record_alignment");
 
-// The record header is the token, the timestamp and the table id as four little-endian 64-bit
-// words, followed by the partition key in its internal representation:
+// The record header is the token, the timestamp, the table id and the schema version as six
+// little-endian 64-bit words, each UUID as its most and then its least significant half, followed
+// by the partition key in its internal representation:
 //
-//   0         8             16                    32                  32 + key_size
-//   +---------+-------------+---------------------+-------------------+
-//   |  token  |  timestamp  |  table id msb, lsb  |   partition key   |
-//   +---------+-------------+---------------------+-------------------+
+//   0         8             16           32                 48                 48 + key_size
+//   +---------+-------------+------------+------------------+-------------------+
+//   |  token  |  timestamp  |  table id  |  schema version  |   partition key   |
+//   +---------+-------------+------------+------------------+-------------------+
 //
 // The fixed fields come first so that they are at constant offsets; the key is the only variable
 // part, and its size is stored in the record_frame_header ahead of the record header.
 static constexpr size_t record_header_fixed_size =
     sizeof(int64_t)                 // token
     + sizeof(api::timestamp_type)   // timestamp
-    + 2 * sizeof(int64_t);          // table id
+    + 2 * sizeof(int64_t)           // table id
+    + 2 * sizeof(int64_t);          // schema version
 
 constexpr size_t record_header_size(size_t key_size) noexcept {
     return record_header_fixed_size + key_size;
@@ -288,6 +290,8 @@ void write_record_header(Output& out, const record_header& h) {
     ser::serializer<api::timestamp_type>::write(out, h.timestamp);
     ser::serializer<int64_t>::write(out, h.table.uuid().get_most_significant_bits());
     ser::serializer<int64_t>::write(out, h.table.uuid().get_least_significant_bits());
+    ser::serializer<int64_t>::write(out, h.schema_version.uuid().get_most_significant_bits());
+    ser::serializer<int64_t>::write(out, h.schema_version.uuid().get_least_significant_bits());
     for (bytes_view frag : fragment_range(managed_bytes_view(h.key.key().representation()))) {
         out.write(reinterpret_cast<const char*>(frag.data()), frag.size());
     }
@@ -298,8 +302,10 @@ template <typename Input>
 record_header read_record_header(Input& in, uint32_t key_size) {
     auto token = dht::token::from_int64(ser::serializer<int64_t>::read(in));
     auto timestamp = ser::serializer<api::timestamp_type>::read(in);
-    auto msb = ser::serializer<int64_t>::read(in);
-    auto lsb = ser::serializer<int64_t>::read(in);
+    auto table_msb = ser::serializer<int64_t>::read(in);
+    auto table_lsb = ser::serializer<int64_t>::read(in);
+    auto version_msb = ser::serializer<int64_t>::read(in);
+    auto version_lsb = ser::serializer<int64_t>::read(in);
     managed_bytes key(managed_bytes::initialized_later(), key_size);
     for (bytes_mutable_view frag : fragment_range(managed_bytes_mutable_view(key))) {
         in.read(reinterpret_cast<char*>(frag.data()), frag.size());
@@ -307,7 +313,8 @@ record_header read_record_header(Input& in, uint32_t key_size) {
     return record_header{
         .key = dht::decorated_key(token, partition_key::from_bytes(std::move(key))),
         .timestamp = timestamp,
-        .table = table_id(utils::UUID(msb, lsb)),
+        .table = table_id(utils::UUID(table_msb, table_lsb)),
+        .schema_version = table_schema_version(utils::UUID(version_msb, version_lsb)),
     };
 }
 

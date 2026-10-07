@@ -167,6 +167,7 @@ future<> logstor::do_write(const schema& s, dht::decorated_key dk, api::timestam
             .key = std::move(dk),
             .timestamp = ts,
             .table = s.id(),
+            .schema_version = s.version(),
         },
         .value = std::move(value),
     };

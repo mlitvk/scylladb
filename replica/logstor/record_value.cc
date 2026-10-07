@@ -41,44 +41,30 @@ void write_partition(Output& out, const schema&, const ser::mutation_partition_v
 }
 
 // The record value is the partition the record holds, encoded as a canonical_mutation stripped
-// of what the record_header already carries: the table id and the partition key. What is
-// left is the version of the schema the record was written under, the column mapping of that
-// schema, and the IDL-serialized mutation_partition, each written by the serializer that
-// canonical_mutation uses for it.
+// of what the record_header already carries: the table id, the partition key and the schema
+// version. What is left is the column mapping of the schema the record was written under and
+// the IDL-serialized mutation_partition, each written by the serializer that canonical_mutation
+// uses for it.
 //
-//   i64  schema_version, most significant half
-//   i64  schema_version, least significant half
 //        column_mapping       ser::serializer<column_mapping>, from idl/mutation.idl.hh
 //        mutation_partition   ser::serializer<mutation_partition>, as mutation_partition_serializer
 //                             writes it
 template <typename Output, typename Partition>
 void write_record_value(Output& out, const schema& s, const Partition& p) {
-    ser::serializer<int64_t>::write(out, s.version().uuid().get_most_significant_bits());
-    ser::serializer<int64_t>::write(out, s.version().uuid().get_least_significant_bits());
     ser::serialize(out, s.get_column_mapping());
     write_partition(out, s, p);
 }
 
-// Reads a record value field by field, in the order above. Construction reads the schema
-// version; the caller then either reads or skips the mapping, and reads the partition.
+// Reads a record value field by field, in the order above: the caller either reads or skips
+// the mapping, and then reads the partition.
 template <typename Input>
 class record_value_reader {
     Input& _in;
-    table_schema_version _schema_version;
-
-    static table_schema_version read_schema_version(Input& in) {
-        const auto msb = ser::serializer<int64_t>::read(in);
-        const auto lsb = ser::serializer<int64_t>::read(in);
-        return table_schema_version(utils::UUID(msb, lsb));
-    }
 
 public:
     explicit record_value_reader(Input& in)
         : _in(in)
-        , _schema_version(read_schema_version(in))
     { }
-
-    table_schema_version schema_version() const noexcept { return _schema_version; }
 
     column_mapping read_mapping() {
         return ser::deserialize(_in, std::type_identity<column_mapping>{});
@@ -186,7 +172,7 @@ mutation decode_record_value(const record_value& v, schema_ptr s, const record_h
 
     mutation m(s, h.key);
 
-    if (reader.schema_version() == s->version()) {
+    if (h.schema_version == s->version()) {
         reader.skip_mapping();
         auto partition_view = mutation_partition_view::from_view(reader.read_partition());
         partition_builder b(*s, m.partition());
