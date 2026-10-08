@@ -12,9 +12,11 @@
 #include <cmath>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <stdexcept>
 #include <map>
 #include <numeric>
+#include <random>
 #include <ranges>
 #include <span>
 #include <vector>
@@ -25,11 +27,14 @@
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/format.hh>
 #include <seastar/core/temporary_buffer.hh>
+#include <seastar/core/shard_id.hh>
 #include <seastar/util/memory-data-source.hh>
 #include <seastar/util/defer.hh>
+#include <seastar/util/file.hh>
 
 #include "mutation/canonical_mutation.hh"
 #include "replica/exceptions.hh"
+#include "replica/logstor/erased_ranges.hh"
 #include "replica/logstor/index.hh"
 #include "replica/logstor/logstor.hh"
 #include "replica/logstor/ondisk.hh"
@@ -58,6 +63,7 @@
 #include "utils/disk-error-handler.hh"
 #include "utils/error_injection.hh"
 #include "utils/exceptions.hh"
+#include "utils/UUID_gen.hh"
 
 using namespace replica::logstor;
 using namespace tests::logstor;
@@ -4364,4 +4370,221 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_range_reader_serves_a_reversed_read) {
             env.make_reader(query::full_partition_range, bypassing));
     BOOST_REQUIRE_EQUAL(stats.partition_hits, hits + ms.size());
     BOOST_REQUIRE_EQUAL(stats.partition_misses, misses);
+}
+
+namespace {
+
+dht::token raw_token(int64_t raw) {
+    return dht::token::from_int64(raw);
+}
+
+// Three erased ranges of two tables: two overlapping ranges of table_a, and the whole ring of
+// table_b. Nothing erases table_c.
+struct erased_ranges_example {
+    const table_id table_a = table_id(utils::UUID_gen::get_time_UUID());
+    const table_id table_b = table_id(utils::UUID_gen::get_time_UUID());
+    const table_id table_c = table_id(utils::UUID_gen::get_time_UUID());
+    const erased_range a1 = erased_ranges::make(table_a, raw_token_range(10, false, 20, false), segment_sequence(5));
+    const erased_range a2 = erased_ranges::make(table_a, raw_token_range(15, true, 30, true), segment_sequence(9));
+    const erased_range b = erased_ranges::make(table_b, dht::token_range(), segment_sequence(3));
+    const erased_ranges set = erased_ranges().insert(a1).insert(a2).insert(b);
+
+    // Requires that `erased` covers what `set` covers.
+    void require_coverage(const erased_ranges& erased) const {
+        // Only a1 covers token 12.
+        BOOST_REQUIRE(erased.covers(table_a, raw_token(12), segment_sequence(5)));
+        BOOST_REQUIRE(!erased.covers(table_a, raw_token(12), segment_sequence(6)));
+        // Both a1 and a2 cover token 17, and the higher sequence counts.
+        BOOST_REQUIRE(erased.covers(table_a, raw_token(17), segment_sequence(9)));
+        BOOST_REQUIRE(!erased.covers(table_a, raw_token(17), segment_sequence(10)));
+        // Only a2 covers tokens 25 and 30.
+        BOOST_REQUIRE(erased.covers(table_a, raw_token(25), segment_sequence(7)));
+        BOOST_REQUIRE(erased.covers(table_a, raw_token(30), segment_sequence(9)));
+        // Neither a1 nor a2 covers tokens 10 and 31.
+        BOOST_REQUIRE(!erased.covers(table_a, raw_token(10), segment_sequence(1)));
+        BOOST_REQUIRE(!erased.covers(table_a, raw_token(31), segment_sequence(1)));
+        // b covers the whole ring of table_b, and nothing covers table_c.
+        BOOST_REQUIRE(erased.covers(table_b, raw_token(std::numeric_limits<int64_t>::min()), segment_sequence(3)));
+        BOOST_REQUIRE(erased.covers(table_b, raw_token(std::numeric_limits<int64_t>::max()), segment_sequence(3)));
+        BOOST_REQUIRE(!erased.covers(table_b, raw_token(0), segment_sequence(4)));
+        BOOST_REQUIRE(!erased.covers(table_c, raw_token(0), segment_sequence(1)));
+    }
+};
+
+} // anonymous namespace
+
+// The bounds of an erased range are the inclusive raw tokens that the index reads a range as.
+SEASTAR_THREAD_TEST_CASE(test_logstor_erased_range_bounds) {
+    const auto table = table_id(utils::UUID_gen::get_time_UUID());
+    const auto r = erased_ranges::make(table, raw_token_range(10, false, 20, false), segment_sequence(5));
+    BOOST_REQUIRE_EQUAL(r.first_token, 11);
+    BOOST_REQUIRE_EQUAL(r.last_token, 19);
+    const auto whole = erased_ranges::make(table, dht::token_range(), segment_sequence(3));
+    BOOST_REQUIRE_EQUAL(whole.first_token, std::numeric_limits<int64_t>::min());
+    BOOST_REQUIRE_EQUAL(whole.last_token, std::numeric_limits<int64_t>::max());
+}
+
+// An erased range covers a record of its table in its range at its sequence or below, and where
+// erased ranges overlap, the highest sequence counts.
+SEASTAR_THREAD_TEST_CASE(test_logstor_erased_ranges_coverage) {
+    const erased_ranges_example example;
+    example.require_coverage(example.set);
+    BOOST_REQUIRE(example.set.seq_floor() == segment_sequence(9));
+
+    // For many nested, overlapping and adjacent ranges of one table, covers() gives the same result
+    // as a direct check of each range.
+    std::mt19937_64 rng(42);
+    std::uniform_int_distribution<int64_t> bound(-50, 50);
+    std::uniform_int_distribution<uint64_t> sequence(1, 20);
+    std::vector<erased_range> added;
+    erased_ranges many;
+    for (int i = 0; i < 200; ++i) {
+        auto first = bound(rng);
+        auto last = bound(rng);
+        if (first > last) {
+            std::swap(first, last);
+        }
+        added.push_back(erased_range{.table = example.table_c, .first_token = first, .last_token = last, .seq = segment_sequence(sequence(rng))});
+        many.insert(added.back());
+    }
+    for (int64_t raw = -60; raw <= 60; ++raw) {
+        segment_sequence highest{0};
+        for (const auto& r : added) {
+            if (r.first_token <= raw && raw <= r.last_token) {
+                highest = std::max(highest, r.seq);
+            }
+        }
+        for (uint64_t seq = 1; seq <= 21; ++seq) {
+            BOOST_REQUIRE_EQUAL(many.covers(example.table_c, raw_token(raw), segment_sequence(seq)), segment_sequence(seq) <= highest);
+        }
+    }
+}
+
+// The erased ranges survive a save and a load.
+SEASTAR_THREAD_TEST_CASE(test_logstor_erased_ranges_save_and_load) {
+    tmpdir dir;
+    const erased_ranges_example example;
+
+    // A missing file loads as an empty set.
+    const auto empty = erased_ranges::load(dir.path(), this_shard_id()).get();
+    BOOST_REQUIRE(empty.empty());
+    BOOST_REQUIRE(!empty.covers(example.table_a, raw_token(0), segment_sequence(1)));
+
+    example.set.save(dir.path(), this_shard_id()).get();
+    const auto loaded = erased_ranges::load(dir.path(), this_shard_id()).get();
+    BOOST_REQUIRE(loaded.all() == example.set.all());
+    BOOST_REQUIRE(loaded.seq_floor() == segment_sequence(9));
+    example.require_coverage(loaded);
+}
+
+// A set of more erased ranges than the streams of a load and a save buffer, of more tables than
+// one, survives a save and a load.
+SEASTAR_THREAD_TEST_CASE(test_logstor_erased_ranges_save_and_load_many) {
+    tmpdir dir;
+    std::vector<table_id> tables;
+    for (int i = 0; i < 3; ++i) {
+        tables.push_back(table_id(utils::UUID_gen::get_time_UUID()));
+    }
+    // 3 tables of 2000 disjoint ranges each give 6000 erased ranges, 240000 bytes.
+    erased_ranges erased;
+    for (int64_t i = 0; i < 2000; ++i) {
+        for (const auto& table : tables) {
+            erased.insert(erased_range{.table = table, .first_token = 10 * i, .last_token = 10 * i + 4, .seq = segment_sequence(i + 1)});
+        }
+    }
+    BOOST_REQUIRE_EQUAL(erased.size(), 6000u);
+    erased.save(dir.path(), this_shard_id()).get();
+    const auto loaded = erased_ranges::load(dir.path(), this_shard_id()).get();
+    BOOST_REQUIRE(loaded.all() == erased.all());
+    BOOST_REQUIRE(loaded.seq_floor() == segment_sequence(2000));
+    for (const auto& table : tables) {
+        BOOST_REQUIRE(loaded.covers(table, raw_token(10 * 1999 + 4), segment_sequence(2000)));
+        BOOST_REQUIRE(!loaded.covers(table, raw_token(10 * 1999 + 5), segment_sequence(1)));
+    }
+}
+
+// Checks the exact bytes of the erased range file, so that a changed member order or field type
+// fails the test and does not silently change the format. A change of the format must also change
+// the expected bytes here.
+SEASTAR_THREAD_TEST_CASE(test_logstor_erased_ranges_file_layout) {
+    tmpdir dir;
+    const auto erased = erased_ranges().insert(erased_range{
+        .table = table_id(utils::UUID(int64_t(0x1122334455667788), int64_t(0x99aabbccddeeff00))),
+        .first_token = -0x0123456789abcdef,
+        .last_token = std::numeric_limits<int64_t>::max(),
+        .seq = segment_sequence{0x0102030405060708},
+    });
+    erased.save(dir.path(), this_shard_id()).get();
+
+    const auto contents = seastar::util::read_entire_file_contiguous(erased_ranges::file_path(dir.path(), this_shard_id())).get();
+    BOOST_REQUIRE_EQUAL(to_hex(bytes_view(reinterpret_cast<const int8_t*>(contents.data()), contents.size())),
+            // The header holds the magic, the version, the reserved bytes, the count and the sequence floor.
+            "4553474c" "01" "000000" "01000000" "0807060504030201"
+            // The erased range holds the table, the first token, the last token and the sequence.
+            "8877665544332211" "00ffeeddccbbaa99" "1132547698badcfe" "ffffffffffffff7f" "0807060504030201"
+            // The CRC follows.
+            "aee69c7e");
+}
+
+// An erased range below the lowest sequence on disk, or of a table that is gone, is obsolete. The
+// sequence floor stays when the erased ranges go, in memory and through the file, because the
+// recovered sequence counter must not go back to a sequence that an erase covered.
+SEASTAR_THREAD_TEST_CASE(test_logstor_erased_ranges_drop_obsolete) {
+    tmpdir dir;
+    const erased_ranges_example example;
+    auto erased = example.set;
+
+    auto all_tables = [] (table_id) { return true; };
+    BOOST_REQUIRE(!erased.drop_obsolete(segment_sequence(3), all_tables));
+    BOOST_REQUIRE(erased.drop_obsolete(segment_sequence(6), all_tables));
+    BOOST_REQUIRE(erased.all() == std::vector<erased_range>{example.a2});
+    BOOST_REQUIRE(erased.drop_obsolete(segment_sequence(1), [&] (table_id t) { return t != example.table_a; }));
+    BOOST_REQUIRE(erased.empty());
+    erased.insert(example.b);
+    BOOST_REQUIRE(erased.drop_obsolete(std::nullopt, all_tables));
+    BOOST_REQUIRE(erased.empty());
+
+    BOOST_REQUIRE(erased.seq_floor() == segment_sequence(9));
+    erased.save(dir.path(), this_shard_id()).get();
+    BOOST_REQUIRE(erased_ranges::load(dir.path(), this_shard_id()).get().seq_floor() == segment_sequence(9));
+}
+
+// load() refuses a file of a format version that this release does not read, and a file whose CRC
+// does not match, for example after a torn write.
+SEASTAR_THREAD_TEST_CASE(test_logstor_erased_ranges_refuse_a_corrupt_file) {
+    tmpdir dir;
+    const erased_ranges_example example;
+    const auto path = erased_ranges::file_path(dir.path(), this_shard_id()).string();
+
+    // Saves the example set, calls `change` on the bytes of the file, and then cuts `cut` bytes from
+    // the end of the file.
+    auto save_and_change = [&] (std::function<void(std::span<char>)> change, size_t cut = 0) {
+        example.set.save(dir.path(), this_shard_id()).get();
+        auto f = seastar::open_file_dma(path, seastar::open_flags::rw).get();
+        const auto size = f.size().get();
+        auto buf = temporary_buffer<char>::aligned(ondisk::block_alignment, ondisk::block_alignment);
+        BOOST_REQUIRE_EQUAL(f.dma_read(0, buf.get_write(), buf.size()).get(), size);
+        change(std::span(buf.get_write(), size));
+        BOOST_REQUIRE_EQUAL(f.dma_write(0, buf.get(), buf.size()).get(), buf.size());
+        f.truncate(size - cut).get();
+        f.flush().get();
+        f.close().get();
+    };
+
+    // The version is the byte after the 4-byte magic.
+    save_and_change([] (std::span<char> contents) { contents[4] = 2; });
+    BOOST_REQUIRE_EXCEPTION(erased_ranges::load(dir.path(), this_shard_id()).get(), std::runtime_error,
+            exception_predicate::message_contains("has format version 2"));
+    // A file of a later version can have another size, and the load still reports the version.
+    save_and_change([] (std::span<char> contents) { contents[4] = 2; }, 1);
+    BOOST_REQUIRE_EXCEPTION(erased_ranges::load(dir.path(), this_shard_id()).get(), std::runtime_error,
+            exception_predicate::message_contains("has format version 2"));
+    // A file of this version with a size that does not match its count is corrupt.
+    save_and_change([] (std::span<char>) {}, 1);
+    BOOST_REQUIRE_EXCEPTION(erased_ranges::load(dir.path(), this_shard_id()).get(), std::runtime_error,
+            exception_predicate::message_contains("count"));
+
+    save_and_change([] (std::span<char> contents) { contents[contents.size() / 2] ^= 0x55; });
+    BOOST_REQUIRE_EXCEPTION(erased_ranges::load(dir.path(), this_shard_id()).get(), std::runtime_error,
+            exception_predicate::message_contains("crc"));
 }

@@ -196,12 +196,32 @@ the exact layout, the field types and the encodings:
 - the `raw_write_buffer` comment in
   [replica/logstor/write_buffer.hh](../../replica/logstor/write_buffer.hh) for the layout of a
   chunk.
+- [replica/logstor/erased_ranges.hh](../../replica/logstor/erased_ranges.hh) and
+  [replica/logstor/erased_ranges.cc](../../replica/logstor/erased_ranges.cc) for the erased range
+  file.
 
 ### Files
 
 Each shard keeps its segments in large files (default 32MB), named
 `ls-{shard}-Data-{file_id}.db`. A file holds a fixed number of segments, and logstor
 pre-formats the file (fills it with zeros) before use.
+
+### Erased Ranges
+
+Each shard keeps the erases whose records can still be on disk in `ls-{shard}-Erase.db`, next
+to its segment files. The shard rewrites the file whole on every erase, through
+`ls-{shard}-Erase.db.tmp`, which replaces it once it is durable, so a crash leaves either version.
+When the file is missing, the shard has no erased ranges. When the file does not parse, has a format
+version that this release does not read, or has a CRC that does not match, the shard does not start.
+The file holds these parts, in this order:
+
+- the **header**, which identifies the file and its format version, and gives the number of erased
+  ranges and the sequence floor. The sequence floor is the highest sequence of every erased range
+  that the shard ever had, and the drop of an erased range does not lower it.
+- the **erased ranges**, one per erase. An erased range gives a table, an inclusive range of raw
+  tokens and a segment sequence. It erases each record of the table in the range that is in a
+  chunk with a `segment_seq` of at most that sequence.
+- a **CRC32** of all the bytes before it.
 
 ### Segments
 

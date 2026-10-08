@@ -30,7 +30,8 @@ namespace replica::logstor {
 extern seastar::logger logstor_logger;
 
 // Holds the first and the last raw token of a token range. Both bounds are inclusive. The index
-// orders its entries by raw token, so these are the bounds of the entries in the range.
+// orders its entries by raw token, so these are the bounds of the entries in the range, and an
+// erased range keeps its tokens in this form.
 struct raw_token_bounds {
     int64_t first;
     int64_t last;

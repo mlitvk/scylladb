@@ -9,6 +9,7 @@ target_sources(replica
     memtable.cc
     exceptions.cc
     dirty_memory_manager.cc
+    logstor/erased_ranges.cc
     logstor/ondisk.cc
     logstor/segment_io.cc
     logstor/segment_file.cc

@@ -42,10 +42,16 @@ public:
     enum class component : uint8_t {
         // A file of segments, with a file id.
         data,
+        // The erased ranges of the shard, see erased_ranges.
+        erase,
     };
 
     static file_name data(unsigned shard, file_id_t file_id) noexcept {
         return file_name(shard, component::data, file_id, false);
+    }
+
+    static file_name erase(unsigned shard) noexcept {
+        return file_name(shard, component::erase, std::nullopt, false);
     }
 
     // The name of the temporary file of this file.

@@ -71,8 +71,11 @@ void make_file(const std::filesystem::path& path) {
 SEASTAR_THREAD_TEST_CASE(test_file_name) {
     BOOST_REQUIRE_EQUAL(file_name::data(3, 17).str(), "ls-3-Data-17.db");
     BOOST_REQUIRE_EQUAL(file_name::data(3, 17).tmp().str(), "ls-3-Data-17.db.tmp");
+    BOOST_REQUIRE_EQUAL(file_name::erase(3).str(), "ls-3-Erase.db");
+    BOOST_REQUIRE_EQUAL(file_name::erase(3).tmp().str(), "ls-3-Erase.db.tmp");
 
-    for (const auto& name : {file_name::data(0, 0), file_name::data(3, 17), file_name::data(3, 17).tmp()}) {
+    for (const auto& name : {file_name::data(0, 0), file_name::data(3, 17), file_name::data(3, 17).tmp(), file_name::erase(3),
+            file_name::erase(3).tmp()}) {
         BOOST_REQUIRE(file_name::parse(name.str()) == name);
     }
     const auto data = file_name::parse("ls-3-Data-17.db.tmp");
@@ -81,10 +84,16 @@ SEASTAR_THREAD_TEST_CASE(test_file_name) {
     BOOST_REQUIRE(data->kind() == file_name::component::data);
     BOOST_REQUIRE_EQUAL(data->file_id().value_or(0), 17u);
     BOOST_REQUIRE(data->is_tmp());
+    const auto erase = file_name::parse("ls-3-Erase.db");
+    BOOST_REQUIRE(erase);
+    BOOST_REQUIRE(erase->kind() == file_name::component::erase);
+    BOOST_REQUIRE(!erase->file_id());
+    BOOST_REQUIRE(!erase->is_tmp());
 
     for (std::string_view name : {"", "ls-3-Data-17", "ls-3-Data-17.db.tmp.tmp", "ls-3-Data.db", "ls-3-Data-.db",
             "ls-3-Data-1x.db", "ls-3-Data-017.db", "ls-03-Data-17.db", "ls--1-Data-17.db", "ls-3-17-Data.db",
-            "ls_3-Data-17.db", "ls-3-Other-17.db", "ls-3-Data-18446744073709551616.db", "me-1-big-Data.db"}) {
+            "ls_3-Data-17.db", "ls-3-Other-17.db", "ls-3-Erase-1.db", "ls-3-Erase", "ls-3Erase.db",
+            "ls-3-Data-18446744073709551616.db", "me-1-big-Data.db"}) {
         BOOST_REQUIRE_MESSAGE(!file_name::parse(name), name);
     }
 }
