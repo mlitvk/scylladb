@@ -12,8 +12,10 @@
 #include <cmath>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <stdexcept>
 #include <map>
+#include <random>
 #include <ranges>
 #include <span>
 #include <vector>
@@ -29,6 +31,7 @@
 #include "mutation/canonical_mutation.hh"
 #include "replica/exceptions.hh"
 #include "replica/logstor/compaction_policy.hh"
+#include "replica/logstor/erase_watermarks.hh"
 #include "replica/logstor/index.hh"
 #include "replica/logstor/logstor.hh"
 #include "replica/logstor/ondisk.hh"
@@ -56,6 +59,7 @@
 #include "utils/disk-error-handler.hh"
 #include "utils/error_injection.hh"
 #include "utils/exceptions.hh"
+#include "utils/UUID_gen.hh"
 
 using namespace replica::logstor;
 using namespace tests::logstor;
@@ -4319,4 +4323,131 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_range_reader_serves_a_reversed_read) {
             env.make_reader(query::full_partition_range, bypassing));
     BOOST_REQUIRE_EQUAL(stats.partition_hits, hits + ms.size());
     BOOST_REQUIRE_EQUAL(stats.partition_misses, misses);
+}
+
+// The erase watermark set: what it covers, how it survives in its file, and what recovery drops.
+SEASTAR_THREAD_TEST_CASE(test_logstor_erase_watermarks) {
+    tmpdir dir;
+    const auto table_a = table_id(utils::UUID_gen::get_time_UUID());
+    const auto table_b = table_id(utils::UUID_gen::get_time_UUID());
+    const auto table_c = table_id(utils::UUID_gen::get_time_UUID());
+    auto token = [] (int64_t raw) { return dht::token::from_int64(raw); };
+    auto range = [&] (int64_t first, bool first_inclusive, int64_t last, bool last_inclusive) {
+        return dht::token_range::make({token(first), first_inclusive}, {token(last), last_inclusive});
+    };
+
+    // No file is no watermarks.
+    auto watermarks = erase_watermarks::load(dir.path()).get();
+    BOOST_REQUIRE(watermarks.empty());
+    BOOST_REQUIRE(!watermarks.erased(table_a, token(0), segment_sequence(1)));
+
+    // The bounds are normalized to inclusive raw tokens, the way the index reads a range.
+    auto a1 = erase_watermarks::make(table_a, range(10, false, 20, false), segment_sequence(5));
+    BOOST_REQUIRE(a1);
+    BOOST_REQUIRE_EQUAL(a1->first_token, 11);
+    BOOST_REQUIRE_EQUAL(a1->last_token, 19);
+    BOOST_REQUIRE(!erase_watermarks::make(table_a, range(10, false, 11, false), segment_sequence(5)));
+    auto a2 = erase_watermarks::make(table_a, range(15, true, 30, true), segment_sequence(9));
+    auto b = erase_watermarks::make(table_b, dht::token_range(), segment_sequence(3));
+    BOOST_REQUIRE(a2 && b);
+    BOOST_REQUIRE_EQUAL(b->first_token, std::numeric_limits<int64_t>::min());
+    BOOST_REQUIRE_EQUAL(b->last_token, std::numeric_limits<int64_t>::max());
+    watermarks = watermarks.with(*a1).with(*a2).with(*b);
+    BOOST_REQUIRE(watermarks.seq_floor() == segment_sequence(9));
+
+    auto check_coverage = [&] (const erase_watermarks& w) {
+        // a1 alone
+        BOOST_REQUIRE(w.erased(table_a, token(12), segment_sequence(5)));
+        BOOST_REQUIRE(!w.erased(table_a, token(12), segment_sequence(6)));
+        // where a1 and a2 overlap the higher one counts
+        BOOST_REQUIRE(w.erased(table_a, token(17), segment_sequence(9)));
+        BOOST_REQUIRE(!w.erased(table_a, token(17), segment_sequence(10)));
+        // a2 alone
+        BOOST_REQUIRE(w.erased(table_a, token(25), segment_sequence(7)));
+        BOOST_REQUIRE(w.erased(table_a, token(30), segment_sequence(9)));
+        // outside both
+        BOOST_REQUIRE(!w.erased(table_a, token(10), segment_sequence(1)));
+        BOOST_REQUIRE(!w.erased(table_a, token(31), segment_sequence(1)));
+        // the whole ring of b, and nothing of c
+        BOOST_REQUIRE(w.erased(table_b, token(std::numeric_limits<int64_t>::min()), segment_sequence(3)));
+        BOOST_REQUIRE(w.erased(table_b, token(std::numeric_limits<int64_t>::max()), segment_sequence(3)));
+        BOOST_REQUIRE(!w.erased(table_b, token(0), segment_sequence(4)));
+        BOOST_REQUIRE(!w.erased(table_c, token(0), segment_sequence(1)));
+    };
+    check_coverage(watermarks);
+
+    // Many ranges of one table, nested, overlapping and touching, against the definition itself.
+    {
+        std::mt19937_64 rng(42);
+        std::uniform_int_distribution<int64_t> bound(-50, 50);
+        std::uniform_int_distribution<uint64_t> sequence(1, 20);
+        std::vector<erase_watermark> ranges;
+        erase_watermarks many;
+        for (int i = 0; i < 200; ++i) {
+            auto first = bound(rng);
+            auto last = bound(rng);
+            if (first > last) {
+                std::swap(first, last);
+            }
+            ranges.push_back(erase_watermark{.table = table_c, .first_token = first, .last_token = last, .seq = segment_sequence(sequence(rng))});
+            many = many.with(ranges.back());
+        }
+        for (int64_t raw = -60; raw <= 60; ++raw) {
+            segment_sequence highest{0};
+            for (const auto& w : ranges) {
+                if (w.first_token <= raw && raw <= w.last_token) {
+                    highest = std::max(highest, w.seq);
+                }
+            }
+            for (uint64_t seq = 1; seq <= 21; ++seq) {
+                BOOST_REQUIRE_EQUAL(many.erased(table_c, token(raw), segment_sequence(seq)), segment_sequence(seq) <= highest);
+            }
+        }
+    }
+
+    watermarks.save(dir.path()).get();
+    auto loaded = erase_watermarks::load(dir.path()).get();
+    BOOST_REQUIRE(loaded.all() == watermarks.all());
+    check_coverage(loaded);
+
+    // with() leaves the set it is called on as it was.
+    auto c = erase_watermarks::make(table_c, dht::token_range(), segment_sequence(12));
+    BOOST_REQUIRE(c);
+    const auto with_c = loaded.with(*c);
+    BOOST_REQUIRE(with_c.erased(table_c, token(0), segment_sequence(12)));
+    BOOST_REQUIRE(with_c.seq_floor() == segment_sequence(12));
+    BOOST_REQUIRE(loaded.all() == watermarks.all());
+    BOOST_REQUIRE(!loaded.erased(table_c, token(0), segment_sequence(1)));
+    BOOST_REQUIRE(loaded.seq_floor() == segment_sequence(9));
+    check_coverage(loaded);
+
+    // GC: below the lowest sequence on disk, or of a table that is gone.
+    auto all_tables = [] (table_id) { return true; };
+    BOOST_REQUIRE(!watermarks.gc(segment_sequence(3), all_tables));
+    BOOST_REQUIRE(watermarks.gc(segment_sequence(6), all_tables));
+    BOOST_REQUIRE(watermarks.all() == std::vector<erase_watermark>{*a2});
+    BOOST_REQUIRE(watermarks.gc(segment_sequence(1), [&] (table_id t) { return t != table_a; }));
+    BOOST_REQUIRE(watermarks.empty());
+    watermarks = watermarks.with(*b);
+    BOOST_REQUIRE(watermarks.gc(std::nullopt, all_tables));
+    BOOST_REQUIRE(watermarks.empty());
+
+    // The sequence floor stays when the watermarks go, in memory and through the file: the
+    // recovered sequence counter must not go back to a sequence an erase covered.
+    BOOST_REQUIRE(watermarks.seq_floor() == segment_sequence(9));
+    watermarks.save(dir.path()).get();
+    BOOST_REQUIRE(erase_watermarks::load(dir.path()).get().seq_floor() == segment_sequence(9));
+
+    // A file that does not check out is refused, a torn write over it included.
+    const auto path = erase_watermarks::file_path(dir.path()).string();
+    auto f = seastar::open_file_dma(path, seastar::open_flags::rw).get();
+    const auto size = f.size().get();
+    auto buf = temporary_buffer<char>::aligned(4096, 4096);
+    BOOST_REQUIRE_EQUAL(f.dma_read(0, buf.get_write(), buf.size()).get(), size);
+    buf.get_write()[size / 2] ^= 0x55;
+    BOOST_REQUIRE_EQUAL(f.dma_write(0, buf.get(), buf.size()).get(), buf.size());
+    f.truncate(size).get();
+    f.flush().get();
+    f.close().get();
+    BOOST_REQUIRE_THROW(erase_watermarks::load(dir.path()).get(), std::runtime_error);
 }
