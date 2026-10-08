@@ -75,6 +75,7 @@ static constexpr std::string_view file_name_prefix = "logstor";
 static std::string_view component_name(file_name::component c) {
     switch (c) {
     case file_name::component::data: return "Data";
+    case file_name::component::erase: return "Erase";
     }
     on_internal_error(logstor_logger, fmt::format("Unknown file component {}", static_cast<int>(c)));
 }
@@ -115,6 +116,9 @@ std::optional<file_name> file_name::parse(std::string_view name) {
     file_id_t file_id;
     if (consume(component_name(component::data)) && consume("-") && consume_number(file_id) && name.empty()) {
         return file_name(shard, component::data, file_id, tmp);
+    }
+    if (name == component_name(component::erase)) {
+        return file_name(shard, component::erase, std::nullopt, tmp);
     }
     return std::nullopt;
 }
