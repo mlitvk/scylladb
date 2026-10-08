@@ -185,6 +185,32 @@ ls-{shard_id}-Data-{file_id}.db
 
 Files are pre-formatted (zero-filled) before use.
 
+### Erase Watermarks
+
+Next to the segment files, each shard keeps `ls-{shard_id}-Erase.db`: the erases whose records may
+still be on disk. It is rewritten whole on every erase, through `ls-{shard_id}-Erase.db.tmp` that
+replaces it once durable, so a crash leaves either version. A missing file means no watermarks; a
+file that does not parse or whose CRC does not match refuses to start.
+
+| Offset | Size   | Field        | Description |
+|--------|--------|--------------|-------------|
+| 0      | 4      | `magic`      | `0x4C475345` ("LGSE"). |
+| 4      | 1      | `version`    | Version of the file format, currently 1. |
+| 5      | 3      | `reserved`   | Written as zero. |
+| 8      | 4      | `count`      | Number of watermarks that follow. |
+| 12     | 8      | `seq_floor`  | The highest `seq` of every watermark the shard ever had. Dropping a watermark does not lower it. |
+| 20     | 40 × n | `watermarks` | One per erase, see below. |
+| 20+40n | 4      | `crc`        | CRC32 of all preceding bytes. |
+
+Each watermark:
+
+| Offset | Size | Field         | Description |
+|--------|------|---------------|-------------|
+| 0      | 16   | `table`       | UUID of the table, written as its most significant and then its least significant 64-bit half. |
+| 16     | 8    | `first_token` | Lowest raw token erased, inclusive. |
+| 24     | 8    | `last_token`  | Highest raw token erased, inclusive. |
+| 32     | 8    | `seq`         | Records of the table in the range in a chunk with `segment_seq` at most this are erased. |
+
 ### Segments
 
 Each segment is a contiguous fixed-size region within a file (default 128KB). A segment is identified by a `log_segment_id` (a 32-bit integer index), which maps to a file and offset within that file.

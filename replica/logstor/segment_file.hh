@@ -43,10 +43,16 @@ public:
     enum class component : uint8_t {
         // A file of segments, with a file id.
         data,
+        // The erase watermarks of the shard, see erase_watermarks.
+        erase,
     };
 
     static file_name data(file_id_t file_id, unsigned shard = this_shard_id()) noexcept {
         return file_name(shard, component::data, file_id, false);
+    }
+
+    static file_name erase(unsigned shard = this_shard_id()) noexcept {
+        return file_name(shard, component::erase, std::nullopt, false);
     }
 
     // The name of the temporary file of this file.
