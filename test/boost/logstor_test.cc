@@ -25,6 +25,7 @@
 
 #include "mutation/canonical_mutation.hh"
 #include "replica/exceptions.hh"
+#include "replica/logstor/column_mapping_registry.hh"
 #include "replica/logstor/index.hh"
 #include "replica/logstor/logstor.hh"
 #include "replica/logstor/ondisk.hh"
@@ -3947,4 +3948,72 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_memory_usage) {
     BOOST_REQUIRE_EQUAL(index.get_entries_memory_usage(), 0u);
     const size_t after_clear = index.get_memory_usage();
     testlog.info("primary index after clear: allocated {} bytes", after_clear);
+}
+
+// Checks that the registry parses a mapping it gets in serialized form, that it keeps a mapping
+// that does not parse as an entry with its bytes only, unchanged, that a copy that parses replaces
+// such an entry and leaves it valid, that no other entry is replaced, that erase_if() erases the
+// entries that match, and that a version is not taken under a second table.
+SEASTAR_THREAD_TEST_CASE(test_logstor_column_mapping_registry) {
+    auto schema = make_kv_schema();
+    auto altered = schema_builder(schema).with_column("w", int32_type).build();
+
+    column_mapping_registry written;
+    const auto& from_schema = written.add(*schema);
+    BOOST_REQUIRE(from_schema.mapping == schema->get_column_mapping());
+    BOOST_REQUIRE_EQUAL(written.find(schema->version()), &from_schema);
+    BOOST_REQUIRE(!written.find(altered->version()));
+
+    // A serialized mapping is parsed.
+    column_mapping_registry scanned;
+    const auto& from_table = scanned.add(schema->id(), schema->version(), from_schema.serialized);
+    BOOST_REQUIRE(from_table.mapping == schema->get_column_mapping());
+    BOOST_REQUIRE(from_table.serialized == from_schema.serialized);
+
+    // A mapping cut short is kept as bytes only. Another copy that does not parse does not replace it.
+    const auto& altered_from_schema = written.add(*altered);
+    const auto truncated = bytes_view(altered_from_schema.serialized).substr(0, altered_from_schema.serialized.size() - 1);
+    const auto& rewrite_only = scanned.add(altered->id(), altered->version(), truncated);
+    BOOST_REQUIRE(!rewrite_only.mapping);
+    BOOST_REQUIRE(rewrite_only.serialized == bytes(truncated.begin(), truncated.end()));
+    BOOST_REQUIRE_EQUAL(scanned.find(altered->version()), &rewrite_only);
+    BOOST_REQUIRE_EQUAL(&scanned.add(altered->id(), altered->version(), truncated.substr(0, truncated.size() - 1)), &rewrite_only);
+
+    // A copy that parses replaces it. The replaced entry stays valid and unchanged.
+    const auto& replacement = scanned.add(altered->id(), altered->version(), altered_from_schema.serialized);
+    BOOST_REQUIRE_NE(&replacement, &rewrite_only);
+    BOOST_REQUIRE(replacement.mapping == altered->get_column_mapping());
+    BOOST_REQUIRE_EQUAL(scanned.find(altered->version()), &replacement);
+    BOOST_REQUIRE(!rewrite_only.mapping);
+    BOOST_REQUIRE(rewrite_only.serialized == bytes(truncated.begin(), truncated.end()));
+
+    // An entry whose mapping parses is not replaced.
+    BOOST_REQUIRE_EQUAL(&scanned.add(altered->id(), altered->version(), truncated), &replacement);
+    BOOST_REQUIRE_EQUAL(&scanned.add(*altered), &replacement);
+    BOOST_REQUIRE(replacement.serialized == altered_from_schema.serialized);
+
+    // erase_if() erases the entries that match, and only those.
+    BOOST_REQUIRE_EQUAL(scanned.erase_if([&] (const schema_mapping& m) { return m.version == altered->version(); }), 1u);
+    BOOST_REQUIRE(!scanned.find(altered->version()));
+    BOOST_REQUIRE_EQUAL(scanned.find(schema->version()), &from_table);
+
+    // A mapping with bytes after its end is kept as bytes only too, and the schema of the version
+    // replaces it.
+    column_mapping_registry trailing;
+    bytes with_trailing_byte(from_schema.serialized.size() + 1, int8_t(0));
+    std::ranges::copy(from_schema.serialized, with_trailing_byte.begin());
+    const auto& with_trailing = trailing.add(schema->id(), schema->version(), with_trailing_byte);
+    BOOST_REQUIRE(!with_trailing.mapping);
+    BOOST_REQUIRE(with_trailing.serialized == with_trailing_byte);
+    const auto& from_local_schema = trailing.add(*schema);
+    BOOST_REQUIRE(from_local_schema.mapping == schema->get_column_mapping());
+    BOOST_REQUIRE(from_local_schema.serialized == from_schema.serialized);
+    BOOST_REQUIRE_EQUAL(trailing.find(schema->version()), &from_local_schema);
+    BOOST_REQUIRE(with_trailing.serialized == with_trailing_byte);
+
+    // A version of one table is not taken under another, from a schema table or from a schema.
+    BOOST_REQUIRE_THROW(scanned.add(table_id::create_random_id(), schema->version(), from_schema.serialized), std::runtime_error);
+    column_mapping_registry other_table;
+    other_table.add(table_id::create_random_id(), schema->version(), from_schema.serialized);
+    BOOST_REQUIRE_THROW(other_table.add(*schema), std::runtime_error);
 }
