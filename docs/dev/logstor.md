@@ -44,7 +44,8 @@ The `buffered_writer` manages multiple write buffers for user writes, an active 
 The `column_mapping_registry` keeps in memory the column mapping of each schema version that records on disk were written under. There is one registry per shard.
 
 - A write adds the mapping of the schema version of its record.
-- A segment scan adds the mappings that the schema table of each chunk lists (see [Schema Table](#schema-table)).
+- A segment scan adds the mappings that the schema table of each chunk lists.
+- A read under another schema version takes the mapping of the record version from the registry.
 - Compaction and the separator rewrite records from their bytes, without a schema. They take the mapping of each record version from the registry, and list it in the schema table of the new chunk.
 
 ### Data Flow
@@ -220,8 +221,7 @@ A record frame holds one record and has these parts, in this order:
 - the **frame header**, which gives the sizes of the parts that follow and the flags of the record.
 - the **record header**, which holds the token, the timestamp, the table, the schema version and the
   partition key.
-- the **record value**, which is the encoded partition. The value also holds the column mapping of
-  the schema version of the record, so that logstor can decode the record after an `ALTER TABLE`.
+- the **record value**, which is the encoded partition.
 - zero padding to a multiple of `ondisk::record_alignment`.
 
 The value of a record is encoded and decoded by `encode_record_value()` and `decode_record_value()`
@@ -249,9 +249,10 @@ them are otherwise easy to confuse:
 ### Schema Table
 
 The schema table follows the record frames. It lists the column mapping of each schema version that
-the records of the chunk were written under, once per version (see
-[Column Mapping Registry](#column-mapping-registry)). The mappings are on disk because the schema
-history in the system tables keeps superseded versions only for a while.
+the records of the chunk were written under, once per version, so that a record written under an
+older version can be decoded (see [Column Mapping Registry](#column-mapping-registry)). The mappings
+are on disk because the schema history in the system tables keeps superseded versions only for a
+while.
 
 The body CRC covers the table. If the table of a chunk that passes the CRC check does not parse,
 lists a mapping that does not parse, or does not list the version of a record of the chunk, the
