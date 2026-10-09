@@ -397,12 +397,23 @@ public:
     future<> submit_normal_compaction(logstor_group&, compaction_batch_limits limits) override;
     future<> submit_split_compaction(logstor_group&, mutation_writer::classify_by_token_group, split_target_group) override;
 
+    size_t schema_table_size_estimate(table_id table) const noexcept override {
+        return _schema_table_sizes.estimate(table);
+    }
+
+    // Called for each full segment that joins a compaction group of the table.
+    void add_schema_table_size_sample(table_id table, size_t schema_table_size) noexcept {
+        _schema_table_sizes.add_sample(table, schema_table_size);
+    }
+
 private:
     // compaction_driver::host
     future<compaction_driver::ranking> find_top_compaction_candidates(const compaction_batch_limits&, size_t max_candidates,
             compaction_driver::host::group_filter filter) override;
     bool can_start(const logstor_group*) const noexcept override;
     compaction_driver::shard_sample sample() const noexcept override;
+
+    schema_table_size_estimator _schema_table_sizes;
 
     future<> submit_group_compaction(logstor_group&, std::function<future<>(group_compaction_state&)>, scheduling_group);
     future<> do_compaction(logstor_group&, compaction_batch_limits, abort_source&);
@@ -1403,6 +1414,7 @@ future<> segment_manager_impl::write_full_segment(write_buffer& wb, logstor_grou
     auto& desc = get_segment_descriptor(seg->id());
     cg.add_logstor_segment(desc);
     add_to_group_failed.cancel();
+    _compaction_mgr.add_schema_table_size_sample(cg.table_id(), wb.schema_table_size());
 }
 
 void segment_manager_impl::on_add_record(record_location location) noexcept {
@@ -1795,7 +1807,8 @@ compaction_manager_impl::find_top_compaction_candidates(const compaction_batch_l
             continue;
         }
 
-        auto batch = select_compaction_batch(it->first->logstor_segments(), _sm.get_segment_size(), limits);
+        auto batch = select_compaction_batch(it->first->logstor_segments(), _sm.get_segment_size(), limits,
+                schema_table_size_estimate(it->first->table_id()));
         if (batch) {
             best_candidates.push(compaction_driver::candidate{.group = it->first, .score = batch->score});
         }
@@ -1934,7 +1947,8 @@ struct split_buffer_pair {
 
 future<> compaction_manager_impl::do_compaction(logstor_group& cg, compaction_batch_limits limits, abort_source& as) {
     const auto segment_size = _sm.get_segment_size();
-    auto batch = select_compaction_batch(cg.logstor_segments(), segment_size, limits);
+    auto batch = select_compaction_batch(cg.logstor_segments(), segment_size, limits,
+            schema_table_size_estimate(cg.table_id()));
     if (!batch) {
         co_return;
     }
@@ -2445,6 +2459,7 @@ segment_manager_impl::needs_separation segment_manager_impl::place_recovered_seg
         }
         if (cg) {
             cg->add_logstor_segment(get_segment_descriptor(seg_id));
+            _compaction_mgr.add_schema_table_size_sample(full.table, full.schema_table_size);
             logstor_logger.debug("Added segment {} with tokens [{},{}] to compaction group of table {}", seg_id, full.first_token, full.last_token,
                     seastar::value_of([&] { return catalog.table_name(full.table); }));
             return needs_separation::no;
