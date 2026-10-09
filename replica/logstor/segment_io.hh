@@ -30,6 +30,7 @@ struct segment_info {
         table_id table;
         dht::token first_token;
         dht::token last_token;
+        uint32_t schema_table_size;
     };
 
     std::variant<mixed, full> v;

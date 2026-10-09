@@ -775,6 +775,15 @@ public:
     // threshold is the only other input.
     void refresh_free_segment_watermarks() noexcept;
 
+    size_t schema_table_size_estimate(table_id table) const noexcept override {
+        return _schema_table_sizes.estimate(table);
+    }
+
+    // Called for each full segment that joins a compaction group of the table.
+    void add_schema_table_size_sample(table_id table, size_t schema_table_size) noexcept {
+        _schema_table_sizes.add_sample(table, schema_table_size);
+    }
+
 private:
 
     // Cached result of make_free_segment_watermarks(). should_run_auto_compaction() calls
@@ -782,6 +791,7 @@ private:
     // computation on every hot-path call.
     free_segment_watermarks _free_segment_watermarks{};
     compaction_limits _compaction_limits{};
+    schema_table_size_estimator _schema_table_sizes;
 
     const free_segment_watermarks& get_free_segment_watermarks() const noexcept {
         return _free_segment_watermarks;
@@ -1657,6 +1667,7 @@ future<> segment_manager_impl::write_full_segment(write_buffer& wb, logstor_grou
     auto& desc = get_segment_descriptor(seg->id());
     cg.add_logstor_segment(desc);
     add_to_group_failed.cancel();
+    _compaction_mgr.add_schema_table_size_sample(cg.table_id(), wb.schema_table_size());
 }
 
 void segment_manager_impl::on_add_record(record_location location) noexcept {
@@ -2050,7 +2061,8 @@ compaction_reenabler compaction_manager_impl::disable_compaction_no_wait(logstor
 std::optional<compaction_manager_impl::compaction_candidate>
 compaction_manager_impl::select_segments_for_compaction(logstor_group& cg) {
     const auto segment_size = _sm.get_segment_size();
-    auto batch = select_compaction_batch(cg.logstor_segments(), segment_size, _compaction_limits.batch_cap);
+    auto batch = select_compaction_batch(cg.logstor_segments(), segment_size, _compaction_limits.batch_cap,
+            schema_table_size_estimate(cg.table_id()));
     if (!batch) {
         return std::nullopt;
     }
@@ -2798,6 +2810,7 @@ future<> segment_manager_impl::add_segment_to_compaction_group(replica::database
         try {
             auto& t = db.find_column_family(full.table);
             t.get_logstor_group(seg_id, full.first_token, full.last_token).add_logstor_segment(desc);
+            _compaction_mgr.add_schema_table_size_sample(full.table, full.schema_table_size);
             logstor_logger.debug("Added segment {} with tokens [{},{}] to compaction group of table {}.{}", seg_id, full.first_token, full.last_token, t.schema()->ks_name(), t.schema()->cf_name());
         } catch (const replica::no_such_column_family&) {
             co_return;

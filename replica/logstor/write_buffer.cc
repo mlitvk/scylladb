@@ -213,12 +213,13 @@ bytes_view raw_write_buffer::seal(segment_sequence segment_seq, std::optional<ta
     return bytes_view(reinterpret_cast<const int8_t*>(_buffer.get()), serialized_size());
 }
 
-size_t raw_write_buffer::estimate_required_segments(size_t record_bytes, size_t record_count, size_t segment_size, segment_kind kind) {
+size_t raw_write_buffer::estimate_required_segments(size_t record_bytes, size_t record_count, size_t segment_size,
+        segment_kind kind, size_t schema_table_size) {
     if (record_count == 0 || record_bytes == 0) {
         return 0;
     }
 
-    const size_t fixed_overhead = chunk_headers_size(kind);
+    const size_t fixed_overhead = chunk_headers_size(kind) + align_up(schema_table_size, ondisk::record_alignment);
 
     if (segment_size <= fixed_overhead) {
         return 1;

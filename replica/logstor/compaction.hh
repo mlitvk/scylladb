@@ -23,6 +23,7 @@
 #include <limits>
 #include <ranges>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 #include <functional>
 #include <utility>
@@ -186,8 +187,29 @@ struct compaction_batch {
 // histogram's first `batch_cap` segments, and select_compaction_prefix() picks a prefix of it.
 // Returns nothing when no prefix reclaims a segment, which answers for the whole group rather than
 // only for this batch, since a longer prefix would only add fuller segments.
+//
+// `schema_table_size` is the estimated size of the schema table of one output segment.
 std::optional<compaction_batch> select_compaction_batch(const segment_set& segments,
-        uint64_t segment_size, size_t batch_cap);
+        uint64_t segment_size, size_t batch_cap, size_t schema_table_size);
+
+// Estimates the size of the schema table of a segment of each table, as a running average over the
+// full segments that join the table's compaction groups. Which schema versions an output segment of
+// compaction holds is known only when its records are read.
+//
+// It is kept per table and not per shard, so that the wide mappings of one table do not make the
+// segments of another table look fuller than they are.
+class schema_table_size_estimator {
+    static constexpr double sample_weight = 1.0 / 8;
+
+    std::unordered_map<table_id, double> _sizes;
+
+public:
+    // A sample that cannot be stored is dropped, as it only refines an estimate.
+    void add_sample(table_id, size_t schema_table_size) noexcept;
+
+    // 0 for a table with no sample.
+    size_t estimate(table_id) const noexcept;
+};
 
 // Where the free-segment target falls on the compaction_shares_pressure() ramp. It is a property of
 // the watermarks rather than a tunable: with the relative hysteresis of make_free_segment_watermarks()
@@ -573,6 +595,9 @@ public:
 
     virtual future<compaction_reenabler> disable_compaction(logstor_group&) = 0;
     virtual compaction_reenabler disable_compaction_no_wait(logstor_group&) = 0;
+
+    // See schema_table_size_estimator.
+    virtual size_t schema_table_size_estimate(table_id) const noexcept = 0;
 };
 
 // A compaction group in logstor.

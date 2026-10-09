@@ -8,6 +8,7 @@
 #include "replica/logstor/compaction.hh"
 #include <algorithm>
 #include <cmath>
+#include <new>
 
 namespace replica::logstor {
 
@@ -106,7 +107,7 @@ static size_t select_compaction_prefix(std::span<const compaction_candidate_scor
     return best;
 }
 
-std::optional<compaction_batch> select_compaction_batch(const segment_set& segments, uint64_t segment_size, size_t batch_cap) {
+std::optional<compaction_batch> select_compaction_batch(const segment_set& segments, uint64_t segment_size, size_t batch_cap, size_t schema_table_size) {
     std::vector<const segment_descriptor*> candidates;
     // prefix_scores[i] scores the batch made of candidates[0..i].
     std::vector<compaction_candidate_score> prefix_scores;
@@ -126,7 +127,7 @@ std::optional<compaction_batch> select_compaction_batch(const segment_set& segme
 
         const auto score = compaction_candidate_score{
             .n_in = candidates.size(),
-            .n_out = raw_write_buffer::estimate_required_segments(accum_record_bytes, accum_record_count, segment_size, segment_kind::full),
+            .n_out = raw_write_buffer::estimate_required_segments(accum_record_bytes, accum_record_count, segment_size, segment_kind::full, schema_table_size),
             .live_bytes = accum_record_bytes,
         };
         prefix_scores.push_back(score);
@@ -143,6 +144,23 @@ std::optional<compaction_batch> select_compaction_batch(const segment_set& segme
         .segments = std::move(candidates),
         .score = prefix_scores[selected_count - 1],
     };
+}
+
+void schema_table_size_estimator::add_sample(table_id table, size_t schema_table_size) noexcept {
+    const auto sample = double(schema_table_size);
+    try {
+        auto [it, inserted] = _sizes.try_emplace(table, sample);
+        if (!inserted) {
+            it->second += (sample - it->second) * sample_weight;
+        }
+    } catch (const std::bad_alloc&) {
+        // Only the first sample of a table allocates.
+    }
+}
+
+size_t schema_table_size_estimator::estimate(table_id table) const noexcept {
+    auto it = _sizes.find(table);
+    return it == _sizes.end() ? 0 : size_t(std::ceil(it->second));
 }
 
 float compaction_shares_pressure(uint64_t available_segments, free_segment_watermarks watermarks) noexcept {

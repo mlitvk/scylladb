@@ -3443,6 +3443,55 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_set_live_bytes) {
     BOOST_REQUIRE_EQUAL(other.live_record_bytes(), 0);
 }
 
+// Checks that the segment estimate charges the schema table of every output segment.
+SEASTAR_THREAD_TEST_CASE(test_logstor_estimate_required_segments_charges_the_schema_table) {
+    constexpr uint64_t segment_size = 128 * 1024;
+    constexpr size_t record_size = 1024;
+    constexpr size_t record_count = 4 * segment_size / record_size;
+    constexpr size_t record_bytes = record_count * record_size;
+
+    const auto without = raw_write_buffer::estimate_required_segments(record_bytes, record_count, segment_size, segment_kind::full, 0);
+    BOOST_REQUIRE_GT(without, 0u);
+
+    // A table small against the segment does not change the count, and never lowers it.
+    const auto with_small = raw_write_buffer::estimate_required_segments(record_bytes, record_count, segment_size, segment_kind::full, 256);
+    BOOST_REQUIRE_GE(with_small, without);
+
+    // One large enough against the segment does: it leaves half of each for records, so it takes
+    // about twice as many of them.
+    const auto with_large = raw_write_buffer::estimate_required_segments(record_bytes, record_count, segment_size, segment_kind::full, segment_size / 2);
+    BOOST_REQUIRE_GT(with_large, without);
+
+    // A table that leaves no room at all still answers, rather than dividing by zero.
+    BOOST_REQUIRE_GE(raw_write_buffer::estimate_required_segments(record_bytes, record_count, segment_size, segment_kind::full, segment_size), 1u);
+}
+
+// Checks that the schema table estimate starts at the first sample of a table, moves part of the
+// way toward each new sample, and is kept per table.
+SEASTAR_THREAD_TEST_CASE(test_logstor_schema_table_size_estimator) {
+    const auto narrow = table_id::create_random_id();
+    const auto wide = table_id::create_random_id();
+    schema_table_size_estimator estimator;
+    BOOST_REQUIRE_EQUAL(estimator.estimate(narrow), 0u);
+
+    estimator.add_sample(narrow, 100);
+    BOOST_REQUIRE_EQUAL(estimator.estimate(narrow), 100u);
+
+    // A wide table does not change the estimate of another table.
+    estimator.add_sample(wide, 20000);
+    BOOST_REQUIRE_EQUAL(estimator.estimate(wide), 20000u);
+    BOOST_REQUIRE_EQUAL(estimator.estimate(narrow), 100u);
+
+    // After an ALTER TABLE adds an entry, one sample moves the estimate an eighth of the way, and
+    // further samples bring it to the new size.
+    estimator.add_sample(narrow, 300);
+    BOOST_REQUIRE_EQUAL(estimator.estimate(narrow), 125u);
+    for (int i = 0; i < 64; ++i) {
+        estimator.add_sample(narrow, 300);
+    }
+    BOOST_REQUIRE_EQUAL(estimator.estimate(narrow), 300u);
+}
+
 // Checks that compaction candidate selection chooses segments in ascending utilization order,
 // respects the batch cap, and the returned score accurately describes the selected segments.
 SEASTAR_THREAD_TEST_CASE(test_logstor_select_compaction_batch) {
@@ -3455,6 +3504,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_select_compaction_batch) {
     // utilization no batch that select_compaction_batch() would consider has a net gain.
     constexpr size_t dense_records = records_per_segment * 98 / 100;
     constexpr size_t sparse_count = 3;
+    // Small against a 128 KiB segment, so it does not change which batch is worth taking.
+    const size_t schema_table_size = raw_write_buffer::schema_table_size(test_registry().add(*make_kv_schema()));
 
     // Descriptors are intrusively linked into the sets, so they must keep their addresses, and every
     // set must be destroyed before them.
@@ -3492,7 +3543,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_select_compaction_batch) {
         BOOST_REQUIRE_EQUAL(batch.score.live_bytes, live_bytes);
     };
 
-    auto batch = select_compaction_batch(segments, segment_size, min_segments_per_compaction);
+    auto batch = select_compaction_batch(segments, segment_size, min_segments_per_compaction, schema_table_size);
     BOOST_REQUIRE(batch);
     check_batch(*batch);
 
@@ -3504,7 +3555,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_select_compaction_batch) {
     }
 
     // The cap bounds the candidate set, not only the prefix chosen out of it.
-    auto capped = select_compaction_batch(segments, segment_size, 2);
+    auto capped = select_compaction_batch(segments, segment_size, 2, schema_table_size);
     BOOST_REQUIRE(capped);
     check_batch(*capped);
     BOOST_REQUIRE_LE(capped->segments.size(), 2u);
@@ -3515,11 +3566,11 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_select_compaction_batch) {
     for (size_t i = 0; i < min_segments_per_compaction; ++i) {
         add_segment(dense, dense_records);
     }
-    BOOST_REQUIRE(!select_compaction_batch(dense, segment_size, min_segments_per_compaction));
+    BOOST_REQUIRE(!select_compaction_batch(dense, segment_size, min_segments_per_compaction, schema_table_size));
 
     // An empty group has nothing to compact.
     segment_set empty{segment_size};
-    BOOST_REQUIRE(!select_compaction_batch(empty, segment_size, min_segments_per_compaction));
+    BOOST_REQUIRE(!select_compaction_batch(empty, segment_size, min_segments_per_compaction, schema_table_size));
 }
 
 // A segment set does not walk its segments to get its statistics. It updates them when it links or
@@ -3954,6 +4005,54 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_rewrites_records_whose_mapping_
     auto actual = ls.read(schema, cg.logstor_index(), expected.decorated_key(), schema->full_slice()).get();
     BOOST_REQUIRE(actual);
     assert_that(*actual).is_equal_to(expected);
+}
+
+// Checks that compaction estimates the schema table of the output segments of a table from the
+// segments that the table writes: a segment that holds records of two schema versions is charged
+// both entries, and the segments of a wide table do not change the estimate of a narrow one.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_estimates_the_schema_table_per_table) {
+    auto schema = make_kv_schema();
+    auto altered = schema_builder(schema).with_column("w", int32_type).build();
+    schema_builder wide_builder(1, "ks", "wide");
+    wide_builder.with_column("pk", utf8_type, column_kind::partition_key);
+    wide_builder.with_column("v", utf8_type);
+    for (int i = 0; i < 40; ++i) {
+        wide_builder.with_column(to_bytes(fmt::format("c{}", i)), utf8_type);
+    }
+    auto wide = wide_builder.build();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    ls.do_recovery_for_test().get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+    test_logstor_group wide_cg(wide, ls);
+    auto guard = ls.get_compaction_manager().disable_compaction(cg).get();
+    auto wide_guard = ls.get_compaction_manager().disable_compaction(wide_cg).get();
+    auto& estimates = ls.get_compaction_manager();
+    BOOST_REQUIRE_EQUAL(estimates.schema_table_size_estimate(schema->id()), 0u);
+
+    // One segment with a record of each version.
+    const std::array two_versions{
+        make_kv_mutation(schema, "pk0", "v0", api::timestamp_type(1)),
+        make_kv_mutation(altered, "pk1", "v1", api::timestamp_type(2)),
+    };
+    write_and_flush_segment(ls, cg, two_versions);
+    BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 1u);
+
+    auto entry_size = [&] (const schema_ptr& s) {
+        return ondisk::schema_table_entry_size(ls.get_segment_manager().column_mappings().find(s->version())->serialized.size());
+    };
+    const auto expected = ondisk::schema_table_header_size + entry_size(schema) + entry_size(altered);
+    BOOST_REQUIRE_EQUAL(estimates.schema_table_size_estimate(schema->id()), expected);
+
+    write_and_flush_segment(ls, wide_cg, make_kv_mutation(wide, "pk0", "v0", api::timestamp_type(3)));
+    BOOST_REQUIRE_EQUAL(estimates.schema_table_size_estimate(wide->id()), ondisk::schema_table_header_size + entry_size(wide));
+    BOOST_REQUIRE_GT(entry_size(wide), entry_size(schema) + entry_size(altered));
+    BOOST_REQUIRE_EQUAL(estimates.schema_table_size_estimate(schema->id()), expected);
 }
 
 SEASTAR_THREAD_TEST_CASE(test_logstor_disabled_group_does_not_compact_on_submit) {

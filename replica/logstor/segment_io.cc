@@ -116,6 +116,7 @@ segment_info make_segment_info(const chunk_headers& headers) {
             .table = sh->table,
             .first_token = sh->first_token,
             .last_token = sh->last_token,
+            .schema_table_size = ch.schema_table_size,
         };
         break;
     case segment_kind::mixed:
