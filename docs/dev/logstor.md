@@ -208,8 +208,8 @@ A serialized form of `ondisk::chunk_header`.
 | 6      | 2    | `reserved`  | Reserved for future use. Currently written as zero and included in the CRC. |
 | 8      | 8    | `segment_seq` | Monotonic segment sequence number used during recovery and segment ordering checks. |
 | 16     | 4    | `records_size` | Size in bytes of the record frames following the header(s), their padding included. |
-| 20     | 4    | `body_crc`  | CRC32 of the chunk's body: the record frames that follow the headers, `records_size` bytes. |
-| 24     | 4    | `reserved2` | Reserved for future use. Currently written as zero and included in the CRC. |
+| 20     | 4    | `body_crc`  | CRC32 of the chunk's body: the record frames that follow the headers and the schema table that follows them, `records_size + schema_table_size` bytes. |
+| 24     | 4    | `schema_table_size` | Size in bytes of the schema table following the record frames. |
 | 28     | 4    | `crc`       | CRC32 of all preceding chunk header fields and, in a full segment, of the segment header that follows. Used for validating the headers. |
 
 The chunk header is 32 bytes long, which keeps it aligned to `record_alignment` (8 bytes).

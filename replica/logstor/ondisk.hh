@@ -55,10 +55,10 @@ static constexpr uint32_t chunk_header_magic = 0x4c475342;
 struct segment_header;
 
 // A segment holds one or more chunks, each starting at a block_alignment boundary and padded to
-// a multiple of it. A chunk is this header, the segment_header in a full segment, and the record
-// frames, which are the chunk's body. Chunks are appended to a mixed segment one at a time; a full
-// segment is a single chunk. A write buffer builds a chunk in memory and seals it - pads it and
-// fills in its header - before it is written.
+// a multiple of it. A chunk is this header, the segment_header in a full segment, and the chunk's
+// body: the record frames and the schema table that follows them. Chunks are appended to a mixed
+// segment one at a time; a full segment is a single chunk. A write buffer builds a chunk in memory
+// and seals it - pads it and fills in its header - before it is written.
 struct chunk_header {
     uint32_t magic;
     segment_kind kind;
@@ -66,11 +66,11 @@ struct chunk_header {
     uint16_t reserved;
     segment_sequence segment_seq;
     uint32_t records_size; // size of the record frames following the header(s), padding included
-    // CRC32 of the chunk's body: the record frames, records_size bytes after the headers. It is what
-    // tells a chunk whose header is durable but whose body was only partly written - a crash mid-write
-    // over a reused segment - from a whole one.
+    // CRC32 of the chunk's body: the record frames and the schema table, records_size +
+    // schema_table_size bytes after the headers. It is what tells a chunk whose header is durable but
+    // whose body was only partly written - a crash mid-write over a reused segment - from a whole one.
     uint32_t body_crc;
-    uint32_t reserved2;
+    uint32_t schema_table_size; // size of the schema table following the records
     uint32_t crc; // of the fields above, and of the segment header in a full segment
 
     uint32_t calculate_crc(const std::optional<segment_header>& sh) const;
@@ -112,7 +112,8 @@ bool validate_chunk_headers(const chunk_header& ch, const std::optional<segment_
 // The CRC a chunk header carries in body_crc, over the chunk's body.
 uint32_t calculate_body_crc(std::span<const char> body);
 
-// Whether the body of the chunk - its record frames - is the one the header was written with.
+// Whether the body of the chunk - its record frames and schema table - is the one the header was
+// written with.
 inline bool validate_chunk_body(const chunk_header& ch, std::span<const char> body) {
     return calculate_body_crc(body) == ch.body_crc;
 }
@@ -144,7 +145,7 @@ struct serializer<replica::logstor::ondisk::chunk_header> {
         + sizeof(uint64_t)          // segment_seq
         + sizeof(uint32_t)          // records_size
         + sizeof(uint32_t)          // body_crc
-        + sizeof(uint32_t)          // reserved2
+        + sizeof(uint32_t)          // schema_table_size
         + sizeof(uint32_t);         // crc
 
     template <typename Output>
@@ -156,7 +157,7 @@ struct serializer<replica::logstor::ondisk::chunk_header> {
         serializer<uint64_t>::write(out, h.segment_seq.value);
         serializer<uint32_t>::write(out, h.records_size);
         serializer<uint32_t>::write(out, h.body_crc);
-        serializer<uint32_t>::write(out, h.reserved2);
+        serializer<uint32_t>::write(out, h.schema_table_size);
         serializer<uint32_t>::write(out, h.crc);
     }
 
@@ -170,7 +171,7 @@ struct serializer<replica::logstor::ondisk::chunk_header> {
         h.segment_seq = replica::logstor::segment_sequence{serializer<uint64_t>::read(in)};
         h.records_size = serializer<uint32_t>::read(in);
         h.body_crc = serializer<uint32_t>::read(in);
-        h.reserved2 = serializer<uint32_t>::read(in);
+        h.schema_table_size = serializer<uint32_t>::read(in);
         h.crc = serializer<uint32_t>::read(in);
         return h;
     }

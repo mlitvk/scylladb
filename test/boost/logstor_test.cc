@@ -151,7 +151,8 @@ void reseal_chunk_crcs(temporary_buffer<char>& buf) {
     if (ch.kind == segment_kind::full) {
         sh = read_segment_header(buf);
     }
-    ch.body_crc = ondisk::calculate_body_crc(std::span(buf.get() + raw_write_buffer::chunk_headers_size(ch.kind), ch.records_size));
+    ch.body_crc = ondisk::calculate_body_crc(std::span(buf.get() + raw_write_buffer::chunk_headers_size(ch.kind),
+            size_t(ch.records_size) + ch.schema_table_size));
     ch.crc = ch.calculate_crc(sh);
     seastar::simple_memory_output_stream out(buf.get_write(), ondisk::chunk_header_size);
     ser::serialize<ondisk::chunk_header>(out, ch);
@@ -472,7 +473,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_ondisk_serialized_sizes) {
         .segment_seq = segment_sequence{0x0102030405060708},
         .records_size = 0xdeadbeef,
         .body_crc = 0x0badf00d,
-        .reserved2 = 0x5eed1e55,
+        .schema_table_size = 0x5eed1e55,
         .crc = 0xfeedface,
     });
 

@@ -24,7 +24,7 @@ uint32_t chunk_header::calculate_crc(const std::optional<segment_header>& sh) co
     c.process_le(segment_seq.value);
     c.process_le(records_size);
     c.process_le(body_crc);
-    c.process_le(reserved2);
+    c.process_le(schema_table_size);
     if (sh) {
         c.process_le(sh->table.uuid().get_most_significant_bits());
         c.process_le(sh->table.uuid().get_least_significant_bits());

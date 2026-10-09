@@ -130,11 +130,12 @@ struct chunk_body {
 future<std::optional<chunk_body>> read_chunk_body(segment_reader& reader,
         const ondisk::chunk_header& ch,
         size_t segment_size) {
-    if (ch.records_size > segment_size - reader.position()) {
+    const size_t body_size = size_t(ch.records_size) + ch.schema_table_size;
+    if (body_size > segment_size - reader.position()) {
         co_return std::nullopt;
     }
-    auto body = co_await reader.read_exactly(ch.records_size);
-    if (body.size() < ch.records_size) {
+    auto body = co_await reader.read_exactly(body_size);
+    if (body.size() < body_size) {
         co_return std::nullopt;
     }
     const bool valid = ondisk::validate_chunk_body(ch, std::span(body.get(), body.size()));
@@ -268,8 +269,10 @@ future<> scan_segment(seastar::input_stream<char>& in,
         // earlier use of the segment that parse cleanly.
         if (body_valid) {
             last_chunk_failed = false;
-            auto records = simple_memory_input_stream(body_buf.get(), body_buf.size());
-            co_await scan_chunk_records(records, reader.position() - records.size(), segment_id, on_record_header, on_record);
+            // The records are the start of the body, which the reader has just read.
+            const size_t records_position = reader.position() - body_buf.size();
+            auto records = simple_memory_input_stream(body_buf.get(), ch.records_size);
+            co_await scan_chunk_records(records, records_position, segment_id, on_record_header, on_record);
         } else {
             // The valid header gives the size of the chunk, so the scan continues at the next
             // chunk. After a torn chunk, what follows is not a valid chunk or is a chunk of an

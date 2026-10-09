@@ -120,6 +120,7 @@ void raw_write_buffer::seal(segment_sequence segment_seq, std::optional<table_id
         throw std::runtime_error("Cannot seal write buffer more than once");
     }
     _chunk_header.records_size = static_cast<uint32_t>(serialized_size() - chunk_headers_size());
+    _chunk_header.schema_table_size = 0;
     pad_to_alignment(alignment);
     write_header(segment_seq, table);
     _sealed = true;
@@ -150,9 +151,9 @@ void raw_write_buffer::write_header(segment_sequence segment_seq, std::optional<
     _chunk_header.version = ondisk::current_version;
     _chunk_header.reserved = 0;
     _chunk_header.segment_seq = segment_seq;
-    // seal() set records_size, which is what the body spans after the headers.
-    _chunk_header.body_crc = ondisk::calculate_body_crc(std::span(_buffer.get() + chunk_headers_size(), _chunk_header.records_size));
-    _chunk_header.reserved2 = 0;
+    // seal() set records_size and schema_table_size, which is what the body spans after the headers.
+    _chunk_header.body_crc = ondisk::calculate_body_crc(std::span(_buffer.get() + chunk_headers_size(),
+            size_t(_chunk_header.records_size) + _chunk_header.schema_table_size));
     _chunk_header.crc = _chunk_header.calculate_crc(seg_hdr);
 
     ser::serialize<ondisk::chunk_header>(_header_stream, _chunk_header);
