@@ -1536,10 +1536,10 @@ future<> segment_manager_impl::write(write_buffer& wb) {
     write_source source = write_source::normal_write;
     auto holder = _async_gate.hold();
     auto write_op = _writes_phaser.start();
-    const auto chunk_size = wb.chunk_size(block_alignment);
+    const auto chunk_size = wb.finish();
 
     if (chunk_size > _cfg.segment_size) {
-        throw std::runtime_error(fmt::format("Chunk size {} exceeds segment size {}", chunk_size, _cfg.segment_size));
+        co_await coroutine::return_exception(std::runtime_error(fmt::format("Chunk size {} exceeds segment size {}", chunk_size, _cfg.segment_size)));
     }
 
     while (true) {
@@ -1562,7 +1562,7 @@ future<> segment_manager_impl::write(write_buffer& wb) {
 
         auto seq_num = seg->seq_num();
 
-        wb.seal(seq_num, std::nullopt, block_alignment);
+        const auto chunk = wb.seal(seq_num, std::nullopt);
 
         // if we wrote a record to the segment but failed to write it to the separator, the segment should not be freed.
         auto write_to_separator_failed = defer([seg_ref] mutable noexcept {
@@ -1571,7 +1571,6 @@ future<> segment_manager_impl::write(write_buffer& wb) {
 
         logstor_logger.trace("Write active segment {} seq {}", seg->id(), seq_num);
 
-        const auto chunk = wb.chunk();
         auto append_result = co_await coroutine::as_future(seg->write_reserved(std::move(*reservation), chunk));
         if (append_result.failed()) {
             auto ex = append_result.get_exception();
@@ -1606,17 +1605,10 @@ future<> segment_manager_impl::write(write_buffer& wb) {
 }
 
 future<> segment_manager_impl::write_full_segment(write_buffer& wb, logstor_group& cg, write_source source) {
-    const auto chunk_size = wb.chunk_size(block_alignment);
-
-    if (chunk_size > _cfg.segment_size) {
-        throw std::runtime_error(fmt::format("Chunk size {} exceeds segment size {}", chunk_size, _cfg.segment_size));
-    }
-
     auto seg = co_await get_segment(source);
     logstor_logger.trace("Write full segment {} seq {} from {}", seg->id(), seg->seq_num(), write_source_to_string(source));
 
-    wb.seal(seg->seq_num(), cg.table_id(), block_alignment);
-    const auto chunk = wb.chunk();
+    const auto chunk = wb.seal(seg->seq_num(), cg.table_id());
 
     auto append_result = co_await coroutine::as_future(seg->append(chunk));
     if (append_result.failed()) {

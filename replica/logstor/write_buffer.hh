@@ -120,14 +120,14 @@ struct buffered_write_result {
 
 // Builds one chunk in memory.
 //
-// Callers append log records one by one and then seal the buffer with a target
-// segment sequence number, which completes the chunk, before writing it out. The
-// chunk's layout is:
+// Callers append log records one by one, then finish the buffer, which sets the
+// final size of the chunk, and then seal it with the sequence number of the
+// segment the chunk goes to, which writes the headers. The chunk's layout is:
 //   chunk_header
 //   (segment_header)?                 // for segment_kind::full only
 //   record_frame_header + record_header (fixed fields + partition key) + record value
 //   ...
-//   zero padding to the requested final alignment
+//   zero padding to block_alignment
 //
 // Each record frame is padded to record_alignment. For a full segment's chunk,
 // the segment header stores the owning table and the min/max token range of the
@@ -153,9 +153,6 @@ private:
     aligned_buffer_type _buffer;
     segment_kind _segment_kind;
     ostream _stream;
-    ondisk::chunk_header _chunk_header;
-    ostream _header_stream;
-    ostream _segment_header_stream;
 
     // The frame sizes of the appended records summed, their padding excluded.
     size_t _record_bytes{0};
@@ -163,6 +160,13 @@ private:
     std::optional<dht::token> _min_token;
     std::optional<dht::token> _max_token;
 
+    // What finish() computes about the chunk body, for the chunk header.
+    struct finished_body {
+        uint32_t records_size;
+        uint32_t body_crc;
+    };
+    // Set by finish().
+    std::optional<finished_body> _body;
     bool _sealed{false};
 
 public:
@@ -179,7 +183,7 @@ public:
 
     const char* data() const noexcept { return _buffer.get(); }
 
-    // The bytes written to the buffer so far, which after seal() is the whole chunk.
+    // The bytes written to the buffer so far, which after finish() is the whole chunk.
     size_t serialized_size() const noexcept { return _buffer_size - _stream.size(); }
 
     size_t buffer_size() const noexcept { return _buffer_size; }
@@ -221,9 +225,6 @@ public:
     template <log_record_writer_concept Writer>
     append_result append(const Writer& writer);
 
-    // The size of the chunk that sealing the buffer at `alignment` would produce.
-    size_t chunk_size(size_t alignment) const noexcept;
-
     // How many segments of this kind `record_count` records of `record_bytes` bytes take.
     static size_t estimate_required_segments(size_t record_bytes, size_t record_count, size_t segment_size, segment_kind);
 
@@ -245,17 +246,17 @@ public:
         return chunk_headers_size(_segment_kind);
     }
 
-    // Completes the chunk: pads it to `alignment` and writes its headers. `table` is set for
-    // segment_kind::full.
-    void seal(segment_sequence segment_seq, std::optional<table_id> table, size_t alignment);
+    // Ends the appends: pads the chunk to block_alignment and computes the body CRC. Returns the
+    // size of the chunk, which does not change after this, so a caller can reserve room for the
+    // chunk in a segment before it seals the buffer.
+    size_t finish();
 
-    // The chunk the buffer was sealed into, which is what is written to a segment.
-    bytes_view chunk() const;
+    // Completes the chunk: finishes the buffer if finish() was not called, and writes the
+    // headers. Returns the chunk, which is what is written to a segment. `table` is set for
+    // segment_kind::full.
+    bytes_view seal(segment_sequence segment_seq, std::optional<table_id> table);
 
 private:
-
-    // table is set for segment_kind::full
-    void write_header(segment_sequence segment_seq, std::optional<table_id> table);
 
     void pad_to_alignment(size_t alignment);
 
@@ -320,15 +321,11 @@ public:
     size_t record_bytes() const noexcept { return _raw.record_bytes(); }
     size_t record_count() const noexcept { return _raw.record_count(); }
 
-    size_t chunk_size(size_t alignment) const noexcept {
-        return _raw.chunk_size(alignment);
-    }
+    size_t finish() { return _raw.finish(); }
 
-    void seal(segment_sequence segment_seq, std::optional<table_id> table, size_t alignment) {
-        _raw.seal(segment_seq, table, alignment);
+    bytes_view seal(segment_sequence segment_seq, std::optional<table_id> table) {
+        return _raw.seal(segment_seq, table);
     }
-
-    bytes_view chunk() const { return _raw.chunk(); }
 
     // Write a record to the buffer.
     // Returns a future that will be resolved with the record location once flushed and a gate holder
