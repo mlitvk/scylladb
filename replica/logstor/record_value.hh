@@ -15,6 +15,8 @@ class mutation;
 
 namespace replica::logstor {
 
+class column_mapping_registry;
+
 // The functions that know what the bytes of a record_value mean. Everything else in logstor
 // treats a value as bytes, so changing the encoding is a change to this file alone.
 //
@@ -32,14 +34,13 @@ api::timestamp_type record_timestamp(const frozen_mutation& m);
 // Encodes the partition of m as the value of a record whose header is built from m.
 record_value encode_record_value(const mutation& m);
 
-// Encodes the partition of m as the value of a record whose header is built from m. s is the
-// schema that m was frozen with.
-record_value encode_record_value(const frozen_mutation& m, const schema& s);
+// Encodes the partition of m as the value of a record whose header is built from m.
+record_value encode_record_value(const frozen_mutation& m);
 
 // Decodes the value of a record with header h as a mutation of the schema s.
-mutation decode_record_value(const record_value& v, schema_ptr s, const record_header& h);
+mutation decode_record_value(const record_value& v, schema_ptr s, const record_header& h, const column_mapping_registry&);
 
 // The mutation a whole record holds.
-mutation to_mutation(const log_record& r, schema_ptr s);
+mutation to_mutation(const log_record& r, schema_ptr s, const column_mapping_registry&);
 
 } // namespace replica::logstor

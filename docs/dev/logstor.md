@@ -41,7 +41,7 @@ The `buffered_writer` manages multiple write buffers for user writes, an active 
 
 #### Column Mapping Registry
 
-The `column_mapping_registry` keeps in memory, one registry per shard, the column mappings of the schema versions that the records were written under (see [Schema Table](#schema-table)). Writes and segment scans add to it, and compaction and the separator take mappings from it.
+The `column_mapping_registry` keeps in memory, one registry per shard, the column mappings of the schema versions that the records were written under (see [Schema Table](#schema-table)). Writes and segment scans add to it, and reads, compaction and the separator take mappings from it.
 
 ### Data Flow
 
@@ -277,14 +277,7 @@ Written by `ondisk::write_record_header()`. The fixed fields come first, at cons
 
 The `value_size` bytes immediately following the record header are the encoded partition. They are opaque to everything but `encode_record_value()` and `decode_record_value()` in `replica/logstor/record_value.hh`: compaction, the separator and segment streaming copy a value as it is.
 
-The encoding is written and read in `replica/logstor/record_value.cc`, behind `encode_record_value()` and `decode_record_value()`. It is a `canonical_mutation` stripped of what the record header already carries, the table id, the partition key and the schema version, with the remaining parts each written by the serializer `canonical_mutation` uses for it:
-
-| Offset | Size       | Field                | Description |
-|--------|------------|----------------------|-------------|
-| 0      | variable   | `column_mapping`     | The columns of the schema version in the header, IDL-serialized. A read under the same schema version steps over it; a read under another version uses it to map the record's columns onto the schema's, so a record stays readable after an `ALTER TABLE`. It is stored in the record because the schema history in the system tables keeps superseded versions only for a while. |
-|        | variable   | `mutation_partition` | The partition, IDL-serialized as `mutation_partition_serializer` writes it. |
-
-The value has no frame or size of its own: `value_size` gives its size.
+The encoding is written and read in `replica/logstor/record_value.cc`, behind `encode_record_value()` and `decode_record_value()`. It is a `canonical_mutation` stripped of what the record header already carries - the table id, the partition key and the schema version - and of the column mapping, which the schema table of the chunk holds. What is left is the partition, IDL-serialized as `mutation_partition_serializer` writes it, frame included.
 
 #### Schema Table
 

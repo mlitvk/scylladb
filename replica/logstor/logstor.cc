@@ -147,7 +147,7 @@ future<> logstor::write(const mutation& m, write_target target, db::timeout_cloc
 future<> logstor::write(const frozen_mutation& m, const schema& s, write_target target, db::timeout_clock::time_point timeout) noexcept {
     try {
         check_schema_version(m.schema_version(), s);
-        return do_write(s, m.decorated_key(s), record_timestamp(m), encode_record_value(m, s),
+        return do_write(s, m.decorated_key(s), record_timestamp(m), encode_record_value(m),
                 std::move(target), timeout);
     } catch (...) {
         return current_exception_as_future();
@@ -235,7 +235,7 @@ future<mutation> logstor::read_from_segment(schema_ptr s, const primary_index& i
         co_await coroutine::return_exception(key_mismatch_error(dk.key(), record.header.key.key(), where.location));
     }
 
-    mutation m = decode_record_value(record.value, s, record.header);
+    mutation m = decode_record_value(record.value, s, record.header, _segment_manager.column_mappings());
 
     if (populate) {
         index.populate_cache(key, where.location, m);

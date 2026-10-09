@@ -52,8 +52,9 @@
 //
 //   --test                       comma separated test names, or `all`
 //   --partitions                 partitions written per shard
-//   --columns                    value columns of the table. The description of the schema a record
-//                                carries and the framing of its cells both scale with this
+//   --columns                    value columns of the table. The framing of the cells of a record
+//                                and the column mapping that the schema table of a chunk lists both
+//                                scale with this
 //   --value-size                 bytes of the value of one column
 //   --select-columns             how many of the value columns a read asks for, the first ones of
 //                                the table; 0, the default, asks for all of them. The slice is
@@ -293,7 +294,6 @@
 #include "keys/keys.hh"
 #include "mutation/frozen_mutation.hh"
 #include "mutation/mutation.hh"
-#include "mutation/mutation_partition_serializer.hh"
 #include "partition_slice_builder.hh"
 #include "reader_concurrency_semaphore.hh"
 #include "replica/logstor/index.hh"
@@ -309,8 +309,8 @@
 #include "test/perf/perf.hh"
 #include "types/types.hh"
 
-// The record size report measures the column mapping a record value carries through the serializer
-// the value is written with.
+// The record size report measures the column mapping that the schema table of a chunk lists
+// through the serializer the table is written with.
 #include "serializer_impl.hh"
 #include "idl/mutation.dist.hh"
 #include "idl/mutation.dist.impl.hh"
@@ -406,8 +406,8 @@ std::ostream& operator<<(std::ostream& os, const test_config& cfg) {
 }
 
 // A logstor table: a partition key and the value columns of the row it holds. The number of them is
-// what the description of the schema a record carries scales with, and what the framing of the
-// cells scales with, so it is a parameter of the run rather than one column.
+// what the framing of the cells scales with, and what the column mapping that the schema table of
+// a chunk lists scales with, so it is a parameter of the run rather than one column.
 schema_ptr make_kv_schema(unsigned columns) {
     auto sb = schema_builder(this_smp_shard_count(), "ks", "cf")
             .with_column("pk", bytes_type, column_kind::partition_key);
@@ -458,8 +458,6 @@ size_t serialized_size_of(const T& v) {
 struct record_sizes {
     size_t header_size{}; // the serialized record_header
     size_t value_size{};  // the record value, the partition as encode_record_value() encodes it
-    size_t mapping{};     // of the value, the column mapping of the schema
-    size_t partition{};   // of the value, the partition itself
     size_t frame_size{};  // the record frame: the frame header, the record header and the value
     size_t padding{};     // what aligning the next frame after this one costs
     size_t table_entry{}; // the schema table entry of the version, paid once per chunk
@@ -472,20 +470,13 @@ record_sizes measure_record(const schema& s, const mutation& m) {
         .table = s.id(),
         .schema_version = s.version(),
     };
-    // The partition as the record value writes it, which is the only part of a record that holds
-    // anything the write was given.
-    bytes_ostream partition;
-    mutation_partition_serializer(s, m.partition()).write(partition);
-
     record_sizes sizes {
         .header_size = ondisk::record_header_size(header),
         .value_size = encode_record_value(m).size(),
-        .mapping = serialized_size_of(s.get_column_mapping()),
-        .partition = partition.size(),
     };
     sizes.frame_size = ondisk::record_frame_header_size + sizes.header_size + sizes.value_size;
     sizes.padding = align_up(sizes.frame_size, ondisk::record_alignment) - sizes.frame_size;
-    sizes.table_entry = ondisk::schema_table_entry_size(sizes.mapping);
+    sizes.table_entry = ondisk::schema_table_entry_size(serialized_size_of(s.get_column_mapping()));
     return sizes;
 }
 
@@ -493,11 +484,10 @@ record_sizes measure_record(const schema& s, const mutation& m) {
 // bytes go. See the record size report in the comment at the top of this file.
 void print_record_size_report(const std::vector<size_t>& key_sizes, const std::vector<size_t>& column_counts,
         const std::vector<size_t>& value_sizes) {
-    fmt::print("{:>4} {:>5} {:>6} {:>8} | {:>7} {:>7} {:>7} {:>4} | {:>9} {:>6} | {:>8} {:>10} | {:>6}\n",
+    fmt::print("{:>4} {:>5} {:>6} {:>8} | {:>7} {:>7} {:>7} {:>4} | {:>9} {:>6} | {:>6}\n",
             "key", "cols", "value", "payload",
             "header", "value", "frame", "pad",
             "overhead", "ratio",
-            "mapping", "partition",
             "table");
     for (auto columns : column_counts) {
         auto s = make_kv_schema(static_cast<unsigned>(columns));
@@ -506,12 +496,11 @@ void print_record_size_report(const std::vector<size_t>& key_sizes, const std::v
                 const row_shape shape{.key_size = key_size, .columns = columns, .value_size = value_size};
                 const auto sizes = measure_record(*s, make_report_mutation(s, shape));
                 const auto payload = shape.payload_size();
-                fmt::print("{:>4} {:>5} {:>6} {:>8} | {:>7} {:>7} {:>7} {:>4} | {:>9} {:>6.2f} | {:>8} {:>10} | {:>6}\n",
+                fmt::print("{:>4} {:>5} {:>6} {:>8} | {:>7} {:>7} {:>7} {:>4} | {:>9} {:>6.2f} | {:>6}\n",
                         key_size, columns, value_size, payload,
                         sizes.header_size, sizes.value_size, sizes.frame_size, sizes.padding,
                         sizes.frame_size - payload,
                         payload ? double(sizes.frame_size) / payload : 0.0,
-                        sizes.mapping, sizes.partition,
                         sizes.table_entry);
             }
         }
@@ -848,7 +837,7 @@ public:
     // And what it pays after that: the value is decoded into the mutation the read returns.
     void do_decode(unsigned count) {
         for (unsigned i = 0; i < count; ++i) {
-            decode_record_value(_record->value, _schema, _record->header);
+            decode_record_value(_record->value, _schema, _record->header, column_mappings());
         }
     }
 

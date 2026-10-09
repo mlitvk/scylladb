@@ -19,6 +19,7 @@
 #include "mutation/mutation_partition_serializer.hh"
 #include "mutation/mutation_partition_view.hh"
 #include "partition_builder.hh"
+#include "replica/logstor/column_mapping_registry.hh"
 #include "schema/schema.hh"
 #include "serializer_impl.hh"
 #include "idl/mutation.dist.hh"
@@ -28,56 +29,27 @@ namespace replica::logstor {
 
 namespace {
 
-// Writes the partition field of a record value. Both overloads write the same bytes: the first
-// encodes a partition from memory, the second copies one that is already encoded.
+// The record value is the partition the record holds, encoded as a canonical_mutation stripped
+// of what the record_header already carries - the table id, the partition key and the
+// schema version - and of the column mapping, which the schema table of the chunk holds. What
+// is left is the IDL-serialized mutation_partition, as mutation_partition_serializer writes it.
+//
+// Both overloads write the same bytes: the first encodes a partition from memory, the second
+// copies one that is already encoded.
 template <typename Output>
-void write_partition(Output& out, const schema& s, const mutation_partition& p) {
+void write_record_value(Output& out, const schema& s, const mutation_partition& p) {
     mutation_partition_serializer(s, p).write(ser::writer_of_mutation_partition<Output>(out));
 }
 
 template <typename Output>
-void write_partition(Output& out, const schema&, const ser::mutation_partition_view& p) {
+void write_record_value(Output& out, const ser::mutation_partition_view& p) {
     ser::serialize(out, p);
 }
 
-// The record value is the partition the record holds, encoded as a canonical_mutation stripped
-// of what the record_header already carries: the table id, the partition key and the schema
-// version. What is left is the column mapping of the schema the record was written under and
-// the IDL-serialized mutation_partition, each written by the serializer that canonical_mutation
-// uses for it.
-//
-//        column_mapping       ser::serializer<column_mapping>, from idl/mutation.idl.hh
-//        mutation_partition   ser::serializer<mutation_partition>, as mutation_partition_serializer
-//                             writes it
-template <typename Output, typename Partition>
-void write_record_value(Output& out, const schema& s, const Partition& p) {
-    ser::serialize(out, s.get_column_mapping());
-    write_partition(out, s, p);
-}
-
-// Reads a record value field by field, in the order above: the caller either reads or skips
-// the mapping, and then reads the partition.
 template <typename Input>
-class record_value_reader {
-    Input& _in;
-
-public:
-    explicit record_value_reader(Input& in)
-        : _in(in)
-    { }
-
-    column_mapping read_mapping() {
-        return ser::deserialize(_in, std::type_identity<column_mapping>{});
-    }
-
-    void skip_mapping() {
-        ser::skip(_in, std::type_identity<column_mapping>{});
-    }
-
-    ser::mutation_partition_view read_partition() {
-        return ser::deserialize(_in, std::type_identity<ser::mutation_partition_view>{});
-    }
-};
+ser::mutation_partition_view read_record_value(Input& in) {
+    return ser::deserialize(in, std::type_identity<ser::mutation_partition_view>{});
+}
 
 // Returns the serialized partition of a frozen mutation.
 ser::mutation_partition_view frozen_partition(const frozen_mutation& m) {
@@ -155,39 +127,48 @@ record_value encode_record_value(const mutation& m) {
     return record_value(std::move(out));
 }
 
-record_value encode_record_value(const frozen_mutation& m, const schema& s) {
+record_value encode_record_value(const frozen_mutation& m) {
     bytes_ostream out;
-    write_record_value(out, s, frozen_partition(m));
+    write_record_value(out, frozen_partition(m));
     return record_value(std::move(out));
 }
 
-mutation decode_record_value(const record_value& v, schema_ptr s, const record_header& h) {
+mutation decode_record_value(const record_value& v, schema_ptr s, const record_header& h, const column_mapping_registry& mappings) {
     if (s->id() != h.table) {
         throw std::runtime_error(format("logstor: record of table {} decoded with the schema of table {} ({}.{})",
                 h.table, s->id(), s->ks_name(), s->cf_name()));
     }
 
     auto in = ser::as_input_stream(v.representation());
-    record_value_reader reader(in);
+    auto partition_view = mutation_partition_view::from_view(read_record_value(in));
 
     mutation m(s, h.key);
 
     if (h.schema_version == s->version()) {
-        reader.skip_mapping();
-        auto partition_view = mutation_partition_view::from_view(reader.read_partition());
         partition_builder b(*s, m.partition());
         partition_view.accept(*s, b);
     } else {
-        column_mapping cm = reader.read_mapping();
-        converting_mutation_partition_applier applier(cm, *s, m.partition());
-        auto partition_view = mutation_partition_view::from_view(reader.read_partition());
-        partition_view.accept(cm, applier);
+        const auto* sm = mappings.find(h.schema_version);
+        if (!sm) [[unlikely]] {
+            throw std::runtime_error(format("logstor: record of table {} ({}.{}) written under schema version {} has no column mapping",
+                    h.table, s->ks_name(), s->cf_name(), h.schema_version));
+        }
+        if (sm->table != h.table) [[unlikely]] {
+            throw std::runtime_error(format("logstor: record of table {} ({}.{}) written under schema version {} has the column mapping of table {}",
+                    h.table, s->ks_name(), s->cf_name(), h.schema_version, sm->table));
+        }
+        if (!sm->mapping) [[unlikely]] {
+            throw std::runtime_error(format("logstor: record of table {} ({}.{}) written under schema version {} has a column mapping that does not parse",
+                    h.table, s->ks_name(), s->cf_name(), h.schema_version));
+        }
+        converting_mutation_partition_applier applier(*sm->mapping, *s, m.partition());
+        partition_view.accept(*sm->mapping, applier);
     }
     return m;
 }
 
-mutation to_mutation(const log_record& r, schema_ptr s) {
-    return decode_record_value(r.value, std::move(s), r.header);
+mutation to_mutation(const log_record& r, schema_ptr s, const column_mapping_registry& mappings) {
+    return decode_record_value(r.value, std::move(s), r.header, mappings);
 }
 
 } // namespace replica::logstor

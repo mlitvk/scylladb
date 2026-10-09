@@ -199,7 +199,7 @@ class logstor_range_reader : public mutation_reader::impl {
                 continue;
             }
             reads.push_back(_logstor->get_segment_manager().read(batch.guard, slot.location).then([this, &slot] (log_record record) {
-                auto mut = decode_record_value(record.value, _schema, record.header);
+                auto mut = decode_record_value(record.value, _schema, record.header, _logstor->get_segment_manager().column_mappings());
                 auto memory = _permit.consume_memory(mut.memory_usage(*_schema));
                 slot.mut = pending_mutation{std::move(mut), std::move(memory)};
             }));
