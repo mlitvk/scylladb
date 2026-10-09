@@ -520,10 +520,6 @@ struct separator_buffer {
         return buf && buf->can_fit(writer);
     }
 
-    bool can_fit(size_t write_size) const noexcept {
-        return buf && buf->can_fit(write_size);
-    }
-
     bool empty() const noexcept {
         return !buf || !buf->has_data();
     }

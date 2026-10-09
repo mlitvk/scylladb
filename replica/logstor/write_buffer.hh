@@ -312,7 +312,6 @@ public:
 
     size_t buffer_size() const noexcept { return _raw.buffer_size(); }
 
-    bool can_fit(size_t record_size) const noexcept { return _raw.can_fit(record_size); }
     template <log_record_writer_concept Writer>
     bool can_fit(const Writer& writer) const noexcept { return _raw.can_fit(writer); }
     bool has_data() const noexcept { return _raw.has_data(); }
