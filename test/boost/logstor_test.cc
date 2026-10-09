@@ -21,6 +21,7 @@
 #include <fmt/format.h>
 #include <seastar/core/byteorder.hh>
 #include <seastar/core/align.hh>
+#include <seastar/core/file.hh>
 #include <seastar/core/memory.hh>
 #include <seastar/core/metrics_api.hh>
 #include <seastar/core/reactor.hh>
@@ -627,14 +628,14 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_value_round_trip) {
 
     auto m = make_multi_column_mutation(schema, "pk0", ts);
     auto value = encode_record_value(m);
-    assert_that(decode_to_mutation(value, schema, make_header(m, ts))).is_equal_to(m);
+    assert_that(decode_to_mutation(value, schema, make_header(m, ts), test_registry())).is_equal_to(m);
     BOOST_REQUIRE_LT(value.size(), canonical_mutation(m).representation().size());
 
     // A partition tombstone alone, with no row.
     mutation deleted(schema, m.decorated_key());
     deleted.partition().apply(tombstone(ts, gc_clock::now()));
     auto deleted_value = encode_record_value(deleted);
-    assert_that(decode_to_mutation(deleted_value, schema, make_header(deleted, ts))).is_equal_to(deleted);
+    assert_that(decode_to_mutation(deleted_value, schema, make_header(deleted, ts), test_registry())).is_equal_to(deleted);
 }
 
 // Checks that a record written under one schema version reads under another the way a
@@ -648,21 +649,33 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_value_decodes_under_another_schema_
     auto value = encode_record_value(m);
     auto header = make_header(m, ts);
     auto oracle = canonical_mutation(m);
+    test_registry().add(*schema);
 
     auto with_added = schema_builder(schema).with_column("y", long_type).build();
     BOOST_REQUIRE(with_added->version() != schema->version());
-    assert_that(decode_to_mutation(value, with_added, header)).is_equal_to(oracle.to_mutation(with_added));
-    assert_that(decode_to_mutation(value, with_added, header)).is_equal_to(m);
+    assert_that(decode_to_mutation(value, with_added, header, test_registry())).is_equal_to(oracle.to_mutation(with_added));
+    assert_that(decode_to_mutation(value, with_added, header, test_registry())).is_equal_to(m);
 
     auto with_dropped = schema_builder(schema).without_column("w", ts + 1).build();
     BOOST_REQUIRE(with_dropped->version() != schema->version());
-    auto decoded = decode_to_mutation(value, with_dropped, header);
+    auto decoded = decode_to_mutation(value, with_dropped, header, test_registry());
     assert_that(decoded).is_equal_to(oracle.to_mutation(with_dropped));
     // Of the three cells written, the one of the dropped column is gone.
     const auto& cells = decoded.partition().clustered_row(*with_dropped, clustering_key::make_empty()).cells();
     BOOST_REQUIRE(cells.find_cell(with_dropped->get_column_definition("v")->id) != nullptr);
     BOOST_REQUIRE(cells.find_cell(with_dropped->get_column_definition("x")->id) != nullptr);
     BOOST_REQUIRE_EQUAL(cells.size(), 2u);
+
+    // Without the mapping of the version the record was written under, it can only be read under
+    // that version.
+    column_mapping_registry without_mapping;
+    BOOST_REQUIRE_THROW(decode_to_mutation(value, with_added, header, without_mapping), std::runtime_error);
+    assert_that(decode_to_mutation(value, schema, header, without_mapping)).is_equal_to(m);
+
+    // A mapping of the version that is registered under another table is not used either.
+    column_mapping_registry other_table;
+    other_table.add(table_id::create_random_id(), header.schema_version, test_registry().find(header.schema_version)->serialized);
+    BOOST_REQUIRE_THROW(decode_to_mutation(value, with_added, header, other_table), std::runtime_error);
 }
 
 // Checks that a value is not decoded with the schema of another table: the table id comes from the
@@ -677,8 +690,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_value_rejects_the_schema_of_another
     auto header = make_header(m, ts);
 
     BOOST_REQUIRE(other->id() != schema->id());
-    BOOST_REQUIRE_THROW(decode_to_mutation(value, other, header), std::runtime_error);
-    assert_that(decode_to_mutation(value, schema, header)).is_equal_to(m);
+    BOOST_REQUIRE_THROW(decode_to_mutation(value, other, header, test_registry()), std::runtime_error);
+    assert_that(decode_to_mutation(value, schema, header, test_registry())).is_equal_to(m);
 }
 
 // Checks that the frozen and the unfrozen forms of a mutation give the same record value and the
@@ -720,12 +733,12 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_frozen_record_value_matches_the_unfrozen_o
 
     for (const auto& m : ms) {
         const auto frozen = freeze(m);
-        BOOST_REQUIRE(encode_record_value(frozen, *schema) == encode_record_value(m));
+        BOOST_REQUIRE(encode_record_value(frozen) == encode_record_value(m));
         BOOST_REQUIRE_EQUAL(record_timestamp(m), ts);
         BOOST_REQUIRE_EQUAL(record_timestamp(frozen), ts);
 
         // The value decodes to the original mutation.
-        assert_that(decode_to_mutation(encode_record_value(frozen, *schema), schema, make_header(m, ts))).is_equal_to(m);
+        assert_that(decode_to_mutation(encode_record_value(frozen), schema, make_header(m, ts), test_registry())).is_equal_to(m);
     }
 }
 
@@ -1087,10 +1100,10 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_mixed_chunks_report_readable_
     BOOST_REQUIRE(seen_headers[3].key.equal(*schema, expected3.decorated_key()));
 
     BOOST_REQUIRE_EQUAL(seen_locations.size(), 4u);
-    assert_that(to_mutation(read_record_at_location(segment_copy, seen_locations[0]), schema)).is_equal_to(expected0);
-    assert_that(to_mutation(read_record_at_location(segment_copy, seen_locations[1]), schema)).is_equal_to(expected1);
-    assert_that(to_mutation(read_record_at_location(segment_copy, seen_locations[2]), schema)).is_equal_to(expected2);
-    assert_that(to_mutation(read_record_at_location(segment_copy, seen_locations[3]), schema)).is_equal_to(expected3);
+    assert_that(to_mutation(read_record_at_location(segment_copy, seen_locations[0]), schema, test_registry())).is_equal_to(expected0);
+    assert_that(to_mutation(read_record_at_location(segment_copy, seen_locations[1]), schema, test_registry())).is_equal_to(expected1);
+    assert_that(to_mutation(read_record_at_location(segment_copy, seen_locations[2]), schema, test_registry())).is_equal_to(expected2);
+    assert_that(to_mutation(read_record_at_location(segment_copy, seen_locations[3]), schema, test_registry())).is_equal_to(expected3);
 
     auto maybe_header = read_chunk_info_from_bytes(segment_copy);
     BOOST_REQUIRE(maybe_header);
@@ -1375,9 +1388,9 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_reads_full_chunk_records_with
     BOOST_REQUIRE_EQUAL(seen_records[0].header.timestamp, api::timestamp_type(31));
     BOOST_REQUIRE_EQUAL(seen_records[1].header.timestamp, api::timestamp_type(32));
     BOOST_REQUIRE_EQUAL(seen_records[2].header.timestamp, api::timestamp_type(33));
-    assert_that(to_mutation(seen_records[0], schema)).is_equal_to(expected0);
-    assert_that(to_mutation(seen_records[1], schema)).is_equal_to(expected1);
-    assert_that(to_mutation(seen_records[2], schema)).is_equal_to(expected2);
+    assert_that(to_mutation(seen_records[0], schema, test_registry())).is_equal_to(expected0);
+    assert_that(to_mutation(seen_records[1], schema, test_registry())).is_equal_to(expected1);
+    assert_that(to_mutation(seen_records[2], schema, test_registry())).is_equal_to(expected2);
 
     BOOST_REQUIRE(maybe_header);
     BOOST_REQUIRE(maybe_header->kind() == segment_kind::full);
@@ -1442,8 +1455,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_stops_on_mixed_chunk_lower_se
     BOOST_REQUIRE_EQUAL(seen_headers[1].timestamp, api::timestamp_type(52));
 
     BOOST_REQUIRE_EQUAL(seen_records.size(), 2u);
-    assert_that(to_mutation(seen_records[0], schema)).is_equal_to(expected0);
-    assert_that(to_mutation(seen_records[1], schema)).is_equal_to(expected1);
+    assert_that(to_mutation(seen_records[0], schema, test_registry())).is_equal_to(expected0);
+    assert_that(to_mutation(seen_records[1], schema, test_registry())).is_equal_to(expected1);
 }
 
 // Checks that the segment scan stops after a later mixed chunk with a corrupted header crc.
@@ -1489,8 +1502,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_stops_on_corrupted_later_mixe
     BOOST_REQUIRE_EQUAL(seen_records.size(), 2u);
     BOOST_REQUIRE_EQUAL(seen_headers[0].timestamp, api::timestamp_type(91));
     BOOST_REQUIRE_EQUAL(seen_headers[1].timestamp, api::timestamp_type(92));
-    assert_that(to_mutation(seen_records[0], schema)).is_equal_to(expected0);
-    assert_that(to_mutation(seen_records[1], schema)).is_equal_to(expected1);
+    assert_that(to_mutation(seen_records[0], schema, test_registry())).is_equal_to(expected0);
+    assert_that(to_mutation(seen_records[1], schema, test_registry())).is_equal_to(expected1);
 }
 
 // Requires that read_chunk_info(), the segment scan and the streamed rewriter all fail with an error
@@ -1576,7 +1589,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_stops_on_a_stale_chunk_of_ano
     BOOST_REQUIRE_EQUAL(seen_segment_infos.size(), 1u);
     BOOST_REQUIRE_EQUAL(seen_segment_infos.front().segment_seq.value, 81u);
     BOOST_REQUIRE_EQUAL(seen_records.size(), 1u);
-    assert_that(to_mutation(seen_records[0], schema)).is_equal_to(expected0);
+    assert_that(to_mutation(seen_records[0], schema, test_registry())).is_equal_to(expected0);
 }
 
 // Checks that the chunk header's CRC covers the full part of the header: a full segment whose
@@ -1838,9 +1851,9 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_streamed_segment_rewriter_rewrites_initial
     BOOST_REQUIRE_EQUAL(seen_records[0].header.table, schema->id());
     BOOST_REQUIRE_EQUAL(seen_records[1].header.table, schema->id());
     BOOST_REQUIRE_EQUAL(seen_records[2].header.table, schema->id());
-    assert_that(to_mutation(seen_records[0], schema)).is_equal_to(expected0);
-    assert_that(to_mutation(seen_records[1], schema)).is_equal_to(expected1);
-    assert_that(to_mutation(seen_records[2], schema)).is_equal_to(expected2);
+    assert_that(to_mutation(seen_records[0], schema, test_registry())).is_equal_to(expected0);
+    assert_that(to_mutation(seen_records[1], schema, test_registry())).is_equal_to(expected1);
+    assert_that(to_mutation(seen_records[2], schema, test_registry())).is_equal_to(expected2);
 }
 
 // A later release can use the reserved bytes of the chunk header for a field that this code does

@@ -42,7 +42,7 @@ namespace {
 void assert_log_record_matches(schema_ptr schema, const log_record& actual, const log_record& expected) {
     BOOST_REQUIRE_EQUAL(actual.header.timestamp, expected.header.timestamp);
     BOOST_REQUIRE_EQUAL(actual.header.table, expected.header.table);
-    assert_that(to_mutation(actual, schema)).is_equal_to(to_mutation(expected, schema));
+    assert_that(to_mutation(actual, schema, test_registry())).is_equal_to(to_mutation(expected, schema, test_registry()));
 }
 
 db::timeout_clock::time_point test_timeout() {
@@ -242,7 +242,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_chunk_builder_finish_counts_the_schema_tab
 }
 
 // Checks that a buffer lists each schema version its records were written under once, in the
-// order they were first appended, and that a scan hands the entries of the table to a registry.
+// order they were first appended, and that a registry built from the table decodes the records.
 SEASTAR_THREAD_TEST_CASE(test_logstor_chunk_builder_lists_each_schema_version_once) {
     auto schema = make_kv_schema();
     auto altered = schema_builder(schema).with_column("w", int32_type).build();
@@ -269,7 +269,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_chunk_builder_lists_each_schema_version_on
     BOOST_REQUIRE_EQUAL(entries[1].schema_version, altered->version());
     BOOST_REQUIRE(entries[1].mapping == altered_mapping.serialized);
 
-    // A scan hands the entries of the table to an empty registry.
+    // A registry built from the scan decodes the records, also under the other version.
     column_mapping_registry recovered;
     auto serialized = copy_chunk(chunk);
     auto records = scan_buffer_records(serialized, log_segment_id{9}, &recovered);
@@ -277,6 +277,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_chunk_builder_lists_each_schema_version_on
     BOOST_REQUIRE(recovered.find(schema->version())->mapping == mapping.mapping);
     BOOST_REQUIRE(recovered.find(altered->version())->mapping == altered_mapping.mapping);
     BOOST_REQUIRE_EQUAL(records.size(), 4u);
+    assert_that(to_mutation(records[0].record, altered, recovered)).is_equal_to(make_kv_mutation(altered, "pk0", "v0", api::timestamp_type(1)));
+    assert_that(to_mutation(records[2].record, schema, recovered)).is_equal_to(make_kv_mutation(schema, "pk2", "v2", api::timestamp_type(3)));
 }
 
 // Checks that a buffer lists a schema version once when its records come with the entries of two
@@ -319,14 +321,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_chunk_builder_charges_the_schema_table_ent
         value += "x";
     }
     auto same_version = make_writer(make_log_record(schema, "pk1", value, api::timestamp_type(2)));
-    // The record value carries the column mapping of its version, and the mapping of the altered
-    // schema is larger. Shorten the value of the other record until the two are the same size.
-    auto other_value = value;
-    auto other_version = make_writer(make_log_record(altered, "pk1", other_value, api::timestamp_type(2)));
-    while (other_version.record_size() > same_version.record_size()) {
-        other_value.resize(other_value.size() - 1);
-        other_version = make_writer(make_log_record(altered, "pk1", other_value, api::timestamp_type(2)));
-    }
+    auto other_version = make_writer(make_log_record(altered, "pk1", value, api::timestamp_type(2)));
     BOOST_REQUIRE_EQUAL(same_version.record_size(), other_version.record_size());
 
     BOOST_REQUIRE(wb.fits(same_version));
