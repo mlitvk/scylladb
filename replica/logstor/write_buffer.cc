@@ -151,6 +151,7 @@ bytes_view raw_write_buffer::seal(segment_sequence segment_seq, std::optional<ta
         .segment_seq = segment_seq,
         .records_size = _finished_body->records_size,
         .body_crc = _finished_body->body_crc,
+        .schema_table_size = 0,
         .reserved = {},
     };
     // The CRC of the chunk header covers the segment header too.

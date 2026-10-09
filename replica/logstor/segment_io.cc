@@ -104,11 +104,17 @@ struct chunk_body {
     bool valid;
 };
 
+// The records, then the schema table.
+size_t chunk_body_size(const ondisk::chunk_header& ch) {
+    return size_t(ch.records_size) + ch.schema_table_size;
+}
+
 // Reads the body of the chunk whose headers the reader read last, and checks it against the body
 // CRC of the header. Returns nullopt if the stream ends first.
 future<std::optional<chunk_body>> read_chunk_body(segment_reader& reader, const ondisk::chunk_header& ch) {
-    auto body = co_await reader.read_exactly(ch.records_size);
-    if (body.size() < ch.records_size) {
+    const size_t body_size = chunk_body_size(ch);
+    auto body = co_await reader.read_exactly(body_size);
+    if (body.size() < body_size) {
         co_return std::nullopt;
     }
     const bool valid = ondisk::validate_chunk_body(ch, std::span(body.get(), body.size()));
@@ -204,21 +210,21 @@ future<std::optional<scanned_chunk>> segment_scanner::read_chunk() {
     }
 
     const size_t body_position = _reader.position();
-    if (body_position + ch.records_size > _segment_size) {
+    if (body_position + chunk_body_size(ch) > _segment_size) {
         // The writer never writes a body past the end of the segment, and a torn write keeps the size
         // in a valid header. So the chunk is corrupt, not torn.
         logstor_logger.warn("Skipped the last chunk of {}: its header gives a body of {} bytes at offset {}, past the end of the segment. "
-                "The segment is corrupt; the records of the chunk are lost.", _segment_id, ch.records_size, body_position);
+                "The segment is corrupt; the records of the chunk are lost.", _segment_id, chunk_body_size(ch), body_position);
         _state = scan_state::last;
         _last_chunk_failed = false;
-        co_return scanned_chunk(_segment_id, std::move(seg_info), {}, body_position, false);
+        co_return scanned_chunk(_segment_id, std::move(seg_info), {}, 0, body_position, false);
     }
     auto body = co_await read_chunk_body(_reader, ch);
     if (!body) {
         _state = scan_state::last;
         _last_chunk_failed = true;
         ++_failed_chunks;
-        co_return scanned_chunk(_segment_id, std::move(seg_info), {}, body_position, false);
+        co_return scanned_chunk(_segment_id, std::move(seg_info), {}, 0, body_position, false);
     }
 
     if (body->valid) {
@@ -230,7 +236,7 @@ future<std::optional<scanned_chunk>> segment_scanner::read_chunk() {
         _last_chunk_failed = true;
         ++_failed_chunks;
     }
-    co_return scanned_chunk(_segment_id, std::move(seg_info), std::move(body->buf), body_position, body->valid);
+    co_return scanned_chunk(_segment_id, std::move(seg_info), std::move(body->buf), ch.records_size, body_position, body->valid);
 }
 
 void segment_scanner::report_failed_chunks() const {
