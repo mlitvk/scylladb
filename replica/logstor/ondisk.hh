@@ -104,10 +104,10 @@ struct field<table_schema_version> : projected_field<utils::UUID, &table_schema_
 static_assert(std::is_same_v<api::timestamp_type, int64_t>, "The timestamp must be of the on-disk type");
 
 // A segment holds one or more chunks, each starting at a block_alignment boundary and padded to
-// a multiple of it. A chunk is the chunk header and the record frames, which are the chunk's body.
-// Chunks are appended to a mixed segment one at a time; a full segment is a single chunk. A write
-// buffer builds a chunk in memory and seals it - pads it and fills in its header - before it is
-// written.
+// a multiple of it. A chunk is the chunk header and the chunk's body: the record frames and the
+// schema table that follows them. Chunks are appended to a mixed segment one at a time; a full
+// segment is a single chunk. A write buffer builds a chunk in memory and seals it - pads it and
+// fills in its header - before it is written.
 //
 // The chunk header has a layout that depends on the kind of the segment. chunk_header_common is the
 // start of the header in every kind, and chunk_header_full_part follows it in a full segment. The
@@ -119,9 +119,9 @@ static_assert(std::is_same_v<api::timestamp_type, int64_t>, "The timestamp must 
 //       0                   4    5    6         8                                       16
 //       +-------------------+----+----+---------+---------------------------------------+
 //    0  |       magic       |ver |kind|  flags  |              segment_seq              |
-//       +-------------------+----+----+---------+---------------------------------------+
-//   16  |    records_size   |      body_crc     |                reserved               |
-//       +-------------------+-------------------+---------------------------------------+
+//       +-------------------+----+----+---------+-------------------+-------------------+
+//   16  |    records_size   |      body_crc     | schema_table_size |      reserved     |
+//       +-------------------+-------------------+-------------------+-------------------+
 //   32  |                                    reserved                                   |
 //       +-----------------------------------------------------------+-------------------+
 //   48  |                          reserved                         |        crc        |
@@ -139,13 +139,15 @@ struct chunk_header_common : fixed_layout {
     uint16_t flags;
     segment_sequence segment_seq;
     uint32_t records_size; // size of the record frames following the header, padding included
-    // CRC32 of the chunk's body: the record frames, records_size bytes after the header. It is what
-    // tells a chunk whose header is durable but whose body was only partly written - a crash mid-write
-    // over a reused segment - from a whole one.
+    // CRC32 of the chunk's body: the record frames and the schema table, `records_size` +
+    // `schema_table_size` bytes after the header. It is what tells a chunk whose header is durable
+    // but whose body was only partly written - a crash mid-write over a reused segment - from a
+    // whole one.
     uint32_t body_crc;
+    uint32_t schema_table_size; // Size of the schema table that follows the record frames.
     // The writer sets these bytes to zero. A new field uses part of these bytes, so that the header
     // keeps its size.
-    std::array<char, 36> reserved;
+    std::array<char, 32> reserved;
     // crc is the CRC32 of the fields above it and, in a full segment, of chunk_header_full_part.
     // crc must stay the last field, because calculate_chunk_header_crc() covers the serialized
     // bytes before crc.
@@ -290,6 +292,7 @@ struct chunk_header {
     uint16_t flags;
     uint32_t records_size;
     uint32_t body_crc;
+    uint32_t schema_table_size;
 
     segment_kind kind() const noexcept {
         return segment.kind();
@@ -332,7 +335,8 @@ inline uint16_t unknown_chunk_flags(const chunk_header& ch) noexcept {
 // The CRC a chunk header carries in body_crc, over the chunk's body.
 uint32_t calculate_body_crc(std::span<const char> body);
 
-// Whether the body of the chunk - its record frames - is the one the header was written with.
+// Whether the body of the chunk - its record frames and schema table - is the one the header was
+// written with.
 inline bool validate_chunk_body(const chunk_header& ch, std::span<const char> body) {
     return calculate_body_crc(body) == ch.body_crc;
 }

@@ -97,6 +97,7 @@ std::optional<chunk_header> parse_chunk_header(const chunk_header_common& common
         .flags = common.flags,
         .records_size = common.records_size,
         .body_crc = common.body_crc,
+        .schema_table_size = common.schema_table_size,
     };
     switch (common.kind) {
     case segment_kind::mixed:
@@ -142,6 +143,7 @@ void write_chunk_header(seastar::simple_memory_output_stream& out, const chunk_h
         .segment_seq = ch.segment.segment_seq,
         .records_size = ch.records_size,
         .body_crc = ch.body_crc,
+        .schema_table_size = ch.schema_table_size,
         .reserved = {},
         .crc = 0,
     };
