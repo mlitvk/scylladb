@@ -150,7 +150,9 @@ public:
 private:
     log_segment_id _segment_id;
     segment_info _info;
+    // The records, then the schema table.
     temporary_buffer<char> _body;
+    size_t _records_size;
     // Where the body starts in the segment. Record locations are relative to the segment.
     size_t _body_position;
     bool _body_valid;
@@ -160,13 +162,14 @@ private:
 
     // The record frames, or nothing if the body is not valid.
     std::span<const char> record_bytes() const noexcept {
-        return _body_valid ? std::span<const char>(_body.get(), _body.size()) : std::span<const char>();
+        return _body_valid ? std::span<const char>(_body.get(), _records_size) : std::span<const char>();
     }
 
-    scanned_chunk(log_segment_id segment_id, segment_info info, temporary_buffer<char> body, size_t body_position, bool body_valid)
+    scanned_chunk(log_segment_id segment_id, segment_info info, temporary_buffer<char> body, size_t records_size, size_t body_position, bool body_valid)
         : _segment_id(segment_id)
         , _info(std::move(info))
         , _body(std::move(body))
+        , _records_size(records_size)
         , _body_position(body_position)
         , _body_valid(body_valid)
     {}
