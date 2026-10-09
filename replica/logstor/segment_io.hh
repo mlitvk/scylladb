@@ -25,11 +25,11 @@
 
 namespace replica::logstor {
 
-// Returns the segment info of the chunk at the start of `in`, or nullopt if its header is not
+// Returns the header of the chunk at the start of `in`, or nullopt if the header is not
 // valid. This function does not read the chunk body, so only a segment_scanner can find a torn
 // chunk. Throws std::runtime_error if the chunk has a format version that this code does not read
 // or an unknown flag. `segment_id` is the segment that `in` reads, and the error message names it.
-future<std::optional<segment_info>> read_chunk_info(seastar::input_stream<char>& in, log_segment_id segment_id);
+future<std::optional<ondisk::chunk_header>> read_chunk_header(seastar::input_stream<char>& in, log_segment_id segment_id);
 
 // Reads a segment through its input stream, and keeps the position in the segment of what it
 // reads next.

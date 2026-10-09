@@ -112,7 +112,7 @@ std::optional<segment_info> read_chunk_info_from_bytes(const temporary_buffer<ch
     temporary_buffer<char> copy(buf.size());
     std::copy_n(buf.get(), buf.size(), copy.get_write());
     auto in = seastar::util::as_input_stream(std::move(copy));
-    auto header = read_chunk_info(in, log_segment_id{0}).get();
+    auto header = read_chunk_header(in, log_segment_id{0}).get().transform([] (ondisk::chunk_header&& ch) { return std::move(ch.segment); });
     in.close().get();
     return header;
 }
@@ -1563,7 +1563,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_stops_on_corrupted_later_mixe
     assert_that(to_mutation(seen_records[1], schema, test_registry())).is_equal_to(expected1);
 }
 
-// Requires that read_chunk_info(), the segment scan and the streamed rewriter all fail with an error
+// Requires that read_chunk_header(), the segment scan and the streamed rewriter all fail with an error
 // that contains `expected` on a segment whose chunk header has `change` applied, because the chunk
 // is from another release and recovery must not free the segment as empty.
 void require_segment_read_fails(std::function<void(ondisk::chunk_header_common&)> change, const sstring& expected) {
@@ -2872,6 +2872,55 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_fails_on_mapping_that_does_not_
         BOOST_REQUIRE(actual);
         assert_that(*actual).is_equal_to(expected);
     }
+}
+
+// Checks that compaction estimates the schema table of the output segments of a table from the
+// segments that the table writes: a segment that holds records of two schema versions is charged
+// both entries, and the segments of a wide table do not change the estimate of a narrow one.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_estimates_the_schema_table_per_table) {
+    auto schema = make_kv_schema();
+    auto altered = schema_builder(schema).with_column("w", int32_type).build();
+    schema_builder wide_builder(1, "ks", "wide");
+    wide_builder.with_column("pk", utf8_type, column_kind::partition_key);
+    wide_builder.with_column("v", utf8_type);
+    for (int i = 0; i < 40; ++i) {
+        wide_builder.with_column(to_bytes(fmt::format("c{}", i)), utf8_type);
+    }
+    auto wide = wide_builder.build();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    test_recovery_catalog no_tables;
+    ls.do_recovery(no_tables).get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+    test_logstor_group wide_cg(wide, ls);
+    auto guard = ls.get_compaction_manager().disable_compaction(cg).get();
+    auto wide_guard = ls.get_compaction_manager().disable_compaction(wide_cg).get();
+    auto& estimates = ls.get_compaction_manager();
+    BOOST_REQUIRE_EQUAL(estimates.schema_table_size_estimate(schema->id()), 0u);
+
+    // One segment with a record of each version.
+    const std::array two_versions{
+        make_kv_mutation(schema, "pk0", "v0", api::timestamp_type(1)),
+        make_kv_mutation(altered, "pk1", "v1", api::timestamp_type(2)),
+    };
+    write_and_flush_segment(ls, cg, two_versions);
+    BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 1u);
+
+    auto entry_size = [&] (const schema_ptr& s) {
+        return ondisk::schema_table_entry_size(ls.get_segment_manager().column_mappings().find(s->version())->serialized.size());
+    };
+    const auto expected = ondisk::schema_table_header_size + entry_size(schema) + entry_size(altered);
+    BOOST_REQUIRE_EQUAL(estimates.schema_table_size_estimate(schema->id()), expected);
+
+    write_and_flush_segment(ls, wide_cg, make_kv_mutation(wide, "pk0", "v0", api::timestamp_type(3)));
+    BOOST_REQUIRE_EQUAL(estimates.schema_table_size_estimate(wide->id()), ondisk::schema_table_header_size + entry_size(wide));
+    BOOST_REQUIRE_GT(entry_size(wide), entry_size(schema) + entry_size(altered));
+    BOOST_REQUIRE_EQUAL(estimates.schema_table_size_estimate(schema->id()), expected);
 }
 
 SEASTAR_THREAD_TEST_CASE(test_logstor_disabled_group_does_not_compact_on_submit) {

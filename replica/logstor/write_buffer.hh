@@ -263,6 +263,9 @@ public:
     size_t record_bytes() const noexcept { return _record_bytes; }
     size_t record_count() const noexcept { return _record_count; }
 
+    // Returns the size of the schema table of the schema versions that were appended so far.
+    size_t schema_table_size() const noexcept { return _schema_table.size(); }
+
     // Returns the bytes of an appended record frame, without the padding after the frame.
     bytes_view frame_bytes(frame_extent frame) const noexcept {
         return bytes_view(reinterpret_cast<const int8_t*>(_buffer.get() + frame.offset), frame.size);
@@ -357,6 +360,7 @@ public:
     size_t buffer_size() const noexcept { return _builder.buffer_size(); }
     size_t record_bytes() const noexcept { return _builder.record_bytes(); }
     size_t record_count() const noexcept { return _builder.record_count(); }
+    size_t schema_table_size() const noexcept { return _builder.schema_table_size(); }
 
 protected:
     write_buffer(size_t buffer_size, segment_kind kind);
