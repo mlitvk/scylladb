@@ -82,14 +82,15 @@ inline replica::logstor::log_record make_log_record(schema_ptr schema, sstring p
 
 // The mutation that a record value decodes to, for the tests that compare mutations: the decoder
 // gives a single_row_partition.
-inline mutation decode_to_mutation(const replica::logstor::record_value& v, schema_ptr s, const replica::logstor::record_header& h) {
-    auto partition = replica::logstor::decode_record_value(v, *s, h);
+inline mutation decode_to_mutation(const replica::logstor::record_value& v, schema_ptr s, const replica::logstor::record_header& h,
+        const replica::logstor::column_mapping_registry& mappings) {
+    auto partition = replica::logstor::decode_record_value(v, *s, h, mappings);
     return replica::logstor::to_mutation(std::move(s), h.key, std::move(partition));
 }
 
 // The mutation that a whole record holds.
-inline mutation to_mutation(const replica::logstor::log_record& r, schema_ptr s) {
-    return decode_to_mutation(r.value, std::move(s), r.header);
+inline mutation to_mutation(const replica::logstor::log_record& r, schema_ptr s, const replica::logstor::column_mapping_registry& mappings) {
+    return decode_to_mutation(r.value, std::move(s), r.header, mappings);
 }
 
 inline temporary_buffer<char> copy_chunk(bytes_view chunk) {
