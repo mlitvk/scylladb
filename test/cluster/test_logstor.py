@@ -305,6 +305,83 @@ async def test_recovery_with_segment_reuse(manager: ScyllaClusterManager):
             assert len(rows) == 1, f"Key {pk} not found after recovery"
             assert rows[0].v == expected_v, f"Key {pk} value mismatch after recovery"
 
+async def test_recovery_after_schema_change(manager: ScyllaClusterManager):
+    """
+    Test that records written before an ALTER TABLE stay readable after a restart.
+
+    Writes under two schema versions, each into segments of its own, restarts, and reads
+    everything back. Then alters the table once more and compacts, so that the records of both
+    versions are converted and rewritten into one segment.
+    """
+    cmdline = ['--logger-log-level', 'logstor=debug', '--smp=1']
+    cfg = {'experimental_features': ['logstor']}
+    servers = await manager.servers_add(1, cmdline=cmdline, config=cfg)
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "WITH tablets={'initial':1}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v int) WITH storage_engine = 'logstor'")
+
+        num_keys = 50
+        for i in range(num_keys):
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, v) VALUES ({i}, {i * 10})")
+        # The flush puts the rows of each schema version into a segment of their own, so that the
+        # compaction below merges segments of both versions.
+        await manager.api.logstor_flush(servers[0].ip_addr)
+
+        await cql.run_async(f"ALTER TABLE {ks}.test ADD v2 int")
+
+        # Rows written under the second schema version, some of them overwriting rows of the first.
+        with_v2 = set(range(10)) | set(range(num_keys, num_keys + 20))
+        for i in sorted(with_v2):
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, v, v2) VALUES ({i}, {i * 10}, {i * 100})")
+        await manager.api.logstor_flush(servers[0].ip_addr)
+        all_keys = range(num_keys + 20)
+
+        def check_row(row, with_v3, read):
+            assert row.v == row.pk * 10, f"Key {row.pk} has wrong v {row.v} in {read}"
+            expected_v2 = row.pk * 100 if row.pk in with_v2 else None
+            assert row.v2 == expected_v2, f"Key {row.pk} has wrong v2 {row.v2} in {read}, expected {expected_v2}"
+            if with_v3:
+                assert row.v3 is None, f"Key {row.pk} has v3 {row.v3} in {read}, which no write set"
+
+        async def check_rows(cql, with_v3=False):
+            columns = "pk, v, v2, v3" if with_v3 else "pk, v, v2"
+            for i in all_keys:
+                rows = await cql.run_async(f"SELECT {columns} FROM {ks}.test WHERE pk = {i} BYPASS CACHE")
+                assert len(rows) == 1, f"Key {i} not found"
+                check_row(rows[0], with_v3, "point read")
+            rows = await cql.run_async(f"SELECT {columns} FROM {ks}.test BYPASS CACHE")
+            assert len(rows) == len(all_keys), f"Range read returned {len(rows)} rows, expected {len(all_keys)}"
+            for row in rows:
+                check_row(row, with_v3, "range read")
+
+        async def get_segments() -> int:
+            metrics = await manager.metrics.query(servers[0].ip_addr)
+            return int(metrics.get("scylla_column_family_logstor_segments", {'ks': ks, 'cf': 'test'}) or 0)
+
+        await check_rows(cql)
+
+        await manager.server_stop_gracefully(servers[0].server_id)
+        await manager.server_start(servers[0].server_id)
+        cql, _ = await manager.get_ready_cql(servers)
+
+        await check_rows(cql)
+
+        # A third version, which no record on disk was written under: the records of both
+        # versions are converted to it.
+        await cql.run_async(f"ALTER TABLE {ks}.test ADD v3 int")
+        await check_rows(cql, with_v3=True)
+
+        # Automatic compaction may already have merged the segments of the two versions. A
+        # compaction request returns before the compaction runs, so request one until a single
+        # segment is left.
+        async def compacted() -> bool:
+            if await get_segments() == 1:
+                return True
+            await manager.api.logstor_compaction(servers[0].ip_addr)
+        await wait_for(compacted, time.time() + 60)
+        await check_rows(cql, with_v3=True)
+
 async def test_grow_logstor_disk_size(manager: ScyllaClusterManager):
     """
     Test that increasing the configured logstor disk size works correctly.
@@ -1129,6 +1206,51 @@ async def test_tablet_migration(manager: ScyllaClusterManager):
             rows = await cql.run_async(f"SELECT pk, v FROM {ks}.test WHERE pk = {i}")
             assert len(rows) == 1, f"Expected 1 row for key {i} after tablet migration, but got {len(rows)}"
             assert rows[0].v == f"{i}_{value}", f"Expected value '{i}_{value}' for key {i} after tablet migration, but got {rows[0].v}"
+
+async def test_tablet_migration_after_schema_change(manager: ScyllaClusterManager):
+    """
+    Test that records written before an ALTER TABLE stay readable after their tablet migrates.
+
+    The segments of a tablet are streamed as they are, so the destination reads records that
+    were written under a schema version older than the current one.
+    """
+    cmdline = ['--logger-log-level', 'logstor=debug', '--logger-log-level', 'stream_blob=debug', '--smp=1']
+    cfg = {'experimental_features': ['logstor']}
+    s1 = await manager.server_add(cmdline=cmdline, config=cfg, property_file={"dc": "dc1", "rack": "rack1"})
+    servers = [s1]
+    cql, _ = await manager.get_ready_cql(servers)
+
+    await manager.disable_tablet_balancing()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets={'initial': 2}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v int) WITH storage_engine = 'logstor'")
+
+        num_keys = 50
+        for i in range(num_keys):
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, v) VALUES ({i}, {i * 10})")
+
+        await cql.run_async(f"ALTER TABLE {ks}.test ADD v2 int")
+        with_v2 = set(range(10)) | set(range(num_keys, num_keys + 20))
+        for i in sorted(with_v2):
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, v, v2) VALUES ({i}, {i * 10}, {i * 100})")
+        all_keys = range(num_keys + 20)
+
+        s2 = await manager.server_add(cmdline=cmdline, config=cfg, property_file={"dc": "dc1", "rack": "rack1"})
+        servers.append(s2)
+        cql, _ = await manager.get_ready_cql(servers)
+
+        # migrate one tablet to the other node
+        h1 = await manager.get_host_id(s1.server_id)
+        h2 = await manager.get_host_id(s2.server_id)
+        tablet_token = 0
+        await manager.api.move_tablet(servers[0].ip_addr, ks, "test", h1, 0, h2, 0, tablet_token)
+
+        for i in all_keys:
+            rows = await cql.run_async(f"SELECT pk, v, v2 FROM {ks}.test WHERE pk = {i} BYPASS CACHE")
+            assert len(rows) == 1, f"Key {i} not found after tablet migration"
+            assert rows[0].v == i * 10, f"Key {i} has wrong v {rows[0].v} after tablet migration"
+            expected_v2 = i * 100 if i in with_v2 else None
+            assert rows[0].v2 == expected_v2, f"Key {i} has wrong v2 {rows[0].v2} after tablet migration, expected {expected_v2}"
 
 async def test_tablet_intranode_migration(manager: ScyllaClusterManager):
     """
