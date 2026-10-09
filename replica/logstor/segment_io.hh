@@ -44,6 +44,10 @@ using log_record_consumer = std::function<future<>(record_location, log_record)>
 // that copies them rather than decoding them.
 using log_record_bytes_consumer = std::function<future<>(record_location, const record_header&, log_record_bytes_view)>;
 using segment_info_consumer = std::function<future<>(const segment_info&)>;
+// Called for each entry of the schema table of a chunk, before any of the chunk's records. The
+// entry's mapping view is only valid during the call. A consumer that throws std::runtime_error
+// rejects the entry, and the scan skips the records of the entry's version.
+using schema_mapping_consumer = std::function<void(const ondisk::schema_table_entry&)>;
 using streamed_buffer_consumer = std::function<future<>(bytes_view)>;
 
 template <typename Consumer>
@@ -60,21 +64,27 @@ future<std::optional<segment_info>> read_segment_info(seastar::input_stream<char
 // Scans the chunks of a segment in order, and delivers their records.
 //
 // For each chunk with valid headers, the scan calls on_segment_info once, before it reads the body.
-// Then it calls on_record_header for each record frame, and on_record for each record that
-// on_record_header asks for. The views that on_record gets point into the chunk body. They are
-// valid until the future of on_record resolves.
+// When the body passes its CRC check, the scan calls on_schema_mapping for each entry of the
+// chunk's schema table, before it delivers any record of the chunk. Then it calls on_record_header
+// for each record frame, and on_record for each record that on_record_header asks for. The views
+// that on_record gets point into the chunk body. They are valid until the future of on_record
+// resolves.
 //
 // The scan stops at the first chunk whose headers are invalid, whose headers or body are cut short,
 // or whose segment_seq is not the one of the first chunk. The body is checked against its body CRC
 // before the scan delivers a record of the chunk. A chunk whose body fails gives its segment info
 // and no records, and the scan continues at the next chunk. The scan also stops after the only
-// chunk of a full segment. A record frame that does not parse ends the scan of its chunk only.
+// chunk of a full segment. A record frame that does not parse ends the scan of its chunk only. A
+// record whose schema version the schema table does not list for the record's table is skipped,
+// and so is a record of a version whose entry on_schema_mapping rejects. A schema table that does
+// not parse lists only the versions before the error.
 future<> scan_segment(seastar::input_stream<char>& in,
         log_segment_id segment_id,
         size_t segment_size,
         segment_info_consumer on_segment_info,
         record_header_consumer on_record_header,
-        log_record_bytes_consumer on_record);
+        log_record_bytes_consumer on_record,
+        schema_mapping_consumer on_schema_mapping = {});
 
 // The same, with each record given to on_record as a log_record.
 future<> scan_segment(seastar::input_stream<char>& in,
@@ -82,7 +92,8 @@ future<> scan_segment(seastar::input_stream<char>& in,
         size_t segment_size,
         segment_info_consumer on_segment_info,
         record_header_consumer on_record_header,
-        log_record_consumer on_record);
+        log_record_consumer on_record,
+        schema_mapping_consumer on_schema_mapping = {});
 
 // Rewrites the initial streamed logstor chunk header to the local segment sequence and
 // forwards subsequent bytes unchanged. This preserves the current branch's streaming

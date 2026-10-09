@@ -39,6 +39,10 @@ The `write_buffer` manages a buffer of log records and handles the serialization
 
 The `buffered_writer` manages multiple write buffers for user writes, an active buffer and multiple flushing ones, to batch writes and manage backpressure.
 
+#### Column Mapping Registry
+
+The `column_mapping_registry` keeps in memory, one registry per shard, the column mappings of the schema versions that the records were written under (see [Schema Table](#schema-table)). Writes and segment scans add to it, and compaction and the separator take mappings from it.
+
 ### Data Flow
 
 **Write Path:**
@@ -188,10 +192,11 @@ record_frame_1
 record_frame_2
 ...
 record_frame_n
+schema_table            -- the column mapping of each schema version the records use
 zero_padding            -- to align the entire chunk to block_alignment (4096 bytes)
 ```
 
-chunk_header, segment_header, and record frames are aligned by `record_alignment` (8 bytes).
+chunk_header, segment_header, record frames and the schema table are aligned by `record_alignment` (8 bytes).
 
 All integer fields in the structures below are serialized little-endian, including the two
 64-bit halves of a UUID.
@@ -281,6 +286,28 @@ The encoding is written and read in `replica/logstor/record_value.cc`, behind `e
 
 The value has no frame or size of its own: `value_size` gives its size.
 
+#### Schema Table
+
+Follows the record frames of the chunk, at offset `header(s) + records_size`, and takes `schema_table_size` bytes. It lists the column mapping of each schema version that the records of the chunk were written under, once per version. The mappings are kept on disk because the schema history in the system tables keeps superseded versions only for a while.
+
+| Offset | Size     | Field   | Description |
+|--------|----------|---------|-------------|
+| 0      | 4        | `count` | Number of entries. |
+| 4      | variable | entries | `count` entries, each as below. |
+
+Each entry:
+
+| Offset | Size           | Field            | Description |
+|--------|----------------|------------------|-------------|
+| 0      | 16             | `table`          | `table_id` (UUID) of the schema's table, written as its most significant and then its least significant 64-bit half. |
+| 16     | 16             | `schema_version` | The schema version, written like the table id. |
+| 32     | 4              | `mapping_size`   | Size in bytes of the mapping that follows. |
+| 36     | `mapping_size` | `column_mapping` | The columns of that schema version, IDL-serialized (`ser::serializer<column_mapping>`). |
+
+The body CRC covers the table. A scan reads the table before the records of the chunk and adds its entries to the column mapping registry. If the table does not parse, or does not list the version of a record, the scan logs an error and skips the records that it cannot trust.
+
+#### Locations
+
 **Record Location** (`record_location`):
 
 The `record_location` stored in the index for each record points to the start of the `record_frame_header`:
@@ -288,4 +315,6 @@ The `record_location` stored in the index for each record points to the start of
 - `offset`: byte offset from the start of the segment to the `record_frame_header`.
 - `size`: the `frame_size`, that is `record_frame_header` + `record_header` + `record_value`, without the padding that follows the frame. Reading exactly these bytes at this offset yields the whole record, which is what `segment_manager::read()` does.
 
-Where a chunk itself landed is a `segment_position` instead: the segment and the offset, with no size. Each record location is derived from it by adding the record's frame offset within the chunk. The two are separate types so that a chunk position cannot be read as a record location.
+**Chunk Position** (`segment_position`):
+
+Where a chunk itself landed is a `segment_position`: the segment and the offset, with no size. Each record location is derived from it by adding the record's frame offset within the chunk. The two are separate types so that a chunk position cannot be read as a record location.

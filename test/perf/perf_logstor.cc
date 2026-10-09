@@ -95,6 +95,8 @@
 // write, on every byte of the segment pool and on every read that goes to a segment, and it is what
 // a change to the format is measured by. The `frame:` line a measured run prints is the same
 // number for the one shape that run used.
+// The `table` column is the schema table entry of the version of the shape, which a chunk pays once
+// for all its records of that version.
 //
 //
 // The tests
@@ -460,6 +462,7 @@ struct record_sizes {
     size_t partition{};   // of the value, the partition itself
     size_t frame_size{};  // the record frame: the frame header, the record header and the value
     size_t padding{};     // what aligning the next frame after this one costs
+    size_t table_entry{}; // the schema table entry of the version, paid once per chunk
 };
 
 record_sizes measure_record(const schema& s, const mutation& m) {
@@ -482,6 +485,7 @@ record_sizes measure_record(const schema& s, const mutation& m) {
     };
     sizes.frame_size = ondisk::record_frame_header_size + sizes.header_size + sizes.value_size;
     sizes.padding = align_up(sizes.frame_size, ondisk::record_alignment) - sizes.frame_size;
+    sizes.table_entry = ondisk::schema_table_entry_size(sizes.mapping);
     return sizes;
 }
 
@@ -489,11 +493,12 @@ record_sizes measure_record(const schema& s, const mutation& m) {
 // bytes go. See the record size report in the comment at the top of this file.
 void print_record_size_report(const std::vector<size_t>& key_sizes, const std::vector<size_t>& column_counts,
         const std::vector<size_t>& value_sizes) {
-    fmt::print("{:>4} {:>5} {:>6} {:>8} | {:>7} {:>7} {:>7} {:>4} | {:>9} {:>6} | {:>8} {:>10}\n",
+    fmt::print("{:>4} {:>5} {:>6} {:>8} | {:>7} {:>7} {:>7} {:>4} | {:>9} {:>6} | {:>8} {:>10} | {:>6}\n",
             "key", "cols", "value", "payload",
             "header", "value", "frame", "pad",
             "overhead", "ratio",
-            "mapping", "partition");
+            "mapping", "partition",
+            "table");
     for (auto columns : column_counts) {
         auto s = make_kv_schema(static_cast<unsigned>(columns));
         for (auto value_size : value_sizes) {
@@ -501,12 +506,13 @@ void print_record_size_report(const std::vector<size_t>& key_sizes, const std::v
                 const row_shape shape{.key_size = key_size, .columns = columns, .value_size = value_size};
                 const auto sizes = measure_record(*s, make_report_mutation(s, shape));
                 const auto payload = shape.payload_size();
-                fmt::print("{:>4} {:>5} {:>6} {:>8} | {:>7} {:>7} {:>7} {:>4} | {:>9} {:>6.2f} | {:>8} {:>10}\n",
+                fmt::print("{:>4} {:>5} {:>6} {:>8} | {:>7} {:>7} {:>7} {:>4} | {:>9} {:>6.2f} | {:>8} {:>10} | {:>6}\n",
                         key_size, columns, value_size, payload,
                         sizes.header_size, sizes.value_size, sizes.frame_size, sizes.padding,
                         sizes.frame_size - payload,
                         payload ? double(sizes.frame_size) / payload : 0.0,
-                        sizes.mapping, sizes.partition);
+                        sizes.mapping, sizes.partition,
+                        sizes.table_entry);
             }
         }
     }
@@ -749,7 +755,7 @@ public:
             _serialization_buffer->append(log_record_writer(log_record{
                 .header = make_record_header(_mutation->decorated_key()),
                 .value = encode_record_value(*_mutation),
-            }));
+            }, column_mappings().add(*_mutation->schema())));
         }
     }
 
@@ -918,6 +924,10 @@ private:
         return *_cached_keys[tests::random::get_int<size_t>(_cached_keys.size() - 1)];
     }
 
+    column_mapping_registry& column_mappings() noexcept {
+        return _logstor->get_segment_manager().column_mappings();
+    }
+
     record_header make_record_header(const dht::decorated_key& key) const {
         return record_header{
             .key = key,
@@ -970,7 +980,7 @@ private:
             .header = make_record_header(_mutation->decorated_key()),
             .value = encode_record_value(*_mutation),
         });
-        _record_writer.emplace(*_record);
+        _record_writer.emplace(*_record, column_mappings().add(*_schema));
         _serialization_buffer->reset();
         auto appended = _serialization_buffer->append(*_record_writer);
         _serialized_record = temporary_buffer<char>(_serialization_buffer->data() + appended.frame_offset,

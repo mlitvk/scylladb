@@ -162,6 +162,9 @@ future<> logstor::do_write(const schema& s, dht::decorated_key dk, api::timestam
     primary_index_key key(dk);
     auto& index = cg.logstor_index();
 
+    // The registry serializes the mapping of a schema version only on its first write.
+    const auto& mapping = _segment_manager.column_mappings().add(s);
+
     log_record record {
         .header = {
             .key = std::move(dk),
@@ -172,7 +175,7 @@ future<> logstor::do_write(const schema& s, dht::decorated_key dk, api::timestam
         .value = std::move(value),
     };
 
-    auto writer = log_record_writer(std::move(record));
+    auto writer = log_record_writer(std::move(record), mapping);
 
     // Two waits, not one: first for the record to be taken into a buffer, then for that buffer to
     // reach a segment. They are awaited here rather than behind a call of their own, which would

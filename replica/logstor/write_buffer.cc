@@ -49,14 +49,28 @@ void raw_write_buffer::reset() {
     _record_count = 0;
     _min_token = std::nullopt;
     _max_token = std::nullopt;
+    _schema_table.clear();
+    _schema_table_size = ondisk::schema_table_header_size;
     _body = std::nullopt;
     _sealed = false;
 }
 
-bool raw_write_buffer::can_fit(size_t record_size) const noexcept {
-    // The record with its frame header and the padding that follows the frame.
-    const auto frame_size = ondisk::record_frame_header_size + record_size;
-    return align_up(frame_size, ondisk::record_alignment) <= _stream.size();
+bool raw_write_buffer::can_fit(size_t record_size, size_t schema_table_growth) const noexcept {
+    // The padded record frame, and the padded schema table that follows the last record.
+    const auto padded_frame_size = align_up(ondisk::record_frame_header_size + record_size, ondisk::record_alignment);
+    const auto table_size = align_up(_schema_table_size + schema_table_growth, ondisk::record_alignment);
+    return padded_frame_size + table_size <= _stream.size();
+}
+
+size_t raw_write_buffer::schema_table_growth(const schema_mapping& mapping) const noexcept {
+    // Matched by version and not by entry, so that the entries of two registries do not list a
+    // version twice. The last version appended is the likely one, so it is checked first.
+    for (auto it = _schema_table.rbegin(); it != _schema_table.rend(); ++it) {
+        if ((*it)->version == mapping.version) {
+            return 0;
+        }
+    }
+    return ondisk::schema_table_entry_size(mapping.serialized.size());
 }
 
 bool raw_write_buffer::has_data() const noexcept {
@@ -77,9 +91,24 @@ raw_write_buffer::append_result raw_write_buffer::append(const Writer& writer) {
         on_internal_error(logstor_logger, "Cannot append a record to a finished write buffer");
     }
 
+    const auto& mapping = writer.mapping();
+    if (mapping.version != header.schema_version || mapping.table != header.table) {
+        on_internal_error(logstor_logger, fmt::format("Record of table {} schema version {} appended with the column mapping of table {} schema version {}",
+                header.table, header.schema_version, mapping.table, mapping.version));
+    }
+
     const auto record_size = header_size + value_size;
-    if (!can_fit(record_size)) {
-        throw std::runtime_error(fmt::format("Record of size {} does not fit the {} bytes left in the buffer", record_size, _stream.size()));
+    const auto schema_table_growth = this->schema_table_growth(mapping);
+    if (!can_fit(record_size, schema_table_growth)) {
+        throw std::runtime_error(fmt::format("Record of size {} does not fit the {} bytes left in the buffer, of which the schema table takes {} ({} for schema version {})",
+                record_size, _stream.size(), _schema_table_size + schema_table_growth, schema_table_growth, header.schema_version));
+    }
+
+    // The entry goes into the table before the frame is written. If push_back() throws, the buffer
+    // is unchanged, and no frame is left whose version the table does not list.
+    if (schema_table_growth > 0) {
+        _schema_table.push_back(&mapping);
+        _schema_table_size += schema_table_growth;
     }
 
     const size_t frame_offset = serialized_size();
@@ -113,15 +142,34 @@ void raw_write_buffer::pad_to_alignment(size_t alignment) {
     }
 }
 
+void raw_write_buffer::write_schema_table() {
+    // The room was reserved by can_fit() as the records were appended.
+    auto out = _stream.write_substream(_schema_table_size);
+    ser::serializer<uint32_t>::write(out, static_cast<uint32_t>(_schema_table.size()));
+    for (const auto* mapping : _schema_table) {
+        ondisk::write_schema_table_entry(out, ondisk::schema_table_entry{
+            .table = mapping->table,
+            .version = mapping->version,
+            .mapping = bytes_view(mapping->serialized),
+        });
+    }
+    if (out.size() != 0) {
+        on_internal_error(logstor_logger, fmt::format("Schema table of {} bytes left {} unwritten", _schema_table_size, out.size()));
+    }
+}
+
 size_t raw_write_buffer::finish() {
     if (_body) {
         return serialized_size();
     }
     const size_t records_size = serialized_size() - chunk_headers_size();
-    const auto body_crc = ondisk::calculate_body_crc(std::span(_buffer.get() + chunk_headers_size(), records_size));
+    write_schema_table();
+    const auto body_crc = ondisk::calculate_body_crc(std::span(_buffer.get() + chunk_headers_size(),
+            records_size + _schema_table_size));
     pad_to_alignment(ondisk::block_alignment);
     _body = finished_body{
         .records_size = static_cast<uint32_t>(records_size),
+        .schema_table_size = static_cast<uint32_t>(_schema_table_size),
         .body_crc = body_crc,
     };
     return serialized_size();
@@ -149,7 +197,7 @@ bytes_view raw_write_buffer::seal(segment_sequence segment_seq, std::optional<ta
         .segment_seq = segment_seq,
         .records_size = _body->records_size,
         .body_crc = _body->body_crc,
-        .schema_table_size = 0,
+        .schema_table_size = _body->schema_table_size,
     };
     // The CRC of the chunk header covers the segment header too.
     chunk_hdr.crc = chunk_hdr.calculate_crc(seg_hdr);
@@ -690,10 +738,12 @@ future<buffered_write_result> buffered_writer::write_to_buffer(log_record_writer
     // later rewrites it into, so it is bounded by whichever of the two takes less: one that only
     // fits the buffer it is written to first would be accepted here and then never fit anywhere the
     // separator could put it.
-    const size_t max_size = raw_write_buffer::max_record_size_any_kind(head_buf().buffer_size());
+    const size_t max_size = raw_write_buffer::max_record_size_any_kind(head_buf().buffer_size(), writer.mapping());
     if (writer.record_size() > max_size) [[unlikely]] {
-        return make_exception_future<buffered_write_result>(std::runtime_error(
-                fmt::format("Write size {} exceeds the maximum record size {}", writer.record_size(), max_size)));
+        return make_exception_future<buffered_write_result>(std::runtime_error(fmt::format(
+                "Write size {} exceeds the maximum record size {} of a {} byte buffer, whose schema table takes {} bytes for schema version {}",
+                writer.record_size(), max_size, head_buf().buffer_size(),
+                raw_write_buffer::schema_table_size(writer.mapping()), writer.header().schema_version)));
     }
 
     // fast path - if there are no queued writes and there is space in the current head buffer or the next, advance the

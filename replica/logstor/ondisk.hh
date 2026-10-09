@@ -8,9 +8,11 @@
 
 #pragma once
 
+#include <concepts>
 #include <limits>
 #include <optional>
 #include <span>
+#include <seastar/core/simple-stream.hh>
 
 #include "idl/uuid.dist.hh"
 #include "idl/uuid.dist.impl.hh"
@@ -58,7 +60,7 @@ struct segment_header;
 // a multiple of it. A chunk is this header, the segment_header in a full segment, and the chunk's
 // body: the record frames and the schema table that follows them. Chunks are appended to a mixed
 // segment one at a time; a full segment is a single chunk. A write buffer builds a chunk in memory
-// and seals it - pads it and fills in its header - before it is written.
+// and seals it - writes its schema table, pads it and fills in its header - before it is written.
 struct chunk_header {
     uint32_t magic;
     segment_kind kind;
@@ -380,6 +382,85 @@ log_record read_record_frame(Input& in) {
         .header = read_record_header(header_stream, frame_header.key_size),
         .value = record_value(bytes_view(reinterpret_cast<const int8_t*>(value_stream.begin()), value_stream.size())),
     };
+}
+
+// The schema table of a chunk lists the column mapping of every schema version the records of
+// the chunk were written under, once per version. The table follows the records of the chunk,
+// because which versions a chunk holds is only known once its buffer is finished, and
+// chunk_header carries its size. Its encoding:
+//
+//   u32  entry count
+//   per entry:
+//     i64  table id, most significant half
+//     i64  table id, least significant half
+//     i64  schema version, most significant half
+//     i64  schema version, least significant half
+//     u32  mapping size
+//          column_mapping   ser::serializer<column_mapping>, from idl/mutation.idl.hh
+//
+// Every record of a chunk names a version that the table has an entry for, with the record's own
+// table, and a scan checks that.
+struct schema_table_entry {
+    table_id table;
+    table_schema_version version;
+    bytes_view mapping; // the IDL-serialized column_mapping
+
+    bool operator==(const schema_table_entry& other) const noexcept = default;
+};
+
+static constexpr size_t schema_table_header_size = sizeof(uint32_t);
+static constexpr size_t schema_table_entry_fixed_size =
+    2 * sizeof(int64_t)         // table id
+    + 2 * sizeof(int64_t)       // schema version
+    + sizeof(uint32_t);         // mapping size
+
+constexpr size_t schema_table_entry_size(size_t mapping_size) noexcept {
+    return schema_table_entry_fixed_size + mapping_size;
+}
+
+template <typename Output>
+void write_schema_table_entry(Output& out, const schema_table_entry& e) {
+    ser::serializer<int64_t>::write(out, e.table.uuid().get_most_significant_bits());
+    ser::serializer<int64_t>::write(out, e.table.uuid().get_least_significant_bits());
+    ser::serializer<int64_t>::write(out, e.version.uuid().get_most_significant_bits());
+    ser::serializer<int64_t>::write(out, e.version.uuid().get_least_significant_bits());
+    ser::serializer<uint32_t>::write(out, static_cast<uint32_t>(e.mapping.size()));
+    out.write(reinterpret_cast<const char*>(e.mapping.data()), e.mapping.size());
+}
+
+// Calls f(const schema_table_entry&) for each entry of the schema table in `table`, whose
+// mapping views point into `table`. Throws std::runtime_error if the table is malformed, and
+// whatever f throws.
+template <std::invocable<const schema_table_entry&> F>
+void for_each_schema_table_entry(bytes_view table, F&& f) {
+    auto in = seastar::simple_memory_input_stream(reinterpret_cast<const char*>(table.data()), table.size());
+    if (in.size() < schema_table_header_size) {
+        throw std::runtime_error(fmt::format("Schema table of {} bytes is shorter than its header", table.size()));
+    }
+    const auto count = ser::serializer<uint32_t>::read(in);
+    for (uint32_t i = 0; i < count; ++i) {
+        if (in.size() < schema_table_entry_fixed_size) {
+            throw std::runtime_error(fmt::format("Schema table entry {} of {} is truncated", i, count));
+        }
+        auto table_msb = ser::serializer<int64_t>::read(in);
+        auto table_lsb = ser::serializer<int64_t>::read(in);
+        auto version_msb = ser::serializer<int64_t>::read(in);
+        auto version_lsb = ser::serializer<int64_t>::read(in);
+        const auto mapping_size = ser::serializer<uint32_t>::read(in);
+        if (in.size() < mapping_size) {
+            throw std::runtime_error(fmt::format("Schema table entry {} of {} claims a mapping of {} bytes with {} left", i, count, mapping_size, in.size()));
+        }
+        auto mapping = bytes_view(reinterpret_cast<const int8_t*>(in.begin()), mapping_size);
+        in.skip(mapping_size);
+        f(schema_table_entry{
+            .table = table_id(utils::UUID(table_msb, table_lsb)),
+            .version = table_schema_version(utils::UUID(version_msb, version_lsb)),
+            .mapping = mapping,
+        });
+    }
+    if (in.size() != 0) {
+        throw std::runtime_error(fmt::format("Schema table has {} bytes past its {} entries", in.size(), count));
+    }
 }
 
 } // namespace replica::logstor::ondisk

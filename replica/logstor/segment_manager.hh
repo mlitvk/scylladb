@@ -19,6 +19,7 @@
 #include <seastar/util/bool_class.hh>
 #include "bytes_fwd.hh"
 #include "mutation_writer/token_group_based_splitting_writer.hh"
+#include "replica/logstor/column_mapping_registry.hh"
 #include "replica/logstor/segment_io.hh"
 #include "replica/logstor/write_buffer.hh"
 #include "replica/logstor/compaction.hh"
@@ -123,6 +124,10 @@ public:
     // Reads the record at a location from the index. Keep the guard of the location until the
     // read is complete, so that the segment stays allocated.
     future<log_record> read(const index_read_guard&, record_location location);
+
+    // The column mappings of the schema versions in the segments of this shard.
+    column_mapping_registry& column_mappings() noexcept;
+    const column_mapping_registry& column_mappings() const noexcept;
 
     void on_add_record(record_location location) noexcept override;
     void on_free_record(record_location location) noexcept override;

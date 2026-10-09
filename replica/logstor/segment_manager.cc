@@ -991,6 +991,9 @@ class segment_manager_impl {
     future<> _reserve_replenisher{make_ready_future<>()};
     seastar::condition_variable _segment_freed_cv;
 
+    // Declared ahead of the buffer pools, because their buffers and writers point into it.
+    column_mapping_registry _column_mappings;
+
     write_buffer_pool _compaction_buffer_pool;
     write_buffer_pool _separator_buffer_pool;
     abort_source _separator_buffer_abort;
@@ -1023,6 +1026,21 @@ public:
     future<> write_full_segment(write_buffer&, logstor_group&, write_source);
 
     future<log_record> read(record_location);
+
+    column_mapping_registry& column_mappings() noexcept { return _column_mappings; }
+    const column_mapping_registry& column_mappings() const noexcept { return _column_mappings; }
+
+    // The registry entry of the schema version of a record that is rewritten from its bytes. A scan
+    // delivers a record only after the registry took the entry of its version, so a missing entry
+    // is an internal error.
+    const schema_mapping& mapping_for_rewrite(const record_header& header, record_location loc) const {
+        const auto* mapping = _column_mappings.find(header.schema_version);
+        if (!mapping) [[unlikely]] {
+            on_internal_error(logstor_logger, fmt::format("Record at {} of table {} names schema version {} which has no column mapping",
+                    loc, header.table, header.schema_version));
+        }
+        return *mapping;
+    }
 
     void on_add_record(record_location) noexcept;
     void on_free_record(record_location) noexcept;
@@ -1908,7 +1926,10 @@ future<> segment_manager_impl::scan_segment(log_segment_id segment_id,
         .read_ahead = 0,
     });
     auto scan_result = co_await coroutine::as_future(::replica::logstor::scan_segment(in, segment_id, _cfg.segment_size,
-            std::move(on_segment_info), std::move(on_record_header), std::move(on_record)));
+            std::move(on_segment_info), std::move(on_record_header), std::move(on_record),
+            [this] (const ondisk::schema_table_entry& e) {
+                _column_mappings.add(e.table, e.version, e.mapping);
+            }));
     co_await in.close();
     if (scan_result.failed()) {
         co_await coroutine::return_exception_ptr(scan_result.get_exception());
@@ -2253,7 +2274,7 @@ struct compaction_buffer {
         auto* index_ptr = &index;
         auto key = header.index_key();
 
-        auto writer = log_record_bytes_writer(header, record_view);
+        auto writer = log_record_bytes_writer(header, record_view, sm.mapping_for_rewrite(header, read_location));
 
         if (!buf->can_fit(writer)) {
             co_await flush();
@@ -2799,12 +2820,12 @@ future<> segment_manager_impl::add_segment_to_compaction_group(replica::database
                     return want_data::no;
                 }
             },
-            [seg_ref, &db] (record_location prev_loc, const record_header& header, log_record_bytes_view record_view) -> future<> {
+            [this, seg_ref, &db] (record_location prev_loc, const record_header& header, log_record_bytes_view record_view) -> future<> {
                 try {
                     auto& t = db.find_column_family(header.table);
                     auto key = header.index_key();
                     auto& cg = t.get_logstor_group(key.token());
-                    auto writer = log_record_bytes_writer(header, record_view);
+                    auto writer = log_record_bytes_writer(header, record_view, mapping_for_rewrite(header, prev_loc));
 
                     co_await cg.write_to_separator(std::move(writer), seg_ref, std::nullopt,
                         separator_index_update {
@@ -2884,6 +2905,14 @@ future<> segment_manager::write(write_buffer& wb) {
 
 future<log_record> segment_manager::read(const index_read_guard&, record_location location) {
     return _impl->read(location);
+}
+
+column_mapping_registry& segment_manager::column_mappings() noexcept {
+    return _impl->column_mappings();
+}
+
+const column_mapping_registry& segment_manager::column_mappings() const noexcept {
+    return _impl->column_mappings();
 }
 
 compaction_manager& segment_manager::get_compaction_manager() noexcept {

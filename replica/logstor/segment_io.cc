@@ -8,12 +8,19 @@
 
 #include "replica/logstor/segment_io.hh"
 
+#include <algorithm>
+#include <new>
+#include <optional>
+#include <stdexcept>
+#include <tuple>
+
 #include <seastar/core/align.hh>
 #include <seastar/core/on_internal_error.hh>
 #include <seastar/core/simple-stream.hh>
 #include <seastar/util/log.hh>
 
 #include "serializer_impl.hh"
+#include "utils/small_vector.hh"
 
 namespace replica::logstor {
 
@@ -142,6 +149,52 @@ future<std::optional<chunk_body>> read_chunk_body(segment_reader& reader,
     co_return chunk_body{std::move(body), valid};
 }
 
+// An entry of the schema table of a chunk.
+struct listed_schema_version {
+    table_schema_version version;
+    table_id table;
+};
+
+using listed_schema_versions = utils::small_vector<listed_schema_version, 2>;
+
+// Parses the schema table of a chunk whose body passed its CRC check, calls on_schema_mapping for
+// each entry, and returns the entries whose records the scan delivers: not the entries that
+// on_schema_mapping rejects, and, if the table does not parse, not the entries after the error.
+//
+// The body CRC covers the table, so a table that does not parse, or that does not list the version
+// of a record, comes from a writer bug or from corruption that the CRC does not catch. The scan
+// still delivers the records of the other versions, because a record that it skips is lost:
+// recovery does not index it. Compaction and split do not rewrite it either, so if the index still
+// points to it, its segment keeps live bytes and free_segment() stops the node, as for a chunk that
+// fails its CRC check.
+listed_schema_versions parse_schema_table(bytes_view table,
+        size_t records_position,
+        log_segment_id segment_id,
+        const schema_mapping_consumer& on_schema_mapping) {
+    listed_schema_versions versions;
+    try {
+        ondisk::for_each_schema_table_entry(table, [&] (const ondisk::schema_table_entry& e) {
+            if (on_schema_mapping) {
+                try {
+                    on_schema_mapping(e);
+                } catch (const std::runtime_error& ex) {
+                    logstor_logger.error("The schema table of the chunk in {} with records at {} lists schema version {} of table {}, which is rejected. "
+                            "The scan skips the records of the version: {}",
+                            segment_id, records_position, e.version, e.table, ex.what());
+                    return;
+                }
+            }
+            versions.push_back({.version = e.version, .table = e.table});
+        });
+    } catch (const std::runtime_error& e) {
+        // The framing checks. Anything else, such as std::bad_alloc, fails the scan.
+        logstor_logger.error("The schema table of the chunk in {} with records at {} is not valid. "
+                "The scan delivers only the records of the versions listed before the error: {}",
+                segment_id, records_position, e.what());
+    }
+    return versions;
+}
+
 struct parsed_record {
     record_header header;
     log_record_bytes_view bytes; // views into the chunk body
@@ -177,13 +230,17 @@ std::optional<parsed_record> read_record(simple_memory_input_stream& records) {
 }
 
 // records_position is where the records start within the segment, which is what a record's
-// location is relative to. A record that does not parse ends the scan of the chunk.
+// location is relative to. A record that does not parse ends the scan of the chunk. A record whose
+// schema version and table are not in `versions` is skipped.
 future<> scan_chunk_records(simple_memory_input_stream records,
         size_t records_position,
         log_segment_id segment_id,
+        std::span<const listed_schema_version> versions,
         const record_header_consumer& on_record_header,
         const log_record_bytes_consumer& on_record) {
     const size_t records_size = records.size();
+    size_t skipped = 0;
+    std::optional<std::tuple<size_t, table_id, table_schema_version>> first_skipped;
     while (records.size() > 0) {
         const size_t record_offset = records_position + (records_size - records.size());
         auto record = read_record(records);
@@ -191,22 +248,40 @@ future<> scan_chunk_records(simple_memory_input_stream records,
             break;
         }
 
-        logstor_logger.trace("Found record of size {} bytes in {}",
-                            record->bytes.header.size() + record->bytes.value.size(), segment_id);
+        const auto& header = record->header;
+        const bool listed = std::ranges::any_of(versions, [&] (const listed_schema_version& v) {
+            return v.version == header.schema_version && v.table == header.table;
+        });
+        if (!listed) [[unlikely]] {
+            if (!first_skipped) {
+                first_skipped.emplace(record_offset, header.table, header.schema_version);
+            }
+            ++skipped;
+        } else {
+            logstor_logger.trace("Found record of size {} bytes in {}",
+                                record->bytes.header.size() + record->bytes.value.size(), segment_id);
 
-        record_location loc {
-            .segment = segment_id,
-            .offset = static_cast<uint32_t>(record_offset),
-            .size = static_cast<uint32_t>(ondisk::record_frame_size(record->bytes.header.size(), record->bytes.value.size()))
-        };
+            record_location loc {
+                .segment = segment_id,
+                .offset = static_cast<uint32_t>(record_offset),
+                .size = static_cast<uint32_t>(ondisk::record_frame_size(record->bytes.header.size(), record->bytes.value.size()))
+            };
 
-        if (on_record_header(loc, record->header) == want_data::yes) {
-            co_await on_record(loc, record->header, record->bytes);
+            if (on_record_header(loc, header) == want_data::yes) {
+                co_await on_record(loc, header, record->bytes);
+            }
         }
 
         // The next record frame starts at a multiple of record_alignment.
         const size_t consumed = records_size - records.size();
         records.skip(std::min(align_up(consumed, ondisk::record_alignment) - consumed, records.size()));
+    }
+
+    if (skipped > 0) {
+        const auto& [offset, table, version] = *first_skipped;
+        logstor_logger.error("Skipped {} records of the chunk in {} with records at {}: the schema table of the chunk does not list "
+                "their schema version for their table. The first is at {}, of table {} with schema version {}.",
+                skipped, segment_id, records_position, offset, table, version);
     }
 }
 
@@ -227,7 +302,8 @@ future<> scan_segment(seastar::input_stream<char>& in,
         size_t segment_size,
         segment_info_consumer on_segment_info,
         record_header_consumer on_record_header,
-        log_record_bytes_consumer on_record) {
+        log_record_bytes_consumer on_record,
+        schema_mapping_consumer on_schema_mapping) {
     segment_reader reader(in);
     std::optional<segment_sequence> segment_seq;
     // The number of chunks whose body does not match its CRC, and whether the last chunk of the scan
@@ -269,10 +345,13 @@ future<> scan_segment(seastar::input_stream<char>& in,
         // earlier use of the segment that parse cleanly.
         if (body_valid) {
             last_chunk_failed = false;
-            // The records are the start of the body, which the reader has just read.
+            // The schema table follows the records. It is parsed first, so that on_schema_mapping
+            // sees the mapping of a schema version before the records of the version.
             const size_t records_position = reader.position() - body_buf.size();
+            const auto schema_table = bytes_view(reinterpret_cast<const int8_t*>(body_buf.get()) + ch.records_size, ch.schema_table_size);
+            const auto versions = parse_schema_table(schema_table, records_position, segment_id, on_schema_mapping);
             auto records = simple_memory_input_stream(body_buf.get(), ch.records_size);
-            co_await scan_chunk_records(records, records_position, segment_id, on_record_header, on_record);
+            co_await scan_chunk_records(records, records_position, segment_id, versions, on_record_header, on_record);
         } else {
             // The valid header gives the size of the chunk, so the scan continues at the next
             // chunk. After a torn chunk, what follows is not a valid chunk or is a chunk of an
@@ -306,12 +385,14 @@ future<> scan_segment(seastar::input_stream<char>& in,
         size_t segment_size,
         segment_info_consumer on_segment_info,
         record_header_consumer on_record_header,
-        log_record_consumer on_record) {
+        log_record_consumer on_record,
+        schema_mapping_consumer on_schema_mapping) {
     co_await scan_segment(in, segment_id, segment_size,
             std::move(on_segment_info), std::move(on_record_header),
             [on_record = std::move(on_record)] (record_location loc, const record_header& header, log_record_bytes_view record_view) {
                 return on_record(loc, log_record{header, record_value(record_view.value)});
-            });
+            },
+            std::move(on_schema_mapping));
 }
 
 streamed_segment_rewriter::streamed_segment_rewriter(log_segment_id target_segment, segment_sequence target_seq, streamed_buffer_consumer on_buffer)

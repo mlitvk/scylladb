@@ -17,6 +17,7 @@
 #include <span>
 #include <vector>
 #include <fmt/format.h>
+#include <seastar/core/align.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/format.hh>
 #include <seastar/core/temporary_buffer.hh>
@@ -73,8 +74,21 @@ mutation make_kv_mutation(schema_ptr schema, sstring pk, sstring value, api::tim
     return m;
 }
 
+// The registry the tests write and read records through.
+column_mapping_registry& test_registry() {
+    static column_mapping_registry registry;
+    return registry;
+}
+
+log_record_writer make_writer(log_record record) {
+    const auto* mapping = test_registry().find(record.header.schema_version);
+    BOOST_REQUIRE(mapping);
+    return log_record_writer(std::move(record), *mapping);
+}
+
 log_record make_log_record(schema_ptr schema, sstring pk, sstring value, api::timestamp_type ts = api::min_timestamp) {
     auto m = make_kv_mutation(schema, std::move(pk), std::move(value), ts);
+    test_registry().add(*schema);
     return log_record {
         .header = {
             .key = m.decorated_key(),
@@ -159,6 +173,25 @@ void reseal_chunk_crcs(temporary_buffer<char>& buf) {
     ser::serialize<ondisk::chunk_header>(out, ch);
 }
 
+struct schema_table_entry_copy {
+    table_id table;
+    table_schema_version version;
+    bytes mapping;
+};
+
+std::vector<schema_table_entry_copy> read_schema_table(bytes_view chunk, const ondisk::chunk_header& ch) {
+    const auto* table = chunk.data() + raw_write_buffer::chunk_headers_size(ch.kind) + ch.records_size;
+    std::vector<schema_table_entry_copy> entries;
+    ondisk::for_each_schema_table_entry(bytes_view(table, ch.schema_table_size), [&entries] (const ondisk::schema_table_entry& e) {
+        entries.push_back(schema_table_entry_copy{
+            .table = e.table,
+            .version = e.version,
+            .mapping = bytes(e.mapping.begin(), e.mapping.end()),
+        });
+    });
+    return entries;
+}
+
 struct rewritten_stream_result {
     temporary_buffer<char> data;
     size_t write_count{0};
@@ -188,7 +221,7 @@ struct scanned_record {
     log_record record;
 };
 
-std::vector<scanned_record> scan_buffer_records(const temporary_buffer<char>& buf, log_segment_id segment_id) {
+std::vector<scanned_record> scan_buffer_records(const temporary_buffer<char>& buf, log_segment_id segment_id, schema_mapping_consumer on_schema_mapping = {}) {
     temporary_buffer<char> copy(buf.size());
     std::copy_n(buf.get(), buf.size(), copy.get_write());
     auto in = seastar::util::as_input_stream(std::move(copy));
@@ -204,7 +237,8 @@ std::vector<scanned_record> scan_buffer_records(const temporary_buffer<char>& bu
         [&records] (record_location loc, log_record rec) {
             records.push_back(scanned_record{.location = loc, .record = std::move(rec)});
             return make_ready_future<>();
-        }).get();
+        },
+        std::move(on_schema_mapping)).get();
     in.close().get();
 
     return records;
@@ -236,7 +270,7 @@ sstring make_single_buffer_value(schema_ptr schema, size_t buffer_size) {
         auto next_value = value;
         next_value += sstring("x");
         auto next_record = make_log_record(schema, "pk0000", next_value, api::timestamp_type(17));
-        auto next_writer = log_record_writer(next_record);
+        auto next_writer = make_writer(next_record);
         raw_write_buffer wb(buffer_size, segment_kind::mixed);
 
         BOOST_REQUIRE(wb.can_fit(next_writer));
@@ -410,7 +444,7 @@ void close_and_return(owned_write_buffer buf) {
 }
 
 size_t record_size_with_value(schema_ptr schema, const sstring& pk, size_t value_size) {
-    return log_record_writer(make_log_record(schema, pk, sstring(value_size, 'x'))).record_size();
+    return make_writer(make_log_record(schema, pk, sstring(value_size, 'x'))).record_size();
 }
 
 // Builds a mutation whose log record serializes to exactly `record_size` bytes, by sizing its value
@@ -645,7 +679,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_record_and_header_serializati
     auto expected = make_log_record(schema, "pk0", "v0", api::timestamp_type(7));
 
     raw_write_buffer wb(32 * 1024, segment_kind::full);
-    auto writer = log_record_writer(expected);
+    auto writer = make_writer(expected);
     auto expected_records_size = size_t(ondisk::record_frame_header_size) + writer.record_size();
     expected_records_size = ((expected_records_size + ondisk::record_alignment - 1) / ondisk::record_alignment) * ondisk::record_alignment;
     wb.append(std::move(writer));
@@ -664,6 +698,134 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_record_and_header_serializati
     BOOST_REQUIRE_EQUAL(sh.table, schema->id());
     BOOST_REQUIRE_EQUAL(sh.first_token, expected.header.key.token());
     BOOST_REQUIRE_EQUAL(sh.last_token, expected.header.key.token());
+
+    // The schema table follows the records and lists the one version the record was written under.
+    const auto& mapping = *test_registry().find(schema->version());
+    BOOST_REQUIRE_EQUAL(ch.schema_table_size, raw_write_buffer::schema_table_size(mapping));
+    auto entries = read_schema_table(chunk, ch);
+    BOOST_REQUIRE_EQUAL(entries.size(), 1u);
+    BOOST_REQUIRE_EQUAL(entries[0].table, schema->id());
+    BOOST_REQUIRE_EQUAL(entries[0].version, schema->version());
+    BOOST_REQUIRE(entries[0].mapping == mapping.serialized);
+}
+
+// Checks that the size finish() returns covers the schema table. The records end at every offset
+// of a block, also close enough to its end for the table to push the chunk into the next block.
+SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_finish_counts_the_schema_table) {
+    auto schema = make_kv_schema();
+    const auto table_size = raw_write_buffer::schema_table_size(test_registry().add(*schema));
+    BOOST_REQUIRE_LT(table_size, ondisk::block_alignment);
+
+    for (size_t value_size = 1; value_size <= ondisk::block_alignment; value_size += ondisk::record_alignment) {
+        raw_write_buffer wb(4 * ondisk::block_alignment, segment_kind::mixed);
+        wb.append(make_writer(make_log_record(schema, "pk0", sstring(value_size, 'x'), api::timestamp_type(1))));
+        const auto size = wb.finish();
+        const auto ch = read_chunk_header(copy_chunk(wb.seal(segment_sequence{1}, std::nullopt)));
+        BOOST_REQUIRE_EQUAL(ch.schema_table_size, table_size);
+        BOOST_REQUIRE_EQUAL(size, align_up(wb.chunk_headers_size() + ch.records_size + ch.schema_table_size, ondisk::block_alignment));
+    }
+}
+
+// Checks that a buffer lists each schema version its records were written under once, in the
+// order they were first appended, and that a scan hands the entries of the table to a registry.
+SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_lists_each_schema_version_once) {
+    auto schema = make_kv_schema();
+    auto altered = schema_builder(schema).with_column("w", int32_type).build();
+    BOOST_REQUIRE(altered->version() != schema->version());
+
+    raw_write_buffer wb(32 * 1024, segment_kind::mixed);
+    wb.append(make_writer(make_log_record(schema, "pk0", "v0", api::timestamp_type(1))));
+    wb.append(make_writer(make_log_record(schema, "pk1", "v1", api::timestamp_type(2))));
+    wb.append(make_writer(make_log_record(altered, "pk2", "v2", api::timestamp_type(3))));
+    wb.append(make_writer(make_log_record(schema, "pk3", "v3", api::timestamp_type(4))));
+    const auto chunk = wb.seal(segment_sequence{5}, std::nullopt);
+
+    BOOST_REQUIRE_EQUAL(wb.schema_table().size(), 2u);
+    auto ch = read_chunk_header(copy_chunk(chunk));
+    const auto& mapping = *test_registry().find(schema->version());
+    const auto& altered_mapping = *test_registry().find(altered->version());
+    BOOST_REQUIRE_EQUAL(ch.schema_table_size, ondisk::schema_table_header_size
+            + ondisk::schema_table_entry_size(mapping.serialized.size())
+            + ondisk::schema_table_entry_size(altered_mapping.serialized.size()));
+
+    auto entries = read_schema_table(chunk, ch);
+    BOOST_REQUIRE_EQUAL(entries.size(), 2u);
+    BOOST_REQUIRE_EQUAL(entries[0].version, schema->version());
+    BOOST_REQUIRE(entries[0].mapping == mapping.serialized);
+    BOOST_REQUIRE_EQUAL(entries[1].version, altered->version());
+    BOOST_REQUIRE(entries[1].mapping == altered_mapping.serialized);
+
+    // A scan hands the entries of the table to an empty registry.
+    column_mapping_registry recovered;
+    auto serialized = copy_chunk(chunk);
+    auto records = scan_buffer_records(serialized, log_segment_id{9}, [&recovered] (const ondisk::schema_table_entry& e) {
+        recovered.add(e.table, e.version, e.mapping);
+    });
+    BOOST_REQUIRE_EQUAL(recovered.size(), 2u);
+    BOOST_REQUIRE(recovered.find(schema->version())->mapping == mapping.mapping);
+    BOOST_REQUIRE(recovered.find(altered->version())->mapping == altered_mapping.mapping);
+    BOOST_REQUIRE_EQUAL(records.size(), 4u);
+}
+
+// Checks that a buffer lists a schema version once when its records come with the entries of two
+// registries.
+SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_lists_a_schema_version_once_across_registries) {
+    auto schema = make_kv_schema();
+
+    column_mapping_registry first;
+    column_mapping_registry second;
+    const auto& from_first = first.add(*schema);
+    const auto& from_second = second.add(*schema);
+    BOOST_REQUIRE(&from_first != &from_second);
+    BOOST_REQUIRE_EQUAL(from_first.version, from_second.version);
+
+    raw_write_buffer wb(32 * 1024, segment_kind::mixed);
+    wb.append(log_record_writer(make_log_record(schema, "pk0", "v0", api::timestamp_type(1)), from_first));
+    wb.append(log_record_writer(make_log_record(schema, "pk1", "v1", api::timestamp_type(2)), from_second));
+    const auto chunk = wb.seal(segment_sequence{7}, std::nullopt);
+
+    BOOST_REQUIRE_EQUAL(wb.schema_table().size(), 1u);
+    auto ch = read_chunk_header(copy_chunk(chunk));
+    BOOST_REQUIRE_EQUAL(ch.schema_table_size, raw_write_buffer::schema_table_size(from_first));
+    auto entries = read_schema_table(chunk, ch);
+    BOOST_REQUIRE_EQUAL(entries.size(), 1u);
+    BOOST_REQUIRE_EQUAL(entries[0].version, schema->version());
+}
+
+// Checks that the room a record's schema table entry takes is charged to the record that brings
+// the version into the buffer: a record that fits as one more of a version the buffer already
+// lists does not fit as the first of another version.
+SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_charges_the_schema_table_entry_to_the_first_record_of_a_version) {
+    auto schema = make_kv_schema();
+    auto altered = schema_builder(schema).with_column("w", int32_type).build();
+
+    raw_write_buffer wb(ondisk::block_alignment, segment_kind::mixed);
+    wb.append(make_writer(make_log_record(schema, "pk0", "v0", api::timestamp_type(1))));
+
+    // The largest record of the buffer's version that still fits.
+    sstring value;
+    while (wb.can_fit(make_writer(make_log_record(schema, "pk1", value + "x", api::timestamp_type(2))))) {
+        value += "x";
+    }
+    auto same_version = make_writer(make_log_record(schema, "pk1", value, api::timestamp_type(2)));
+    // The record value carries the column mapping of its version, and the mapping of the altered
+    // schema is larger. Shorten the value of the other record until the two are the same size.
+    auto other_value = value;
+    auto other_version = make_writer(make_log_record(altered, "pk1", other_value, api::timestamp_type(2)));
+    while (other_version.record_size() > same_version.record_size()) {
+        other_value.resize(other_value.size() - 1);
+        other_version = make_writer(make_log_record(altered, "pk1", other_value, api::timestamp_type(2)));
+    }
+    BOOST_REQUIRE_EQUAL(same_version.record_size(), other_version.record_size());
+
+    BOOST_REQUIRE(wb.can_fit(same_version));
+    BOOST_REQUIRE(!wb.can_fit(other_version));
+    BOOST_REQUIRE_THROW(wb.append(other_version), std::runtime_error);
+
+    // The same record fits an empty buffer, whose max_record_size() accounts for its entry.
+    raw_write_buffer empty(ondisk::block_alignment, segment_kind::mixed);
+    BOOST_REQUIRE_LE(other_version.record_size(), empty.max_record_size(other_version.mapping()));
+    BOOST_REQUIRE(empty.can_fit(other_version));
 }
 
 namespace {
@@ -885,16 +1047,16 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_accepts_record_at_max_record_
     auto schema = make_kv_schema();
 
     raw_write_buffer wb(ondisk::block_alignment, segment_kind::mixed);
-    auto max_size = wb.max_record_size();
 
     sstring value;
     auto record = make_log_record(schema, "pk", "", api::timestamp_type(27));
-    log_record_writer writer(record);
+    auto writer = make_writer(record);
+    auto max_size = wb.max_record_size(writer.mapping());
 
     while (writer.record_size() < max_size) {
         value += "x";
         record = make_log_record(schema, "pk", value, api::timestamp_type(27));
-        writer = log_record_writer(record);
+        writer = make_writer(record);
     }
 
     BOOST_REQUIRE_EQUAL(writer.record_size(), max_size);
@@ -911,7 +1073,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_finish_returns_the_final_chun
     auto schema = make_kv_schema();
 
     raw_write_buffer wb(4 * ondisk::block_alignment, segment_kind::mixed);
-    wb.append(log_record_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(1))));
+    wb.append(make_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(1))));
     const auto size = wb.finish();
     BOOST_REQUIRE_EQUAL(size % ondisk::block_alignment, 0u);
     BOOST_REQUIRE_EQUAL(wb.finish(), size);
@@ -939,7 +1101,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_largest_accepted_record_can_be_separated) 
     test_logstor_group cg(schema, ls);
 
     const auto segment_size = ls.get_segment_manager().get_segment_size();
-    const auto max_size = raw_write_buffer::max_record_size_any_kind(segment_size);
+    const auto max_size = raw_write_buffer::max_record_size_any_kind(segment_size, test_registry().add(*schema));
 
     auto expected = make_kv_mutation_of_record_size(schema, "pk0", max_size);
     auto key = expected.decorated_key();
@@ -990,7 +1152,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_rejects_record_that_does_not_fit_a_segment
     test_logstor_group cg(schema, ls);
 
     const auto segment_size = ls.get_segment_manager().get_segment_size();
-    const auto max_size = raw_write_buffer::max_record_size_any_kind(segment_size);
+    const auto max_size = raw_write_buffer::max_record_size_any_kind(segment_size, test_registry().add(*schema));
 
     auto too_big = make_kv_mutation_of_record_size(schema, "pk0", max_size + 1);
     BOOST_REQUIRE_THROW(ls.write(too_big, write_target(&cg, {}), db::no_timeout).get(), std::runtime_error);
@@ -1006,7 +1168,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_abort_writes_reclaims_unflush
     auto schema = make_kv_schema();
 
     write_buffer wb(32 * 1024, segment_kind::full);
-    auto written = wb.write(log_record_writer(make_log_record(schema, "pk0", "v0", api::timestamp_type(1))));
+    auto written = wb.write(make_writer(make_log_record(schema, "pk0", "v0", api::timestamp_type(1))));
     BOOST_REQUIRE(!written.available());
 
     auto closed = wb.close();
@@ -1526,10 +1688,10 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_mixed_chunks_report_readable_
     auto expected2 = make_kv_mutation(schema, "pk2", "v2", api::timestamp_type(13));
     auto expected3 = make_kv_mutation(schema, long_pk, "value-three-is-even-longer-than-before", api::timestamp_type(14));
 
-    wb0.append(log_record_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(11))));
-    wb0.append(log_record_writer(make_log_record(schema, "pk1", "value1-longer", api::timestamp_type(12))));
-    wb1.append(log_record_writer(make_log_record(schema, "pk2", "v2", api::timestamp_type(13))));
-    wb1.append(log_record_writer(make_log_record(schema, long_pk, "value-three-is-even-longer-than-before", api::timestamp_type(14))));
+    wb0.append(make_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(11))));
+    wb0.append(make_writer(make_log_record(schema, "pk1", "value1-longer", api::timestamp_type(12))));
+    wb1.append(make_writer(make_log_record(schema, "pk2", "v2", api::timestamp_type(13))));
+    wb1.append(make_writer(make_log_record(schema, long_pk, "value-three-is-even-longer-than-before", api::timestamp_type(14))));
 
     auto serialized0 = copy_chunk(wb0.seal(segment_sequence{23}, std::nullopt));
     auto serialized1 = copy_chunk(wb1.seal(segment_sequence{23}, std::nullopt));
@@ -1599,9 +1761,9 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_rejects_corrupt_key_size) {
     auto scan_with_corrupt_key_size = [&] (uint32_t key_size) {
         raw_write_buffer wb0(64 * 1024, segment_kind::mixed);
         raw_write_buffer wb1(64 * 1024, segment_kind::mixed);
-        wb0.append(log_record_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(31))));
-        wb0.append(log_record_writer(make_log_record(schema, "pk1", "value1", api::timestamp_type(32))));
-        wb1.append(log_record_writer(make_log_record(schema, "pk2", "value2", api::timestamp_type(33))));
+        wb0.append(make_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(31))));
+        wb0.append(make_writer(make_log_record(schema, "pk1", "value1", api::timestamp_type(32))));
+        wb1.append(make_writer(make_log_record(schema, "pk2", "value2", api::timestamp_type(33))));
 
         auto serialized0 = copy_chunk(wb0.seal(segment_sequence{29}, std::nullopt));
         auto serialized1 = copy_chunk(wb1.seal(segment_sequence{29}, std::nullopt));
@@ -1642,6 +1804,241 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_rejects_corrupt_key_size) {
     BOOST_REQUIRE_EQUAL(seen[0], api::timestamp_type(33));
 }
 
+// Checks that scan_segment() skips a record whose schema version the schema table of its chunk does
+// not list for the record's table, and delivers the records after it.
+SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_skips_record_of_unlisted_schema_version) {
+    auto schema = make_kv_schema();
+
+    raw_write_buffer wb0(64 * 1024, segment_kind::mixed);
+    raw_write_buffer wb1(64 * 1024, segment_kind::mixed);
+    wb0.append(make_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(41))));
+    wb0.append(make_writer(make_log_record(schema, "pk1", "value1", api::timestamp_type(42))));
+    wb0.append(make_writer(make_log_record(schema, "pk3", "value3", api::timestamp_type(44))));
+    wb1.append(make_writer(make_log_record(schema, "pk2", "value2", api::timestamp_type(43))));
+
+    const auto chunk0 = wb0.seal(segment_sequence{39}, std::nullopt);
+    const auto serialized1 = copy_chunk(wb1.seal(segment_sequence{39}, std::nullopt));
+    // The second record of the first chunk. Its table id follows its token and timestamp, and its
+    // schema version follows the table id.
+    const auto first_frame_size = ondisk::record_frame_header_size + make_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(41))).record_size();
+    const auto second_record = ondisk::chunk_header_size + align_up(first_frame_size, ondisk::record_alignment);
+    const auto table_offset = second_record + ondisk::record_frame_header_size + 2 * sizeof(int64_t);
+    const auto version_offset = table_offset + 2 * sizeof(int64_t);
+
+    auto scan_with_flipped_byte = [&] (size_t offset) {
+        auto serialized0 = copy_chunk(chunk0);
+        flip_byte(serialized0, offset);
+        reseal_chunk_crcs(serialized0);
+
+        auto segment = concat_chunks({&serialized0, &serialized1});
+        const auto segment_size = segment.size();
+        auto in = seastar::util::as_input_stream(std::move(segment));
+
+        std::vector<api::timestamp_type> seen;
+        size_t schema_mappings = 0;
+        scan_segment(in, log_segment_id{6}, segment_size,
+            [] (const segment_info&) {
+                return make_ready_future<>();
+            },
+            [&seen] (record_location, const record_header& header) {
+                seen.push_back(header.timestamp);
+                return want_data::no;
+            },
+            [] (record_location, log_record) {
+                return make_ready_future<>();
+            },
+            [&schema_mappings] (const ondisk::schema_table_entry&) {
+                ++schema_mappings;
+            }).get();
+        in.close().get();
+        BOOST_REQUIRE_EQUAL(schema_mappings, 2u);
+        return seen;
+    };
+
+    // The first and third records of the first chunk, then the record of the second chunk.
+    const auto expected = std::vector<api::timestamp_type>{41, 44, 43};
+    // A version that the table does not list.
+    BOOST_REQUIRE(scan_with_flipped_byte(version_offset) == expected);
+    // A version that the table lists, but for another table.
+    BOOST_REQUIRE(scan_with_flipped_byte(table_offset) == expected);
+}
+
+// Checks that the scan skips only the records of a schema version whose entry it cannot use - an
+// entry that the consumer rejects, or an entry after the point where the schema table stops to
+// parse - and delivers the records of the other versions of the chunk.
+SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_skips_only_records_of_rejected_versions) {
+    auto schema = make_kv_schema();
+    auto altered = schema_builder(schema).with_column("w", int32_type).build();
+
+    raw_write_buffer wb(64 * 1024, segment_kind::mixed);
+    wb.append(make_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(61))));
+    wb.append(make_writer(make_log_record(altered, "pk1", "value1", api::timestamp_type(62))));
+    wb.append(make_writer(make_log_record(schema, "pk2", "value2", api::timestamp_type(63))));
+    const auto sealed = wb.seal(segment_sequence{59}, std::nullopt);
+
+    auto scan = [&] (const temporary_buffer<char>& chunk, schema_mapping_consumer on_schema_mapping) {
+        auto segment = concat_chunks({&chunk});
+        const auto segment_size = segment.size();
+        auto in = seastar::util::as_input_stream(std::move(segment));
+        std::vector<api::timestamp_type> seen;
+        scan_segment(in, log_segment_id{8}, segment_size,
+            [] (const segment_info&) {
+                return make_ready_future<>();
+            },
+            [&seen] (record_location, const record_header& header) {
+                seen.push_back(header.timestamp);
+                return want_data::no;
+            },
+            [] (record_location, log_record) {
+                return make_ready_future<>();
+            },
+            std::move(on_schema_mapping)).get();
+        in.close().get();
+        return seen;
+    };
+
+    // The consumer rejects the entry of the altered version.
+    const auto serialized = copy_chunk(sealed);
+    BOOST_REQUIRE(scan(serialized, [&] (const ondisk::schema_table_entry& e) {
+        if (e.version == altered->version()) {
+            throw std::runtime_error("rejected by the test");
+        }
+    }) == (std::vector<api::timestamp_type>{61, 63}));
+
+    // The second entry, of the altered version, claims a mapping longer than what is left of the
+    // table, so the table stops to parse after the first entry.
+    auto truncated = copy_chunk(sealed);
+    const auto ch = read_chunk_header(truncated);
+    const auto second_entry = wb.chunk_headers_size() + ch.records_size + ondisk::schema_table_header_size
+            + ondisk::schema_table_entry_size(test_registry().find(schema->version())->serialized.size());
+    const auto mapping_size_offset = second_entry + 4 * sizeof(int64_t);
+    BOOST_REQUIRE_LT(mapping_size_offset + sizeof(uint32_t), truncated.size());
+    std::fill_n(truncated.get_write() + mapping_size_offset, sizeof(uint32_t), char(0xff));
+    reseal_chunk_crcs(truncated);
+    size_t entries = 0;
+    BOOST_REQUIRE(scan(truncated, [&] (const ondisk::schema_table_entry& e) {
+        BOOST_REQUIRE(e.version == schema->version());
+        ++entries;
+    }) == (std::vector<api::timestamp_type>{61, 63}));
+    BOOST_REQUIRE_EQUAL(entries, 1u);
+}
+
+// Checks that a chunk whose column mapping does not parse still gives its records, that a later copy
+// that parses replaces it in the registry, and that an entry the registry rejects skips the records
+// of its version.
+SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_keeps_mappings_that_do_not_parse) {
+    auto schema = make_kv_schema();
+
+    raw_write_buffer wb0(64 * 1024, segment_kind::mixed);
+    raw_write_buffer wb1(64 * 1024, segment_kind::mixed);
+    wb0.append(make_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(51))));
+    wb0.append(make_writer(make_log_record(schema, "pk1", "value1", api::timestamp_type(52))));
+    wb1.append(make_writer(make_log_record(schema, "pk2", "value2", api::timestamp_type(53))));
+
+    auto serialized0 = copy_chunk(wb0.seal(segment_sequence{49}, std::nullopt));
+    auto serialized1 = copy_chunk(wb1.seal(segment_sequence{49}, std::nullopt));
+
+    // The size at the head of the mapping of the chunk's one schema table entry. The framing of
+    // the table is left alone, so only the deserializer sees that the mapping is cut short.
+    const auto ch0 = read_chunk_header(serialized0);
+    const auto mapping_offset = wb0.chunk_headers_size() + ch0.records_size
+            + ondisk::schema_table_header_size + ondisk::schema_table_entry_fixed_size;
+    BOOST_REQUIRE_LT(mapping_offset + sizeof(uint32_t), serialized0.size());
+    std::fill_n(serialized0.get_write() + mapping_offset, sizeof(uint32_t), char(0xff));
+    // The body CRC covers the table, and would reject the chunk before the table is parsed.
+    reseal_chunk_crcs(serialized0);
+
+    auto scan = [&] (column_mapping_registry& registry) {
+        auto segment = concat_chunks({&serialized0, &serialized1});
+        const auto segment_size = segment.size();
+        auto in = seastar::util::as_input_stream(std::move(segment));
+        std::vector<api::timestamp_type> seen;
+        // What a segment scan in the segment manager does with the entries.
+        scan_segment(in, log_segment_id{7}, segment_size,
+            [] (const segment_info&) {
+                return make_ready_future<>();
+            },
+            [&seen] (record_location, const record_header& header) {
+                seen.push_back(header.timestamp);
+                return want_data::no;
+            },
+            [] (record_location, log_record) {
+                return make_ready_future<>();
+            },
+            [&registry] (const ondisk::schema_table_entry& e) {
+                registry.add(e.table, e.version, e.mapping);
+            }).get();
+        in.close().get();
+        return seen;
+    };
+
+    // Every record is found. The second chunk's copy of the mapping, which parses, replaces the
+    // first chunk's copy.
+    column_mapping_registry recovered;
+    BOOST_REQUIRE(scan(recovered) == (std::vector<api::timestamp_type>{51, 52, 53}));
+    BOOST_REQUIRE_EQUAL(recovered.size(), 1u);
+    const auto* registered = recovered.find(schema->version());
+    BOOST_REQUIRE(registered);
+    BOOST_REQUIRE(registered->mapping == schema->get_column_mapping());
+    BOOST_REQUIRE(registered->serialized == test_registry().find(schema->version())->serialized);
+
+    // A registry that has the version under another table rejects the entries. The chunks hold
+    // records of that version only, so neither gives a record.
+    column_mapping_registry other_table;
+    other_table.add(table_id::create_random_id(), schema->version(), test_registry().find(schema->version())->serialized);
+    BOOST_REQUIRE(scan(other_table).empty());
+}
+
+// Checks that the body CRC covers the schema table: a chunk whose table is corrupt gives its segment
+// info, no table entries and no records, and the scan continues at the next chunk.
+SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_rejects_chunk_with_corrupt_schema_table) {
+    auto schema = make_kv_schema();
+
+    raw_write_buffer wb0(64 * 1024, segment_kind::mixed);
+    raw_write_buffer wb1(64 * 1024, segment_kind::mixed);
+    wb0.append(make_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(61))));
+    wb0.append(make_writer(make_log_record(schema, "pk1", "value1", api::timestamp_type(62))));
+    wb1.append(make_writer(make_log_record(schema, "pk2", "value2", api::timestamp_type(63))));
+
+    auto serialized0 = copy_chunk(wb0.seal(segment_sequence{59}, std::nullopt));
+    auto serialized1 = copy_chunk(wb1.seal(segment_sequence{59}, std::nullopt));
+
+    // A byte of the schema version of the table's one entry. The table still parses, and lists a
+    // version that no record of the chunk has.
+    const auto ch0 = read_chunk_header(serialized0);
+    BOOST_REQUIRE_GT(ch0.schema_table_size, 0u);
+    flip_byte(serialized0, wb0.chunk_headers_size() + ch0.records_size + ondisk::schema_table_header_size + 2 * sizeof(int64_t));
+
+    auto segment = concat_chunks({&serialized0, &serialized1});
+    const auto segment_size = segment.size();
+    auto in = seastar::util::as_input_stream(std::move(segment));
+
+    size_t segment_infos = 0;
+    std::vector<api::timestamp_type> seen;
+    size_t schema_mappings = 0;
+    scan_segment(in, log_segment_id{8}, segment_size,
+        [&segment_infos] (const segment_info&) {
+            ++segment_infos;
+            return make_ready_future<>();
+        },
+        [&seen] (record_location, const record_header& header) {
+            seen.push_back(header.timestamp);
+            return want_data::no;
+        },
+        [] (record_location, log_record) {
+            return make_ready_future<>();
+        },
+        [&schema_mappings] (const ondisk::schema_table_entry&) {
+            ++schema_mappings;
+        }).get();
+    in.close().get();
+
+    // Only the second chunk gives its table entry and its record.
+    BOOST_REQUIRE_EQUAL(segment_infos, 2u);
+    BOOST_REQUIRE(seen == std::vector<api::timestamp_type>{api::timestamp_type(63)});
+    BOOST_REQUIRE_EQUAL(schema_mappings, 1u);
+}
+
 // Checks that scan_segment() only delivers records whose headers were accepted with want_data::yes.
 SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_returns_only_selected_records) {
     auto schema = make_kv_schema();
@@ -1652,10 +2049,10 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_returns_only_selected_records
     auto expected1 = make_kv_mutation(schema, "pk1", "value1", api::timestamp_type(72));
     auto expected3 = make_kv_mutation(schema, "pk3", "value3", api::timestamp_type(74));
 
-    wb0.append(log_record_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(71))));
-    wb0.append(log_record_writer(make_log_record(schema, "pk1", "value1", api::timestamp_type(72))));
-    wb1.append(log_record_writer(make_log_record(schema, "pk2", "value2", api::timestamp_type(73))));
-    wb1.append(log_record_writer(make_log_record(schema, "pk3", "value3", api::timestamp_type(74))));
+    wb0.append(make_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(71))));
+    wb0.append(make_writer(make_log_record(schema, "pk1", "value1", api::timestamp_type(72))));
+    wb1.append(make_writer(make_log_record(schema, "pk2", "value2", api::timestamp_type(73))));
+    wb1.append(make_writer(make_log_record(schema, "pk3", "value3", api::timestamp_type(74))));
 
     auto serialized0 = copy_chunk(wb0.seal(segment_sequence{81}, std::nullopt));
     auto serialized1 = copy_chunk(wb1.seal(segment_sequence{81}, std::nullopt));
@@ -1702,9 +2099,9 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_reads_full_chunk_records_with
     auto expected0 = make_kv_mutation(schema, "pk-full-0", "x", api::timestamp_type(31));
     auto expected1 = make_kv_mutation(schema, "pk-full-1-with-longer-key", "medium-value", api::timestamp_type(32));
     auto expected2 = make_kv_mutation(schema, "pk-full-2", "value-with-a-significantly-longer-payload-to-exercise-varying-record-sizes", api::timestamp_type(33));
-    wb.append(log_record_writer(make_log_record(schema, "pk-full-0", "x", api::timestamp_type(31))));
-    wb.append(log_record_writer(make_log_record(schema, "pk-full-1-with-longer-key", "medium-value", api::timestamp_type(32))));
-    wb.append(log_record_writer(make_log_record(schema, "pk-full-2", "value-with-a-significantly-longer-payload-to-exercise-varying-record-sizes", api::timestamp_type(33))));
+    wb.append(make_writer(make_log_record(schema, "pk-full-0", "x", api::timestamp_type(31))));
+    wb.append(make_writer(make_log_record(schema, "pk-full-1-with-longer-key", "medium-value", api::timestamp_type(32))));
+    wb.append(make_writer(make_log_record(schema, "pk-full-2", "value-with-a-significantly-longer-payload-to-exercise-varying-record-sizes", api::timestamp_type(33))));
     const auto chunk = wb.seal(segment_sequence{41}, schema->id());
 
     auto serialized = copy_chunk(chunk);
@@ -1772,10 +2169,10 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_stops_on_mixed_chunk_lower_se
 
     auto expected0 = make_kv_mutation(schema, "pk0", "value0", api::timestamp_type(51));
     auto expected1 = make_kv_mutation(schema, "pk1", "value1", api::timestamp_type(52));
-    wb0.append(log_record_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(51))));
-    wb0.append(log_record_writer(make_log_record(schema, "pk1", "value1", api::timestamp_type(52))));
-    wb1.append(log_record_writer(make_log_record(schema, "pk2", "value2", api::timestamp_type(53))));
-    wb1.append(log_record_writer(make_log_record(schema, "pk3", "value3", api::timestamp_type(54))));
+    wb0.append(make_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(51))));
+    wb0.append(make_writer(make_log_record(schema, "pk1", "value1", api::timestamp_type(52))));
+    wb1.append(make_writer(make_log_record(schema, "pk2", "value2", api::timestamp_type(53))));
+    wb1.append(make_writer(make_log_record(schema, "pk3", "value3", api::timestamp_type(54))));
 
     auto serialized0 = copy_chunk(wb0.seal(segment_sequence{61}, std::nullopt));
     auto serialized1 = copy_chunk(wb1.seal(segment_sequence{60}, std::nullopt));
@@ -1825,10 +2222,10 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_stops_on_corrupted_later_mixe
     auto expected0 = make_kv_mutation(schema, "pk0", "value0", api::timestamp_type(91));
     auto expected1 = make_kv_mutation(schema, "pk1", "value1", api::timestamp_type(92));
 
-    wb0.append(log_record_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(91))));
-    wb0.append(log_record_writer(make_log_record(schema, "pk1", "value1", api::timestamp_type(92))));
-    wb1.append(log_record_writer(make_log_record(schema, "pk2", "value2", api::timestamp_type(93))));
-    wb1.append(log_record_writer(make_log_record(schema, "pk3", "value3", api::timestamp_type(94))));
+    wb0.append(make_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(91))));
+    wb0.append(make_writer(make_log_record(schema, "pk1", "value1", api::timestamp_type(92))));
+    wb1.append(make_writer(make_log_record(schema, "pk2", "value2", api::timestamp_type(93))));
+    wb1.append(make_writer(make_log_record(schema, "pk3", "value3", api::timestamp_type(94))));
 
     auto serialized0 = copy_chunk(wb0.seal(segment_sequence{101}, std::nullopt));
     auto serialized1 = copy_chunk(wb1.seal(segment_sequence{101}, std::nullopt));
@@ -1872,7 +2269,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_rejects_corrupt_segment_heade
     auto schema = make_kv_schema();
 
     raw_write_buffer wb(64 * 1024, segment_kind::full);
-    wb.append(log_record_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(111))));
+    wb.append(make_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(111))));
 
     auto serialized = copy_chunk(wb.seal(segment_sequence{121}, schema->id()));
     BOOST_REQUIRE(read_segment_info_from_bytes(serialized));
@@ -1913,6 +2310,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_rejects_corrupt_segment_heade
 // takes the highest segment_seq on disk from it.
 SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_rejects_torn_chunk) {
     auto schema = make_kv_schema();
+    test_registry().add(*schema);
     constexpr size_t record_size = 1024;
     constexpr size_t record_count = 4;
 
@@ -1920,7 +2318,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_rejects_torn_chunk) {
         raw_write_buffer wb(64 * 1024, segment_kind::mixed);
         for (size_t i = 0; i < record_count; ++i) {
             auto m = make_kv_mutation_of_record_size(schema, fmt::format("{}{}", key_prefix, i), record_size);
-            wb.append(log_record_writer(log_record {
+            wb.append(make_writer(log_record {
                 .header = {
                     .key = m.decorated_key(),
                     .timestamp = api::timestamp_type(first_ts + i),
@@ -1987,7 +2385,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_skips_chunk_with_failed_body)
 
     auto make_chunk = [&] (api::timestamp_type ts, segment_sequence seq) {
         raw_write_buffer wb(64 * 1024, segment_kind::mixed);
-        wb.append(log_record_writer(make_log_record(schema, sstring(fmt::format("pk{}", ts)), "value", ts)));
+        wb.append(make_writer(make_log_record(schema, sstring(fmt::format("pk{}", ts)), "value", ts)));
         return copy_chunk(wb.seal(seq, std::nullopt));
     };
     auto make_failed_chunk = [&] (api::timestamp_type ts, segment_sequence seq) {
@@ -2052,9 +2450,9 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_streamed_segment_rewriter_rewrites_initial
     auto expected0 = make_kv_mutation(schema, "pk0", "value0", api::timestamp_type(201));
     auto expected1 = make_kv_mutation(schema, "pk1-longer-key", "value1", api::timestamp_type(202));
     auto expected2 = make_kv_mutation(schema, "pk2", "value2-with-a-longer-payload", api::timestamp_type(203));
-    wb.append(log_record_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(201))));
-    wb.append(log_record_writer(make_log_record(schema, "pk1-longer-key", "value1", api::timestamp_type(202))));
-    wb.append(log_record_writer(make_log_record(schema, "pk2", "value2-with-a-longer-payload", api::timestamp_type(203))));
+    wb.append(make_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(201))));
+    wb.append(make_writer(make_log_record(schema, "pk1-longer-key", "value1", api::timestamp_type(202))));
+    wb.append(make_writer(make_log_record(schema, "pk2", "value2-with-a-longer-payload", api::timestamp_type(203))));
 
     auto serialized = copy_chunk(wb.seal(segment_sequence{211}, schema->id()));
     auto rewritten = rewrite_streamed_segment(log_segment_id{33}, segment_sequence{221}, std::span(&serialized, 1));
@@ -2103,7 +2501,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_streamed_segment_rewriter_handles_fragment
     auto schema = make_kv_schema();
 
     raw_write_buffer wb(64 * 1024, segment_kind::mixed);
-    wb.append(log_record_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(231))));
+    wb.append(make_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(231))));
 
     auto serialized = copy_chunk(wb.seal(segment_sequence{241}, std::nullopt));
     auto split = ondisk::chunk_header_size - 1;
@@ -2123,7 +2521,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_streamed_segment_rewriter_rejects_invalid_
     auto schema = make_kv_schema();
 
     raw_write_buffer wb(64 * 1024, segment_kind::mixed);
-    wb.append(log_record_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(291))));
+    wb.append(make_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(291))));
 
     auto serialized = copy_chunk(wb.seal(segment_sequence{301}, std::nullopt));
     flip_byte(serialized, 0);
@@ -2136,7 +2534,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_streamed_segment_rewriter_rejects_truncate
     auto schema = make_kv_schema();
 
     raw_write_buffer wb(64 * 1024, segment_kind::mixed);
-    wb.append(log_record_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(321))));
+    wb.append(make_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(321))));
 
     auto serialized = copy_chunk(wb.seal(segment_sequence{331}, std::nullopt));
     auto truncated = slice_buffer(serialized, 0, ondisk::chunk_header_size - 1);
@@ -2164,7 +2562,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_buffered_writer_basic_flushes_records) {
     for (size_t i = 0; i < 3; ++i) {
         auto record = make_buffered_writer_record(schema, i, sstring(fmt::format("value{}", i)), api::timestamp_type(100 + i));
         expected.push_back(record);
-        auto accepted = writer.write_to_buffer(log_record_writer(record), test_timeout()).get();
+        auto accepted = writer.write_to_buffer(make_writer(record), test_timeout()).get();
         persisted.push_back(std::move(accepted.persisted));
     }
 
@@ -2204,7 +2602,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_buffered_writer_flushes_partial_buffer_wit
     for (size_t i = 0; i < 3; ++i) {
         auto record = make_buffered_writer_record(schema, i, sstring(fmt::format("value{}", i)), api::timestamp_type(150 + i));
         expected.push_back(record);
-        auto accepted = writer.write_to_buffer(log_record_writer(record), test_timeout()).get();
+        auto accepted = writer.write_to_buffer(make_writer(record), test_timeout()).get();
         persisted.push_back(std::move(accepted.persisted));
     }
 
@@ -2254,16 +2652,16 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_buffered_writer_paused_flush_fills_ring_th
         expected.push_back(make_buffered_writer_record(schema, i, large_value, api::timestamp_type(200 + i)));
     }
 
-    auto accepted0 = writer.write_to_buffer(log_record_writer(expected[0]), test_timeout()).get();
+    auto accepted0 = writer.write_to_buffer(make_writer(expected[0]), test_timeout()).get();
     auto persisted0 = std::move(accepted0.persisted);
     flush_ctl.wait_for_flush_starts(1);
     BOOST_REQUIRE(!persisted0.available());
 
-    auto accepted1 = writer.write_to_buffer(log_record_writer(expected[1]), test_timeout()).get();
+    auto accepted1 = writer.write_to_buffer(make_writer(expected[1]), test_timeout()).get();
     auto persisted1 = std::move(accepted1.persisted);
 
-    auto queued2 = writer.write_to_buffer(log_record_writer(expected[2]), test_timeout());
-    auto queued3 = writer.write_to_buffer(log_record_writer(expected[3]), test_timeout());
+    auto queued2 = writer.write_to_buffer(make_writer(expected[2]), test_timeout());
+    auto queued3 = writer.write_to_buffer(make_writer(expected[3]), test_timeout());
     BOOST_REQUIRE(!queued2.available());
     BOOST_REQUIRE(!queued3.available());
     BOOST_REQUIRE_EQUAL(writer.queued_write_count(), 2u);
@@ -2324,14 +2722,14 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_buffered_writer_queued_write_keeps_its_wri
     }
 
     // Fill the ring: the first record is being flushed and the second holds the only other buffer.
-    auto accepted0 = writer.write_to_buffer(log_record_writer(expected[0]), test_timeout()).get();
+    auto accepted0 = writer.write_to_buffer(make_writer(expected[0]), test_timeout()).get();
     auto persisted0 = std::move(accepted0.persisted);
     flush_ctl.wait_for_flush_starts(1);
-    auto accepted1 = writer.write_to_buffer(log_record_writer(expected[1]), test_timeout()).get();
+    auto accepted1 = writer.write_to_buffer(make_writer(expected[1]), test_timeout()).get();
     auto persisted1 = std::move(accepted1.persisted);
 
     // The third record has nowhere to go, so it is queued rather than appended.
-    auto queued = writer.write_to_buffer(log_record_writer(expected[2]), test_timeout(), write_target{
+    auto queued = writer.write_to_buffer(make_writer(expected[2]), test_timeout(), write_target{
             .cg = nullptr,
             .non_empty_holder = non_empty_gate.hold(),
             .alive_holder = alive_gate.hold(),
@@ -2385,16 +2783,16 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_buffered_writer_queued_writes_preserve_fif
         expected.push_back(make_buffered_writer_record(schema, i, large_value, api::timestamp_type(300 + i)));
     }
 
-    auto accepted0 = writer.write_to_buffer(log_record_writer(expected[0]), test_timeout()).get();
+    auto accepted0 = writer.write_to_buffer(make_writer(expected[0]), test_timeout()).get();
     auto persisted0 = std::move(accepted0.persisted);
     flush_ctl.wait_for_flush_starts(1);
 
-    auto accepted1 = writer.write_to_buffer(log_record_writer(expected[1]), test_timeout()).get();
+    auto accepted1 = writer.write_to_buffer(make_writer(expected[1]), test_timeout()).get();
     auto persisted1 = std::move(accepted1.persisted);
 
-    auto queued2 = writer.write_to_buffer(log_record_writer(expected[2]), test_timeout());
-    auto queued3 = writer.write_to_buffer(log_record_writer(expected[3]), test_timeout());
-    auto queued4 = writer.write_to_buffer(log_record_writer(expected[4]), test_timeout());
+    auto queued2 = writer.write_to_buffer(make_writer(expected[2]), test_timeout());
+    auto queued3 = writer.write_to_buffer(make_writer(expected[3]), test_timeout());
+    auto queued4 = writer.write_to_buffer(make_writer(expected[4]), test_timeout());
 
     BOOST_REQUIRE(!queued2.available());
     BOOST_REQUIRE(!queued3.available());
@@ -2443,7 +2841,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_buffered_writer_rejects_when_max_queued_wr
     const auto large_value = make_single_buffer_value(schema, buffer_size);
 
     auto record0 = make_buffered_writer_record(schema, 0, large_value, api::timestamp_type(400));
-    const auto queued_write_budget = log_record_writer(record0).record_size() * 2;
+    const auto queued_write_budget = make_writer(record0).record_size() * 2;
 
     test_flush_controller flush_ctl{.pause_flushes = true};
     buffered_writer writer(make_buffered_writer_config(buffer_size, 2, queued_write_budget), [&flush_ctl] (write_buffer& wb) {
@@ -2460,21 +2858,21 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_buffered_writer_rejects_when_max_queued_wr
         expected.push_back(make_buffered_writer_record(schema, i, large_value, api::timestamp_type(400 + i)));
     }
 
-    auto accepted0 = writer.write_to_buffer(log_record_writer(expected[0]), test_timeout()).get();
+    auto accepted0 = writer.write_to_buffer(make_writer(expected[0]), test_timeout()).get();
     auto persisted0 = std::move(accepted0.persisted);
     flush_ctl.wait_for_flush_starts(1);
 
-    auto accepted1 = writer.write_to_buffer(log_record_writer(expected[1]), test_timeout()).get();
+    auto accepted1 = writer.write_to_buffer(make_writer(expected[1]), test_timeout()).get();
     auto persisted1 = std::move(accepted1.persisted);
 
-    auto queued2 = writer.write_to_buffer(log_record_writer(expected[2]), test_timeout());
-    auto queued3 = writer.write_to_buffer(log_record_writer(expected[3]), test_timeout());
+    auto queued2 = writer.write_to_buffer(make_writer(expected[2]), test_timeout());
+    auto queued3 = writer.write_to_buffer(make_writer(expected[3]), test_timeout());
     BOOST_REQUIRE(!queued2.available());
     BOOST_REQUIRE(!queued3.available());
     BOOST_REQUIRE_EQUAL(writer.queued_write_count(), 2u);
 
     auto rejected = make_buffered_writer_record(schema, 4, large_value, api::timestamp_type(404));
-    BOOST_REQUIRE_THROW(writer.write_to_buffer(log_record_writer(rejected), test_timeout()).get(), replica::rate_limit_exception);
+    BOOST_REQUIRE_THROW(writer.write_to_buffer(make_writer(rejected), test_timeout()).get(), replica::rate_limit_exception);
 
     flush_ctl.release_one_flush();
     wait_for_persisted(persisted0);
@@ -2518,14 +2916,14 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_buffered_writer_acceptance_stays_blocked_w
     auto record1 = make_buffered_writer_record(schema, 1, large_value, api::timestamp_type(501));
     auto record2 = make_buffered_writer_record(schema, 2, large_value, api::timestamp_type(502));
 
-    auto accepted0 = writer.write_to_buffer(log_record_writer(record0), test_timeout()).get();
+    auto accepted0 = writer.write_to_buffer(make_writer(record0), test_timeout()).get();
     auto persisted0 = std::move(accepted0.persisted);
     flush_ctl.wait_for_flush_starts(1);
 
-    auto accepted1 = writer.write_to_buffer(log_record_writer(record1), test_timeout()).get();
+    auto accepted1 = writer.write_to_buffer(make_writer(record1), test_timeout()).get();
     auto persisted1 = std::move(accepted1.persisted);
 
-    auto queued2 = writer.write_to_buffer(log_record_writer(record2), test_timeout());
+    auto queued2 = writer.write_to_buffer(make_writer(record2), test_timeout());
     BOOST_REQUIRE(!queued2.available());
     BOOST_REQUIRE_EQUAL(writer.queued_write_count(), 1u);
 
@@ -2562,7 +2960,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_buffered_writer_stop_drains_blocked_in_fli
 
     writer.start().get();
 
-    auto accepted = writer.write_to_buffer(log_record_writer(record), test_timeout()).get();
+    auto accepted = writer.write_to_buffer(make_writer(record), test_timeout()).get();
     auto persisted = std::move(accepted.persisted);
     flush_ctl.wait_for_flush_starts(1);
 
@@ -2586,9 +2984,9 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_buffered_writer_flush_failure_fails_all_wr
     auto record0 = make_buffered_writer_record(schema, 0, "value0", api::timestamp_type(700));
     auto record1 = make_buffered_writer_record(schema, 1, "value1", api::timestamp_type(701));
     raw_write_buffer scratch(buffer_size, segment_kind::mixed);
-    BOOST_REQUIRE(scratch.can_fit(log_record_writer(record0)));
-    scratch.append(log_record_writer(record0));
-    BOOST_REQUIRE(scratch.can_fit(log_record_writer(record1)));
+    BOOST_REQUIRE(scratch.can_fit(make_writer(record0)));
+    scratch.append(make_writer(record0));
+    BOOST_REQUIRE(scratch.can_fit(make_writer(record1)));
 
     test_flush_controller flush_ctl{.fail_flush_index = 0};
     // long sync period so both writes land in the same buffer.
@@ -2601,8 +2999,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_buffered_writer_flush_failure_fails_all_wr
         writer.stop().get();
     });
 
-    auto accepted0 = writer.write_to_buffer(log_record_writer(record0), test_timeout()).get();
-    auto accepted1 = writer.write_to_buffer(log_record_writer(record1), test_timeout()).get();
+    auto accepted0 = writer.write_to_buffer(make_writer(record0), test_timeout()).get();
+    auto accepted1 = writer.write_to_buffer(make_writer(record1), test_timeout()).get();
 
     auto flush = writer.flush();
 
@@ -3381,6 +3779,76 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_group_compaction_rewrites_live_records) {
     // Overwritten records do not appear.
     BOOST_REQUIRE_EQUAL(record_counts.count(api::timestamp_type(1)), 0u); // pk0_v0 - stale
     BOOST_REQUIRE_EQUAL(record_counts.count(api::timestamp_type(2)), 0u); // pk1_v0 - stale
+}
+
+// Checks that compaction rewrites the records of two schema versions into one segment, whose schema
+// table lists both versions with the column mappings it takes from the registry, and that the
+// records stay readable under a later schema version.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_rewrites_records_of_two_schema_versions) {
+    auto schema = make_kv_schema();
+    auto altered = schema_builder(schema).with_column("w", int32_type).build();
+    auto latest = schema_builder(altered).with_column("z", long_type).build();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    ls.do_recovery_for_test().get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+    auto setup_guard = std::make_optional(ls.get_compaction_manager().disable_compaction(cg).get());
+
+    // Each write goes to a segment of its own. pk0 is written under both versions, and only the
+    // write under the altered schema is live.
+    write_and_flush_segment(ls, cg, make_kv_mutation(schema, "pk0", "v0", api::timestamp_type(1)));
+    write_and_flush_segment(ls, cg, make_kv_mutation(schema, "pk1", "v1", api::timestamp_type(2)));
+    write_and_flush_segment(ls, cg, make_kv_mutation(altered, "pk2", "v2", api::timestamp_type(3)));
+    write_and_flush_segment(ls, cg, make_kv_mutation(altered, "pk0", "v0-new", api::timestamp_type(4)));
+    BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 4u);
+
+    setup_guard.reset();
+    ls.get_compaction_manager().submit(cg);
+    auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+
+    auto snapshot = ls.get_segment_manager().make_snapshot(cg).get();
+    BOOST_REQUIRE_EQUAL(snapshot.size(), 1u);
+
+    std::vector<table_schema_version> listed;
+    std::vector<api::timestamp_type> seen;
+    const auto segment_size = ls.get_segment_manager().get_segment_size();
+    auto in = snapshot.front().source(seastar::file_input_stream_options{
+        .buffer_size = std::min<size_t>(segment_size, 128 * 1024),
+        .read_ahead = 1,
+    }).get();
+    scan_segment(in, snapshot.front().segment_id, segment_size,
+        [] (const segment_info&) { return make_ready_future<>(); },
+        [&seen] (record_location, const record_header& header) {
+            seen.push_back(header.timestamp);
+            return want_data::no;
+        },
+        [] (record_location, log_record) { return make_ready_future<>(); },
+        [&listed] (const ondisk::schema_table_entry& e) {
+            listed.push_back(e.version);
+        }).get();
+    in.close().get();
+
+    std::ranges::sort(seen);
+    BOOST_REQUIRE(seen == (std::vector<api::timestamp_type>{2, 3, 4}));
+    BOOST_REQUIRE_EQUAL(listed.size(), 2u);
+    BOOST_REQUIRE(std::ranges::contains(listed, schema->version()));
+    BOOST_REQUIRE(std::ranges::contains(listed, altered->version()));
+
+    // A read under a version that no record was written under converts the records of both.
+    auto expect = [&] (sstring pk, sstring value, api::timestamp_type ts) {
+        auto expected = make_kv_mutation(latest, pk, value, ts);
+        auto actual = ls.read(latest, cg.logstor_index(), expected.decorated_key(), latest->full_slice()).get();
+        BOOST_REQUIRE(actual);
+        assert_that(*actual).is_equal_to(expected);
+    };
+    expect("pk0", "v0-new", api::timestamp_type(4));
+    expect("pk1", "v1", api::timestamp_type(2));
+    expect("pk2", "v2", api::timestamp_type(3));
 }
 
 SEASTAR_THREAD_TEST_CASE(test_logstor_disabled_group_does_not_compact_on_submit) {
