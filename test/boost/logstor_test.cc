@@ -124,7 +124,8 @@ temporary_buffer<char> slice_buffer(const temporary_buffer<char>& buf, size_t of
 // records on purpose and wants the scan to get past the body CRC to what it is testing.
 void reseal_chunk_crcs(temporary_buffer<char>& buf) {
     rewrite_chunk_header(buf, [&] (ondisk::chunk_header_common& common) {
-        common.body_crc = ondisk::calculate_body_crc(std::span(buf.get() + ondisk::chunk_header_size(common.kind), common.records_size));
+        common.body_crc = ondisk::calculate_body_crc(std::span(buf.get() + ondisk::chunk_header_size(common.kind),
+                size_t(common.records_size) + common.schema_table_size));
     });
 }
 
@@ -262,7 +263,7 @@ void check_ondisk_layout(const char* name, const T& value, std::string_view expe
 SEASTAR_THREAD_TEST_CASE(test_logstor_ondisk_layout) {
     auto table = table_id(utils::UUID(int64_t(0x1122334455667788), int64_t(0x99aabbccddeeff00)));
 
-    std::array<char, 36> reserved;
+    std::array<char, 32> reserved;
     std::iota(reserved.begin(), reserved.end(), char(0x40));
 
     check_ondisk_layout("chunk_header_common", ondisk::chunk_header_common {
@@ -273,10 +274,11 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_ondisk_layout) {
         .segment_seq = segment_sequence{0x0102030405060708},
         .records_size = 0xdeadbeef,
         .body_crc = 0x0badf00d,
+        .schema_table_size = 0x5eed1e55,
         .reserved = reserved,
         .crc = 0xfeedface,
-    }, "4253474c" "01" "02" "3412" "0807060504030201" "efbeadde" "0df0ad0b"
-       "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f60616263" "cefaedfe");
+    }, "4253474c" "01" "02" "3412" "0807060504030201" "efbeadde" "0df0ad0b" "551eed5e"
+       "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f" "cefaedfe");
 
     std::array<char, 32> full_part_reserved;
     std::iota(full_part_reserved.begin(), full_part_reserved.end(), char(0x70));
@@ -323,15 +325,16 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_ondisk_layout) {
         .segment_seq = segment_sequence{0x0102030405060708},
         .records_size = 0xdeadbeef,
         .body_crc = 0x0badf00d,
+        .schema_table_size = 0x5eed1e55,
         .reserved = reserved,
         .crc = 0xfeedface,
     };
-    BOOST_REQUIRE_EQUAL(ondisk::calculate_chunk_header_crc(common, {}), 0xfea1ab1fu);
+    BOOST_REQUIRE_EQUAL(ondisk::calculate_chunk_header_crc(common, {}), 0x7236b678u);
     common.kind = segment_kind::full;
     std::array<char, ondisk::chunk_header_full_part_size> full_part_bytes;
     seastar::simple_memory_output_stream full_part_out(full_part_bytes.data(), full_part_bytes.size());
     ser::serialize(full_part_out, full_part);
-    BOOST_REQUIRE_EQUAL(ondisk::calculate_chunk_header_crc(common, full_part_bytes), 0x642f0a42u);
+    BOOST_REQUIRE_EQUAL(ondisk::calculate_chunk_header_crc(common, full_part_bytes), 0x7034ebfdu);
 
     // write_chunk_header() writes the fields of chunk_header, and parse_chunk_header() reads them back.
     auto mixed_ch = ondisk::chunk_header {
@@ -339,6 +342,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_ondisk_layout) {
         .flags = 0x1234,
         .records_size = 0xdeadbeef,
         .body_crc = 0x0badf00d,
+        .schema_table_size = 0x5eed1e55,
     };
     auto full_ch = mixed_ch;
     full_ch.segment.v = segment_info::full {
