@@ -287,7 +287,9 @@ public:
     append_result append(const Writer& writer);
 
     // How many segments of this kind `record_count` records of `record_bytes` bytes take.
-    static size_t estimate_required_segments(size_t record_bytes, size_t record_count, size_t segment_size, segment_kind);
+    // `schema_table_size` is the estimated size of the schema table of one segment.
+    static size_t estimate_required_segments(size_t record_bytes, size_t record_count, size_t segment_size,
+            segment_kind, size_t schema_table_size);
 
     size_t chunk_header_size() const noexcept {
         return ondisk::chunk_header_size(_segment_kind);
@@ -302,6 +304,9 @@ public:
     // header. Returns the chunk, which is what is written to a segment. `table` is set for
     // segment_kind::full.
     bytes_view seal(segment_sequence segment_seq, std::optional<table_id> table);
+
+    // The size of the schema table of the versions appended so far.
+    size_t schema_table_size() const noexcept { return _schema_table.size(); }
 
 private:
 
@@ -374,6 +379,8 @@ public:
     bytes_view seal(segment_sequence segment_seq, std::optional<table_id> table) {
         return _raw.seal(segment_seq, table);
     }
+
+    size_t schema_table_size() const noexcept { return _raw.schema_table_size(); }
 
     // Write a record to the buffer.
     // Returns a future that will be resolved with the record location once flushed and a gate holder

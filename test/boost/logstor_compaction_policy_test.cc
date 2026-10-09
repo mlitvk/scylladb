@@ -99,6 +99,32 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_top_compaction_candidates) {
     BOOST_REQUIRE(ids(std::move(top).take_sorted()) == (std::vector<int>{3, 2, 1}));
 }
 
+// Checks that the schema table estimate starts at the first sample of a table, moves part of the
+// way toward each new sample, and is kept per table.
+SEASTAR_THREAD_TEST_CASE(test_logstor_schema_table_size_estimator) {
+    const auto narrow = table_id::create_random_id();
+    const auto wide = table_id::create_random_id();
+    schema_table_size_estimator estimator;
+    BOOST_REQUIRE_EQUAL(estimator.estimate(narrow), 0u);
+
+    estimator.add_sample(narrow, 100);
+    BOOST_REQUIRE_EQUAL(estimator.estimate(narrow), 100u);
+
+    // A wide table does not change the estimate of another table.
+    estimator.add_sample(wide, 20000);
+    BOOST_REQUIRE_EQUAL(estimator.estimate(wide), 20000u);
+    BOOST_REQUIRE_EQUAL(estimator.estimate(narrow), 100u);
+
+    // After an ALTER TABLE adds an entry, one sample moves the estimate an eighth of the way, and
+    // further samples bring it to the new size.
+    estimator.add_sample(narrow, 300);
+    BOOST_REQUIRE_EQUAL(estimator.estimate(narrow), 125u);
+    for (int i = 0; i < 64; ++i) {
+        estimator.add_sample(narrow, 300);
+    }
+    BOOST_REQUIRE_EQUAL(estimator.estimate(narrow), 300u);
+}
+
 // Checks that compaction candidate selection chooses segments in ascending utilization order,
 // respects the batch cap, and the returned score accurately describes the selected segments.
 SEASTAR_THREAD_TEST_CASE(test_logstor_select_compaction_batch) {
@@ -111,6 +137,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_select_compaction_batch) {
     // utilization no batch that select_compaction_batch() would consider has a net gain.
     constexpr size_t dense_records = records_per_segment * 98 / 100;
     constexpr size_t sparse_count = 3;
+    // Small against a 128 KiB segment, so it does not change which batch is worth taking.
+    constexpr size_t schema_table_size = 256;
 
     // Descriptors are intrusively linked into the sets, so they must keep their addresses, and every
     // set must be destroyed before them.
@@ -148,7 +176,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_select_compaction_batch) {
         BOOST_REQUIRE_EQUAL(batch.score.live_bytes, live_bytes);
     };
 
-    auto batch = select_compaction_batch(segments, segment_size, any_batch(min_segments_per_compaction));
+    auto batch = select_compaction_batch(segments, segment_size, any_batch(min_segments_per_compaction), schema_table_size);
     BOOST_REQUIRE(batch);
     check_batch(*batch);
 
@@ -160,7 +188,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_select_compaction_batch) {
     }
 
     // The cap bounds the candidate set, not only the prefix chosen out of it.
-    auto capped = select_compaction_batch(segments, segment_size, any_batch(2));
+    auto capped = select_compaction_batch(segments, segment_size, any_batch(2), schema_table_size);
     BOOST_REQUIRE(capped);
     check_batch(*capped);
     BOOST_REQUIRE_LE(capped->segments.size(), 2u);
@@ -171,11 +199,11 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_select_compaction_batch) {
     for (size_t i = 0; i < min_segments_per_compaction; ++i) {
         add_segment(dense, dense_records);
     }
-    BOOST_REQUIRE(!select_compaction_batch(dense, segment_size, any_batch(min_segments_per_compaction)));
+    BOOST_REQUIRE(!select_compaction_batch(dense, segment_size, any_batch(min_segments_per_compaction), schema_table_size));
 
     // An empty group has nothing to compact.
     segment_set empty{segment_size};
-    BOOST_REQUIRE(!select_compaction_batch(empty, segment_size, any_batch(min_segments_per_compaction)));
+    BOOST_REQUIRE(!select_compaction_batch(empty, segment_size, any_batch(min_segments_per_compaction), schema_table_size));
 }
 
 // A job next to a job in flight starts only if its batch reclaims nearly as well as the best batch.
@@ -343,6 +371,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_select_compaction_batch_threshold) {
         desc.on_write(live_records * record_size, live_records);
         set.add_segment(desc);
     };
+    // The segments carry no schema table, so each selection below passes 0 as its size.
     auto limits = [] (size_t min_batch, double threshold) {
         return compaction_batch_limits{
             .batch_cap = min_segments_per_compaction,
@@ -361,7 +390,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_select_compaction_batch_threshold) {
         }
         const double threshold = 0.05 + 0.9 * (rng() % 1000) / 1000.0;
         BOOST_TEST_CONTEXT("i=" << i << " threshold=" << threshold) {
-            auto batch = select_compaction_batch(segments, segment_size, limits(1, threshold));
+            auto batch = select_compaction_batch(segments, segment_size, limits(1, threshold), 0);
             if (batch) {
                 for (const auto* desc : batch->segments) {
                     BOOST_REQUIRE_LE(desc->record_bytes(segment_size), threshold * segment_size);
@@ -377,7 +406,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_select_compaction_batch_threshold) {
     for (size_t live_records : {31, 30, 33, 34, 35}) {
         add_segment(straddling, live_records);
     }
-    auto under = select_compaction_batch(straddling, segment_size, limits(2, 0.25));
+    auto under = select_compaction_batch(straddling, segment_size, limits(2, 0.25), 0);
     BOOST_REQUIRE(under);
     BOOST_REQUIRE_EQUAL(under->segments.size(), 2u);
 
@@ -392,7 +421,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_select_compaction_batch_threshold) {
             add_segment(capped, 33);
         }
         BOOST_TEST_CONTEXT("over_count=" << over_count) {
-            auto batch = select_compaction_batch(capped, segment_size, limits(2, 0.25));
+            auto batch = select_compaction_batch(capped, segment_size, limits(2, 0.25), 0);
             BOOST_REQUIRE_EQUAL(bool(batch), over_count < min_segments_per_compaction);
         }
     }
@@ -405,11 +434,11 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_select_compaction_batch_threshold) {
     for (size_t i = 0; i < 5; ++i) {
         add_segment(mixed, records_per_segment * 6 / 10);
     }
-    BOOST_REQUIRE(!select_compaction_batch(mixed, segment_size, limits(4, 0.5)));
-    auto three = select_compaction_batch(mixed, segment_size, limits(3, 0.5));
+    BOOST_REQUIRE(!select_compaction_batch(mixed, segment_size, limits(4, 0.5), 0));
+    auto three = select_compaction_batch(mixed, segment_size, limits(3, 0.5), 0);
     BOOST_REQUIRE(three);
     BOOST_REQUIRE_EQUAL(three->segments.size(), 3u);
-    BOOST_REQUIRE(!select_compaction_batch(mixed, segment_size, limits(1, 0.05)));
+    BOOST_REQUIRE(!select_compaction_batch(mixed, segment_size, limits(1, 0.05), 0));
 
     // Dead segments do not wait for the minimum batch.
     segment_set with_dead{segment_size};
@@ -419,7 +448,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_select_compaction_batch_threshold) {
     for (size_t i = 0; i < 2; ++i) {
         add_segment(with_dead, records_per_segment / 2);
     }
-    auto dead = select_compaction_batch(with_dead, segment_size, limits(min_segments_per_compaction, 0.6));
+    auto dead = select_compaction_batch(with_dead, segment_size, limits(min_segments_per_compaction, 0.6), 0);
     BOOST_REQUIRE(dead);
     BOOST_REQUIRE_EQUAL(dead->segments.size(), 3u);
     for (const auto* desc : dead->segments) {
