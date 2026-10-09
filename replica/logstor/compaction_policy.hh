@@ -155,8 +155,10 @@ struct compaction_batch_limits {
 // histogram's first `batch_cap` segments, and select_compaction_prefix() picks a prefix of it.
 // Returns nothing when no prefix reclaims a segment, which answers for the whole group rather than
 // only for this batch, since a longer prefix would only add fuller segments.
+//
+// `schema_table_size` is the estimated size of the schema table of one output segment.
 std::optional<compaction_batch> select_compaction_batch(const segment_set& segments,
-        uint64_t segment_size, const compaction_batch_limits& limits);
+        uint64_t segment_size, const compaction_batch_limits& limits, size_t schema_table_size);
 
 // Gives the score of a compaction candidate, which top_compaction_candidates ranks it by.
 struct compaction_score_of {

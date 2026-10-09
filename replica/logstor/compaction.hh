@@ -23,6 +23,7 @@
 #include <limits>
 #include <ranges>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 #include <functional>
 #include <utility>
@@ -62,6 +63,25 @@ using split_target_group = std::function<logstor_group&(log_segment_id, dht::tok
 // still holds the buffer it writes into; beyond that a group waits for a buffer to come back, which
 // is the same back-pressure it already takes when its own flush is in flight.
 constexpr size_t separator_flush_reserve = 16;
+
+// Estimates the size of the schema table of a segment of each table, as a running average over the
+// full segments that join the table's compaction groups. Which schema versions an output segment of
+// compaction holds is known only when its records are read.
+//
+// It is kept per table and not per shard, so that the wide mappings of one table do not make the
+// segments of another table look fuller than they are.
+class schema_table_size_estimator {
+    static constexpr double sample_weight = 1.0 / 8;
+
+    std::unordered_map<table_id, double> _sizes;
+
+public:
+    // A sample that cannot be stored is dropped, as it only refines an estimate.
+    void add_sample(table_id, size_t schema_table_size) noexcept;
+
+    // 0 for a table with no sample.
+    size_t estimate(table_id) const noexcept;
+};
 
 inline constexpr log_heap_options segment_descriptor_hist_options(4 * 1024, 3, 128 * 1024);
 
@@ -443,6 +463,9 @@ public:
 
     virtual future<compaction_reenabler> disable_compaction(logstor_group&) = 0;
     virtual compaction_reenabler disable_compaction_no_wait(logstor_group&) = 0;
+
+    // See schema_table_size_estimator.
+    virtual size_t schema_table_size_estimate(table_id) const noexcept = 0;
 };
 
 // A compaction group in logstor.
