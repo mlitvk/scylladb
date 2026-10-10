@@ -1665,16 +1665,19 @@ void segment_manager_impl::free_segment(log_segment_id segment_id) noexcept {
 // 7. Switch the active segment, so that the next write to the range lands above S. This runs
 //    also when a step after 3 fails, because the fence comes down when the erase returns. If
 //    the switch fails, the erase drops the active segment, and the next write takes a new one.
-// This is steps 2-7: the caller fences writes to the range for the duration and has drained the
-// write path into the separator (logstor::erase() does the latter), unless the range is the
-// stopped group's own, whose closed gate says the same (compaction_group::stop()). The groups
-// are the registered groups of the index that the range reaches into, whose segments and
-// separator buffers hold every record in it, found once the erase holds the shard's erase
-// semaphore, and `stopped_group`, if given: tablet cleanup erases a group it stopped, which is
-// no longer registered. A referenced segment - one a migration is streaming out - is taken out
-// of its group and left to its last reference.
+// This is steps 2-7: logstor::erase() holds a write fence on the index for the range
+// (primary_index::fence_writes()) for the duration and has drained the write path into the
+// separator, unless the range is the stopped group's own, whose closed gate says the same
+// (compaction_group::stop()). The groups are the registered groups of the index that the range
+// reaches into, whose segments and separator buffers hold every record in it, found once the
+// erase holds the shard's erase semaphore, and `stopped_group`, if given: tablet cleanup erases
+// a group it stopped, which is no longer registered. A referenced segment - one a migration is
+// streaming out - is taken out of its group and left to its last reference.
 future<> segment_manager_impl::erase(table_id table, primary_index& index, dht::token_range range, logstor_group* stopped_group) {
     auto holder = _async_gate.hold();
+    if (!index.writes_fenced(range)) {
+        on_internal_error(logstor_logger, format("Erasing table {} range {} with writes to the range not fenced", table, range));
+    }
     auto units = co_await get_units(_erase_sem, 1);
 
     // The groups are found only now. A group the caller could see before the semaphore may be gone,
@@ -1688,10 +1691,10 @@ future<> segment_manager_impl::erase(table_id table, primary_index& index, dht::
         groups.push_back(stopped_group);
     }
 
-    // Steps 2 and 3 of the erase protocol (see above), drain first: the caller drained
-    // the write path into the separator, or the range is a stopped group's own, whose gate closed
-    // with every write to it done, and the groups' separator buffers are flushed here, so that
-    // every record of the range is in a segment whose sequence has been issued. Compaction
+    // Steps 2 and 3 of the erase protocol (see above), drain first: logstor::erase()
+    // drained the write path into the separator, or the range is a stopped group's own, whose gate
+    // closed with every write to it done, and the groups' separator buffers are flushed here, so
+    // that every record of the range is in a segment whose sequence has been issued. Compaction
     // is disabled only then, since a flush needs a free segment per group and compaction is what
     // frees segments; a copy it makes in between is in a group segment discarded below, at a
     // sequence the watermark covers.

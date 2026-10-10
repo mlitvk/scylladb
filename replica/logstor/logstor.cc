@@ -17,6 +17,7 @@
 #include "replica/logstor/record_value.hh"
 #include "replica/logstor/segment_manager.hh"
 #include "replica/logstor/types.hh"
+#include "utils/error_injection.hh"
 #include "utils/managed_bytes.hh"
 #include <random>
 
@@ -132,6 +133,10 @@ future<> logstor::flush_to_separator() {
 
 future<> logstor::erase(table_id table, primary_index& index, dht::token_range range, logstor_group* stopped_group) {
     auto gate_holder = _async_gate.hold();
+    // Step 1 of the erase protocol: fence writes to the range until the erase is done, which is
+    // after the active segment was switched, so a write that waited lands above the watermark. The
+    // fence is on the table's index, so it holds for every group of the table in the range.
+    auto fence = index.fence_writes(range);
     // Every write accepted before the fence is in a separator buffer once this returns. A stopped
     // group that covers the range needs none of it: its gate closed when every write to it, and
     // the separator task carrying it, was done, see write_target::alive_holder. The flush seals a
@@ -163,18 +168,31 @@ future<> logstor::write(const frozen_mutation& m, const schema& s, write_target 
     }
 }
 
+future<> primary_index::wait_for_writes_unfenced(dht::token token, db::timeout_clock::time_point timeout) {
+    try {
+        co_await _writes_unfenced.wait(timeout, [this, token] { return !writes_fenced(token); });
+    } catch (const seastar::condition_variable_timed_out&) {
+        throw seastar::timed_out_error();
+    }
+    // Holds a write that found no fence, before it goes on, so that a test can put a fence up again.
+    co_await utils::get_local_injector().inject("logstor_write_wait_after_unfenced", utils::wait_for_message(std::chrono::seconds{60}));
+}
+
 future<> logstor::do_write(const schema& s, dht::decorated_key dk, api::timestamp_type ts, record_value value,
         write_target target, db::timeout_clock::time_point timeout) {
-    // Every exit before the index insert is a failed write: a closed gate, a failure to buffer or
-    // persist the record, an allocation failure. The callers count what fails before this frame
-    // exists.
+    // Every exit before the index insert is a failed write: a closed gate, a fence timeout, a
+    // failure to buffer or persist the record, an allocation failure. The callers count what fails
+    // before this frame exists.
     auto count_failure = defer([this] noexcept { _stats.write_failures++; });
     auto gate_holder = _async_gate.hold();
 
     auto& cg = *target.cg;
     primary_index_key key(dk);
     auto& index = cg.logstor_index();
+    const auto token = dk.token();
 
+    // Nothing of s is used after the first suspension: the caller may pass a temporary of the
+    // expression that calls write().
     log_record record {
         .header = {
             .key = std::move(dk),
@@ -185,6 +203,14 @@ future<> logstor::do_write(const schema& s, dht::decorated_key dk, api::timestam
     };
 
     auto writer = log_record_writer(std::move(record));
+
+    // The erase fence, see logstor::erase(). Nothing between the last check and the write buffer
+    // yields, so a write that passed the check before the fence went up is in the write buffer by
+    // the time the erase drains it. A loop, since another erase can put its fence up while a
+    // waiting write wakes.
+    while (index.writes_fenced(token)) [[unlikely]] {
+        co_await index.wait_for_writes_unfenced(token, timeout);
+    }
 
     // Two waits, not one: first for the record to be taken into a buffer, then for that buffer to
     // reach a segment. They are awaited here rather than behind a call of their own, which would

@@ -1262,6 +1262,8 @@ future<> compaction_group::split(compaction::compaction_type_options::split opt,
 }
 
 future<> compaction_group::erase_logstor() {
+    // The erase fences writes to the range itself; the closed gate is what says that no write is
+    // queued for a group that is going away for good.
     if (!stopped()) {
         on_internal_error(tlogger, format("Erasing the logstor records of compaction group {} of {}.{} that is not stopped",
                 _group_id, _t.schema()->ks_name(), _t.schema()->cf_name()));

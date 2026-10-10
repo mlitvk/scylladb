@@ -179,10 +179,9 @@ public:
     sstring get_segment_file_path(log_segment_id) const;
 
     // Erases all the records of `table` in `range` durably, so that reads do not find them and a
-    // restart does not bring them back. The caller must fence the writes to the range until the
-    // erase ends, and logstor::erase() drains the write path before it calls this function.
-    // `stopped_group` is a group of the range that tablet cleanup stopped and removed from the
-    // registry, so the erase cannot find it there.
+    // restart does not bring them back. Call it through logstor::erase(), which fences the writes
+    // to the range and drains the write path first. `stopped_group` is a group of the range that
+    // tablet cleanup stopped and removed from the registry, so the erase cannot find it there.
     future<> erase(table_id, primary_index&, dht::token_range, logstor_group* stopped_group = nullptr);
 
     segment_manager_usage get_usage() const noexcept;

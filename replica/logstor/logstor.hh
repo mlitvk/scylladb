@@ -68,6 +68,10 @@ public:
 
     size_t get_memory_usage() const;
 
+    uint64_t write_failures() const noexcept {
+        return _stats.write_failures;
+    }
+
     segment_manager& get_segment_manager() noexcept;
     const segment_manager& get_segment_manager() const noexcept;
 
@@ -78,6 +82,8 @@ public:
 
     future<> flush_to_separator();
 
+    // Each overload takes what it needs of its arguments before it returns, so an argument may be a
+    // temporary of the calling expression.
     future<> write(const mutation&, write_target target, db::timeout_clock::time_point timeout) noexcept;
 
     // Writes a frozen mutation without unfreezing it. s must be the schema version that the
@@ -106,8 +112,8 @@ public:
     // Erases every record of `table` in `range` that has been written so far, durably, so that no
     // restart brings one back: tablet cleanup, truncate and drop. The erase finds the table's groups
     // in the range itself; `stopped_group` is a group of the range that the caller already stopped,
-    // which is no longer registered. Writes to the range must be fenced by the caller until this
-    // returns, see segment_manager::erase().
+    // which is no longer registered. Writes to the range wait until this returns, see
+    // segment_manager::erase().
     future<> erase(table_id table, primary_index& index, dht::token_range range, logstor_group* stopped_group = nullptr);
 
 private:
