@@ -7,8 +7,11 @@
  */
 #pragma once
 
+#include "db/timeout_clock.hh"
 #include "dht/i_partitioner.hh"
+#include <algorithm>
 #include <functional>
+#include <seastar/core/condition-variable.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 #include <optional>
 #include "dht/token.hh"
@@ -322,6 +325,22 @@ private:
 
     mutable utils::phased_barrier _reads_phaser{"logstor_primary_index"};
 
+    // Step 1 of the erase protocol (segment_manager::erase()): while a fence over a range is held, a
+    // write of a key in the range waits in logstor::write(). One entry per fence, since erases put
+    // their fences up before they are serialized, so a truncate and a cleanup can hold fences at once.
+    struct write_fence_entry {
+        uint64_t id;
+        dht::token_range range;
+    };
+    utils::small_vector<write_fence_entry, 1> _write_fences;
+    uint64_t _next_write_fence_id = 0;
+    seastar::condition_variable _writes_unfenced;
+
+    void remove_write_fence(uint64_t id) noexcept {
+        _write_fences.erase(std::ranges::find(_write_fences, id, &write_fence_entry::id));
+        _writes_unfenced.broadcast();
+    }
+
     // Non-owning pointer to the cache tracker; null when the cache is not set up.
     // Mutable so that logically-const methods can call non-const methods on the
     // tracker (touch, insert) for LRU accounting.
@@ -439,6 +458,55 @@ public:
             }
         }
     }
+
+    // Holds a write fence, see fence_writes().
+    class write_fence {
+        primary_index* _index = nullptr;
+        uint64_t _id = 0;
+        friend class primary_index;
+        write_fence(primary_index& index, uint64_t id) noexcept : _index(&index), _id(id) {}
+    public:
+        write_fence(write_fence&& o) noexcept : _index(std::exchange(o._index, nullptr)), _id(o._id) {}
+        write_fence& operator=(write_fence&&) = delete;
+        ~write_fence() {
+            if (_index) {
+                _index->remove_write_fence(_id);
+            }
+        }
+    };
+
+    // Fences the writes of keys in `range` for as long as the result lives: a write arriving
+    // meanwhile waits in logstor::write() and then goes on as if it had just arrived. The index is
+    // the table's, so the fence holds for every group of the table in the range, a group that joins
+    // the table while the fence is up included. Copies the separator and compaction make are not
+    // writes in this sense; the erase protocol covers them by draining and stopping the copiers.
+    write_fence fence_writes(dht::token_range range) {
+        _write_fences.push_back(write_fence_entry{.id = _next_write_fence_id, .range = std::move(range)});
+        return write_fence(*this, _next_write_fence_id++);
+    }
+
+    // On the write path: one branch while no fence is held.
+    bool writes_fenced(dht::token token) const noexcept {
+        if (_write_fences.empty()) [[likely]] {
+            return false;
+        }
+        return std::ranges::any_of(_write_fences, [&token] (const write_fence_entry& f) {
+            return f.range.contains(token, dht::token_comparator());
+        });
+    }
+
+    // Whether one held fence covers all of `range`.
+    bool writes_fenced(const dht::token_range& range) const noexcept {
+        return std::ranges::any_of(_write_fences, [&range] (const write_fence_entry& f) {
+            return f.range.contains(range, dht::token_comparator());
+        });
+    }
+
+    // Waits until no write fence covers `token`, or the timeout passes, which fails with
+    // timed_out_error as the write would have failed anyway. Out of line, so the write path's frame
+    // does not carry it; defined in logstor.cc, next to its caller. The waiting write holds
+    // logstor's gate, so a stop() during a long erase waits for the erase too.
+    future<> wait_for_writes_unfenced(dht::token token, db::timeout_clock::time_point timeout);
 
     future<> await_pending_reads() {
         return _reads_phaser.advance_and_await();
