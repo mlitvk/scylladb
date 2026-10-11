@@ -199,6 +199,8 @@ public:
 
     // Create an output stream to write a segment (for receiving from remote node)
     // Allocates a new local segment and returns an output stream for writing to the segment.
+    // The sink is work in progress of the segment manager until it is closed or aborted: stop()
+    // waits for it, and after stop() starts this fails with gate_closed_exception.
     future<std::unique_ptr<segment_stream_sink>> create_segment_output_stream(recovery_catalog&);
 
     friend class segment_manager_impl;
