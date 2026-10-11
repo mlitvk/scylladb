@@ -2566,12 +2566,16 @@ future<seastar::input_stream<char>> segment_manager_impl::create_segment_input_s
     co_return std::move(stream);
 }
 
+// The sink is work of the segment manager that is in progress until it is closed or aborted. It
+// holds the gate of the segment manager for that time, so that stop() waits for it, as it waits for
+// a write. The segment comes from the segment pool, which stops after the gate is closed.
 class segment_stream_sink_impl : public segment_stream_sink {
     segment_manager_impl& _sm;
+    seastar::gate::holder _holder;
     seg_ptr _seg;
 public:
-    segment_stream_sink_impl(segment_manager_impl& sm, seg_ptr seg)
-        : _sm(sm), _seg(std::move(seg))
+    segment_stream_sink_impl(segment_manager_impl& sm, seastar::gate::holder holder, seg_ptr seg)
+        : _sm(sm), _holder(std::move(holder)), _seg(std::move(seg))
     {}
 public:
     log_segment_id segment_id() const noexcept override {
@@ -2585,9 +2589,11 @@ public:
     future<> close(replica::database& db) override {
         co_await _seg->stop();
         co_await _sm.load_segment(db, _seg->id());
+        _holder.release();
     }
     future<> abort() override {
         co_await _seg->stop();
+        _holder.release();
     }
 };
 
@@ -2600,8 +2606,11 @@ future<> segment_manager_impl::load_segment(replica::database& db, log_segment_i
 }
 
 future<std::unique_ptr<segment_stream_sink>> segment_manager_impl::create_segment_output_stream() {
+    // Taken before the segment, so that a sink is never made while the segment manager stops. If
+    // the gate is closed, this fails with gate_closed_exception, and no stream starts.
+    auto holder = _async_gate.hold();
     auto seg = co_await get_segment(write_source::streaming);
-    co_return std::make_unique<segment_stream_sink_impl>(*this, std::move(seg));
+    co_return std::make_unique<segment_stream_sink_impl>(*this, std::move(holder), std::move(seg));
 }
 
 future<utils::chunked_vector<segment_snapshot>> segment_manager::make_snapshot(logstor_group& cg) {

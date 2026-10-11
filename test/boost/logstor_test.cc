@@ -21,6 +21,8 @@
 #include <seastar/core/memory.hh>
 #include <seastar/util/closeable.hh>
 #include <seastar/core/semaphore.hh>
+#include <seastar/core/gate.hh>
+#include <seastar/core/sleep.hh>
 #include <seastar/core/format.hh>
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/util/memory-data-source.hh>
@@ -4305,4 +4307,30 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_range_reader_serves_a_reversed_read) {
             env.make_reader(query::full_partition_range, bypassing));
     BOOST_REQUIRE_EQUAL(stats.partition_hits, hits + ms.size());
     BOOST_REQUIRE_EQUAL(stats.partition_misses, misses);
+}
+
+// Checks that the stop of the store waits for a segment stream sink that is open, and that no sink
+// can be made after the stop started. The sink writes a streamed segment with a segment and a file
+// of the store, which the stop must not take away from it.
+SEASTAR_THREAD_TEST_CASE(test_logstor_stop_waits_for_segment_stream_sink) {
+    tmpdir dir;
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    ls.do_recovery_for_test().get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    auto& sm = ls.get_segment_manager();
+    auto sink = sm.create_segment_output_stream().get();
+
+    auto stop_f = ls.stop();
+    seastar::sleep(std::chrono::milliseconds(100)).get();
+    BOOST_REQUIRE(!stop_f.available());
+
+    // A new sink is refused while the store stops.
+    BOOST_REQUIRE_THROW(sm.create_segment_output_stream().get(), seastar::gate_closed_exception);
+
+    sink->abort().get();
+    sink.reset();
+    stop_f.get();
 }
