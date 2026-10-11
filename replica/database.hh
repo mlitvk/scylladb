@@ -1551,7 +1551,7 @@ public:
     future<utils::chunked_vector<sstables::shared_sstable>> take_sstable_set_snapshot();
 
     future<utils::chunked_vector<logstor::segment_snapshot>> take_logstor_snapshot(dht::token_range tr);
-    future<std::unique_ptr<logstor::segment_stream_sink>> create_logstor_segment_sink(replica::database&);
+    future<std::unique_ptr<logstor::segment_stream_sink>> create_logstor_segment_sink();
 
     // Clones storage of a given tablet. Memtable is flushed first to guarantee that the
     // snapshot (list of sstables) will include all the data written up to the time it was taken.

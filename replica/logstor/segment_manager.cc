@@ -802,7 +802,7 @@ public:
     future<utils::chunked_vector<segment_snapshot>> make_snapshot(logstor_group&);
 
     future<seastar::input_stream<char>> create_segment_input_stream(log_segment_id segment_id, const seastar::file_input_stream_options& opts);
-    future<std::unique_ptr<segment_stream_sink>> create_segment_output_stream(replica::database&);
+    future<std::unique_ptr<segment_stream_sink>> create_segment_output_stream();
 
     uint64_t allocatable_new_segment_count() const noexcept {
         return _next_new_segment_id < _configured_max_segments ? _configured_max_segments - _next_new_segment_id : 0;
@@ -2568,11 +2568,10 @@ future<seastar::input_stream<char>> segment_manager_impl::create_segment_input_s
 
 class segment_stream_sink_impl : public segment_stream_sink {
     segment_manager_impl& _sm;
-    replica::database& _db;
     seg_ptr _seg;
 public:
-    segment_stream_sink_impl(segment_manager_impl& sm, replica::database& db, seg_ptr seg)
-        : _sm(sm), _db(db), _seg(std::move(seg))
+    segment_stream_sink_impl(segment_manager_impl& sm, seg_ptr seg)
+        : _sm(sm), _seg(std::move(seg))
     {}
 public:
     log_segment_id segment_id() const noexcept override {
@@ -2583,9 +2582,9 @@ public:
         auto stream = output_stream<char>(data_sink(std::move(sink)));
         co_return std::move(stream);
     }
-    future<> close() override {
+    future<> close(replica::database& db) override {
         co_await _seg->stop();
-        co_await _sm.load_segment(_db, _seg->id());
+        co_await _sm.load_segment(db, _seg->id());
     }
     future<> abort() override {
         co_await _seg->stop();
@@ -2600,17 +2599,17 @@ future<> segment_manager_impl::load_segment(replica::database& db, log_segment_i
     co_await add_segment_to_compaction_group(db, desc);
 }
 
-future<std::unique_ptr<segment_stream_sink>> segment_manager_impl::create_segment_output_stream(replica::database& db) {
+future<std::unique_ptr<segment_stream_sink>> segment_manager_impl::create_segment_output_stream() {
     auto seg = co_await get_segment(write_source::streaming);
-    co_return std::make_unique<segment_stream_sink_impl>(*this, db, std::move(seg));
+    co_return std::make_unique<segment_stream_sink_impl>(*this, std::move(seg));
 }
 
 future<utils::chunked_vector<segment_snapshot>> segment_manager::make_snapshot(logstor_group& cg) {
     return _impl->make_snapshot(cg);
 }
 
-future<std::unique_ptr<segment_stream_sink>> segment_manager::create_segment_output_stream(replica::database& db) {
-    return _impl->create_segment_output_stream(db);
+future<std::unique_ptr<segment_stream_sink>> segment_manager::create_segment_output_stream() {
+    return _impl->create_segment_output_stream();
 }
 
 separator_buffer::~separator_buffer() {

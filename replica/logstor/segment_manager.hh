@@ -96,7 +96,8 @@ public:
     virtual ~segment_stream_sink() = default;
     virtual log_segment_id segment_id() const noexcept = 0;
     virtual future<output_stream<char>> output() = 0;
-    virtual future<> close() = 0;
+    // Seals the segment and loads its records into the index of their table.
+    virtual future<> close(replica::database&) = 0;
     virtual future<> abort() = 0;
 };
 
@@ -161,7 +162,7 @@ public:
 
     // Create an output stream to write a segment (for receiving from remote node)
     // Allocates a new local segment and returns an output stream for writing to the segment.
-    future<std::unique_ptr<segment_stream_sink>> create_segment_output_stream(replica::database&);
+    future<std::unique_ptr<segment_stream_sink>> create_segment_output_stream();
 
     friend class segment_manager_impl;
 

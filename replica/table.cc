@@ -1811,8 +1811,8 @@ future<utils::chunked_vector<logstor::segment_snapshot>> table::take_logstor_sna
     co_return std::move(snp);
 }
 
-future<std::unique_ptr<logstor::segment_stream_sink>> table::create_logstor_segment_sink(replica::database& db) {
-    return get_logstor_segment_manager().create_segment_output_stream(db);
+future<std::unique_ptr<logstor::segment_stream_sink>> table::create_logstor_segment_sink() {
+    return get_logstor_segment_manager().create_segment_output_stream();
 }
 
 future<utils::chunked_vector<sstables::entry_descriptor>>

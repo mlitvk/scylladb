@@ -213,7 +213,7 @@ public:
 
     future<> close() {
         return _db.invoke_on(_target_shard, [this] (replica::database& db) -> future<> {
-            return _segment_sink->close();
+            return _segment_sink->close(db);
         });
     }
 
@@ -228,7 +228,7 @@ future<logstor_sink> make_logstor_sink(sharded<replica::database>& db, table_id 
     auto sink = co_await db.invoke_on(target_shard, [tid] (replica::database& db) -> future<foreign_segment_sink> {
         auto& table = db.find_column_family(tid);
         auto table_stream_op = table.stream_in_progress();
-        auto segment_sink = co_await table.create_logstor_segment_sink(db);
+        auto segment_sink = co_await table.create_logstor_segment_sink();
         co_return make_foreign(std::move(segment_sink));
     });
     co_return logstor_sink(db, tid, target_shard, std::move(sink));
