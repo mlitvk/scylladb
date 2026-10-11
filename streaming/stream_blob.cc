@@ -227,7 +227,6 @@ public:
 future<logstor_sink> make_logstor_sink(sharded<replica::database>& db, table_id tid, shard_id target_shard) {
     auto sink = co_await db.invoke_on(target_shard, [tid] (replica::database& db) -> future<foreign_segment_sink> {
         auto& table = db.find_column_family(tid);
-        auto table_stream_op = table.stream_in_progress();
         auto segment_sink = co_await table.create_logstor_segment_sink();
         co_return make_foreign(std::move(segment_sink));
     });
