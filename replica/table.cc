@@ -1838,8 +1838,35 @@ future<utils::chunked_vector<logstor::segment_snapshot>> table::take_logstor_sna
     co_return std::move(snp);
 }
 
+// The sink of a streamed logstor segment, with the stream kept in progress for the table until the
+// sink is closed or aborted. Thus stop() and await_pending_ops() of the table wait for it.
+class logstor_segment_sink_of_table final : public logstor::segment_stream_sink {
+    std::unique_ptr<logstor::segment_stream_sink> _sink;
+    utils::phased_barrier::operation _stream_op;
+public:
+    logstor_segment_sink_of_table(std::unique_ptr<logstor::segment_stream_sink> sink, utils::phased_barrier::operation stream_op)
+        : _sink(std::move(sink)), _stream_op(std::move(stream_op))
+    {}
+    logstor::log_segment_id segment_id() const noexcept override {
+        return _sink->segment_id();
+    }
+    future<output_stream<char>> output() override {
+        return _sink->output();
+    }
+    future<> close() override {
+        co_await _sink->close();
+        _stream_op = {};
+    }
+    future<> abort() override {
+        co_await _sink->abort();
+        _stream_op = {};
+    }
+};
+
 future<std::unique_ptr<logstor::segment_stream_sink>> table::create_logstor_segment_sink(replica::database& db) {
-    return get_logstor_segment_manager().create_segment_output_stream(db.logstor_catalog());
+    auto stream_op = stream_in_progress();
+    auto sink = co_await get_logstor_segment_manager().create_segment_output_stream(db.logstor_catalog());
+    co_return std::make_unique<logstor_segment_sink_of_table>(std::move(sink), std::move(stream_op));
 }
 
 future<utils::chunked_vector<sstables::entry_descriptor>>
