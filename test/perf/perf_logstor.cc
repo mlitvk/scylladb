@@ -536,6 +536,24 @@ query::partition_slice make_read_slice(const schema& s, unsigned select_columns,
     return builder.build();
 }
 
+// The logstor of one shard, with a segment pool of the geometry the run was given. The segment
+// manager checks the geometry, and throws if it cannot use it.
+std::unique_ptr<logstor> make_logstor(const test_config& cfg, const std::filesystem::path& dir, ::cache_tracker& shared_tracker) {
+    auto logstor_cfg = tests::logstor::make_test_logstor_config(dir, {
+        .segment_size = cfg.segment_size,
+        .file_size = cfg.file_size,
+        .disk_size = cfg.disk_size,
+        // Preallocated rather than sparse, which is what a node writes into: a read of a hole
+        // is not a read of a disk, and a write into one pays for the extent it allocates.
+        .sparse_files = false,
+        .compaction_enabled = cfg.compaction,
+    });
+    // The same share of memory a node gives the writes it has taken but not yet flushed, which
+    // is what bounds how far ahead of the disk the write path may run.
+    logstor_cfg.max_queued_write_bytes = memory::stats().total_memory() / 100;
+    return std::make_unique<logstor>(std::move(logstor_cfg), shared_tracker);
+}
+
 // One logstor of one shard, with a dataset written to it, which is what a shard of a node has: the
 // segments of a shard are its own, and so is its index.
 class logstor_bench {
@@ -543,6 +561,9 @@ class logstor_bench {
     schema_ptr _schema;
     // Outlives _logstor, which holds a reference to it.
     tests::logstor::shared_logstor_cache _cache;
+    // Made before _semaphore, which must be stopped before it is destroyed. If the segment manager
+    // rejects the geometry, the constructor fails before the semaphore exists, and the run fails
+    // with the error of the segment manager.
     std::unique_ptr<logstor> _logstor;
     std::unique_ptr<tests::logstor::test_logstor_group> _group;
     std::vector<dht::decorated_key> _keys;
@@ -590,6 +611,7 @@ public:
     logstor_bench(test_config cfg, std::filesystem::path dir)
         : _cfg(cfg)
         , _schema(make_kv_schema(cfg.columns))
+        , _logstor(make_logstor(cfg, dir, _cache.shared_tracker))
         , _value(bytes::initialized_later(), cfg.value_size)
         , _slice(make_read_slice(*_schema, cfg.select_columns, false))
         , _slice_bypassing_cache(make_read_slice(*_schema, cfg.select_columns, true))
@@ -598,19 +620,6 @@ public:
         , _serialization_buffer(std::make_unique<raw_write_buffer>(cfg.segment_size, segment_kind::mixed))
         , _dir(dir) {
         std::ranges::fill(_value, int8_t('v'));
-        auto logstor_cfg = tests::logstor::make_test_logstor_config(dir, {
-            .segment_size = cfg.segment_size,
-            .file_size = cfg.file_size,
-            .disk_size = cfg.disk_size,
-            // Preallocated rather than sparse, which is what a node writes into: a read of a hole
-            // is not a read of a disk, and a write into one pays for the extent it allocates.
-            .sparse_files = false,
-            .compaction_enabled = cfg.compaction,
-        });
-        // The same share of memory a node gives the writes it has taken but not yet flushed, which
-        // is what bounds how far ahead of the disk the write path may run.
-        logstor_cfg.max_queued_write_bytes = memory::stats().total_memory() / 100;
-        _logstor = std::make_unique<logstor>(std::move(logstor_cfg), _cache.shared_tracker);
     }
 
     future<> start() {
