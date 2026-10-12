@@ -12,7 +12,7 @@ target_sources(replica
     logstor/ondisk.cc
     logstor/segment_io.cc
     logstor/cache.cc
-    logstor/compaction.cc
+    logstor/compaction_policy.cc
     logstor/segment_manager.cc
     logstor/logstor.cc
     logstor/readers.cc

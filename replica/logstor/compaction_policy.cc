@@ -5,6 +5,7 @@
 /*
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
+#include "replica/logstor/compaction_policy.hh"
 #include "replica/logstor/compaction.hh"
 #include <algorithm>
 #include <cmath>
