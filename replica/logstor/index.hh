@@ -217,6 +217,9 @@ class primary_index final {
     // Set by the first populate, so that drain_cache() does not scan an index that never had a
     // cached partition. When it is true, `_cache_tracker` is set.
     mutable bool _cache_used = false;
+    // The row cache of the index's table, which the reads of the cache are accounted in; set when
+    // the cache tracker is.
+    row_cache* _table_cache = nullptr;
 
     // Gets the record added, record freed and record moved events of the index. The segment
     // manager is the only subscriber.
@@ -246,17 +249,29 @@ class primary_index final {
         return _cache_tracker && _cache_enabled;
     }
 
+    bool reads_cache(use_cache uses_cache) const noexcept {
+        return reads_cache() && uses_cache;
+    }
+
     index_read_guard make_read_guard() const {
         return index_read_guard(_reads_phaser.start());
     }
 
 public:
-    explicit primary_index(space_accounting_subscriber& space_accounting, cache_tracker* ct, bool cache_enabled)
+    // When the node has the cache, the index is given both the tracker of the shard's logstor cache
+    // and the row cache of its table, and when the node has no cache, neither.
+    // `cache_enabled` is the caching option of the table, which set_cache_enabled() changes.
+    primary_index(space_accounting_subscriber& space_accounting, cache_tracker* ct, row_cache* table_cache, bool cache_enabled)
         : _entries(dht::raw_token_less_comparator{})
         , _cache_tracker(ct)
         , _cache_enabled(cache_enabled)
+        , _table_cache(table_cache)
         , _space_accounting(space_accounting)
-        {}
+    {
+        if (bool(_cache_tracker) != bool(_table_cache)) {
+            on_internal_error(logstor_logger, "primary_index: a cache tracker without the table's row cache, or the other way around");
+        }
+    }
 
     // Evicts the cached partition of each entry, because an entry must not be destroyed while it
     // links to a cached partition. Does not report the records of the entries to the space
@@ -393,6 +408,12 @@ public:
     // record if the cache does not have it.
     using read_lookup_result = std::variant<keyed_single_row_partition, guarded_location>;
 
+    // The row cache a read is accounted in, through a read_context, or null when the read does not
+    // consult the cache: the cache is not enabled, or the read does not use it.
+    row_cache* cache_for_read(use_cache uses_cache) const noexcept {
+        return reads_cache(uses_cache) ? _table_cache : nullptr;
+    }
+
     // Finds a key for a point read. Returns nullopt if the index does not have the key. If the
     // read uses the cache and the cache has the key, returns the cached partition with its key,
     // with the columns that `columns` selects. If not, returns the location of the record with a
@@ -401,7 +422,7 @@ public:
     std::optional<read_lookup_result> lookup_for_read(const primary_index_key& key, const schema& target_schema, use_cache uses_cache,
             const column_filter& columns) const {
         return find_entry(key).transform([&] (const primary_index_entry& e) -> read_lookup_result {
-            if (reads_cache() && uses_cache) {
+            if (reads_cache(uses_cache)) {
                 if (auto cached = _cache_tracker->read_partition(e, target_schema, columns)) {
                     return std::move(*cached);
                 }
@@ -489,8 +510,7 @@ public:
 
         // Returns the cached partition of the entry, with its key and with the columns that
         // `columns` selects. Returns nullopt when the cache does not hold the entry or when the
-        // index does not read the cache. Counts a hit or a miss and touches the LRU, like a point
-        // read does.
+        // index does not read the cache. Touches the LRU, like a point read does.
         std::optional<keyed_single_row_partition> read_cached(const schema& target_schema, const column_filter& columns) const {
             if (!_index.reads_cache()) {
                 return std::nullopt;

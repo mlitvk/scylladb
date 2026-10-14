@@ -7,6 +7,7 @@
  */
 #include "replica/logstor/cache.hh"
 #include "db/cache_tracker.hh"
+#include "db/row_cache.hh"
 #include "replica/logstor/index.hh"
 #include "utils/assert.hh"
 
@@ -46,6 +47,39 @@ void cached_partition_entry::on_evicted() noexcept {
     current_allocator().destroy(this);
 }
 
+// read_context
+
+read_context::read_context(row_cache& cache)
+        : _cache(cache) {
+    ++_cache._tracker.get_stats().reads;
+}
+
+read_context::~read_context() {
+    auto& stats = _cache._tracker.get_stats();
+    ++stats.reads_done;
+    if (_missed) {
+        _cache._stats.reads_with_misses.mark();
+        ++stats.reads_with_misses;
+    } else {
+        _cache._stats.reads_with_no_misses.mark();
+    }
+}
+
+void read_context::on_hit(bool with_row) {
+    _cache.on_partition_hit();
+    if (with_row) {
+        _cache.on_row_hit();
+    }
+}
+
+void read_context::on_miss(bool with_row) {
+    _missed = true;
+    _cache.on_partition_miss();
+    if (with_row) {
+        _cache.on_row_miss();
+    }
+}
+
 // cache_tracker
 
 cache_tracker::cache_tracker(::cache_tracker& shared_tracker)
@@ -79,7 +113,7 @@ std::optional<keyed_single_row_partition> cache_tracker::read_partition(const pr
     // The partition is built inside the section and returned out of it by value: an allocation
     // failure re-runs the section's function from the start, and nothing outside it has been
     // touched by then.
-    auto cached = _read_section(region(), [&] () -> std::optional<keyed_single_row_partition> {
+    return _read_section(region(), [&] () -> std::optional<keyed_single_row_partition> {
         if (!pie._cached_entry) {
             return std::nullopt;
         }
@@ -92,14 +126,6 @@ std::optional<keyed_single_row_partition> cache_tracker::read_partition(const pr
         }
         return keyed_single_row_partition{dht::decorated_key(pie.key().token(), e.key()), e.partition().copy(*e.schema(), columns)};
     });
-
-    if (cached) {
-        _shared_tracker.on_partition_hit();
-    } else {
-        _shared_tracker.on_partition_miss();
-    }
-
-    return cached;
 }
 
 std::optional<mutation> cache_tracker::peek(const primary_index_entry& pie, schema_ptr target_schema) {

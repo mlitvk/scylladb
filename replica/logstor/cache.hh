@@ -16,6 +16,8 @@
 #include <optional>
 #include <type_traits>
 
+class row_cache;
+
 namespace replica::logstor {
 
 class cache_tracker;
@@ -110,8 +112,34 @@ public:
     friend class cached_partition_entry;
 };
 
+// Accounts one read that consults the logstor cache, from its start to its end, the way
+// cache::read_context accounts a read of the row cache: a read, and one with misses if the cache did
+// not have a partition it returned, with a partition hit or miss and a row hit or miss for every
+// partition it returns. What a read of the row cache counts in the table's row cache - the rates of
+// rows hit and missed, and of reads with and without misses, which are the table's cache hit rate -
+// this counts in the row cache of the logstor table, which is otherwise empty.
+class read_context {
+    row_cache& _cache;
+    bool _missed = false;
+
+public:
+    explicit read_context(row_cache&);
+    ~read_context();
+
+    read_context(const read_context&) = delete;
+    read_context& operator=(const read_context&) = delete;
+
+    // A partition the read returns, from the cache or from a segment; `with_row` is whether the read
+    // returns its row with it.
+    void on_hit(bool with_row);
+    void on_miss(bool with_row);
+};
+
 // The cache of a primary index: uses the shared row-cache LSA region and LRU list, and is read
 // and written through the index, since a cached partition hangs off the index entry of its key.
+// It accounts for what it holds in the shared tracker - admissions, evictions and invalidations of
+// partitions and their rows - while the reads that consult it account for what they are served,
+// through a read_context.
 class cache_tracker {
     ::cache_tracker& _shared_tracker;
     // Used by the read path to lock the LSA region without changing the current allocator
@@ -135,18 +163,18 @@ public:
         _shared_tracker.on_mispopulate();
     }
 
-    // The hit path of a read: touches the LRU, counts a hit or a miss, upgrades the entry in place,
-    // and hands out the partition with its key. A reader turns the partition into fragments without
-    // a mutation in between. The partition is copied with single_row_partition::copy(s, columns).
-    // The index entry has only the hash of the key, so a point read compares the key it gets with
-    // its own. The schema is taken by reference, because only a hit that upgrades the entry needs a
-    // reference to it. Never yields.
+    // The hit path of a read: touches the LRU, upgrades the entry in place, and hands out the
+    // partition with its key. A reader turns the partition into fragments without a mutation in
+    // between. The partition is copied with single_row_partition::copy(s, columns). The index entry
+    // has only the hash of the key, so a point read compares the key it gets with its own. The
+    // schema is taken by reference, because only a hit that upgrades the entry needs a reference to
+    // it. Never yields.
     std::optional<keyed_single_row_partition> read_partition(const primary_index_entry&, const schema& target_schema,
             const column_filter& columns);
 
     // For introspection: a snapshot of the cached partition as a mutation, taken without
-    // touching the LRU, without counting a hit or a miss and without upgrading the cached
-    // entry in place - the snapshot is upgraded instead.
+    // touching the LRU and without upgrading the cached entry in place - the snapshot is
+    // upgraded instead.
     std::optional<mutation> peek(const primary_index_entry&, schema_ptr);
 
 private:
