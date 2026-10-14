@@ -326,6 +326,9 @@ private:
     // Mutable so that logically-const methods can call non-const methods on the
     // tracker (touch, insert) for LRU accounting.
     mutable cache_tracker* _cache_tracker = nullptr;
+    // The row cache of the index's table, which the reads of the cache are accounted in; set when
+    // the cache tracker is.
+    row_cache* _table_cache = nullptr;
 
     // Currently we support a single subscriber for space accounting which is the segment manager.
     space_accounting_subscriber& _space_accounting;
@@ -415,12 +418,23 @@ private:
         return _partitions.upper_bound(token.raw(), primary_index_key_cmp{});
     }
 
+    bool reads_cache(use_cache uses_cache) const noexcept {
+        return _cache_tracker && uses_cache;
+    }
+
 public:
-    explicit primary_index(space_accounting_subscriber& space_accounting, cache_tracker* ct)
+    // With the cache enabled, the index is given both the tracker of the shard's logstor cache and
+    // the row cache of its table; with the cache disabled, neither.
+    primary_index(space_accounting_subscriber& space_accounting, cache_tracker* ct, row_cache* table_cache)
         : _partitions(dht::raw_token_less_comparator{})
         , _cache_tracker(ct)
+        , _table_cache(table_cache)
         , _space_accounting(space_accounting)
-        {}
+    {
+        if (bool(_cache_tracker) != bool(_table_cache)) {
+            on_internal_error(logstor_logger, "primary_index: a cache tracker without the table's row cache, or the other way around");
+        }
+    }
 
     ~primary_index() {
         with_allocator(_tree_allocator, [this] { _partitions.clear(); });
@@ -472,13 +486,19 @@ public:
         return result;
     }
 
+    // The row cache a read is accounted in, through a read_context, or null when the read does not
+    // consult the cache: the cache is not enabled, or the read does not use it.
+    row_cache* cache_for_read(use_cache uses_cache) const noexcept {
+        return reads_cache(uses_cache) ? _table_cache : nullptr;
+    }
+
     // The cached partition of an entry the caller holds from scan(), with its key, or nullopt when
-    // the entry holds nothing, the cache is not enabled or the read does not use it. Counts a hit
-    // or a miss and touches the LRU, like a point read does. `columns` says which columns a hit
-    // copies. The entry must belong to this index.
+    // the entry holds nothing, the cache is not enabled or the read does not use it. Touches the
+    // LRU, like a point read does. `columns` says which columns a hit copies. The entry must
+    // belong to this index.
     std::optional<keyed_single_row_partition> lookup_cached(const primary_index_entry& e, const schema& target_schema, use_cache uses_cache,
             const column_filter& columns) const {
-        if (!_cache_tracker || !uses_cache) {
+        if (!reads_cache(uses_cache)) {
             return std::nullopt;
         }
         return _cache_tracker->read_partition(e, target_schema, columns);
@@ -496,7 +516,7 @@ public:
             return std::nullopt;
         }
 
-        if (_cache_tracker && uses_cache) {
+        if (reads_cache(uses_cache)) {
             if (auto cached = _cache_tracker->read_partition(*it, target_schema, columns)) {
                 return std::move(*cached);
             }

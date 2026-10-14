@@ -75,7 +75,9 @@ public:
     compaction_manager& get_compaction_manager() noexcept;
     const compaction_manager& get_compaction_manager() const noexcept;
 
-    std::unique_ptr<primary_index> make_primary_index(bool cache_enabled);
+    // The index of a table. With the table's row cache, the index caches partitions, and the reads
+    // of its cache are accounted in the metrics of that row cache; without it, the cache is disabled.
+    std::unique_ptr<primary_index> make_primary_index(row_cache* table_cache);
 
     future<> flush_to_separator();
 

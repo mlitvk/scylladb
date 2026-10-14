@@ -1459,3 +1459,54 @@ async def test_cache(manager: ScyllaClusterManager):
             for i in range(num_keys):
                 rows = await cql.run_async(f"SELECT pk, v FROM {ks}.test_no_cache WHERE pk = {i}")
                 assert rows[0].v == i * 10, f"unexpected value for pk={i}"
+
+@pytest.mark.asyncio
+async def test_cache_metrics(manager: ScyllaClusterManager):
+    """
+    The logstor cache reports through the row cache's metrics beyond the partition counters: the
+    rows it holds, the reads that consult it, and the table's own cache hits and misses, which the
+    table's cache hit rate is made of.
+    """
+    cmdline = ['--smp=1']
+    cfg = {'experimental_features': ['logstor']}
+    server = await manager.server_add(cmdline=cmdline, config=cfg)
+    cql = manager.get_cql()
+
+    names = ("rows", "row_hits", "row_misses", "reads", "reads_with_misses")
+
+    async def cache_metrics():
+        m = await manager.metrics.query(server.ip_addr)
+        return {name: m.get(f"scylla_cache_{name}") or 0 for name in names}
+
+    async def table_count(ks, what):
+        meter = await manager.api.client.get_json(f"/column_family/metrics/row_cache_{what}/{ks}:test", host=server.ip_addr)
+        return meter["count"]
+
+    async with new_test_keyspace(manager, "WITH tablets={'initial': 1}") as ks:
+        await cql.run_async(
+            f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v int)"
+            " WITH storage_engine = 'logstor'"
+        )
+        num_keys = 10
+        for i in range(num_keys):
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, v) VALUES ({i}, {i})")
+
+        before = await cache_metrics()
+        # A cold read of every key, and a warm one.
+        for _ in range(2):
+            for i in range(num_keys):
+                rows = await cql.run_async(f"SELECT v FROM {ks}.test WHERE pk = {i}")
+                assert rows[0].v == i
+        after = await cache_metrics()
+
+        # The table's own counts are its reads' alone.
+        assert await table_count(ks, "miss") == num_keys
+        assert await table_count(ks, "hit") == num_keys
+
+        # The node-wide ones are shared with the row cache, which the system tables use, so only
+        # lower bounds hold for them.
+        assert after["rows"] >= num_keys
+        assert after["row_misses"] - before["row_misses"] >= num_keys
+        assert after["row_hits"] - before["row_hits"] >= num_keys
+        assert after["reads"] - before["reads"] >= 2 * num_keys
+        assert after["reads_with_misses"] - before["reads_with_misses"] >= num_keys

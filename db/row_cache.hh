@@ -30,6 +30,9 @@ class mutation_reader;
 
 namespace replica {
 class memtable_entry;
+namespace logstor {
+class read_context;
+}
 }
 
 namespace tracing { class trace_state_ptr; }
@@ -162,6 +165,9 @@ public:
     friend class cache::cache_mutation_reader;
     friend class cache::lsa_manager;
     friend class cache::read_context;
+    // The logstor cache is not a row cache, but a table's row cache is where its reads are
+    // accounted, see replica/logstor/cache.hh.
+    friend class replica::logstor::read_context;
     friend class partition_range_cursor;
     friend class cache_tester;
 

@@ -33,7 +33,8 @@ namespace {
 // its buffer is owed a stop between any two fragments - so the fragments not pushed yet wait for
 // the next fill. The fragments account for themselves as they are pushed, so the reader charges a
 // partition to the permit only while its key or its row waits outside the buffer, and releases the
-// charge when it pushes the row.
+// charge when it pushes the row. A read that consults the cache is accounted in its metrics for
+// what it returns, as each partition is begun.
 class logstor_reader_base : public mutation_reader::impl {
 protected:
     struct pending_partition {
@@ -41,6 +42,8 @@ protected:
         single_row_partition partition;
         // The charge for the partition while it waits outside the buffer, or none.
         reader_permit::resource_units memory;
+        // Whether the partition came from the cache rather than from a segment.
+        bool cached;
     };
 
     // The query's schema, _schema, is what the fragments are pushed under. The table's is what the
@@ -54,6 +57,9 @@ protected:
     // what it reads from a segment.
     const use_cache _use_cache;
     const column_filter _columns;
+    // Engaged while the read consults the cache: for the lifetime of a range read, and from the
+    // moment a point read finds its key in the index.
+    std::optional<read_context> _read_context;
 
 private:
     // The partition whose fragments are going into the buffer, from its start being pushed until
@@ -95,6 +101,13 @@ protected:
         // one, and only an empty list excludes the row.
         if (p.partition.row && _slice.row_ranges(*_schema, p.key.key()).empty()) {
             p.partition.row.reset();
+        }
+        if (_read_context) {
+            if (p.cached) {
+                _read_context->on_hit(p.partition.row.has_value());
+            } else {
+                _read_context->on_miss(p.partition.row.has_value());
+            }
         }
         _row_pushed = false;
         push_mutation_fragment(*_schema, _permit, partition_start(std::move(p.key), p.partition.partition_tombstone));
@@ -157,9 +170,9 @@ class logstor_single_key_reader : public logstor_reader_base {
 
     // The partition, found: begun in the buffer, and the stream ends with it. It goes into the
     // buffer at once, so it has no charge unless its row has to wait for the next fill.
-    void begin(single_row_partition&& partition) {
+    void begin(single_row_partition&& partition, bool cached) {
         _started = true;
-        start_partition(pending_partition{std::move(_dk), std::move(partition), _permit.consume_memory()});
+        start_partition(pending_partition{std::move(_dk), std::move(partition), _permit.consume_memory(), cached});
         _end_of_stream = !emitting();
     }
 
@@ -179,7 +192,7 @@ class logstor_single_key_reader : public logstor_reader_base {
             _index.populate_cache(key, where.location, _table_schema, _dk.key(), partition);
         }
         tracing::trace(_trace_state, "logstor_single_key_reader: fetched key {}", _dk);
-        begin(std::move(partition));
+        begin(std::move(partition), false);
     }
 
 public:
@@ -206,15 +219,21 @@ public:
             primary_index_key key(_dk);
             auto found = _index.lookup_for_read(key, *_table_schema, _use_cache, _columns);
             if (!found) {
+                // Answered by the index alone, like a read of a key the row cache knows is
+                // absent: not a read of the cache.
                 _end_of_stream = true;
                 return make_ready_future<>();
             }
-            if (auto* cached = std::get_if<keyed_single_row_partition>(&*found)) {
-                if (cached->key.key() != _dk.key()) [[unlikely]] {
-                    throw key_mismatch_error(_dk.key(), cached->key.key(), key_mismatch_error::cache_location{});
-                }
+            auto* cached = std::get_if<keyed_single_row_partition>(&*found);
+            if (cached && cached->key.key() != _dk.key()) [[unlikely]] {
+                throw key_mismatch_error(_dk.key(), cached->key.key(), key_mismatch_error::cache_location{});
+            }
+            if (auto* cache = _index.cache_for_read(_use_cache)) {
+                _read_context.emplace(*cache);
+            }
+            if (cached) {
                 tracing::trace(_trace_state, "logstor_single_key_reader: fetched key {} from the cache", _dk);
-                begin(std::move(cached->partition));
+                begin(std::move(cached->partition), true);
                 return make_ready_future<>();
             }
             return read_miss(key, std::get<primary_index::guarded_location>(std::move(*found)));
@@ -298,9 +317,9 @@ class logstor_range_reader : public logstor_reader_base {
 
     // A partition of a batch, charged from now: it waits in the batch and then in
     // _pending, across fills, before it goes into the buffer.
-    pending_partition make_pending(dht::decorated_key key, single_row_partition partition) {
+    pending_partition make_pending(dht::decorated_key key, single_row_partition partition, bool cached) {
         auto memory = _permit.consume_memory(waiting_memory_usage(key, partition));
-        return pending_partition{std::move(key), std::move(partition), std::move(memory)};
+        return pending_partition{std::move(key), std::move(partition), std::move(memory), cached};
     }
 
     // Reads the records the cache did not have, filling each slot in place so that the batch
@@ -344,7 +363,7 @@ class logstor_range_reader : public logstor_reader_base {
         for (auto& slot : slots) {
             if (slot.record) {
                 auto partition = decode_record_value(slot.record->value, *_table_schema, slot.record->header);
-                slot.partition = make_pending(std::move(slot.record->header.key), std::move(partition));
+                slot.partition = make_pending(std::move(slot.record->header.key), std::move(partition), false);
                 slot.record.reset();
             }
             partitions.push_back(std::move(*slot.partition));
@@ -410,7 +429,7 @@ class logstor_range_reader : public logstor_reader_base {
         for (const auto& entry : index_batch->entries) {
             batch_slot slot{.location = entry.get().entry().location};
             if (auto cached = _index.lookup_cached(entry.get(), *_table_schema, _use_cache, _columns)) {
-                slot.partition = make_pending(std::move(cached->key), std::move(cached->partition));
+                slot.partition = make_pending(std::move(cached->key), std::move(cached->partition), true);
             }
             batch.slots.push_back(std::move(slot));
         }
@@ -454,7 +473,11 @@ public:
         , _segment_manager(sm), _index(idx), _pr(std::move(pr))
         , _scan(_index.scan(partition_range_to_token_range(_pr)))
         , _trace_state(std::move(ts))
-    {}
+    {
+        if (auto* cache = _index.cache_for_read(_use_cache)) {
+            _read_context.emplace(*cache);
+        }
+    }
 
     virtual future<> fill_buffer() override {
         while (!is_buffer_full() && !_end_of_stream) {
