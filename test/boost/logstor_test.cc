@@ -45,6 +45,7 @@
 #include "gms/feature_service.hh"
 #include "init.hh"
 #include <seastar/core/simple-stream.hh>
+#include "mutation_query.hh"
 #include "partition_slice_builder.hh"
 #include "test/lib/logstor_test_utils.hh"
 #include "test/lib/mutation_assertions.hh"
@@ -4338,4 +4339,55 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_range_reader_serves_a_reversed_read) {
             env.make_reader(query::full_partition_range, bypassing));
     BOOST_REQUIRE_EQUAL(stats.partition_hits, hits + ms.size());
     BOOST_REQUIRE_EQUAL(stats.partition_misses, misses);
+}
+
+// A read the cache serves and the same read from the log give the same mutation, and the querier
+// makes the same result and digest of it, for every selection of the multi-column row: a live
+// cell, an expiring one, a dead one, and combinations. The same for a scan.
+SEASTAR_THREAD_TEST_CASE(test_logstor_reader_hit_answers_a_narrow_query_like_the_log) {
+    auto schema = make_multi_column_schema();
+    reader_test_env env(true /* cache_enabled */, schema);
+    const auto ts = api::timestamp_type(11);
+    auto m = make_multi_column_mutation(schema, "pk0", ts);
+    env.populate(std::span(&m, 1));
+    assert_that(env.make_reader(singular_range(m))).produces(m).produces_end_of_stream();
+
+    const auto now = gc_clock::now();
+    const auto opts = query::result_options{query::result_request::result_and_digest, query::digest_algorithm::xxHash};
+
+    auto read_through = [&] (const dht::partition_range& pr, const query::partition_slice& slice) {
+        auto rd = env.make_reader(pr, slice);
+        auto close_rd = deferred_close(rd);
+        auto mo = read_mutation_from_mutation_reader(rd).get();
+        BOOST_REQUIRE(mo);
+        return std::move(*mo);
+    };
+
+    std::vector<std::vector<const char*>> selections{{"v"}, {"w"}, {"x"}, {"v", "x"}, {"w", "x"}, {"v", "w", "x"}};
+    for (const auto& names : selections) {
+        partition_slice_builder builder(*schema);
+        for (const char* name : names) {
+            builder.with_regular_column(to_bytes(name));
+        }
+        auto slice = builder.build();
+        auto bypassing = slice;
+        bypassing.options.set<query::partition_slice::option::bypass_cache>();
+
+        for (const auto& pr : {singular_range(m), query::full_partition_range}) {
+            const auto hits = env.cache_stats().partition_hits;
+            auto from_cache = read_through(pr, slice);
+            BOOST_REQUIRE_EQUAL(env.cache_stats().partition_hits, hits + 1);
+            auto from_log = read_through(pr, bypassing);
+
+            const auto& cached_row = from_cache.partition().clustered_row(*schema, clustering_key::make_empty());
+            BOOST_REQUIRE_LE(cached_row.cells().size(), names.size());
+            assert_that(from_cache).is_equal_to(from_log);
+
+            auto cached_result = query_mutation(std::move(from_cache), slice, query::max_rows, now, opts);
+            auto log_result = query_mutation(std::move(from_log), slice, query::max_rows, now, opts);
+            BOOST_REQUIRE(cached_result.buf() == log_result.buf());
+            BOOST_REQUIRE(cached_result.digest() && log_result.digest());
+            BOOST_REQUIRE(*cached_result.digest() == *log_result.digest());
+        }
+    }
 }

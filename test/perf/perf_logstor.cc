@@ -57,8 +57,8 @@
 //   --value-size                 bytes of the value of one column
 //   --select-columns             how many of the value columns a read asks for, the first ones of
 //                                the table; 0, the default, asks for all of them. The slice is
-//                                given to the whole reads - `query-cached` and `query-disk` - and
-//                                to none of the single steps
+//                                given to the reads that take a partition - `cache-lookup`,
+//                                `query-cached` and `query-disk` - and to none of the single steps
 //   --concurrency                operations in flight per shard, for the tests that wait for the disk
 //   --duration                   one second iterations per test
 //   --operations-per-shard       a fixed number of operations per shard instead, for comparing builds
@@ -551,6 +551,8 @@ class logstor_bench {
     bytes _value;
     query::partition_slice _slice;
     query::partition_slice _slice_bypassing_cache;
+    // The columns of _slice, for the cache-lookup test, which calls the index as a reader does.
+    column_filter _columns;
     // The permit the query-cached test makes its readers with. A query is handed one by the layer
     // above logstor, so one is made up front and every reader of the test shares it. Released, and
     // its semaphore stopped, in stop().
@@ -585,6 +587,7 @@ public:
         , _value(bytes::initialized_later(), cfg.value_size)
         , _slice(make_read_slice(*_schema, cfg.select_columns, false))
         , _slice_bypassing_cache(make_read_slice(*_schema, cfg.select_columns, true))
+        , _columns(*_schema, _slice)
         , _semaphore(reader_concurrency_semaphore::no_limits{}, "perf_logstor", reader_concurrency_semaphore::register_metrics::no)
         , _permit(_semaphore.make_tracking_only_permit(nullptr, "perf_logstor", db::no_timeout, {}))
         , _serialization_buffer(std::make_unique<raw_write_buffer>(cfg.segment_size, segment_kind::mixed))
@@ -691,7 +694,7 @@ public:
     // holding a location from before the measurement would not survive compaction moving its record.
     future<> do_segment_read() {
         const auto& key = random_key();
-        auto result = index().lookup_for_read(primary_index_key{key}, *_schema, use_cache::no);
+        auto result = index().lookup_for_read(primary_index_key{key}, *_schema, use_cache::no, column_filter());
         if (!result) [[unlikely]] {
             on_internal_error(logstor_logger, "key of the dataset is missing from the index");
         }
@@ -795,7 +798,7 @@ public:
     // cache_misses().
     void do_cache_lookup(unsigned count) {
         for (unsigned i = 0; i < count; ++i) {
-            auto result = index().lookup_for_read(primary_index_key{random_cached_key()}, *_schema, use_cache::yes);
+            auto result = index().lookup_for_read(primary_index_key{random_cached_key()}, *_schema, use_cache::yes, _columns);
             if (!result) [[unlikely]] {
                 on_internal_error(logstor_logger, "key of the dataset is missing from the index");
             }

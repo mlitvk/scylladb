@@ -57,6 +57,8 @@ Only step 4 writes to the disk - all other steps only update in-memory metadata.
 3. Segment manager reads record from disk
 4. Record is decoded into a partition, which is added to the cache and returned
 
+A read returns only the requested columns of a row when its row marker keeps the row live. So a caller that writes back the whole partition it read, such as read repair, must read with all columns.
+
 **Separator:**
 1. When a record is written to the active segment, it is also written to its compaction group's separator buffer. The separator buffer holds a reference to the original segment.
 2. The separator buffer is flushed when it's full, or requested to flush for other reason. It is written into a new segment in the compaction group, and it updates the location of the records from the original mixed segments to the new segments in the compaction group.

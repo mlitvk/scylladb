@@ -11,11 +11,13 @@
 #include <seastar/testing/thread_test_case.hh>
 
 #include "replica/logstor/index.hh"
+#include "replica/logstor/record_value.hh"
 #include "replica/logstor/single_row_partition.hh"
 #include "db/cache_tracker.hh"
 #include <seastar/core/on_internal_error.hh>
 #include <seastar/util/defer.hh>
 #include <variant>
+#include "partition_slice_builder.hh"
 #include "schema/schema_builder.hh"
 #include "test/lib/logstor_test_utils.hh"
 #include "test/lib/mutation_assertions.hh"
@@ -81,7 +83,7 @@ void populate(primary_index& index, const primary_index_key& key, const mutation
 }
 
 mutation lookup_mutation(primary_index& index, const primary_index_key& key, schema_ptr schema) {
-    auto result = index.lookup_for_read(key, *schema, use_cache::yes);
+    auto result = index.lookup_for_read(key, *schema, use_cache::yes, column_filter());
     BOOST_REQUIRE(result);
     auto* cached = std::get_if<keyed_single_row_partition>(&*result);
     BOOST_REQUIRE(cached);
@@ -93,7 +95,7 @@ mutation_partition lookup(primary_index& index, const primary_index_key& key, sc
 }
 
 bool lookup_exists(primary_index& index, const primary_index_key& key, schema_ptr schema) {
-    auto result = index.lookup_for_read(key, *schema, use_cache::yes);
+    auto result = index.lookup_for_read(key, *schema, use_cache::yes, column_filter());
     BOOST_REQUIRE(result);
     return std::holds_alternative<keyed_single_row_partition>(*result);
 }
@@ -484,15 +486,20 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_single_row_partition_rejects_a_partition_o
 
 // Reads the partition of `pk` as a point read does: by the hash of the key, asking for the key
 // itself.
-static std::optional<single_row_partition> read_partition(primary_index& index, sstring pk, const schema& schema) {
+static std::optional<single_row_partition> read_partition(primary_index& index, sstring pk, const schema& schema,
+        const column_filter& columns) {
     auto dk = make_decorated_key(schema, std::move(pk));
-    auto result = index.lookup_for_read(primary_index_key(dk), schema, use_cache::yes);
+    auto result = index.lookup_for_read(primary_index_key(dk), schema, use_cache::yes, columns);
     BOOST_REQUIRE(result);
     if (auto* cached = std::get_if<keyed_single_row_partition>(&*result)) {
         BOOST_REQUIRE(cached->key.equal(schema, dk));
         return std::move(cached->partition);
     }
     return std::nullopt;
+}
+
+static std::optional<single_row_partition> read_partition(primary_index& index, sstring pk, const schema& schema) {
+    return read_partition(index, std::move(pk), schema, column_filter());
 }
 
 SEASTAR_THREAD_TEST_CASE(test_logstor_cache_read_partition_hands_out_the_row) {
@@ -635,20 +642,184 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_cache_lookup_cached_hands_out_the_key_too)
     BOOST_REQUIRE(!index.insert(key, make_index_entry(1, 0, 10, 1)).previous_entry);
 
     const auto stats_before = cache.shared_tracker.get_stats();
-    BOOST_REQUIRE(!index.lookup_cached(find_entry(index, key), *schema, use_cache::yes));
+    BOOST_REQUIRE(!index.lookup_cached(find_entry(index, key), *schema, use_cache::yes, column_filter()));
     BOOST_REQUIRE_EQUAL(cache.shared_tracker.get_stats().partition_misses, stats_before.partition_misses + 1);
 
     auto m = make_mutation(schema, "pk0", "v0");
     populate(index, key, m);
-    auto cached = index.lookup_cached(find_entry(index, key), *schema, use_cache::yes);
+    auto cached = index.lookup_cached(find_entry(index, key), *schema, use_cache::yes, column_filter());
     BOOST_REQUIRE(cached);
     BOOST_REQUIRE_EQUAL(cache.shared_tracker.get_stats().partition_hits, stats_before.partition_hits + 1);
     BOOST_REQUIRE(cached->key.equal(*schema, m.decorated_key()));
     assert_that(to_mutation(schema, std::move(cached->key), std::move(cached->partition))).is_equal_to(m);
 
     // A read that does not use the cache is not a lookup at all.
-    BOOST_REQUIRE(!index.lookup_cached(find_entry(index, key), *schema, use_cache::no));
+    BOOST_REQUIRE(!index.lookup_cached(find_entry(index, key), *schema, use_cache::no, column_filter()));
     BOOST_REQUIRE_EQUAL(cache.shared_tracker.get_stats().partition_hits, stats_before.partition_hits + 1);
     BOOST_REQUIRE_EQUAL(cache.shared_tracker.get_stats().partition_misses, stats_before.partition_misses + 1);
     index.drain_cache().get();
+}
+
+// A table of five value columns, for the reads that ask for fewer of them than the row has.
+static schema_ptr make_wide_schema() {
+    auto sb = schema_builder(this_smp_shard_count(), "ks", "wide")
+            .with_column("pk", utf8_type, column_kind::partition_key);
+    for (int i = 0; i < 5; ++i) {
+        sb.with_column(to_bytes(format("v{}", i)), utf8_type);
+    }
+    return sb.build();
+}
+
+// A row of the wide schema with the given marker and a live cell of timestamp `ts` in every column.
+static mutation make_wide_mutation(schema_ptr schema, sstring pk, row_marker marker, api::timestamp_type ts) {
+    auto key = partition_key::from_single_value(*schema, serialized(std::move(pk)));
+    mutation m(schema, dht::decorate_key(*schema, key));
+    auto& row = m.partition().clustered_row(*schema, clustering_key::make_empty());
+    row.apply(marker);
+    for (const auto& def : schema->regular_columns()) {
+        row.cells().apply(def, atomic_cell::make_live(*def.type, ts, serialized(format("{}-value", def.name_as_text()))));
+    }
+    return m;
+}
+
+static query::partition_slice select_columns(const schema& s, std::initializer_list<const char*> names) {
+    partition_slice_builder builder(s);
+    for (const char* name : names) {
+        builder.with_regular_column(to_bytes(name));
+    }
+    return builder.build();
+}
+
+static size_t cell_count(const single_row_partition& partition) {
+    BOOST_REQUIRE(partition.row);
+    return partition.row->cells().size();
+}
+
+// The cache and the entry a test of a slice reads through, with one wide row under one key.
+struct wide_row_fixture {
+    schema_ptr schema = make_wide_schema();
+    shared_logstor_cache cache;
+    primary_index index{noop_space_accounting, &cache.logstor_tracker};
+    primary_index_key key = make_primary_index_key(*schema, "pk0");
+    mutation source;
+
+    explicit wide_row_fixture(const mutation& m) : source(m) {
+        BOOST_REQUIRE(!index.insert(key, make_index_entry(1, 0, 10, 1)).previous_entry);
+        populate(index, key, m);
+    }
+
+    ~wide_row_fixture() {
+        index.drain_cache().get();
+    }
+
+    // Also checks that narrow() leaves the same cells in the decoded record, as a miss reads it.
+    single_row_partition read(const query::partition_slice& slice) {
+        const column_filter columns(*schema, slice);
+        auto partition = read_partition(index, "pk0", *schema, columns);
+        BOOST_REQUIRE(partition);
+        const record_header header{.key = source.decorated_key(), .timestamp = api::timestamp_type(1), .table = source.schema()->id()};
+        auto decoded = decode_record_value(encode_record_value(source), *source.schema(), header);
+        decoded.narrow(columns);
+        assert_that(to_mutation(schema, "pk0", std::move(decoded))).is_equal_to(to_mutation(schema, "pk0", partition->copy(*schema)));
+        return std::move(*partition);
+    }
+
+    // The scan's read, which goes through the same copy.
+    single_row_partition read_with_key(const query::partition_slice& slice) {
+        auto cached = index.lookup_cached(find_entry(index, key), *schema, use_cache::yes, column_filter(*schema, slice));
+        BOOST_REQUIRE(cached);
+        return std::move(cached->partition);
+    }
+};
+
+// While the marker keeps the row live, only the columns the slice asks for are copied, and the
+// row that comes out is the row with just those cells - for a point read and for a scan alike.
+SEASTAR_THREAD_TEST_CASE(test_logstor_cache_read_partition_copies_only_the_requested_columns) {
+    const auto ts = api::timestamp_type(5);
+    auto schema = make_wide_schema();
+    auto m = make_wide_mutation(schema, "pk0", row_marker(ts), ts);
+    wide_row_fixture f(m);
+
+    auto partition = f.read(select_columns(*f.schema, {"v1"}));
+    BOOST_REQUIRE_EQUAL(cell_count(partition), 1);
+    BOOST_REQUIRE(partition.row->marker().is_live());
+
+    mutation expected(f.schema, m.decorated_key());
+    {
+        auto& row = expected.partition().clustered_row(*f.schema, clustering_key::make_empty());
+        row.apply(row_marker(ts));
+        const auto& v1 = *f.schema->get_column_definition("v1");
+        row.cells().apply(v1, atomic_cell::make_live(*v1.type, ts, serialized(sstring("v1-value"))));
+    }
+    assert_that(to_mutation(f.schema, "pk0", std::move(partition))).is_equal_to(expected);
+    assert_that(to_mutation(f.schema, "pk0", f.read_with_key(select_columns(*f.schema, {"v1"})))).is_equal_to(expected);
+
+    // Two of five, in either order of the slice.
+    BOOST_REQUIRE_EQUAL(cell_count(f.read(select_columns(*f.schema, {"v4", "v0"}))), 2);
+    // The full slice copies every cell, and so does a slice that names them all.
+    BOOST_REQUIRE_EQUAL(cell_count(f.read(f.schema->full_slice())), 5);
+    BOOST_REQUIRE_EQUAL(cell_count(f.read(select_columns(*f.schema, {"v0", "v1", "v2", "v3", "v4"}))), 5);
+    // A column named twice is one column.
+    BOOST_REQUIRE_EQUAL(cell_count(f.read(select_columns(*f.schema, {"v1", "v1"}))), 1);
+    BOOST_REQUIRE_EQUAL(cell_count(f.read(select_columns(*f.schema, {"v0", "v1", "v1", "v2"}))), 3);
+}
+
+// A column the row does not have is not a cell; the row still comes out, with its marker.
+SEASTAR_THREAD_TEST_CASE(test_logstor_cache_read_partition_of_a_column_the_row_lacks) {
+    const auto ts = api::timestamp_type(5);
+    auto schema = make_wide_schema();
+    mutation m(schema, dht::decorate_key(*schema, partition_key::from_single_value(*schema, serialized(sstring("pk0")))));
+    {
+        auto& row = m.partition().clustered_row(*schema, clustering_key::make_empty());
+        row.apply(row_marker(ts));
+        const auto& v0 = *schema->get_column_definition("v0");
+        row.cells().apply(v0, atomic_cell::make_live(*v0.type, ts, serialized(sstring("v0-value"))));
+    }
+    wide_row_fixture f(m);
+    auto partition = f.read(select_columns(*f.schema, {"v1"}));
+    BOOST_REQUIRE_EQUAL(cell_count(partition), 0);
+    BOOST_REQUIRE(partition.row->marker().is_live());
+    BOOST_REQUIRE_EQUAL(cell_count(f.read(select_columns(*f.schema, {"v0"}))), 1);
+}
+
+// When the marker does not keep the row live for certain - it is dead, it expires or expired, or a
+// tombstone shadows it - a live cell the query did not ask for may be what does, so every cell is
+// copied.
+SEASTAR_THREAD_TEST_CASE(test_logstor_cache_read_partition_copies_every_cell_when_the_marker_is_not_live) {
+    const auto ts = api::timestamp_type(5);
+    const auto now = gc_clock::now();
+    auto one = select_columns(*make_wide_schema(), {"v1"});
+
+    {
+        // A dead marker under live cells.
+        wide_row_fixture f(make_wide_mutation(make_wide_schema(), "pk0", row_marker(tombstone(ts, now)), ts + 1));
+        BOOST_REQUIRE_EQUAL(cell_count(f.read(one)), 5);
+    }
+    {
+        // A marker that expired an hour ago, under cells that did not.
+        wide_row_fixture f(make_wide_mutation(make_wide_schema(), "pk0",
+                row_marker(ts, std::chrono::seconds(1), now - std::chrono::hours(1)), ts));
+        BOOST_REQUIRE_EQUAL(cell_count(f.read(one)), 5);
+    }
+    {
+        // A marker that expires an hour from now is live by the replica's clock, but the querier
+        // decides liveness at the query's timestamp, so the row is not narrowed on it.
+        wide_row_fixture f(make_wide_mutation(make_wide_schema(), "pk0",
+                row_marker(ts, std::chrono::hours(1), now + std::chrono::hours(1)), ts));
+        BOOST_REQUIRE_EQUAL(cell_count(f.read(one)), 5);
+    }
+    {
+        // A row tombstone newer than the marker but older than the cells.
+        auto m = make_wide_mutation(make_wide_schema(), "pk0", row_marker(ts), ts + 2);
+        m.partition().clustered_row(*m.schema(), clustering_key::make_empty()).apply(row_tombstone(tombstone(ts + 1, now)));
+        wide_row_fixture f(m);
+        BOOST_REQUIRE_EQUAL(cell_count(f.read(one)), 5);
+    }
+    {
+        // A partition tombstone newer than the marker but older than the cells.
+        auto m = make_wide_mutation(make_wide_schema(), "pk0", row_marker(ts), ts + 2);
+        m.partition().apply(tombstone(ts + 1, now));
+        wide_row_fixture f(m);
+        BOOST_REQUIRE_EQUAL(cell_count(f.read(one)), 5);
+    }
 }

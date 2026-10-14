@@ -476,26 +476,30 @@ public:
 
     // The cached partition of an entry the caller holds from scan(), with its key, or nullopt when
     // the entry holds nothing, the cache is not enabled or the read does not use it. Counts a hit
-    // or a miss and touches the LRU, like a point read does. The entry must belong to this index.
-    std::optional<keyed_single_row_partition> lookup_cached(const primary_index_entry& e, const schema& target_schema, use_cache uses_cache) const {
+    // or a miss and touches the LRU, like a point read does. `columns` says which columns a hit
+    // copies. The entry must belong to this index.
+    std::optional<keyed_single_row_partition> lookup_cached(const primary_index_entry& e, const schema& target_schema, use_cache uses_cache,
+            const column_filter& columns) const {
         if (!_cache_tracker || !uses_cache) {
             return std::nullopt;
         }
-        return _cache_tracker->read_partition(e, target_schema);
+        return _cache_tracker->read_partition(e, target_schema, columns);
     }
 
     // Finds a key for a point read. Returns nullopt if the index does not have the key. If the
-    // read uses the cache and the cache has the key, returns the cached partition with its key. If
-    // not, returns the location of the record with a guard. The entry has only the hash of the key,
-    // so the caller compares the key of a cached partition with its own.
-    std::optional<read_lookup_result> lookup_for_read(const primary_index_key& key, const schema& target_schema, use_cache uses_cache) const {
+    // read uses the cache and the cache has the key, returns the cached partition with its key,
+    // with the columns that `columns` selects. If not, returns the location of the record with a
+    // guard. The entry has only the hash of the key, so the caller compares the key of a cached
+    // partition with its own.
+    std::optional<read_lookup_result> lookup_for_read(const primary_index_key& key, const schema& target_schema, use_cache uses_cache,
+            const column_filter& columns) const {
         auto it = find_key(key);
         if (it == _partitions.end()) {
             return std::nullopt;
         }
 
         if (_cache_tracker && uses_cache) {
-            if (auto cached = _cache_tracker->read_partition(*it, target_schema)) {
+            if (auto cached = _cache_tracker->read_partition(*it, target_schema, columns)) {
                 return std::move(*cached);
             }
         }

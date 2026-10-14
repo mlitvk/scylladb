@@ -85,7 +85,9 @@ public:
     // mutation was frozen with.
     future<> write(const frozen_mutation&, const schema& s, write_target target, db::timeout_clock::time_point timeout) noexcept;
 
-    // Create a mutation reader for a partition range.
+    // Create a mutation reader for a partition range. A row can come out with only the columns that
+    // `slice` asks for (see single_row_partition::copy()), so a caller that writes back the whole
+    // partition it read must read with all columns.
     mutation_reader make_reader(schema_ptr schema,
                                 const primary_index& index,
                                 reader_permit permit,

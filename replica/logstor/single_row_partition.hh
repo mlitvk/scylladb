@@ -7,15 +7,46 @@
  */
 #pragma once
 
+#include <algorithm>
 #include <optional>
 #include "dht/decorated_key.hh"
 #include "mutation/mutation_partition.hh"
 #include "mutation/tombstone.hh"
 #include "schema/schema_fwd.hh"
+#include "utils/small_vector.hh"
 
 class mutation;
 
+namespace query {
+class partition_slice;
+}
+
 namespace replica::logstor {
+
+// The regular columns that a read asks for, made once per read from its slice.
+class column_filter {
+public:
+    // query::column_id_vector, without query-request.hh.
+    using column_ids = utils::small_vector<column_id, 8>;
+private:
+    // Sorted and without duplicates, or nullopt when the read asks for all columns.
+    std::optional<column_ids> _ids;
+public:
+    // All columns.
+    column_filter() = default;
+    column_filter(const schema& s, const query::partition_slice& slice);
+
+    bool selects_all() const noexcept {
+        return !_ids;
+    }
+    // Only when !selects_all().
+    const column_ids& ids() const noexcept {
+        return *_ids;
+    }
+    bool selects(column_id id) const noexcept {
+        return !_ids || std::ranges::binary_search(*_ids, id);
+    }
+};
 
 // A logstor partition as the cache holds it, and as a reader pushes it into its buffer as fragments
 // out of the cache or the record decoder. A logstor table has no clustering columns, so its
@@ -36,6 +67,16 @@ struct single_row_partition {
         }
         return partition;
     }
+
+    // A read gets only the cells of the columns that `columns` selects, when the row marker alone
+    // keeps the row live. Otherwise a cell that `columns` does not select can be what keeps the row
+    // live, so the read gets all cells. A cache hit gets them with copy(s, columns) and a decoded
+    // record with narrow(columns), so a read gets the same cells from both.
+    single_row_partition copy(const schema& s, const column_filter& columns) const;
+    void narrow(const column_filter& columns);
+
+private:
+    bool can_narrow(const column_filter& columns) const;
 };
 
 // A cached partition together with its key, as a read of the cache hands it out. The index entry
