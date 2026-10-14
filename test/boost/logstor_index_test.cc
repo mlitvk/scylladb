@@ -188,7 +188,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_space_accounting) {
         }
     } accounting;
 
-    primary_index index(accounting, nullptr, false);
+    primary_index index(accounting, nullptr, nullptr, false);
 
     // The index counts the bytes of the records it points at for the table it belongs to, which is
     // the same number the subscriber accumulates, so the two must agree after every operation.
@@ -358,7 +358,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_range_erase_and_clear_space_
         }
     } accounting;
 
-    primary_index index(accounting, nullptr, false);
+    primary_index index(accounting, nullptr, nullptr, false);
 
     auto check_live_bytes = [&] (ssize_t expected) {
         BOOST_REQUIRE_EQUAL(accounting.live_bytes, expected);
@@ -432,7 +432,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_range_erase_and_clear_space_
 // standing, so after clear() the index has to use as much as an index whose only key was erased.
 SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_memory_usage) {
     auto schema = make_logstor_schema();
-    primary_index index(noop_space_accounting, nullptr, false);
+    primary_index index(noop_space_accounting, nullptr, nullptr, false);
 
     // The tree builds its root on the first insert, so an untouched index holds nothing.
     BOOST_REQUIRE_EQUAL(index.get_usage().entries_memory_usage, 0u);
@@ -472,7 +472,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_memory_usage) {
     const size_t after_clear = index.get_usage().memory_usage;
     testlog.info("primary index after clear: allocated {} bytes", after_clear);
 
-    primary_index root_only(noop_space_accounting, nullptr, false);
+    primary_index root_only(noop_space_accounting, nullptr, nullptr, false);
     const auto location = record_location{.segment = log_segment_id{1}, .offset = 0, .size = 32};
     root_only.insert(keys[0], index_entry{.location = location, .timestamp = 1});
     BOOST_REQUIRE(root_only.erase(keys[0], location));
@@ -483,7 +483,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_memory_usage) {
 SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_cache_invalidation_and_eviction) {
     auto schema = make_logstor_schema();
     shared_logstor_cache cache;
-    primary_index index(noop_space_accounting, &cache.logstor_tracker, true);
+    auto table_cache = cache.make_table_cache(schema);
+    primary_index index(noop_space_accounting, &cache.logstor_tracker, &table_cache, true);
 
     auto key0 = make_primary_index_key(*schema, "pk0");
     auto key1 = make_primary_index_key(*schema, "pk1");
@@ -571,7 +572,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_cache_invalidation_and_evict
 SEASTAR_THREAD_TEST_CASE(test_logstor_cache_counts_the_rows_of_cached_partitions) {
     auto schema = make_logstor_schema();
     shared_logstor_cache cache;
-    primary_index index(noop_space_accounting, &cache.logstor_tracker, true);
+    auto table_cache = cache.make_table_cache(schema);
+    primary_index index(noop_space_accounting, &cache.logstor_tracker, &table_cache, true);
     const auto& stats = cache.shared_tracker.get_stats();
 
     std::vector<primary_index_key> keys;
@@ -611,7 +613,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_cache_counts_the_rows_of_cached_partitions
 SEASTAR_THREAD_TEST_CASE(test_logstor_cache_counts_a_stale_read_as_a_mispopulation) {
     auto schema = make_logstor_schema();
     shared_logstor_cache cache;
-    primary_index index(noop_space_accounting, &cache.logstor_tracker, true);
+    auto table_cache = cache.make_table_cache(schema);
+    primary_index index(noop_space_accounting, &cache.logstor_tracker, &table_cache, true);
     const auto& stats = cache.shared_tracker.get_stats();
 
     auto key = make_primary_index_key(*schema, "pk0");
@@ -637,7 +640,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_cache_counts_a_stale_read_as_a_mispopulati
 SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_drain_cache_preserves_index_entries) {
     auto schema = make_logstor_schema();
     shared_logstor_cache cache;
-    primary_index index(noop_space_accounting, &cache.logstor_tracker, true);
+    auto table_cache = cache.make_table_cache(schema);
+    primary_index index(noop_space_accounting, &cache.logstor_tracker, &table_cache, true);
 
     auto key0 = make_primary_index_key(*schema, "pk0");
     auto key1 = make_primary_index_key(*schema, "pk1");
@@ -666,7 +670,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_drain_cache_preserves_index_
 SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_destructor_evicts_cached_partitions) {
     auto schema = make_logstor_schema();
     shared_logstor_cache cache;
-    std::optional<primary_index> index(std::in_place, noop_space_accounting, &cache.logstor_tracker, true);
+    auto table_cache = cache.make_table_cache(schema);
+    std::optional<primary_index> index(std::in_place, noop_space_accounting, &cache.logstor_tracker, &table_cache, true);
 
     auto key0 = make_primary_index_key(*schema, "pk0");
     auto key1 = make_primary_index_key(*schema, "pk1");
@@ -688,7 +693,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_destructor_evicts_cached_par
 SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_cache_survives_index_rebalancing) {
     auto schema = make_logstor_schema();
     shared_logstor_cache cache;
-    primary_index index(noop_space_accounting, &cache.logstor_tracker, true);
+    auto table_cache = cache.make_table_cache(schema);
+    primary_index index(noop_space_accounting, &cache.logstor_tracker, &table_cache, true);
 
     constexpr int64_t fixed_token = 7;
     auto hot_keys = insert_same_token_keys(index, *schema, fixed_token, 0, 24);
@@ -767,7 +773,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_range_that_holds_no_token) {
     BOOST_REQUIRE_EQUAL(bounds->last, 19);
 
     auto schema = make_logstor_schema();
-    primary_index index(noop_space_accounting, nullptr, false);
+    primary_index index(noop_space_accounting, nullptr, nullptr, false);
     std::vector<primary_index_key> keys;
     for (int i = 0; i < 5; ++i) {
         keys.push_back(make_primary_index_key(*schema, fmt::format("pk{}", i)));
@@ -800,7 +806,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_range_that_holds_no_token) {
 
 SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_scan_resumes_across_batches_by_token) {
     auto schema = make_logstor_schema();
-    primary_index index(noop_space_accounting, nullptr, false);
+    primary_index index(noop_space_accounting, nullptr, nullptr, false);
 
     insert_same_token_keys(index, *schema, 7, 0, 2);
     insert_same_token_keys(index, *schema, 11, 100, 3);
@@ -834,7 +840,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_scan_resumes_across_batches_
 
 SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_scan_keeps_oversized_same_token_batch_intact) {
     auto schema = make_logstor_schema();
-    primary_index index(noop_space_accounting, nullptr, false);
+    primary_index index(noop_space_accounting, nullptr, nullptr, false);
 
     insert_same_token_keys(index, *schema, 23, 0, 5);
     insert_same_token_keys(index, *schema, 29, 100, 1);
@@ -861,7 +867,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_scan_keeps_oversized_same_to
 SEASTAR_THREAD_TEST_CASE(test_logstor_cache_survives_lsa_compaction_before_exchange) {
     auto schema = make_logstor_schema();
     shared_logstor_cache cache;
-    primary_index index(noop_space_accounting, &cache.logstor_tracker, true);
+    auto table_cache = cache.make_table_cache(schema);
+    primary_index index(noop_space_accounting, &cache.logstor_tracker, &table_cache, true);
 
     constexpr int64_t fixed_token = 19;
     auto keys = insert_same_token_keys(index, *schema, fixed_token, 20'000, 8);
@@ -912,7 +919,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_cache_survives_lsa_compaction_before_excha
 SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_survives_lsa_compaction) {
     auto schema = make_logstor_schema();
     shared_logstor_cache cache;
-    primary_index index(noop_space_accounting, &cache.logstor_tracker, true);
+    auto table_cache = cache.make_table_cache(schema);
+    primary_index index(noop_space_accounting, &cache.logstor_tracker, &table_cache, true);
 
     constexpr int key_count = 6000;
     constexpr int cached_every = 16;
@@ -1039,7 +1047,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_insert_survives_allocation_f
     uint64_t max_allocations = 0;
     for (int i = 0; i < key_count; ++i) {
         for (uint64_t fail_at = 0; ; ++fail_at) {
-            primary_index index(noop_space_accounting, nullptr, false);
+            primary_index index(noop_space_accounting, nullptr, nullptr, false);
             for (int j = 0; j < i; ++j) {
                 index.insert(keys[j], entry_of(j));
             }
@@ -1084,7 +1092,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_insert_survives_allocation_f
 SEASTAR_THREAD_TEST_CASE(test_logstor_cache_upgrades_cached_partition_after_schema_change) {
     auto schema = make_logstor_schema();
     shared_logstor_cache cache;
-    primary_index index(noop_space_accounting, &cache.logstor_tracker, true);
+    auto table_cache = cache.make_table_cache(schema);
+    primary_index index(noop_space_accounting, &cache.logstor_tracker, &table_cache, true);
 
     auto key = make_primary_index_key(*schema, "pk0");
     BOOST_REQUIRE(!index.insert(key, make_index_entry(1, 0, 10, 1)).previous_entry);
@@ -1095,9 +1104,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_cache_upgrades_cached_partition_after_sche
 
     auto new_schema = schema_builder(schema).with_column("v2", utf8_type).build();
 
-    auto hits_before = cache.shared_tracker.get_stats().partition_hits;
     BOOST_REQUIRE(lookup_exists(index, key, new_schema));
-    BOOST_REQUIRE_EQUAL(cache.shared_tracker.get_stats().partition_hits, hits_before + 1);
 
     auto cached = lookup(index, key, new_schema);
     auto expected = original;
@@ -1188,7 +1195,8 @@ static std::optional<single_row_partition> read_partition(primary_index& index, 
 SEASTAR_THREAD_TEST_CASE(test_logstor_cache_read_partition_hands_out_the_row) {
     auto schema = make_logstor_schema();
     shared_logstor_cache cache;
-    primary_index index(noop_space_accounting, &cache.logstor_tracker, true);
+    auto table_cache = cache.make_table_cache(schema);
+    primary_index index(noop_space_accounting, &cache.logstor_tracker, &table_cache, true);
 
     auto key = make_primary_index_key(*schema, "pk0");
     BOOST_REQUIRE(!index.insert(key, make_index_entry(1, 0, 10, 1)).previous_entry);
@@ -1199,10 +1207,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_cache_read_partition_hands_out_the_row) {
     m.partition().clustered_row(*schema, clustering_key::make_empty()).apply(row_tombstone(tombstone(api::timestamp_type(0), gc_clock::now())));
     populate(index, key, m);
 
-    const auto hits_before = cache.shared_tracker.get_stats().partition_hits;
     auto partition = read_partition(index, "pk0", *schema);
     BOOST_REQUIRE(partition);
-    BOOST_REQUIRE_EQUAL(cache.shared_tracker.get_stats().partition_hits, hits_before + 1);
     BOOST_REQUIRE(!partition->partition_tombstone);
     BOOST_REQUIRE(partition->row);
     BOOST_REQUIRE(partition->row->marker().is_live());
@@ -1215,7 +1221,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_cache_read_partition_hands_out_the_row) {
 SEASTAR_THREAD_TEST_CASE(test_logstor_cache_read_partition_of_a_tombstone_has_no_row) {
     auto schema = make_logstor_schema();
     shared_logstor_cache cache;
-    primary_index index(noop_space_accounting, &cache.logstor_tracker, true);
+    auto table_cache = cache.make_table_cache(schema);
+    primary_index index(noop_space_accounting, &cache.logstor_tracker, &table_cache, true);
 
     auto key = make_primary_index_key(*schema, "pk0");
     BOOST_REQUIRE(!index.insert(key, make_index_entry(1, 0, 10, 1)).previous_entry);
@@ -1233,23 +1240,23 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_cache_read_partition_of_a_tombstone_has_no
     index.drain_cache().get();
 }
 
-SEASTAR_THREAD_TEST_CASE(test_logstor_cache_read_partition_counts_a_miss) {
+SEASTAR_THREAD_TEST_CASE(test_logstor_cache_read_partition_of_an_uncached_entry_is_empty) {
     auto schema = make_logstor_schema();
     shared_logstor_cache cache;
-    primary_index index(noop_space_accounting, &cache.logstor_tracker, true);
+    auto table_cache = cache.make_table_cache(schema);
+    primary_index index(noop_space_accounting, &cache.logstor_tracker, &table_cache, true);
 
     auto key = make_primary_index_key(*schema, "pk0");
     BOOST_REQUIRE(!index.insert(key, make_index_entry(1, 0, 10, 1)).previous_entry);
 
-    const auto misses_before = cache.shared_tracker.get_stats().partition_misses;
     BOOST_REQUIRE(!read_partition(index, "pk0", *schema));
-    BOOST_REQUIRE_EQUAL(cache.shared_tracker.get_stats().partition_misses, misses_before + 1);
 }
 
 SEASTAR_THREAD_TEST_CASE(test_logstor_cache_read_partition_upgrades_the_entry) {
     auto schema = make_logstor_schema();
     shared_logstor_cache cache;
-    primary_index index(noop_space_accounting, &cache.logstor_tracker, true);
+    auto table_cache = cache.make_table_cache(schema);
+    primary_index index(noop_space_accounting, &cache.logstor_tracker, &table_cache, true);
 
     auto key = make_primary_index_key(*schema, "pk0");
     BOOST_REQUIRE(!index.insert(key, make_index_entry(1, 0, 10, 1)).previous_entry);
@@ -1273,7 +1280,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_cache_read_partition_upgrades_the_entry) {
 SEASTAR_THREAD_TEST_CASE(test_logstor_cache_peek_snapshots_without_counting) {
     auto schema = make_logstor_schema();
     shared_logstor_cache cache;
-    primary_index index(noop_space_accounting, &cache.logstor_tracker, true);
+    auto table_cache = cache.make_table_cache(schema);
+    primary_index index(noop_space_accounting, &cache.logstor_tracker, &table_cache, true);
 
     auto key = make_primary_index_key(*schema, "pk0");
     BOOST_REQUIRE(!index.insert(key, make_index_entry(1, 0, 10, 1)).previous_entry);
@@ -1315,25 +1323,22 @@ static std::optional<keyed_single_row_partition> scan_read_cached(primary_index&
     return cached;
 }
 
-// The scan's read of the cache: the key comes too, since the scan holds only the entry, and it
-// counts as a hit or a miss like a point read does.
+// The scan's read of the cache: the key comes too, since the scan holds only the entry.
 SEASTAR_THREAD_TEST_CASE(test_logstor_cache_read_cached_hands_out_the_key_too) {
     auto schema = make_logstor_schema();
     shared_logstor_cache cache;
-    primary_index index(noop_space_accounting, &cache.logstor_tracker, true);
+    auto table_cache = cache.make_table_cache(schema);
+    primary_index index(noop_space_accounting, &cache.logstor_tracker, &table_cache, true);
 
     auto key = make_primary_index_key(*schema, "pk0");
     BOOST_REQUIRE(!index.insert(key, make_index_entry(1, 0, 10, 1)).previous_entry);
 
-    const auto stats_before = cache.shared_tracker.get_stats();
     BOOST_REQUIRE(!scan_read_cached(index, key, *schema));
-    BOOST_REQUIRE_EQUAL(cache.shared_tracker.get_stats().partition_misses, stats_before.partition_misses + 1);
 
     auto m = make_mutation(schema, "pk0", "v0");
     populate(index, key, m);
     auto cached = scan_read_cached(index, key, *schema);
     BOOST_REQUIRE(cached);
-    BOOST_REQUIRE_EQUAL(cache.shared_tracker.get_stats().partition_hits, stats_before.partition_hits + 1);
     BOOST_REQUIRE(cached->key.equal(*schema, m.decorated_key()));
     assert_that(to_mutation(schema, std::move(cached->key), std::move(cached->partition))).is_equal_to(m);
 
@@ -1344,7 +1349,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_cache_read_cached_hands_out_the_key_too) {
 SEASTAR_THREAD_TEST_CASE(test_logstor_cache_disabled_index_does_not_read_or_populate) {
     auto schema = make_logstor_schema();
     shared_logstor_cache cache;
-    primary_index index(noop_space_accounting, &cache.logstor_tracker, false);
+    auto table_cache = cache.make_table_cache(schema);
+    primary_index index(noop_space_accounting, &cache.logstor_tracker, &table_cache, false);
 
     auto key = make_primary_index_key(*schema, "pk0");
     BOOST_REQUIRE(!index.insert(key, make_index_entry(1, 0, 10, 1)).previous_entry);
@@ -1364,7 +1370,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_cache_disabled_index_does_not_read_or_popu
 SEASTAR_THREAD_TEST_CASE(test_logstor_cache_disabled_index_still_evicts) {
     auto schema = make_logstor_schema();
     shared_logstor_cache cache;
-    primary_index index(noop_space_accounting, &cache.logstor_tracker, true);
+    auto table_cache = cache.make_table_cache(schema);
+    primary_index index(noop_space_accounting, &cache.logstor_tracker, &table_cache, true);
 
     auto key0 = make_primary_index_key(*schema, "pk0");
     auto key1 = make_primary_index_key(*schema, "pk1");
@@ -1440,7 +1447,8 @@ static size_t cell_count(const single_row_partition& partition) {
 struct wide_row_fixture {
     schema_ptr schema = make_wide_schema();
     shared_logstor_cache cache;
-    primary_index index{noop_space_accounting, &cache.logstor_tracker, true};
+    row_cache table_cache = cache.make_table_cache(schema);
+    primary_index index{noop_space_accounting, &cache.logstor_tracker, &table_cache, true};
     primary_index_key key = make_primary_index_key(*schema, "pk0");
     mutation source;
 
