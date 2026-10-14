@@ -75,11 +75,12 @@ public:
     const compaction_manager& get_compaction_manager() const noexcept;
 
     // Makes the primary index of a table.
-    // `with_cache_tracker` is true when the node has the cache. It does not change for the life of
-    // the index.
+    // `table_cache` is the row cache of the table when the node has the cache, and null when it does
+    // not. The reads of the logstor cache are accounted in the metrics of that row cache. It does not
+    // change for the life of the index.
     // `cache_enabled` is the caching option of the table. The table can change it later with
     // primary_index::set_cache_enabled().
-    std::unique_ptr<primary_index> make_primary_index(bool with_cache_tracker, bool cache_enabled);
+    std::unique_ptr<primary_index> make_primary_index(row_cache* table_cache, bool cache_enabled);
 
     future<> flush_to_separator();
 

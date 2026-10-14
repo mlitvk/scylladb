@@ -23,10 +23,12 @@
 #include <seastar/coroutine/as_future.hh>
 
 #include "db/cache_tracker.hh"
+#include "db/row_cache.hh"
 #include "dht/i_partitioner_fwd.hh"
 #include "mutation/mutation.hh"
 #include "reader_concurrency_semaphore.hh"
 #include "readers/mutation_reader.hh"
+#include "readers/mutation_source.hh"
 #include "replica/logstor/cache.hh"
 #include "replica/logstor/compaction.hh"
 #include "replica/logstor/index.hh"
@@ -56,6 +58,12 @@ struct shared_logstor_cache {
     shared_logstor_cache()
         : shared_tracker(utils::updateable_value<double>(1.0), ::cache_tracker::register_metrics::no)
         , logstor_tracker(shared_tracker) {
+    }
+
+    // The row cache of a logstor table, which holds nothing: what the reads of the logstor cache
+    // are accounted in.
+    row_cache make_table_cache(schema_ptr schema) {
+        return row_cache(std::move(schema), make_empty_snapshot_source(), shared_tracker);
     }
 };
 
@@ -104,10 +112,11 @@ class test_logstor_group final : public replica::logstor::logstor_group {
     replica::logstor::primary_index& _index;
     replica::logstor::compaction_manager& _cm;
 public:
-    test_logstor_group(schema_ptr schema, replica::logstor::logstor& ls, bool cache_enabled = false)
+    // The index caches partitions when given the table's row cache, see make_primary_index().
+    test_logstor_group(schema_ptr schema, replica::logstor::logstor& ls, row_cache* table_cache = nullptr)
         : logstor_group(ls.get_segment_manager().get_segment_size(), &ls.get_segment_manager().shard_segment_stats())
         , _table_id(schema->id())
-        , _owned_index(ls.make_primary_index(cache_enabled, cache_enabled))
+        , _owned_index(ls.make_primary_index(table_cache, table_cache != nullptr))
         , _index(*_owned_index)
         , _cm(ls.get_compaction_manager()) {
         _cm.add(*this);
@@ -251,7 +260,7 @@ inline index_entries entries_of(const replica::logstor::primary_index& index) {
 // separating or compacting while it runs: it reads the segments as they are.
 inline std::unique_ptr<replica::logstor::primary_index> rebuild_index_from_disk(replica::logstor::logstor& ls, ::table_id table,
         null_space_accounting& accounting) {
-    auto index = std::make_unique<replica::logstor::primary_index>(accounting, nullptr, false);
+    auto index = std::make_unique<replica::logstor::primary_index>(accounting, nullptr, nullptr, false);
     ls.get_segment_manager().rebuild_index_from_disk([&] (const replica::logstor::record_header& h) -> replica::logstor::primary_index* {
         return h.table == table ? index.get() : nullptr;
     }).get();

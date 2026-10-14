@@ -543,6 +543,8 @@ class logstor_bench {
     schema_ptr _schema;
     // Outlives _logstor, which holds a reference to it.
     tests::logstor::shared_logstor_cache _cache;
+    // The row cache of the table, which the reads of the logstor cache are accounted in.
+    row_cache _table_cache;
     std::unique_ptr<logstor> _logstor;
     std::unique_ptr<tests::logstor::test_logstor_group> _group;
     std::vector<dht::decorated_key> _keys;
@@ -583,6 +585,9 @@ class logstor_bench {
     // is what makes the store to it something the compiler has to keep; it costs the same load and
     // store in every test that uses it, so it cancels out of a difference between two of them.
     volatile uint64_t _sink = 0;
+    // The cache-lookup steps that found no cached partition, which is also what keeps the result of
+    // the step from being unused.
+    uint64_t _lookup_misses = 0;
     // The first data file of the shard, opened for the raw read test.
     seastar::file _data_file;
     uint64_t _data_file_size = 0;
@@ -592,6 +597,7 @@ public:
     logstor_bench(test_config cfg, std::filesystem::path dir)
         : _cfg(cfg)
         , _schema(make_kv_schema(cfg.columns))
+        , _table_cache(_cache.make_table_cache(_schema))
         , _value(bytes::initialized_later(), cfg.value_size)
         , _slice(make_read_slice(*_schema, cfg.select_columns, false))
         , _slice_bypassing_cache(make_read_slice(*_schema, cfg.select_columns, true))
@@ -624,7 +630,7 @@ public:
         co_await _logstor->start();
         // The cache is enabled, and the tests that are not about it bypass it per read instead, so
         // that one dataset serves them all.
-        _group = std::make_unique<tests::logstor::test_logstor_group>(_schema, *_logstor, true /* cache_enabled */);
+        _group = std::make_unique<tests::logstor::test_logstor_group>(_schema, *_logstor, &_table_cache);
         co_await populate();
         prepare_single_step_inputs();
         co_await open_data_file();
@@ -741,7 +747,7 @@ public:
     future<> prepare_private_index() {
         // A tracker of its own, so cache-populate's churn doesn't tune the allocating sections the
         // other tests use; region and LRU are shared.
-        auto copy = std::make_unique<primary_index>(tests::logstor::noop_space_accounting, &_cache.logstor_tracker, true);
+        auto copy = std::make_unique<primary_index>(tests::logstor::noop_space_accounting, &_cache.logstor_tracker, &_table_cache, true);
         for (const auto& key : _keys) {
             primary_index_key pk{key};
             auto entry = index().get(pk);
@@ -831,15 +837,15 @@ public:
     // What a read that the cache serves pays before its reader: the entry of the key is looked up
     // and the cached partition and its key are copied out of the cache region. Draws from the keys
     // the cache holds, which warm_cache_and_find_cached_keys() collected, rather than from the
-    // whole dataset. A lookup that finds nothing is counted by the cache tracker, see
-    // cache_misses().
+    // whole dataset. A lookup that finds nothing is counted here, since only a read accounts for
+    // what the cache served it, see cache_misses().
     void do_cache_lookup(unsigned count) {
         for (unsigned i = 0; i < count; ++i) {
             auto result = index().lookup_for_read(primary_index_key{random_cached_key()}, *_schema, use_cache::yes, _columns);
             if (!result) [[unlikely]] {
                 on_internal_error(logstor_logger, "key of the dataset is missing from the index");
             }
-            _sink += std::holds_alternative<keyed_single_row_partition>(*result);
+            _lookup_misses += !std::holds_alternative<keyed_single_row_partition>(*result);
         }
     }
 
@@ -924,7 +930,7 @@ public:
     // LSA reclaiming under memory pressure, or a miss of a cached read evicting another key to admit
     // its own. Counted rather than treated as an error: a run that says its number is not a cache hit is
     // more use than one that ends here.
-    uint64_t cache_misses() const noexcept { return _cache.shared_tracker.get_stats().partition_misses; }
+    uint64_t cache_misses() const noexcept { return _cache.shared_tracker.get_stats().partition_misses + _lookup_misses; }
 
     // The partition key of the dataset is an int64 - see populate() - which is what the payload of
     // one of its records counts as its key.

@@ -1290,7 +1290,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_space_accounting) {
         }
     } accounting;
 
-    primary_index index(accounting, nullptr, false);
+    primary_index index(accounting, nullptr, nullptr, false);
 
     // The index counts the bytes of the records it points at for the table it belongs to, which is
     // the same number the subscriber accumulates, so the two must agree after every operation.
@@ -1453,7 +1453,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_range_erase_and_clear_space_
         }
     } accounting;
 
-    primary_index index(accounting, nullptr, false);
+    primary_index index(accounting, nullptr, nullptr, false);
 
     auto check_live_bytes = [&] (ssize_t expected) {
         BOOST_REQUIRE_EQUAL(accounting.live_bytes, expected);
@@ -3348,6 +3348,8 @@ struct reader_test_env {
     tmpdir dir;
     shared_logstor_cache cache;
     logstor ls{make_test_logstor_config(dir.path()), cache.shared_tracker};
+    // The row cache of the table, with the cache enabled.
+    std::optional<row_cache> table_cache;
     std::optional<test_logstor_group> cg;
     tests::reader_concurrency_semaphore_wrapper semaphore;
 
@@ -3356,7 +3358,10 @@ struct reader_test_env {
         test_recovery_catalog no_tables;
         ls.do_recovery(no_tables).get();
         ls.start().get();
-        cg.emplace(schema, ls, cache_enabled);
+        if (cache_enabled) {
+            table_cache.emplace(cache.make_table_cache(schema));
+        }
+        cg.emplace(schema, ls, table_cache ? &*table_cache : nullptr);
     }
 
     ~reader_test_env() {
@@ -3682,7 +3687,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_reader_produces_nothing_for_empty_ranges) 
 // larger of the two and it has to follow the index up and back down.
 SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_memory_usage) {
     auto schema = make_kv_schema();
-    primary_index index(noop_space_accounting, nullptr, false);
+    primary_index index(noop_space_accounting, nullptr, nullptr, false);
 
     // The tree builds its root on the first insert, so an untouched index holds nothing.
     BOOST_REQUIRE_EQUAL(index.get_entries_memory_usage(), 0u);
@@ -4051,6 +4056,97 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_range_reader_serves_a_reversed_read) {
     require_same_fragments(*env.schema, env.make_reader(reversed_schema, query::full_partition_range, reversed),
             env.make_reader(query::full_partition_range, bypassing));
     BOOST_REQUIRE_EQUAL(stats.partition_hits, hits + ms.size());
+    BOOST_REQUIRE_EQUAL(stats.partition_misses, misses);
+}
+
+// A read of the cache is accounted the way the row cache accounts one: as a read from its start to
+// its end, and one with misses when the cache did not have a partition it returned, with a
+// partition hit or miss and a row hit or miss for every partition it returns - in the shared
+// tracker, and in the table's row cache, whose rates are the table's cache hit rate. A key the index
+// does not hold is not a read of the cache, and neither is a read that bypasses it.
+SEASTAR_THREAD_TEST_CASE(test_logstor_reader_accounts_a_cache_read_like_the_row_cache) {
+    reader_test_env env(true /* cache_enabled */);
+    auto ms = make_token_ordered_mutations(env.schema, 2);
+    env.populate(ms);
+    const auto& stats = env.cache_stats();
+    const auto& table_stats = env.table_cache->stats();
+
+    // A miss, which admits the partition.
+    assert_that(env.make_reader(singular_range(ms[0]))).produces(ms[0]).produces_end_of_stream();
+    BOOST_REQUIRE_EQUAL(stats.reads, 1);
+    BOOST_REQUIRE_EQUAL(stats.reads_with_misses, 1);
+    BOOST_REQUIRE_EQUAL(stats.active_reads(), 0);
+    BOOST_REQUIRE_EQUAL(stats.partition_misses, 1);
+    BOOST_REQUIRE_EQUAL(stats.row_misses, 1);
+    BOOST_REQUIRE_EQUAL(table_stats.misses.count(), 1);
+    BOOST_REQUIRE_EQUAL(table_stats.reads_with_misses.count(), 1);
+
+    // A hit, which is an active read until its reader goes.
+    {
+        auto rd = env.make_reader(singular_range(ms[0]));
+        auto close_rd = deferred_close(rd);
+        rd.fill_buffer().get();
+        BOOST_REQUIRE_EQUAL(stats.active_reads(), 1);
+    }
+    BOOST_REQUIRE_EQUAL(stats.reads, 2);
+    BOOST_REQUIRE_EQUAL(stats.reads_with_misses, 1);
+    BOOST_REQUIRE_EQUAL(stats.active_reads(), 0);
+    BOOST_REQUIRE_EQUAL(stats.partition_hits, 1);
+    BOOST_REQUIRE_EQUAL(stats.row_hits, 1);
+    BOOST_REQUIRE_EQUAL(table_stats.hits.count(), 1);
+    BOOST_REQUIRE_EQUAL(table_stats.reads_with_no_misses.count(), 1);
+
+    // A hit of a slice without the row counts no row.
+    auto no_rows = partition_slice_builder(*env.schema).with_ranges({}).build();
+    assert_that(env.make_reader(singular_range(ms[0]), no_rows)).produces_partition_start(ms[0].decorated_key()).produces_partition_end()
+            .produces_end_of_stream();
+    BOOST_REQUIRE_EQUAL(stats.partition_hits, 2);
+    BOOST_REQUIRE_EQUAL(stats.row_hits, 1);
+    BOOST_REQUIRE_EQUAL(stats.reads, 3);
+
+    // Neither a key the index does not hold nor a read that bypasses the cache reads the cache.
+    auto absent = make_kv_mutation(env.schema, "absent", "v");
+    assert_that(env.make_reader(singular_range(absent))).produces_end_of_stream();
+    auto bypassing = partition_slice_builder(*env.schema).with_option<query::partition_slice::option::bypass_cache>().build();
+    assert_that(env.make_reader(singular_range(ms[1]), bypassing)).produces(ms[1]).produces_end_of_stream();
+    assert_that(env.make_reader(query::full_partition_range, bypassing)).produces(ms[0]).produces(ms[1]).produces_end_of_stream();
+    BOOST_REQUIRE_EQUAL(stats.reads, 3);
+    BOOST_REQUIRE_EQUAL(stats.partition_hits + stats.partition_misses, 3);
+
+    // A scan is one read, with a hit or a miss per partition.
+    assert_that(env.make_reader(query::full_partition_range)).produces(ms[0]).produces(ms[1]).produces_end_of_stream();
+    BOOST_REQUIRE_EQUAL(stats.reads, 4);
+    BOOST_REQUIRE_EQUAL(stats.reads_with_misses, 2);
+    BOOST_REQUIRE_EQUAL(stats.partition_hits, 3);
+    BOOST_REQUIRE_EQUAL(stats.partition_misses, 2);
+    BOOST_REQUIRE_EQUAL(table_stats.hits.count(), 2);
+    BOOST_REQUIRE_EQUAL(table_stats.misses.count(), 2);
+    BOOST_REQUIRE_EQUAL(stats.active_reads(), 0);
+}
+
+// A scan looks the cache up for the whole token of a bound with a key, so it meets the partitions
+// of that token outside the range as well, and drops them once it has their keys to compare. It
+// accounts only for the partitions it returns.
+SEASTAR_THREAD_TEST_CASE(test_logstor_range_reader_accounts_only_the_partitions_it_returns) {
+    reader_test_env env(true /* cache_enabled */);
+    const auto token = dht::token::from_int64(42);
+    std::vector<mutation> ms;
+    for (const auto* pk : {"pk0", "pk1", "pk2"}) {
+        auto m = make_kv_mutation(env.schema, pk, "v");
+        ms.emplace_back(env.schema, dht::decorated_key(token, m.key()), std::move(m.partition()));
+    }
+    std::ranges::sort(ms, mutation_decorated_key_less_comparator());
+    env.populate(ms);
+    for (const auto& m : ms) {
+        assert_that(env.make_reader(singular_range(m))).produces(m).produces_end_of_stream();
+    }
+
+    const auto& stats = env.cache_stats();
+    const auto hits = stats.partition_hits;
+    const auto misses = stats.partition_misses;
+    auto from_second = dht::partition_range::make_starting_with({dht::ring_position(ms[1].decorated_key()), true});
+    assert_that(env.make_reader(from_second)).produces(ms[1]).produces(ms[2]).produces_end_of_stream();
+    BOOST_REQUIRE_EQUAL(stats.partition_hits, hits + 2);
     BOOST_REQUIRE_EQUAL(stats.partition_misses, misses);
 }
 
