@@ -137,6 +137,14 @@ public:
     // Returns the index that a record found on disk goes into, or nullptr to drop the record.
     using index_resolver = std::function<primary_index*(const record_header&)>;
 
+    // Rebuilds indexes from the records on disk the same way that recovery does. It scans every
+    // segment of the allocated files and gives each record to the index that the resolver returns.
+    // That index keeps the newest entry for each key, which is the entry with the highest
+    // timestamp, then the highest segment sequence, then the highest offset. Recovery runs it on
+    // the indexes of the tables. A test runs it on its own indexes while nothing else runs, to
+    // check that recovery would rebuild the live indexes exactly.
+    future<> rebuild_index_from_disk(index_resolver);
+
     future<> start();
     future<> stop();
 

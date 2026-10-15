@@ -7,14 +7,21 @@
  */
 #pragma once
 
+#include <algorithm>
 #include <filesystem>
+#include <map>
 #include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
+#include <fmt/format.h>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/scheduling.hh>
 #include <seastar/coroutine/as_future.hh>
 
 #include "db/cache_tracker.hh"
+#include "dht/i_partitioner_fwd.hh"
 #include "mutation/mutation.hh"
 #include "reader_concurrency_semaphore.hh"
 #include "readers/mutation_reader.hh"
@@ -22,6 +29,7 @@
 #include "replica/logstor/compaction.hh"
 #include "replica/logstor/index.hh"
 #include "replica/logstor/logstor.hh"
+#include "replica/logstor/recovery_catalog.hh"
 #include "replica/logstor/segment_manager.hh"
 #include "replica/logstor/single_row_partition.hh"
 #include "schema/schema_fwd.hh"
@@ -160,6 +168,116 @@ inline future<mutation_opt> read_mutation(replica::logstor::logstor& ls, schema_
     auto m = co_await coroutine::as_future(read_mutation(ls, std::move(s), index, std::move(permit), dk, slice));
     co_await semaphore.stop();
     co_return co_await std::move(m);
+}
+
+// The recovery catalog of a test. It holds only the groups that the test adds, each with the token
+// range that the group owns. The index of a table is the index of the groups that the test added
+// for it.
+class test_recovery_catalog final : public replica::logstor::recovery_catalog {
+    struct table_groups {
+        replica::logstor::primary_index* index;
+        std::vector<std::pair<dht::token_range, replica::logstor::logstor_group*>> groups;
+    };
+    std::map<::table_id, table_groups> _tables;
+public:
+    void add(replica::logstor::logstor_group& group, dht::token_range range = dht::token_range::make_open_ended_both_sides()) {
+        auto& table = _tables[group.table_id()];
+        table.index = &group.logstor_index();
+        table.groups.emplace_back(std::move(range), &group);
+    }
+
+    replica::logstor::primary_index* index(::table_id table) override {
+        auto it = _tables.find(table);
+        return it != _tables.end() ? it->second.index : nullptr;
+    }
+
+    target find(::table_id table, dht::token token) override {
+        return find(table, token, token);
+    }
+
+    target find(::table_id table, dht::token first, dht::token last) override {
+        auto it = _tables.find(table);
+        if (it == _tables.end()) {
+            return {};
+        }
+        for (auto& [range, group] : it->second.groups) {
+            if (range.contains(first, dht::token_comparator()) && range.contains(last, dht::token_comparator())) {
+                return {it->second.index, group};
+            }
+        }
+        return {it->second.index, nullptr};
+    }
+
+    sstring table_name(::table_id table) override {
+        return fmt::format("{}", table);
+    }
+};
+
+// Space accounting that does nothing, for an index that a test rebuilds from disk next to the live
+// index. The live index already charges the records to their segments.
+struct null_space_accounting final : replica::logstor::space_accounting_subscriber {
+    void on_add_record(replica::logstor::record_location) noexcept override {}
+    void on_free_record(replica::logstor::record_location) noexcept override {}
+};
+
+using index_entries = std::vector<std::pair<replica::logstor::primary_index_key, replica::logstor::index_entry>>;
+
+inline index_entries entries_of(const replica::logstor::primary_index& index) {
+    index_entries out;
+    out.reserve(index.get_key_count());
+    auto scan = index.scan();
+    while (auto batch = scan.next_batch(1024)) {
+        for (const auto& e : batch->entries) {
+            out.emplace_back(e.get().key(), e.get().entry());
+        }
+    }
+    return out;
+}
+
+// Rebuilds the index of one table from disk with the routine that recovery uses. Nothing may write,
+// separate or compact while it runs, because it reads the segments directly and does not
+// synchronize with those operations.
+inline std::unique_ptr<replica::logstor::primary_index> rebuild_index_from_disk(replica::logstor::logstor& ls, ::table_id table,
+        null_space_accounting& accounting) {
+    auto index = std::make_unique<replica::logstor::primary_index>(accounting, nullptr);
+    ls.get_segment_manager().rebuild_index_from_disk([&] (const replica::logstor::record_header& h) -> replica::logstor::primary_index* {
+        return h.table == table ? index.get() : nullptr;
+    }).get();
+    return index;
+}
+
+// Rebuilds the index of `table` from disk the same way that recovery does and compares it with
+// the `live` index. Returns an empty string when the two indexes have the same entries. Otherwise
+// returns a report that lists the entries that are in only one of the two indexes, with at most
+// `max_reported` entries from each index. The same rules as for rebuild_index_from_disk() apply:
+// nothing may write, separate or compact while it runs.
+inline std::string recovery_divergence(replica::logstor::logstor& ls, ::table_id table, const replica::logstor::primary_index& live) {
+    null_space_accounting accounting;
+    auto rebuilt = rebuild_index_from_disk(ls, table, accounting);
+    const auto expected = entries_of(live);
+    const auto actual = entries_of(*rebuilt);
+    if (expected == actual) {
+        return {};
+    }
+    static constexpr size_t max_reported = 5;
+    auto describe = [] (const index_entries& only_in, const index_entries& other, std::string_view what) {
+        std::string out;
+        size_t reported = 0;
+        for (const auto& [key, entry] : only_in) {
+            if (std::ranges::find(other, std::pair(key, entry)) != other.end()) {
+                continue;
+            }
+            if (reported++ < max_reported) {
+                out += fmt::format("\n  {} only: {} at {} ts {}", what, key, entry.location, entry.timestamp);
+            }
+        }
+        if (reported > max_reported) {
+            out += fmt::format("\n  ... {} more {} only", reported - max_reported, what);
+        }
+        return out;
+    };
+    return fmt::format("live index has {} entries, the index rebuilt from disk has {}:{}{}", expected.size(), actual.size(),
+            describe(expected, actual, "live"), describe(actual, expected, "rebuilt"));
 }
 
 } // namespace tests::logstor
