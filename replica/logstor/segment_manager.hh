@@ -132,6 +132,11 @@ public:
 
     uint64_t get_segment_size() const noexcept;
 
+    // The fraction of the configured pool of this shard that the live records take, the records
+    // the separator has not moved yet included, because they take the pool too. The segments above
+    // the configured pool after a shrink are not in it, because they are retired as they free.
+    double pool_utilization() const noexcept;
+
     // The statistics of the segments that the compaction groups of this shard own, with their
     // distribution by utilization. The segment_set of each group adds its changes to them. A group
     // gives a pointer to them to the constructor of its segment_set.

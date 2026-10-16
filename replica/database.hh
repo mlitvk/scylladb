@@ -2224,6 +2224,10 @@ public:
     // groups own, which are what the tablets report as their sizes. The tablet balancer adds it to
     // the free space to get the capacity of the node. Zero when logstor is unused.
     uint64_t logstor_space_not_in_tablet_sizes() const;
+    // Whether the live records take more of the logstor pool of this shard than
+    // logstor_critical_utilization_level, above which the rest of the pool is the space compaction
+    // needs to run.
+    bool logstor_pool_critical() const;
 
     // Space the storage of this shard takes on disk, which is what a node reports as its load: the
     // sstables of all its tables plus the logstor segments holding their data. Slightly more than

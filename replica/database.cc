@@ -3195,6 +3195,10 @@ uint64_t database::logstor_space_not_in_tablet_sizes() const {
     return space > live_record_bytes ? space - live_record_bytes : 0;
 }
 
+bool database::logstor_pool_critical() const {
+    return _logstor && _logstor->get_segment_manager().pool_utilization() > _cfg.logstor_critical_utilization_level();
+}
+
 uint64_t database::disk_space_used() const {
     // The logstor part is the segments holding data, not every file logstor has allocated for them:
     // space that holds nothing is nobody's load, the same as for sstables, where the room left on

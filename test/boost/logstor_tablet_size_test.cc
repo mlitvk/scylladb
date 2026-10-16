@@ -86,6 +86,20 @@ uint64_t logstor_space(const replica::database& db) {
     return db.get_config().logstor_sparse_files() ? usage.segment_bytes_in_use : usage.disk_usage;
 }
 
+void set_critical_level(cql_test_env& e, sstring level) {
+    e.db_config().logstor_critical_utilization_level.set_value_on_all_shards(level, utils::config_file::config_source::Internal).get();
+}
+
+// Whether the logstor pool of each shard holding records of the table is critical, and of no other.
+// Returns false if no shard holds records.
+bool pool_critical_where_records_are(cql_test_env& e) {
+    return e.db().map_reduce0([] (replica::database& db) {
+        const bool has_records = db.find_column_family("ks", "t").logstor_live_record_bytes() > 0;
+        BOOST_REQUIRE_EQUAL(db.logstor_pool_critical(), has_records);
+        return has_records;
+    }, false, std::logical_or<bool>()).get();
+}
+
 } // anonymous namespace
 
 SEASTAR_TEST_CASE(test_data_size_follows_live_records) {
@@ -192,4 +206,20 @@ SEASTAR_TEST_CASE(test_effective_capacity_counts_the_pool) {
             break;
         }
     }, make_logstor_env_config(false));
+}
+
+SEASTAR_TEST_CASE(test_pool_critical_follows_the_level) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        create_table(e);
+        set_critical_level(e, "0.000001");
+        BOOST_REQUIRE(!pool_critical_where_records_are(e));
+
+        write_rows(e);
+        BOOST_REQUIRE(pool_critical_where_records_are(e));
+
+        set_critical_level(e, "1");
+        e.db().invoke_on_all([] (replica::database& db) {
+            BOOST_REQUIRE(!db.logstor_pool_critical());
+        }).get();
+    }, make_logstor_env_config());
 }

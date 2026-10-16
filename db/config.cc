@@ -1009,6 +1009,9 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "When enabled, the file is only extended to its nominal size, so unwritten regions consume no disk space. Useful for tests, where the disk space and I/O of formatting files is wasteful.")
     , logstor_compaction_trigger_threshold(this, "logstor_compaction_trigger_threshold", liveness::LiveUpdate, value_status::Used, 0.05,
         "Trigger automatic logstor compaction when the number of available segments drops below this fraction of the total number of logstor segments. A value of 0 disables the trigger threshold.")
+    , logstor_critical_utilization_level(this, "logstor_critical_utilization_level", liveness::LiveUpdate, value_status::Used, 0.85,
+        "Fraction of the logstor pool of a shard that live records may take before the node refuses streamed tablets and reports itself as critical to the topology coordinator. "
+        "The space above it is what compaction needs to run, so a tablet streamed into it would stall. User writes are not affected.")
     , logstor_compaction_max_shares(this, "logstor_compaction_max_shares", liveness::LiveUpdate, value_status::Used, 2000,
         "Maximum CPU shares the logstor compaction controller gives the logstor compaction scheduling group, reached at full space pressure. ")
     , file_cache_size_in_mb(this, "file_cache_size_in_mb", value_status::Unused, 512,
