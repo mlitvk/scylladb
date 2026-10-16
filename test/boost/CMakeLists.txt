@@ -184,6 +184,8 @@ add_scylla_test(logstor_cache_test
   KIND SEASTAR)
 add_scylla_test(logstor_file_test
   KIND SEASTAR)
+add_scylla_test(logstor_pool_critical_test
+  KIND SEASTAR)
 add_scylla_test(logstor_record_stream_test
   KIND SEASTAR)
 add_scylla_test(lru_string_map_test

@@ -1001,6 +1001,7 @@ database::init_logstor() {
             .format_on_startup = _cfg.logstor_format_on_startup(),
             .sparse_files = _cfg.logstor_sparse_files(),
             .trigger_compaction_threshold = _cfg.logstor_compaction_trigger_threshold,
+            .critical_utilization_level = _cfg.logstor_critical_utilization_level,
             .compaction_sg = _dbcfg.logstor_compaction_scheduling_group,
             .compaction_static_shares = _cfg.compaction_static_shares,
             .compaction_max_shares = _cfg.logstor_compaction_max_shares,
@@ -3217,6 +3218,10 @@ uint64_t database::get_logstor_disk_space_used() const {
 
 uint64_t database::logstor_space_on_disk() const {
     return _logstor ? _logstor->get_segment_manager().get_usage().space_on_disk : 0;
+}
+
+bool database::logstor_pool_critical() const {
+    return _logstor && _logstor->get_segment_manager().pool_critical();
 }
 
 uint64_t database::disk_space_used() const {

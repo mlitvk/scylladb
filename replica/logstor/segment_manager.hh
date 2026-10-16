@@ -55,6 +55,8 @@ struct segment_manager_config {
     bool compaction_enabled = true;
     size_t max_segments_per_compaction = 32;
     utils::updateable_value<double> trigger_compaction_threshold{0.05};
+    // The pool utilization above which the shard refuses streamed tablets.
+    utils::updateable_value<double> critical_utilization_level{0.85};
     seastar::scheduling_group compaction_sg;
     utils::updateable_value<float> compaction_static_shares;
     utils::updateable_value<float> compaction_max_shares;
@@ -125,6 +127,15 @@ public:
     const compaction_manager& get_compaction_manager() const noexcept;
 
     uint64_t get_segment_size() const noexcept;
+
+    // The fraction of the configured pool of this shard that the live records take, the records
+    // the separator has not moved yet included, because they take the pool too. After a shrink the
+    // segments above the configured pool hold records until they are retired, so the fraction can
+    // exceed 1: the data does not fit the pool.
+    double pool_utilization() const noexcept;
+    // Whether the live records take more of the pool than critical_utilization_level, above which
+    // the rest of the pool is the space compaction needs to run.
+    bool pool_critical() const noexcept;
 
     // The statistics of the segments that the compaction groups of this shard own, with their
     // distribution by utilization. The segment_set of each group adds its changes to them. A group
