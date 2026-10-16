@@ -28,6 +28,28 @@ The balancer will use this information to compute the disk load (disk utilizatio
 on every node and shard. It will then migrate tablets from the most to the least
 loaded nodes and shards.
 
+# Logstor tables
+
+The size of a logstor tablet is the live record bytes of the segments its compaction group owns,
+and not the space of those segments. Compaction reclaims dead records when the free segments of the
+whole shard fall low, so it keeps the pool of every shard nearly full, and the space of the segments
+of a group follows the churn of the shard rather than the data of the tablet. The table size used
+for split and merge is the sum of the same tablet sizes.
+
+The logstor pool takes more of the disk than the live records the tablets report. With files
+allocated in full, all of the pool is missing from the available disk space, so the
+``effective_capacity`` of a node also adds the space of the logstor files less the live record
+bytes. Without it, a node whose pool is most of its disk would read as full.
+
+A tablet streamed into a pool that is almost full takes the space compaction needs to run. When the
+live records take more of the pool of a shard than ``logstor_critical_utilization_level``, the shard
+refuses streamed segments, which fails the stream, and the node sets its flag in
+``critical_disk_utilization`` of ``load_stats``. The topology coordinator then rolls the migration
+back instead of retrying it, as it does for a node whose disk is full. The refusal applies to every
+stream into the shard, so a rebuild or a removenode that streams into the node fails too, and a
+decommission whose stream into the node fails is cancelled. The balancer does not read the flag, so
+it can still choose such a node as a destination.
+
 # Table balance
 
 The secondary goal of the load balancer is to achieve table balance. This means that

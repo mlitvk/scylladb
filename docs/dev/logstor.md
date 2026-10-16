@@ -141,6 +141,35 @@ mutation sources:
 SELECT * FROM MUTATION_FRAGMENTS(keyspace.table_name) WHERE pk = 1;
 ```
 
+## Space Accounting
+
+Logstor counts the space it takes in several ways, because its consumers ask different questions. The
+segments a compaction group owns hold live records and dead ones, and the dead ones stay until
+compaction reclaims them. Compaction runs when the free segments of the whole shard fall low, so the
+space of the segments of a group follows the churn of every group on the shard, and only the live
+record bytes follow the data of the group.
+
+| Number | Where | Consumers |
+|--------|-------|-----------|
+| Space of the segments a group owns | `compaction_group::live_disk_space_used()`, the `live_disk_space` and `logstor_segments` table metrics | the disk space of a table (nodetool, the `column_family` API) |
+| Live record bytes of the segments a group owns | `compaction_group::data_size()`, the `owned_segments_live_record_bytes` metric | tablet sizes, the table size for split and merge |
+| Live record bytes the index refers to, the records in mixed segments included | the `logstor_live_record_bytes` table metric, the `live_record_bytes` metric, `segment_manager::pool_utilization()` | the pool-critical level |
+| Segments that hold records | `segment_bytes_in_use`, the `segments_in_use` metric | the load of the node (`database::disk_space_used()`) |
+| Files allocated for segments | `disk_usage`, the `disk_usage` metric | the capacity of the node for the tablet balancer |
+
+A write counts in the live record bytes of a group only after the separator moves it into a segment
+of the group. Until then the tablet size does not include it, and an overwrite makes the tablet size
+smaller for that time, because the old record is freed at once.
+
+Two settings act on the pool of a shard:
+
+- `logstor_compaction_trigger_threshold`: compaction starts when the free segments fall below this
+  fraction of the pool.
+- `logstor_critical_utilization_level` (0.85 by default): when the live records take more than this
+  fraction of the pool, the shard refuses streamed segments and the node reports itself as critical
+  to the topology coordinator, so a tablet migration into it is rolled back. User writes are not
+  affected. See [Size based load balancing](size-based-load-balancing.md#logstor-tables).
+
 ## Measuring Performance
 
 Two tests measure the cost of a logstor operation on one node, at two levels.
