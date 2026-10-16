@@ -1033,6 +1033,9 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     , logstor_compaction_min_utilization_threshold(this, "logstor_compaction_min_utilization_threshold", liveness::LiveUpdate, value_status::Used, 0.1,
         "The utilization threshold of logstor compaction while more than twice logstor_compaction_space_floor of the disk is free. It limits the space that segments with a few long-lived records hold, "
         "at a lower write amplification than logstor_compaction_utilization_threshold. A value at or above logstor_compaction_utilization_threshold keeps that threshold also when more of the disk is free.")
+    , logstor_critical_utilization_level(this, "logstor_critical_utilization_level", liveness::LiveUpdate, value_status::Used, 0.85,
+        "Fraction of the logstor pool of a shard that live records may take before the node refuses streamed tablets and reports itself as critical to the topology coordinator. "
+        "The space above it is what compaction needs to run, so a tablet streamed into it would stall. User writes are not affected.")
     , logstor_compaction_max_shares(this, "logstor_compaction_max_shares", liveness::LiveUpdate, value_status::Used, 2000,
         "Maximum CPU shares of the logstor compaction scheduling group, reached at logstor_compaction_space_floor. As the free space falls from twice the space floor to the space floor, the shares increase linearly from 50.")
     , file_cache_size_in_mb(this, "file_cache_size_in_mb", value_status::Unused, 512,

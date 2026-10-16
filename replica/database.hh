@@ -2278,6 +2278,10 @@ public:
     uint64_t get_logstor_disk_space_used() const;
     // Space the logstor files of this shard take from the filesystem. Zero when logstor is unused.
     uint64_t logstor_space_on_disk() const;
+    // Whether the live records take more of the logstor pool of this shard than
+    // logstor_critical_utilization_level, above which the rest of the pool is the space compaction
+    // needs to run.
+    bool logstor_pool_critical() const;
 
     // Space the storage of this shard takes on disk, which is what a node reports as its load: the
     // sstables of all its tables plus the logstor segments holding their data. Slightly more than

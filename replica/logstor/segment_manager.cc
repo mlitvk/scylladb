@@ -794,6 +794,15 @@ public:
         return _cfg.sparse_files ? get_segment_bytes_in_use() : get_disk_usage();
     }
 
+    double pool_utilization() const noexcept {
+        const uint64_t pool_size = _configured_max_segments * _cfg.segment_size;
+        return pool_size ? double(_stats.live_record_bytes) / double(pool_size) : 0;
+    }
+
+    bool pool_critical() const noexcept {
+        return pool_utilization() > _cfg.critical_utilization_level();
+    }
+
     segment_stats& shard_segment_stats() noexcept {
         return _segment_stats;
     }
@@ -2629,6 +2638,14 @@ const compaction_manager& segment_manager::get_compaction_manager() const noexce
 
 uint64_t segment_manager::get_segment_size() const noexcept {
     return _impl->get_segment_size();
+}
+
+double segment_manager::pool_utilization() const noexcept {
+    return _impl->pool_utilization();
+}
+
+bool segment_manager::pool_critical() const noexcept {
+    return _impl->pool_critical();
 }
 
 segment_stats& segment_manager::shard_segment_stats() noexcept {
