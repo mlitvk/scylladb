@@ -3177,6 +3177,24 @@ uint64_t database::get_logstor_disk_space_used() const {
     return _logstor ? _logstor->get_segment_manager().get_usage().segment_bytes_in_use : 0;
 }
 
+uint64_t database::logstor_space_not_in_tablet_sizes() const {
+    if (!_logstor) {
+        return 0;
+    }
+    // The capacity of a node is its free space plus the sizes of its tablets, plus this. With files
+    // allocated in full, the files are not in the free space, so this is the space of the files less
+    // the live record bytes, and the capacity is the disk less the space that neither logstor nor the
+    // sstables take. With sparse files, the blocks a segment has not written are still free space, so
+    // this is the space of the segments in use less the live record bytes. A freed segment keeps
+    // its blocks, so the capacity is less than the disk by those blocks, which is good enough for
+    // the tests, the only users of sparse files.
+    const auto& sm = _logstor->get_segment_manager();
+    const auto usage = sm.get_usage();
+    const uint64_t space = _cfg.logstor_sparse_files() ? usage.segment_bytes_in_use : usage.disk_usage;
+    const uint64_t live_record_bytes = sm.shard_segment_stats().live_record_bytes;
+    return space > live_record_bytes ? space - live_record_bytes : 0;
+}
+
 uint64_t database::disk_space_used() const {
     // The logstor part is the segments holding data, not every file logstor has allocated for them:
     // space that holds nothing is nobody's load, the same as for sstables, where the room left on

@@ -13,16 +13,20 @@
 #include <seastar/testing/thread_test_case.hh>
 
 #include "replica/database.hh"
+#include "replica/logstor/segment_manager.hh"
+#include "service/storage_service.hh"
 #include "test/boost/sstable_test.hh"
 #include "test/lib/cql_test_env.hh"
+#include "utils/disk_space_monitor.hh"
 
 namespace {
 
 constexpr size_t value_size = 20 * 1024;
 constexpr int row_count = 20;
 
-cql_test_config make_logstor_env_config() {
+cql_test_config make_logstor_env_config(bool sparse_files = true) {
     cql_test_config cfg;
+    cfg.db_config->logstor_sparse_files(sparse_files);
     cfg.db_config->experimental_features({db::experimental_features_t::feature::LOGSTOR});
     cfg.db_config->tablets_mode_for_new_keyspaces(db::tablets_mode_t::mode::enabled);
     cfg.db_config->logstor_disk_size_in_mb(16);
@@ -75,6 +79,13 @@ uint64_t index_live_record_bytes(cql_test_env& e) {
     }, uint64_t(0), std::plus<uint64_t>()).get();
 }
 
+// The space of the logstor segments of this shard: the space of the files allocated for them, or,
+// with sparse files, of the segments that hold records.
+uint64_t logstor_space(const replica::database& db) {
+    const auto usage = db.find_column_family("ks", "t").get_logstor_segment_manager().get_usage();
+    return db.get_config().logstor_sparse_files() ? usage.segment_bytes_in_use : usage.disk_usage;
+}
+
 } // anonymous namespace
 
 SEASTAR_TEST_CASE(test_data_size_follows_live_records) {
@@ -125,4 +136,60 @@ SEASTAR_TEST_CASE(test_table_load_stats_reports_data_size) {
             BOOST_REQUIRE_NE(stats.table_ls.size_in_bytes, live_disk_space_used);
         }).get();
     }, make_logstor_env_config());
+}
+
+// The tablet sizes and the logstor space not in them add up to the space of the logstor segments.
+void check_logstor_space_not_in_tablet_sizes(bool sparse_files) {
+    do_with_cql_env_thread([] (cql_test_env& e) {
+        create_table(e);
+        write_rows(e);
+        write_rows(e);
+        flush(e);
+
+        e.db().invoke_on_all([] (replica::database& db) {
+            const auto& t = db.find_column_family("ks", "t");
+            const uint64_t tablet_sizes = t.table_load_stats().table_ls.size_in_bytes;
+            BOOST_REQUIRE_GT(tablet_sizes, 0);
+            BOOST_REQUIRE_EQUAL(tablet_sizes + db.logstor_space_not_in_tablet_sizes(), logstor_space(db));
+        }).get();
+    }, make_logstor_env_config(sparse_files)).get();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_logstor_space_not_in_tablet_sizes_sparse_files) {
+    check_logstor_space_not_in_tablet_sizes(true);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_logstor_space_not_in_tablet_sizes_allocated_files) {
+    check_logstor_space_not_in_tablet_sizes(false);
+}
+
+// With files allocated in full, the files are not in the free space of the disk, so the capacity of
+// the node must add them back: all of them, not only the live record bytes the tablets report.
+SEASTAR_TEST_CASE(test_effective_capacity_counts_the_pool) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        create_table(e);
+        write_rows(e);
+        write_rows(e);
+        flush(e);
+
+        const uint64_t logstor_space_on_all_shards = e.db().map_reduce0([] (replica::database& db) {
+            return logstor_space(db);
+        }, uint64_t(0), std::plus<uint64_t>()).get();
+        BOOST_REQUIRE_GT(logstor_space_on_all_shards, 0);
+
+        // The capacity reads the free space the disk space monitor polled last. Read it on both
+        // sides of the stats, and retry if a poll came in between.
+        for (;;) {
+            const uint64_t available = e.disk_space_monitor().space().available;
+            const auto stats = e.get_storage_service().local().load_stats_for_tablet_based_tables().get();
+            if (e.disk_space_monitor().space().available != available) {
+                continue;
+            }
+            const auto host = e.db().local().get_token_metadata().get_my_id();
+            // The logstor table is the only table with tablets, so its tablets and the rest of the
+            // logstor files are all the capacity adds to the free space.
+            BOOST_REQUIRE_EQUAL(stats.tablet_stats.at(host).effective_capacity, available + logstor_space_on_all_shards);
+            break;
+        }
+    }, make_logstor_env_config(false));
 }

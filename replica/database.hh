@@ -2220,6 +2220,10 @@ public:
     // Space the logstor segments holding data take on this shard, which is less than the space of
     // the files logstor has allocated to hold them. Zero when logstor is unused.
     uint64_t get_logstor_disk_space_used() const;
+    // Space the logstor of this shard takes on disk beyond the live record bytes its compaction
+    // groups own, which are what the tablets report as their sizes. The tablet balancer adds it to
+    // the free space to get the capacity of the node. Zero when logstor is unused.
+    uint64_t logstor_space_not_in_tablet_sizes() const;
 
     // Space the storage of this shard takes on disk, which is what a node reports as its load: the
     // sstables of all its tables plus the logstor segments holding their data. Slightly more than

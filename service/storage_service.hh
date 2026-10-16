@@ -240,13 +240,13 @@ private:
     // when both of which sit on the same node. So all the movement is local.
     future<> clone_locally_tablet_storage(locator::global_tablet_id, locator::tablet_replica leaving, locator::tablet_replica pending);
     future<> cleanup_tablet(locator::global_tablet_id);
-    // Handler for table load stats RPC.
-    future<locator::load_stats> load_stats_for_tablet_based_tables();
     future<> process_tablet_split_candidate(table_id) noexcept;
     void register_tablet_split_candidate(table_id) noexcept;
     future<> run_tablet_split_monitor();
     void check_raft_rpc(raft::server_id dst);
 public:
+    // Handler for table load stats RPC.
+    future<locator::load_stats> load_stats_for_tablet_based_tables();
     future<service::tablet_operation_result> do_tablet_operation(locator::global_tablet_id tablet,
                                  sstring op_name,
                                  std::function<future<service::tablet_operation_result>(locator::tablet_metadata_guard&)> op);
