@@ -984,13 +984,17 @@ async def test_trigger_separator_flush(manager: ScyllaClusterManager):
 
 async def test_tablet_split_trigger_by_size(manager: ScyllaClusterManager):
     """
-    Test that a logstor table automatically splits tablets when the data size
-    exceeds --target-tablet-size-in-bytes.
+    Test that a logstor table automatically splits and merges tablets as the size of its data
+    crosses the thresholds set by --target-tablet-size-in-bytes.
 
-    The split threshold is set to 300KB (~2 segments at 128KB each).
-    Writing 5 keys with ~100KB values fills 5 segments (~640KB total), which
-    exceeds the threshold and should trigger an automatic split.
-    After the split, all data must remain readable.
+    The size of a logstor tablet is the live record bytes of its segments. A tablet splits above
+    twice the target, 600KB: writing 7 keys with ~100KB values gives ~700KB of live records, which
+    triggers an automatic split. After the split, all data must remain readable.
+
+    A tablet merges below half the target, 150KB: deleting 6 of the keys replaces their values with
+    small tombstones, which leaves ~100KB of live records, so the tablets merge back. The segments
+    of the deleted values stay in place until compaction reclaims them, so the merge shows that the
+    size follows the live records and not the space of the segments.
     """
     cmdline = [
         '--logger-log-level', 'logstor=debug',
@@ -1014,10 +1018,11 @@ async def test_tablet_split_trigger_by_size(manager: ScyllaClusterManager):
 
         s0_mark = await s0_log.mark()
 
-        # Write 5 keys with ~100KB values to fill 5 segments (~640KB total).
-        # This exceeds the 300KB target and should trigger a split.
+        # Write 7 keys with ~100KB values, ~700KB of live records.
+        # This exceeds twice the 300KB target and should trigger a split.
+        key_count = 7
         value = 'x' * (100 * 1024)
-        for i in range(5):
+        for i in range(key_count):
             await cql.run_async(f"INSERT INTO {ks}.test (pk, v) VALUES ({i}, '{value}')")
 
         # Flush to assign segments to compaction groups so their size is
@@ -1028,10 +1033,31 @@ async def test_tablet_split_trigger_by_size(manager: ScyllaClusterManager):
         await asyncio.sleep(1)
 
         # Verify all data is accessible after the split
-        for i in range(5):
+        for i in range(key_count):
             rows = await cql.run_async(f"SELECT pk, v FROM {ks}.test WHERE pk = {i}")
             assert len(rows) == 1, f"Key {i} not found after tablet split"
             assert rows[0].v == value, f"Wrong value for key {i} after tablet split"
+
+        # Delete all keys but one, which leaves ~100KB of live records, below half the target.
+        # The split may have made more than two tablets, so wait for the count to get back to
+        # one rather than for one merge.
+        s0_mark = await s0_log.mark()
+        for i in range(1, key_count):
+            await cql.run_async(f"DELETE FROM {ks}.test WHERE pk = {i}")
+        await manager.api.logstor_flush(servers[0].ip_addr)
+        await s0_log.wait_for('Detected tablet merge for table', from_mark=s0_mark, timeout=60)
+
+        async def tablets_merged():
+            if await get_tablet_count(manager, servers[0], ks, 'test') == 1:
+                return True
+        await wait_for(tablets_merged, time.time() + 60)
+
+        # The merge came from the live records alone: no segment was compacted.
+        metrics = await manager.metrics.query(servers[0].ip_addr)
+        assert (metrics.get("scylla_logstor_sm_compaction_segments_in") or 0) == 0
+
+        rows = await cql.run_async(f"SELECT pk, v FROM {ks}.test")
+        assert [(r.pk, r.v) for r in rows] == [(0, value)]
 
 async def test_tablet_split_and_merge(manager: ScyllaClusterManager):
     logger.info("Bootstrapping cluster")
