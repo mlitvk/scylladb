@@ -268,6 +268,14 @@ public:
     size_t live_sstable_count() const noexcept;
     // Disk space used by all the storage of this group, sstables and logstor segments alike.
     uint64_t live_disk_space_used() const noexcept;
+    // The data this group holds, which the tablet balancer and the resize logic read. For sstables it
+    // is the space of the live sstables, dead rows included until compaction drops them: the group has
+    // its own compaction strategy, so that space is bounded by its own data. For logstor it is the live
+    // record bytes of the segments the group owns, and not their space: the dead records in those
+    // segments are reclaimed when the free level of the whole shard asks for it, so their space
+    // follows the churn of every group on the shard and says nothing about the data of this one.
+    // live_disk_space_used() is the footprint for both engines.
+    uint64_t data_size() const noexcept;
     uint64_t total_disk_space_used() const noexcept;
     // Space taken by the logstor segments this group owns. Zero for a table that doesn't use logstor.
     size_t logstor_disk_space_used() const noexcept;
@@ -402,6 +410,8 @@ public:
     compaction_group_ptr& select_compaction_group(dht::token first, dht::token last, const locator::tablet_map&) noexcept;
 
     uint64_t live_disk_space_used() const;
+    // The sum of compaction_group::data_size() over the groups of this storage group.
+    uint64_t data_size() const;
 
     void for_each_compaction_group(std::function<void(const compaction_group_ptr&)> action) const;
     utils::small_vector<compaction_group_ptr, 3> compaction_groups_immediate();
