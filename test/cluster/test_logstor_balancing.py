@@ -19,9 +19,9 @@ from cassandra.murmur3 import murmur3
 
 from test.pylib.rest_client import read_barrier
 from test.pylib.scylla_cluster_manager import ScyllaClusterManager
-from test.pylib.tablets import get_all_tablet_replicas
+from test.pylib.tablets import get_all_tablet_replicas, get_tablet_replica
 from test.pylib.util import wait_for
-from test.cluster.util import new_test_keyspace
+from test.cluster.util import get_topology_coordinator, new_test_keyspace
 
 logger = logging.getLogger(__name__)
 
@@ -252,3 +252,61 @@ async def test_tablet_sizes_reach_coordinator(manager: ScyllaClusterManager):
         assert load.effective_capacity >= disk_usage
         assert load.storage_load == size
         assert 0 <= load.storage_utilization < 1
+
+
+async def test_pool_critical_rolls_back_migration(manager: ScyllaClusterManager):
+    """
+    The live records of a node take more of its logstor pool than logstor_critical_utilization_level.
+    A tablet moved into it must be refused, and the topology coordinator must roll the migration back
+    rather than retry it, because the node reports itself as critical. Once the level is raised, the
+    same move succeeds.
+    """
+    value = 'x' * (60 * 1024)
+    # 25 keys of 60KB in each of the two tablets of the critical node take about 3MB of its 8MB
+    # pool, above the level of 0.25. The tablet to move holds a few keys, so it has a segment to
+    # stream: a tablet with no segment streams nothing, and nothing would be refused.
+    keys_per_tablet = 25
+    keys_to_move = 4
+    critical_cfg = cfg | {'logstor_critical_utilization_level': 0.25}
+    critical_cmdline = cmdline + ['--logger-log-level', 'raft_topology=debug', '--logger-log-level', 'stream_blob=debug']
+
+    servers = await manager.servers_add(2, cmdline=critical_cmdline, config=critical_cfg, property_file={'dc': 'dc1', 'rack': 'r1'})
+    cql = manager.get_cql()
+    await manager.disable_tablet_balancing()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'initial': 4}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v text) WITH storage_engine = 'logstor'")
+
+        source_host = await manager.get_host_id(servers[0].server_id)
+        target_host = await manager.get_host_id(servers[1].server_id)
+        tablets = await keys_by_tablet(manager, servers[0], ks, 'test', keys_per_tablet)
+        assert sorted(host for _, host, _ in tablets) == sorted([source_host] * 2 + [target_host] * 2), f"expected 2 tablets on each node, got {tablets}"
+        moved_token, _, moved_keys = next(t for t in tablets if t[1] == source_host)
+        moved_keys = moved_keys[:keys_to_move]
+        await write(cql, ks, [pk for _, host, keys in tablets if host == target_host for pk in keys] + moved_keys, value)
+        await flush_and_refresh(manager, servers)
+
+        target_log = await manager.server_open_log(servers[1].server_id)
+        target_mark = await target_log.mark()
+        coordinator = await manager.find_server_by_host_id(servers, await get_topology_coordinator(manager))
+        coordinator_log = await manager.server_open_log(coordinator.server_id)
+        coordinator_mark = await coordinator_log.mark()
+
+        try:
+            await manager.api.move_tablet(servers[0].ip_addr, ks, 'test', source_host, 0, target_host, 0, moved_token)
+        except Exception as e:
+            logger.info(f"move_tablet failed: {e}")
+        await target_log.wait_for('rejected streamed logstor segment', from_mark=target_mark, timeout=60)
+        await coordinator_log.wait_for(f'critical disk utilization on {target_host}', from_mark=coordinator_mark, timeout=60)
+        await manager.api.quiesce_topology(servers[0].ip_addr)
+        assert await get_tablet_replica(manager, servers[0], ks, 'test', moved_token) == (source_host, 0)
+
+        for s in servers:
+            await manager.server_update_config(s.server_id, 'logstor_critical_utilization_level', 0.85)
+        await flush_and_refresh(manager, servers)
+        await manager.api.move_tablet(servers[0].ip_addr, ks, 'test', source_host, 0, target_host, 0, moved_token)
+        assert await get_tablet_replica(manager, servers[0], ks, 'test', moved_token) == (target_host, 0)
+
+        rows = await cql.run_async(f"SELECT pk, v FROM {ks}.test WHERE pk IN ({', '.join(map(str, moved_keys))})")
+        assert sorted(r.pk for r in rows) == sorted(moved_keys)
+        assert all(r.v == value for r in rows)

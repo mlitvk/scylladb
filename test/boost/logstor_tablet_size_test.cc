@@ -9,10 +9,12 @@
 // Tests for the sizes a logstor table reports to the tablet balancer: the live record bytes of the
 // segments its groups own, and not the space of those segments.
 
+#include <seastar/coroutine/as_future.hh>
 #include <seastar/testing/test_case.hh>
 #include <seastar/testing/thread_test_case.hh>
 
 #include "replica/database.hh"
+#include "replica/exceptions.hh"
 #include "replica/logstor/segment_manager.hh"
 #include "service/storage_service.hh"
 #include "test/boost/sstable_test.hh"
@@ -221,5 +223,44 @@ SEASTAR_TEST_CASE(test_pool_critical_follows_the_level) {
         e.db().invoke_on_all([] (replica::database& db) {
             BOOST_REQUIRE(!db.logstor_pool_critical());
         }).get();
+    }, make_logstor_env_config());
+}
+
+SEASTAR_TEST_CASE(test_pool_critical_refuses_a_stream_sink) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        create_table(e);
+        write_rows(e);
+        set_critical_level(e, "0.000001");
+
+        const unsigned refusals = e.db().map_reduce0([] (replica::database& db) -> future<unsigned> {
+            if (!db.logstor_pool_critical()) {
+                co_return 0;
+            }
+            auto& sm = db.find_column_family("ks", "t").get_logstor_segment_manager();
+            auto sink = co_await coroutine::as_future(sm.create_segment_output_stream(db));
+            BOOST_REQUIRE(sink.failed());
+            BOOST_REQUIRE_THROW(std::rethrow_exception(sink.get_exception()), replica::critical_disk_utilization_exception);
+            co_return 1;
+        }, 0u, std::plus<unsigned>()).get();
+        BOOST_REQUIRE_GT(refusals, 0);
+
+        set_critical_level(e, "1");
+        auto& db = e.local_db();
+        auto sink = db.find_column_family("ks", "t").get_logstor_segment_manager().create_segment_output_stream(db).get();
+        sink->abort().get();
+    }, make_logstor_env_config());
+}
+
+SEASTAR_TEST_CASE(test_pool_critical_marks_the_node) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        create_table(e);
+        write_rows(e);
+        auto& ss = e.get_storage_service().local();
+        const auto host = e.db().local().get_token_metadata().get_my_id();
+
+        BOOST_REQUIRE(!ss.load_stats_for_tablet_based_tables().get().critical_disk_utilization.at(host));
+
+        set_critical_level(e, "0.000001");
+        BOOST_REQUIRE(ss.load_stats_for_tablet_based_tables().get().critical_disk_utilization.at(host));
     }, make_logstor_env_config());
 }

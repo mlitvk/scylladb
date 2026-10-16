@@ -50,6 +50,7 @@
 #include "utils/serialized_action.hh"
 #include "utils/lister.hh"
 #include "replica/database.hh"
+#include "replica/exceptions.hh"
 
 namespace replica::logstor {
 
@@ -3009,6 +3010,13 @@ future<> segment_manager_impl::load_segment(replica::database& db, log_segment_i
 }
 
 future<std::unique_ptr<segment_stream_sink>> segment_manager_impl::create_segment_output_stream(replica::database& db) {
+    // A streamed tablet would take the space compaction needs, and the stream would wait here for a
+    // free segment. Fail the stream instead, with the exception the sstable stream fails with on a
+    // full disk. The topology coordinator rolls the migration back rather than retry it, because
+    // the node also reports itself as critical (see load_stats_for_tablet_based_tables()).
+    if (db.logstor_pool_critical()) {
+        co_await coroutine::return_exception(replica::critical_disk_utilization_exception("rejected streamed logstor segment"));
+    }
     auto seg = co_await get_segment(write_source::streaming);
     co_return std::make_unique<segment_stream_sink_impl>(*this, db, std::move(seg));
 }

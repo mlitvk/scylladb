@@ -6541,6 +6541,7 @@ future<locator::load_stats> storage_service::load_stats_for_tablet_based_tables(
     struct alignas(64) shard_load {
         uint64_t tablet_sizes = 0;
         uint64_t logstor_space_not_in_tablet_sizes = 0;
+        bool logstor_pool_critical = false;
     };
     std::vector<shard_load> load_per_shard(this_smp_shard_count());
 
@@ -6563,12 +6564,19 @@ future<locator::load_stats> storage_service::load_stats_for_tablet_based_tables(
             co_await coroutine::maybe_yield();
         }
         load_per_shard[this_shard_id()].logstor_space_not_in_tablet_sizes = db.logstor_space_not_in_tablet_sizes();
+        load_per_shard[this_shard_id()].logstor_pool_critical = db.logstor_pool_critical();
 
         co_return std::move(load_stats);
     }, locator::load_stats{}, std::plus<locator::load_stats>());
 
     load_stats.capacity[this_host] = _disk_space_monitor->space().capacity;
-    load_stats.critical_disk_utilization[this_host] = _disk_space_monitor->disk_utilization() > _db.local().get_config().critical_disk_utilization_level();
+    // A shard whose logstor pool is critical refuses streamed segments, which fails the stream of a
+    // migration into the node. The topology coordinator rolls such a migration back only if the
+    // node reports itself as critical, and retries it otherwise. Like a full disk, this also cancels
+    // a decommission whose stream into the node fails.
+    const bool logstor_pool_critical = std::ranges::any_of(load_per_shard, &shard_load::logstor_pool_critical);
+    load_stats.critical_disk_utilization[this_host] = _disk_space_monitor->disk_utilization() > _db.local().get_config().critical_disk_utilization_level()
+            || logstor_pool_critical;
 
     const std::filesystem::space_info si = _disk_space_monitor->space();
     load_stats.capacity[this_host] = si.capacity;
