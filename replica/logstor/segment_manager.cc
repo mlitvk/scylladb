@@ -685,6 +685,9 @@ private:
     struct stats {
         uint64_t segments_in{0};
         uint64_t segments_out{0};
+        // `n_in - n_out` over the jobs that finished: what compaction gave back net, which is the
+        // quantity the cost model is written in and the rate controller is paced by.
+        uint64_t segments_reclaimed{0};
         uint64_t records_skipped{0};
         uint64_t records_rewritten{0};
         uint64_t bytes_read{0};
@@ -1420,6 +1423,8 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
                        sm::description("Counts number of input segments selected for compaction.")),
         sm::make_counter("compaction_segments_out", _compaction_mgr.get_stats().segments_out,
                        sm::description("Counts number of output segments written by compaction.")),
+        sm::make_counter("compaction_segments_reclaimed", _compaction_mgr.get_stats().segments_reclaimed,
+                       sm::description("Counts the segments that compaction freed net: its input segments minus its output segments, for the jobs that finished.")),
         sm::make_counter("compaction_records_skipped", _compaction_mgr.get_stats().records_skipped,
                        sm::description("Counts number of records skipped during compaction.")),
         sm::make_counter("compaction_records_rewritten", _compaction_mgr.get_stats().records_rewritten,
@@ -2398,6 +2403,8 @@ future<> compaction_manager_impl::do_compaction(logstor_group& cg, const compact
 
     _stats.segments_in += compaction_segments_in;
     _stats.segments_out += compaction_segments_out;
+    _stats.segments_reclaimed += compaction_segments_in > compaction_segments_out
+            ? compaction_segments_in - compaction_segments_out : 0;
     _stats.records_rewritten += cb_stats.records_rewritten;
     _stats.records_skipped += cb_stats.records_skipped;
     _stats.bytes_read += nonempty_segments.size() * _sm.get_segment_size();
