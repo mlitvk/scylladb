@@ -440,8 +440,8 @@ future<segment_position> segment::append(bytes_view data) {
     auto reservation = co_await reserve(data.size());
     if (!reservation) {
         co_return coroutine::return_exception(std::runtime_error(_failed
-                ? fmt::format("Can't append write of size {} to segment {} retired by a failed write", data.size(), _id)
-                : fmt::format("Can't append write of size {} to segment with {} bytes remaining", data.size(), bytes_remaining())));
+                ? fmt::format("Cannot append write of size {} to segment {}, which failed a write", data.size(), _id)
+                : fmt::format("Cannot append write of size {} to segment with {} bytes remaining", data.size(), bytes_remaining())));
     }
     co_return co_await write_reserved(std::move(*reservation), data);
 }
