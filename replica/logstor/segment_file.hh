@@ -217,7 +217,7 @@ private:
     future<seastar::file> open_file(file_id_t);
 };
 
-class writeable_segment {
+class segment {
     log_segment_id _id;
     seastar::file _file;
     uint64_t _file_offset; // Offset within the shared file where this segment starts
@@ -246,7 +246,7 @@ class writeable_segment {
     }
 
 public:
-    writeable_segment(log_segment_id id, seastar::file file, uint64_t file_offset, uint64_t max_size);
+    segment(log_segment_id id, seastar::file file, uint64_t file_offset, uint64_t max_size);
 
     log_segment_id id() const noexcept { return _id; }
 

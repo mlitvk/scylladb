@@ -369,26 +369,26 @@ future<> file_manager::zero_region(file_id_t file_id, uint64_t offset, uint64_t 
     co_await write_zeros(get_open_file(file_id), offset, size);
 }
 
-writeable_segment::writeable_segment(log_segment_id id, seastar::file file, uint64_t file_offset, uint64_t max_size)
+segment::segment(log_segment_id id, seastar::file file, uint64_t file_offset, uint64_t max_size)
     : _id(id)
     , _file(std::move(file))
     , _file_offset(file_offset)
     , _max_size(max_size) {
 }
 
-void writeable_segment::start(segment_ref seg_ref, segment_sequence seq_num) {
+void segment::start(segment_ref seg_ref, segment_sequence seq_num) {
     _seg_ref = std::move(seg_ref);
     _seq_num = seq_num;
 }
 
-future<> writeable_segment::stop() {
+future<> segment::stop() {
     if (_write_gate.is_closed()) {
         co_return;
     }
     co_await _write_gate.close();
 }
 
-future<std::optional<writeable_segment::append_reservation>> writeable_segment::reserve(size_t size) {
+future<std::optional<segment::append_reservation>> segment::reserve(size_t size) {
     if (_failed) [[unlikely]] {
         co_return std::nullopt;
     }
@@ -420,7 +420,7 @@ future<std::optional<writeable_segment::append_reservation>> writeable_segment::
     co_return std::move(reservation);
 }
 
-future<segment_position> writeable_segment::write_reserved(append_reservation reservation, bytes_view data) {
+future<segment_position> segment::write_reserved(append_reservation reservation, bytes_view data) {
     auto write_result = co_await coroutine::as_future(do_write(reservation.pos, data));
     if (write_result.failed()) {
         auto ex = write_result.get_exception();
@@ -436,7 +436,7 @@ future<segment_position> writeable_segment::write_reserved(append_reservation re
     co_return reservation.pos;
 }
 
-future<segment_position> writeable_segment::append(bytes_view data) {
+future<segment_position> segment::append(bytes_view data) {
     auto reservation = co_await reserve(data.size());
     if (!reservation) {
         co_return coroutine::return_exception(std::runtime_error(_failed
@@ -446,7 +446,7 @@ future<segment_position> writeable_segment::append(bytes_view data) {
     co_return co_await write_reserved(std::move(*reservation), data);
 }
 
-future<> writeable_segment::do_write(segment_position pos, bytes_view data) {
+future<> segment::do_write(segment_position pos, bytes_view data) {
     utils::get_local_injector().inject("logstor_fail_segment_write", [] {
         throw std::runtime_error("segment write failed by injection");
     });
