@@ -482,6 +482,7 @@ future<> segment::do_write(segment_position pos, bytes_view data) {
         auto new_written = co_await _file.dma_write(
                 base_offset + written, data.data() + written, total - written);
 
+        const auto previous_written = written;
         written += new_written;
         if (written == total) {
             break;
@@ -491,6 +492,12 @@ future<> segment::do_write(segment_position pos, bytes_view data) {
         // aligned offset. Thus it starts at the last aligned offset that was written, and writes
         // the bytes after that offset again.
         written = align_down(written, alignment);
+        // A write that did not write a full aligned block would give the same write again, forever.
+        if (written == previous_written) [[unlikely]] {
+            co_await coroutine::return_exception(std::runtime_error(fmt::format(
+                    "Short write to segment {} wrote {} bytes at offset {}, less than the alignment {}",
+                    _id, new_written, pos.offset + written, alignment)));
+        }
     }
 }
 
