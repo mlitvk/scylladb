@@ -221,7 +221,9 @@ private:
 // manager, and writes append to it from the start of the region to its end. The segment manager
 // makes the object when it allocates the segment. When a writer takes the segment, start() gives
 // the segment its reference and its sequence number. A writer holds the write gate while it uses
-// the segment, and stop() waits for these writers.
+// the segment, and stop() waits for these writers. The segment writes through the open file of the
+// file manager, and file_manager::stop() closes that file. Thus the writes to the segment must end
+// before the file manager stops.
 //
 // An append has two steps: reserve() takes the next region of the segment, and write_reserved()
 // writes the data to it. _append_sem has one unit, and a reservation holds it until its write
@@ -273,6 +275,7 @@ private:
     seastar::file _file;
     // The offset in the file where the segment starts.
     const uint64_t _file_offset;
+    // The size of the region of the segment in the file.
     const uint64_t _size;
 
     seastar::gate _write_gate;
