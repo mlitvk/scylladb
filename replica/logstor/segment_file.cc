@@ -397,9 +397,8 @@ future<std::optional<segment::append_reservation>> segment::reserve(size_t size)
     try {
         units = co_await get_units(_append_sem, 1);
     } catch (...) {
-        // The only way _append_sem breaks is a failed write retiring the segment, which
-        // may have happened while we were waiting for the permit. Nothing was reserved,
-        // so the caller can retry on another segment.
+        // Only a failed write breaks _append_sem, and the failure can occur while this call waits
+        // for the unit. Nothing is reserved, thus the caller can try again on another segment.
         co_return std::nullopt;
     }
 
@@ -425,8 +424,9 @@ future<segment_position> segment::write_reserved(append_reservation reservation,
     if (write_result.failed()) {
         auto ex = write_result.get_exception();
 
-        // if a write fails, fail also all later writes to the segment, since we assume no holes in a segment.
-        // the segment is retired, so that callers switch to a new segment instead of failing forever.
+        // A segment must have no holes, thus a failed write also fails all the later writes to the
+        // segment. The segment accepts no more appends, so that the callers write to a new segment
+        // and do not fail again.
         _failed = true;
         _append_sem.broken(ex);
         logstor_logger.warn("Write to segment {} seq {} failed: {}, retiring segment", _id, _seq_num, ex);
@@ -472,6 +472,9 @@ future<> segment::do_write(segment_position pos, bytes_view data) {
             break;
         }
 
+        // A DMA write can write less than it was given, and the next DMA write must start at an
+        // aligned offset. Thus it starts at the last aligned offset that was written, and writes
+        // the bytes after that offset again.
         written = align_down(written, alignment);
     }
 }
