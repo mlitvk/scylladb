@@ -217,28 +217,12 @@ private:
     future<seastar::file> open_file(file_id_t);
 };
 
-class segment {
-protected:
+class writeable_segment {
     log_segment_id _id;
     seastar::file _file;
     uint64_t _file_offset; // Offset within the shared file where this segment starts
     uint64_t _max_size;
 
-public:
-    segment(log_segment_id id, seastar::file file, uint64_t file_offset, uint64_t max_size);
-
-    virtual ~segment() = default;
-
-    log_segment_id id() const noexcept { return _id; }
-    seastar::file& get_file() noexcept { return _file; }
-
-protected:
-    uint64_t absolute_offset(uint64_t relative_offset) const noexcept {
-        return _file_offset + relative_offset;
-    }
-};
-
-class writeable_segment : public segment {
     seastar::gate _write_gate;
     seastar::semaphore _append_sem{1};
     segment_ref _seg_ref;
@@ -257,8 +241,14 @@ class writeable_segment : public segment {
         return _current_offset + size <= _max_size;
     }
 
+    uint64_t absolute_offset(uint64_t relative_offset) const noexcept {
+        return _file_offset + relative_offset;
+    }
+
 public:
-    using segment::segment;
+    writeable_segment(log_segment_id id, seastar::file file, uint64_t file_offset, uint64_t max_size);
+
+    log_segment_id id() const noexcept { return _id; }
 
     void start(segment_ref, segment_sequence);
 

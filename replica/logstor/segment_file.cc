@@ -369,7 +369,7 @@ future<> file_manager::zero_region(file_id_t file_id, uint64_t offset, uint64_t 
     co_await write_zeros(get_open_file(file_id), offset, size);
 }
 
-segment::segment(log_segment_id id, seastar::file file, uint64_t file_offset, uint64_t max_size)
+writeable_segment::writeable_segment(log_segment_id id, seastar::file file, uint64_t file_offset, uint64_t max_size)
     : _id(id)
     , _file(std::move(file))
     , _file_offset(file_offset)
