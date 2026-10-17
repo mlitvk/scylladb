@@ -66,29 +66,6 @@ constexpr double compaction_batch_extension_tolerance = 0.8;
 // compaction would stop instead of running at the efficiency the disk allows.
 constexpr double compaction_marginal_admission_ratio = 0.75;
 
-// Watermarks, in available segments, that drive automatic compaction. It starts once the number of
-// available segments drops below `low` - the free-segment target - and stops once it is back at
-// `high`. Both are zero when the trigger is disabled.
-struct free_segment_watermarks {
-    uint64_t low;
-    uint64_t high;
-};
-
-// The free-segment target is a fraction of the disk, which is the dominant write-amplification
-// knob, with an absolute floor that keeps the target meaningful on small disks, where a fraction of
-// the disk rounds down to a segment or two.  `target_fraction` is
-// logstor_compaction_trigger_threshold; 0 disables the trigger.
-free_segment_watermarks make_free_segment_watermarks(uint64_t segment_count, double target_fraction) noexcept;
-
-// Whether the free-segment level wants automatic compaction running, given whether it is running
-// now. The two watermarks are a hysteresis band: compaction starts once the free-segment target is
-// breached and runs until the disk is back at the stop watermark, rather than stopping again at the
-// first write that crosses back over the target. Both watermarks are zero when the trigger is
-// disabled, which answers "no" at any number of available segments.
-//
-// This is only the space half of the decision; whether compaction may run at all is the caller's.
-bool auto_compaction_wanted(bool running, uint64_t available_segments, free_segment_watermarks watermarks) noexcept;
-
 // The space floor: the free segments that compaction keeps for itself. It is what its jobs in
 // flight may hold, and the level of free segments at which space pressure has fully overridden the
 // utilization threshold that decides what is worth compacting, see compaction_space_pressure(). A
@@ -121,9 +98,6 @@ struct compaction_limits {
 // minimum of compaction_space_floor() has already been capped by the disk size and a batch of
 // `min_segments_per_compaction` is the least that can reclaim anything.
 compaction_limits make_compaction_limits(uint64_t space_floor, size_t max_batch_cap) noexcept;
-// The same, with the free-segment target as the budget. Drives the engine until the threshold
-// controller does.
-compaction_limits make_compaction_limits(free_segment_watermarks watermarks, size_t max_batch_cap) noexcept;
 
 // The utilization threshold as a function of the free level: a piecewise-linear curve through
 // three points, in available segments.
@@ -323,25 +297,6 @@ std::optional<compaction_candidate_score> marginal_admission_bar(const std::vect
     }
     return std::nullopt;
 }
-
-// Where the free-segment target falls on the compaction_shares_pressure() ramp. It is a property of
-// the watermarks rather than a tunable: with the relative hysteresis of make_free_segment_watermarks()
-// the target sits a third of the way up the ramp on any disk size, up to the rounding of the two
-// watermarks to whole segments. Exported so that the shares controller can put a control point on it.
-constexpr float compaction_shares_pressure_at_target = 1.0f / 3.0f;
-
-// Space pressure driving the compaction shares controller: 0 at or above the high watermark, where
-// automatic compaction stops and there is no space demand at all, compaction_shares_pressure_at_target
-// at the free-segment target - the intended steady-state operating point - and 1 once half the
-// target has been consumed, linear in between.
-//
-// The free-segment count is the integral of the mismatch between the write rate and the rate at
-// which compaction reclaims, so mapping it proportionally to shares is integral control on that
-// mismatch: the loop settles at whatever shares match the write rate, and the slope only decides
-// where in the free-segment range it settles. That is why pressure saturates while half the target
-// is still in hand instead of at the point where writes stall: a workload that needs the maximum
-// shares must be able to settle somewhere that still leaves the write path room.
-float compaction_shares_pressure(uint64_t available_segments, free_segment_watermarks watermarks) noexcept;
 
 // What compaction could give back: the segments under the utilization threshold, and the net number
 // of segments compacting all of them would free, both read off a utilization histogram in O(buckets).
