@@ -410,12 +410,12 @@ future<std::optional<segment::append_reservation>> segment::reserve(size_t size)
     append_reservation reservation {
         .pos = segment_position {
             .segment = _id,
-            .offset = _current_offset,
+            .offset = _append_offset,
         },
         .units = std::move(*units),
     };
 
-    _current_offset += size;
+    _append_offset += size;
 
     co_return std::move(reservation);
 }

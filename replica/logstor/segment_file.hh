@@ -228,7 +228,7 @@ class segment {
     segment_ref _seg_ref;
     segment_sequence _seq_num;
 
-    uint32_t _current_offset = 0; // next offset for write
+    uint32_t _append_offset = 0; // next offset for write
 
     // Set when a write to this segment failed. The segment is retired: it accepts no
     // further appends, and reserve() returns nullopt so that the caller switches to a
@@ -238,7 +238,7 @@ class segment {
     future<> do_write(segment_position, bytes_view data);
 
     bool can_fit(size_t size) const noexcept {
-        return _current_offset + size <= _max_size;
+        return _append_offset + size <= _max_size;
     }
 
     uint64_t absolute_offset(uint64_t relative_offset) const noexcept {
@@ -273,7 +273,7 @@ public:
     future<segment_position> append(bytes_view data);
 
     size_t bytes_remaining() const noexcept {
-        return _max_size - _current_offset;
+        return _max_size - _append_offset;
     }
 
     seastar::gate::holder hold() {
