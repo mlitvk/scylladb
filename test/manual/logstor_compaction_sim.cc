@@ -19,14 +19,14 @@
 //   - select_compaction_batch(), and with it the efficiency score, the batch extension tolerance and
 //     estimate_required_segments();
 //   - top_compaction_candidates, which ranks the groups;
-//   - make_free_segment_watermarks(), make_compaction_limits(), compaction_space_floor() and
-//     compaction_space_pressure(), so that the free-segment target, the batch cap, the parallelism
-//     and the space floor are derived per disk as they are in the engine;
-//   - auto_compaction_wanted(), which decides when the free-segment target runs compaction, and
-//     compaction_shares_pressure(), which the shares follow under it;
+//   - make_compaction_limits(), compaction_space_floor() and compaction_space_pressure(), so that the
+//     batch cap, the parallelism and the space floor are derived per disk as they are in the engine;
 //   - compaction_rate_controller, which paces compaction and asks for its CPU, and with it the
 //     utilization threshold, the reclaimable backlog and the shares demand - run rather than
-//     reimplemented, so that the simulated dynamics are the controller's own;
+//     reimplemented, so that the simulated dynamics are the controller's own. The free-segment
+//     target, a relay on the level, is reimplemented here as --controller relay, so that the
+//     simulator keeps it as the baseline every controller is measured against whatever the
+//     engine runs;
 //   - the ondisk:: sizes and alignments, so that what a segment holds and what it wastes are real.
 //
 // What is modeled here, because the engine's version of it is IO or future bound: the primary index
@@ -145,6 +145,46 @@ enum class strategy_kind {
     random_victim,
 };
 
+// The free-segment target that drives automatic compaction in the engine, as a relay: on once the
+// available segments drop below `low`, off once they are back at `high`. The simulator has its own
+// copy, so that it keeps the relay as the baseline every controller is measured against whatever
+// the engine runs. `target_fraction` is the fraction of the disk the target is, floored and capped
+// as the engine's is; 0 disables it.
+struct relay_watermarks {
+    uint64_t low;
+    uint64_t high;
+};
+
+relay_watermarks make_relay_watermarks(uint64_t segment_count, double target_fraction) noexcept {
+    if (!std::isfinite(target_fraction) || target_fraction <= 0) {
+        return {0, 0};
+    }
+    const auto fraction = std::min(target_fraction, 1.0);
+    const auto by_fraction = static_cast<uint64_t>(std::ceil(segment_count * fraction));
+    const auto min_target = std::min<uint64_t>(2 * min_segments_per_compaction, std::max<uint64_t>(1, segment_count / 8));
+    const auto low = std::min(segment_count, std::max(by_fraction, min_target));
+    // Relative hysteresis, a quarter of the target.
+    const auto high = std::min(segment_count, low + std::max<uint64_t>(1, low / 4));
+    return {low, high};
+}
+
+bool relay_wants_compaction(bool running, uint64_t available_segments, relay_watermarks watermarks) noexcept {
+    return available_segments < (running ? watermarks.high : watermarks.low);
+}
+
+// The shares ramp of the relay: 0 at the stop watermark, saturating at half the target, linear in
+// between. What a contended shard's compaction bandwidth follows under the relay.
+double relay_shares_pressure(uint64_t available_segments, relay_watermarks watermarks) noexcept {
+    if (available_segments >= watermarks.high) {
+        return 0;
+    }
+    const auto saturation_point = watermarks.low / 2;
+    if (available_segments <= saturation_point) {
+        return 1;
+    }
+    return double(watermarks.high - available_segments) / double(watermarks.high - saturation_point);
+}
+
 struct sim_params {
     uint64_t disk_size = 128 * 1024 * 1024;
     uint64_t segment_size = default_segment_size;
@@ -159,7 +199,7 @@ struct sim_params {
     double trigger_threshold = 0.05;
     // Replaces the hysteresis band with a fixed number of segments, so that configurations which
     // reclaim at different rates are still compared at the same free level, and therefore at the
-    // same U_eff. 0 keeps the band make_free_segment_watermarks() derives.
+    // same U_eff. 0 keeps the band make_relay_watermarks() derives.
     uint64_t free_band = 0;
     // segment_manager_config::max_segments_per_compaction, the bound the derived cap is clamped to.
     size_t batch_cap = 32;
@@ -685,7 +725,7 @@ struct sim_result {
     uint64_t segment_count = 0;
     size_t batch_cap = 0;
     size_t parallelism = 0;
-    free_segment_watermarks watermarks{};
+    relay_watermarks watermarks{};
     uint64_t space_floor = 0;
     utilization_threshold_curve curve{};
     uint64_t keys = 0;
@@ -818,7 +858,7 @@ struct trace_row {
 class compaction_sim {
     sim_params _p;
     uint64_t _segment_count;
-    free_segment_watermarks _watermarks;
+    relay_watermarks _watermarks;
     // compaction_space_floor() for this disk: what the threshold policy derives its limits from and
     // where its space pressure starts.
     uint64_t _space_floor;
@@ -876,7 +916,7 @@ class compaction_sim {
         .shares_rise_time = _p.shares_rise_time > 0 ? _p.shares_rise_time : compaction_shares_rise_time,
         .shares_decay_time = _p.shares_decay_time > 0 ? _p.shares_decay_time : compaction_shares_decay_time,
     }};
-    // Whether the relay's driver fiber is running, which is the state auto_compaction_wanted() takes
+    // Whether the relay's driver fiber is running, which is the state relay_wants_compaction() takes
     // and which only a timed run has to remember across polls.
     bool _relay_running = false;
     // What the controller is told at the end of the period it covers.
@@ -893,7 +933,7 @@ public:
     explicit compaction_sim(sim_params p)
         : _p(std::move(p))
         , _segment_count((_p.disk_size / _p.file_size) * (_p.file_size / _p.segment_size))
-        , _watermarks(make_free_segment_watermarks(_segment_count, _p.trigger_threshold))
+        , _watermarks(make_relay_watermarks(_segment_count, _p.trigger_threshold))
         , _space_floor(compaction_space_floor(_segment_count))
         , _curve(make_utilization_threshold_curve(_segment_count, _space_floor, _p.utilization_threshold,
                 _p.threshold_anchor, _p.threshold_ceiling))
@@ -930,8 +970,8 @@ public:
             _watermarks.high = std::min(_segment_count, _watermarks.low + _p.free_band);
         }
         // What the jobs in flight may hold: the engine's space floor under the threshold
-        // policy, and the free-segment target under the relay, as make_compaction_limits() derives
-        // it from the watermarks.
+        // policy, and the free-segment target under the relay, which the relay derives its limits
+        // from.
         const auto budget = threshold_policy()
                 ? _space_floor
                 : std::max<uint64_t>(_watermarks.low, min_segments_per_compaction);
@@ -1059,7 +1099,7 @@ private:
         if (threshold_policy()) {
             return _rate_controller.shares_demand();
         }
-        return compaction_shares_pressure(available_segments(write_source::user_write), _watermarks);
+        return relay_shares_pressure(available_segments(write_source::user_write), _watermarks);
     }
 
     static double controller_period() noexcept {
@@ -1466,7 +1506,7 @@ private:
         // moment the free level is back at the target.
         bool running = false;
         while (threshold_policy()
-                || auto_compaction_wanted(running, available_segments(write_source::user_write), _watermarks)) {
+                || relay_wants_compaction(running, available_segments(write_source::user_write), _watermarks)) {
             running = true;
             start_jobs();
             if (_jobs.empty()) {
@@ -1490,7 +1530,7 @@ private:
         _copy_budget = std::min(_copy_budget + bandwidth * dt, bandwidth * controller_period());
 
         if (!threshold_policy()) {
-            _relay_running = auto_compaction_wanted(_relay_running,
+            _relay_running = relay_wants_compaction(_relay_running,
                     available_segments(write_source::user_write), _watermarks);
         }
 
