@@ -235,7 +235,7 @@ public:
         seastar::semaphore_units<> units;
     };
 
-    segment(log_segment_id id, seastar::file file, uint64_t file_offset, uint64_t max_size);
+    segment(log_segment_id id, seastar::file file, uint64_t file_offset, uint64_t size);
 
     void start(segment_ref, segment_sequence);
 
@@ -273,7 +273,7 @@ private:
     seastar::file _file;
     // The offset in the file where the segment starts.
     const uint64_t _file_offset;
-    const uint64_t _max_size;
+    const uint64_t _size;
 
     seastar::gate _write_gate;
     seastar::semaphore _append_sem{1};
@@ -290,7 +290,7 @@ private:
     future<> do_write(segment_position, bytes_view data);
 
     bool can_fit(size_t size) const noexcept {
-        return _append_offset + size <= _max_size;
+        return _append_offset + size <= _size;
     }
 
     uint64_t absolute_offset(uint64_t relative_offset) const noexcept {
@@ -298,7 +298,7 @@ private:
     }
 
     size_t bytes_remaining() const noexcept {
-        return _max_size - _append_offset;
+        return _size - _append_offset;
     }
 };
 
