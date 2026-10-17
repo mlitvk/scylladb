@@ -260,7 +260,7 @@ public:
 
     log_segment_id id() const noexcept { return _id; }
 
-    segment_ref ref() {
+    segment_ref ref() const {
         return _seg_ref;
     }
 
@@ -268,16 +268,12 @@ public:
         return _seq_num;
     }
 
-    size_t bytes_remaining() const noexcept {
-        return _max_size - _append_offset;
-    }
-
 private:
-    log_segment_id _id;
+    const log_segment_id _id;
     seastar::file _file;
     // The offset in the file where the segment starts.
-    uint64_t _file_offset;
-    uint64_t _max_size;
+    const uint64_t _file_offset;
+    const uint64_t _max_size;
 
     seastar::gate _write_gate;
     seastar::semaphore _append_sem{1};
@@ -299,6 +295,10 @@ private:
 
     uint64_t absolute_offset(uint64_t relative_offset) const noexcept {
         return _file_offset + relative_offset;
+    }
+
+    size_t bytes_remaining() const noexcept {
+        return _max_size - _append_offset;
     }
 };
 
