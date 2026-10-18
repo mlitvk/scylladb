@@ -131,23 +131,37 @@ struct buffered_write_result {
     future<record_location_with_holder> persisted;
 };
 
-// Builds one chunk in memory.
+// Builds one chunk in memory, in a buffer of buffer_size() bytes:
 //
-// Callers append log records one by one, then finish the buffer, which sets the
-// final size of the chunk, and then seal it with the sequence number of the
-// segment the chunk goes to, which writes the headers. The chunk's layout is:
-//   chunk_header
-//   (segment_header)?                 // for segment_kind::full only
-//   record_frame_header + record_header (fixed fields + partition key) + record value
-//   ...
-//   schema_table                      // the column mapping of each schema version above
-//   zero padding to block_alignment
+//   0                     +------------------+
+//                         |   chunk_header   |  seal()
+//                         |  segment_header  |  seal(), full segments only
+//   chunk_headers_size()  +------------------+
+//                         |   record frame   |  append(), one frame per record,
+//                         |   record frame   |  each padded to record_alignment
+//                         |       ...        |
+//   + records_size        +------------------+
+//                         |   schema_table   |  finish()
+//   + schema_table_size   +------------------+
+//                         |   zero padding   |  finish(), to block_alignment
+//   serialized_size()     +------------------+
+//                         |      unused      |
+//   buffer_size()         +------------------+
 //
-// Each record frame is padded to record_alignment. For a full segment's chunk,
-// the segment header stores the owning table and the min/max token range of the
-// appended records. The room the schema table needs is reserved as records are
-// appended. This type is serialization-only and is used directly by tests and
-// internally by write_buffer.
+// reset() reserves the room for the headers, so the records start at
+// chunk_headers_size(). The segment_header holds the table and the token range of the
+// records. The schema_table lists the column mapping of each schema version of the
+// records once. The record frames and the schema table are the body of the chunk,
+// which the body CRC covers.
+//
+// append() also reserves the room for the schema table entry of a new schema version,
+// so the table always fits. finish() writes the table, computes the body CRC and pads
+// the chunk, and the size it returns does not change after this. seal() then writes
+// the headers, which hold the sequence number of the segment the chunk goes to. So a
+// caller can reserve room for the chunk in a segment before it knows that number.
+//
+// This type is serialization-only and is used directly by tests and internally by
+// write_buffer.
 class raw_write_buffer {
 public:
 
