@@ -24,6 +24,8 @@
 #include <concepts>
 #include <system_error>
 #include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
 #include <seastar/core/file.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/fstream.hh>
@@ -52,6 +54,7 @@
 #include "utils/disk-error-handler.hh"
 #include "utils/dynamic_bitset.hh"
 #include "utils/serialized_action.hh"
+#include "utils/small_vector.hh"
 #include "replica/database.hh"
 
 namespace replica::logstor {
@@ -779,12 +782,19 @@ public:
     }
 
     future<> load_segment(replica::database&, log_segment_id);
+    // The schema versions that a segment lists, each once.
+    using segment_schema_versions = utils::small_vector<table_schema_version, 2>;
     // Calls `on_chunk` with each chunk of the segment, before it inserts the records of the chunk
     // into the index.
     template <typename Func>
         requires std::invocable<Func&, const scanned_chunk&>
     future<> recover_segment(replica::database&, log_segment_id, primary_index::entry_cmp_fn cmp, Func on_chunk);
     future<> add_segment_to_compaction_group(replica::database&, segment_descriptor&);
+
+    // The segments that list each schema version, as recovery finds them.
+    using segments_by_schema_version = std::unordered_map<table_schema_version, utils::chunked_vector<log_segment_id>>;
+    // Erases the column mappings that recovery registered and that no live record can use.
+    future<> trim_column_mappings(replica::database&, const utils::dynamic_bitset& used_segments, const segments_by_schema_version&);
 
     compaction_manager& get_compaction_manager() noexcept {
         return _compaction_mgr;
@@ -2293,13 +2303,24 @@ future<> segment_manager_impl::do_recovery(replica::database& db) {
         return old_entry.location.offset <=> candidate.location.offset;
     };
 
+    segments_by_schema_version schema_version_segments;
+
     for (file_id_t file_id = 0; file_id < found_file_count; ++file_id) {
         logstor_logger.info("Recovering segments from file {}: {}%", _file_mgr.file_path(file_id).string(), (file_id + 1) * 100 / found_file_count);
         co_await max_concurrent_for_each(segments_in_file(file_id), 32,
-            [this, &db, &cmp_with_seq, &segment_seqs, &max_segment_seq] (log_segment_id seg_id) {
-                return recover_segment(db, seg_id, cmp_with_seq, [seg_id, &segment_seqs, &max_segment_seq] (const scanned_chunk& chunk) {
+            [this, &db, &cmp_with_seq, &segment_seqs, &max_segment_seq, &schema_version_segments] (log_segment_id seg_id) {
+                return recover_segment(db, seg_id, cmp_with_seq,
+                        [seg_id, &segment_seqs, &max_segment_seq, &schema_version_segments, listed_versions = segment_schema_versions()]
+                        (const scanned_chunk& chunk) mutable {
                     segment_seqs[seg_id.value] = chunk.info().segment_seq;
                     max_segment_seq = std::max(max_segment_seq, chunk.info().segment_seq);
+                    // The chunks of a segment can list the same version many times.
+                    for (const auto& e : chunk.schema_table()) {
+                        if (!std::ranges::contains(listed_versions, e.schema_version)) {
+                            listed_versions.push_back(e.schema_version);
+                            schema_version_segments[e.schema_version].push_back(seg_id);
+                        }
+                    }
                 });
             }
         );
@@ -2363,7 +2384,39 @@ future<> segment_manager_impl::do_recovery(replica::database& db) {
 
     co_await files.finish();
 
+    co_await trim_column_mappings(db, used_segments, schema_version_segments);
+
     logstor_logger.info("Recovery complete");
+}
+
+future<> segment_manager_impl::trim_column_mappings(replica::database& db, const utils::dynamic_bitset& used_segments,
+        const segments_by_schema_version& schema_version_segments) {
+    // The scan also registered the schema versions of free segments, whose data stays on disk until
+    // the segment is written again. Keep only the versions that a used segment lists, of a table that
+    // exists. A used mixed segment can list the versions of a dropped table.
+    //
+    // No writer or buffer holds an erased entry: the shard does not write or compact yet, and the
+    // separator holds writers only for live records of existing tables.
+    std::unordered_set<table_schema_version> used_schema_versions;
+    for (const auto& [schema_version, segments] : schema_version_segments) {
+        for (auto seg_id : segments) {
+            co_await coroutine::maybe_yield();
+            if (used_segments.test(seg_id.value)) {
+                used_schema_versions.insert(schema_version);
+                break;
+            }
+        }
+    }
+    const auto registered_count = _column_mappings.size();
+    const auto erased_count = _column_mappings.erase_if([&] (const schema_mapping& mapping) {
+        if (used_schema_versions.contains(mapping.schema_version) && db.column_family_exists(mapping.table)) {
+            return false;
+        }
+        logstor_logger.debug("Recovery: dropping the column mapping of schema version {} of table {}, which no live record can use",
+                mapping.schema_version, mapping.table);
+        return true;
+    });
+    logstor_logger.info("Recovery: kept {} of {} column mappings", registered_count - erased_count, registered_count);
 }
 
 future<> segment_manager_impl::do_recovery_for_test() {
