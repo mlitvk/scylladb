@@ -50,7 +50,7 @@ struct write_target {
 // Writer for log records that handles serialization and size computation.
 //
 // The writer also holds the registry entry of the record's schema version, for the schema table of
-// the buffer. The registry never erases an entry, so the reference outlives the writer.
+// the buffer. The registry never erases an entry that a writer holds.
 class log_record_writer {
     using ostream = seastar::simple_memory_output_stream;
 

@@ -20,6 +20,8 @@
 #include <array>
 #include <chrono>
 #include <system_error>
+#include <unordered_map>
+#include <unordered_set>
 #include <seastar/core/file.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/fstream.hh>
@@ -48,6 +50,7 @@
 #include "utils/checked-file-impl.hh"
 #include "utils/dynamic_bitset.hh"
 #include "utils/serialized_action.hh"
+#include "utils/small_vector.hh"
 #include "utils/lister.hh"
 #include "replica/database.hh"
 
@@ -1080,7 +1083,9 @@ public:
     }
 
     future<> load_segment(replica::database&, log_segment_id);
-    future<> recover_segment(replica::database&, log_segment_id, primary_index::entry_cmp_fn cmp, std::function<void(const segment_info&)> on_segment_info);
+    // `on_schema_version`, if set, is called once for each schema version that the segment lists.
+    future<> recover_segment(replica::database&, log_segment_id, primary_index::entry_cmp_fn cmp, std::function<void(const segment_info&)> on_segment_info,
+            std::function<void(table_schema_version)> on_schema_version = {});
     future<> add_segment_to_compaction_group(replica::database&, segment_descriptor&);
 
     compaction_manager& get_compaction_manager() noexcept {
@@ -1188,11 +1193,14 @@ private:
     // `on_record_header` is called with the record header of each record and returns
     // whether the record value should be read and passed to `on_record`, or skipped.
     // `on_record` is invoked only for records whose value was requested.
+    // `on_schema_mapping`, if set, is invoked with the registry entry of each schema table entry
+    // that the registry took.
     template <log_record_consumer_like RecordConsumer>
     future<> scan_segment(log_segment_id segment_id,
                           segment_info_consumer on_segment_info,
                           record_header_consumer on_record_header,
-                          RecordConsumer on_record);
+                          RecordConsumer on_record,
+                          std::function<void(const schema_mapping&)> on_schema_mapping = {});
 
     segment_ref make_segment_ref(log_segment_id seg_id) {
         auto& desc = get_segment_descriptor(seg_id);
@@ -1931,15 +1939,19 @@ template <log_record_consumer_like RecordConsumer>
 future<> segment_manager_impl::scan_segment(log_segment_id segment_id,
                                 segment_info_consumer on_segment_info,
                                 record_header_consumer on_record_header,
-                                RecordConsumer on_record) {
+                                RecordConsumer on_record,
+                                std::function<void(const schema_mapping&)> on_schema_mapping) {
     auto in = co_await create_segment_input_stream(segment_id, seastar::file_input_stream_options {
         .buffer_size = std::max<size_t>(_cfg.segment_size, 128 * 1024),
         .read_ahead = 0,
     });
     auto scan_result = co_await coroutine::as_future(::replica::logstor::scan_segment(in, segment_id, _cfg.segment_size,
             std::move(on_segment_info), std::move(on_record_header), std::move(on_record),
-            [this] (const ondisk::schema_table_entry& e) {
-                _column_mappings.add(e.table, e.version, e.mapping);
+            [this, &on_schema_mapping] (const ondisk::schema_table_entry& e) {
+                const auto& mapping = _column_mappings.add(e.table, e.version, e.mapping);
+                if (on_schema_mapping) {
+                    on_schema_mapping(mapping);
+                }
             }));
     co_await in.close();
     if (scan_result.failed()) {
@@ -2658,14 +2670,20 @@ future<> segment_manager_impl::do_recovery(replica::database& db) {
         return old_entry.location.offset <=> candidate.location.offset;
     };
 
+    // The segments that list each schema version.
+    std::unordered_map<table_schema_version, utils::chunked_vector<log_segment_id>> schema_version_segments;
+
     for (auto file_id : found_file_ids) {
         logstor_logger.info("Recovering segments from file {}: {}%", _file_mgr.get_file_path(file_id).string(), (file_id + 1) * 100 / found_file_ids.size());
         co_await max_concurrent_for_each(segments_in_file(file_id), 32,
-            [this, &db, &cmp_with_seq, &segment_seqs, &max_segment_seq] (log_segment_id seg_id) {
+            [this, &db, &cmp_with_seq, &segment_seqs, &max_segment_seq, &schema_version_segments] (log_segment_id seg_id) {
                 return recover_segment(db, seg_id, cmp_with_seq,
                     [seg_id, &segment_seqs, &max_segment_seq] (const segment_info& seg_info) {
                         segment_seqs[seg_id.value] = seg_info.segment_seq;
                         max_segment_seq = std::max(max_segment_seq, seg_info.segment_seq);
+                    },
+                    [seg_id, &schema_version_segments] (table_schema_version version) {
+                        schema_version_segments[version].push_back(seg_id);
                     });
             }
         );
@@ -2737,6 +2755,33 @@ future<> segment_manager_impl::do_recovery(replica::database& db) {
 
     co_await _file_mgr.recover_next_file(next_file_id);
 
+    // The scan also registered the schema versions of free segments, whose data stays on disk until
+    // the segment is written again. Keep only the versions that a used segment lists, of a table that
+    // exists. A used mixed segment can list the versions of a dropped table.
+    //
+    // No writer or buffer holds an erased entry: the shard does not write or compact yet, and the
+    // separator holds writers only for live records of existing tables.
+    std::unordered_set<table_schema_version> used_schema_versions;
+    for (const auto& [version, segments] : schema_version_segments) {
+        for (auto seg_id : segments) {
+            co_await coroutine::maybe_yield();
+            if (used_segments.test(seg_id.value)) {
+                used_schema_versions.insert(version);
+                break;
+            }
+        }
+    }
+    const auto registered_count = _column_mappings.size();
+    const auto erased_count = _column_mappings.erase_if([&] (const schema_mapping& mapping) {
+        if (used_schema_versions.contains(mapping.version) && db.column_family_exists(mapping.table)) {
+            return false;
+        }
+        logstor_logger.debug("Recovery: dropping the column mapping of schema version {} of table {}, which no live record can use",
+                mapping.version, mapping.table);
+        return true;
+    });
+    logstor_logger.info("Recovery: kept {} of {} column mappings", registered_count - erased_count, registered_count);
+
     logstor_logger.info("Recovery complete");
 }
 
@@ -2746,9 +2791,13 @@ future<> segment_manager_impl::do_recovery_for_test() {
 }
 
 future<> segment_manager_impl::recover_segment(replica::database& db, log_segment_id segment_id,
-        primary_index::entry_cmp_fn cmp, std::function<void(const segment_info&)> on_segment_info) {
+        primary_index::entry_cmp_fn cmp, std::function<void(const segment_info&)> on_segment_info,
+        std::function<void(table_schema_version)> on_schema_version) {
     auto& desc = get_segment_descriptor(segment_id);
     desc.reset(_cfg.segment_size);
+
+    // The chunks of a segment can list the same version many times.
+    utils::small_vector<table_schema_version, 2> schema_versions;
 
     co_await scan_segment(segment_id,
         [segment_id, on_segment_info = std::move(on_segment_info)] (const segment_info& seg_info) mutable {
@@ -2779,7 +2828,18 @@ future<> segment_manager_impl::recover_segment(replica::database& db, log_segmen
         [] (record_location, log_record) {
             // we don't read record data, only headers.
             return make_ready_future<>();
+        },
+        [&schema_versions] (const schema_mapping& mapping) {
+            if (std::ranges::find(schema_versions, mapping.version) == schema_versions.end()) {
+                schema_versions.push_back(mapping.version);
+            }
         });
+
+    if (on_schema_version) {
+        for (auto version : schema_versions) {
+            on_schema_version(version);
+        }
+    }
 }
 
 void segment_manager::on_add_record(record_location location) noexcept {

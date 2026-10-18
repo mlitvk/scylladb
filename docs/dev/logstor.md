@@ -41,7 +41,7 @@ The `buffered_writer` manages multiple write buffers for user writes, an active 
 
 #### Column Mapping Registry
 
-The `column_mapping_registry` keeps in memory, one registry per shard, the column mappings of the schema versions that the records were written under (see [Schema Table](#schema-table)). Writes and segment scans add to it, and reads, compaction and the separator take mappings from it.
+The `column_mapping_registry` keeps in memory, one registry per shard, the column mappings of the schema versions that the records were written under (see [Schema Table](#schema-table)). Writes and segment scans add to it, and reads, compaction and the separator take mappings from it. At the end of recovery, the shard drops the mappings that no live record uses.
 
 ### Data Flow
 

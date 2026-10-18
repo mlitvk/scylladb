@@ -361,10 +361,14 @@ async def test_recovery_after_schema_change(manager: ScyllaClusterManager):
 
         await check_rows(cql)
 
+        server_log = await manager.server_open_log(servers[0].server_id)
+        log_mark = await server_log.mark()
         await manager.server_stop_gracefully(servers[0].server_id)
         await manager.server_start(servers[0].server_id)
         cql, _ = await manager.get_ready_cql(servers)
 
+        # Records of both versions are live, so recovery keeps the mappings of both.
+        assert await server_log.grep("Recovery: kept 2 of 2 column mappings", from_mark=log_mark)
         await check_rows(cql)
 
         # A third version, which no record on disk was written under: the records of both
@@ -381,6 +385,97 @@ async def test_recovery_after_schema_change(manager: ScyllaClusterManager):
             await manager.api.logstor_compaction(servers[0].ip_addr)
         await wait_for(compacted, time.time() + 60)
         await check_rows(cql, with_v3=True)
+
+async def test_recovery_drops_column_mappings_of_dropped_table(manager: ScyllaClusterManager):
+    """
+    Test that recovery does not keep the column mappings of a dropped table.
+
+    The separator frees the mixed segment that the rows of both tables were first written to, and
+    its data, with a schema table that lists the versions of both tables, stays on disk. Recovery
+    scans it and registers both versions, then keeps only the version of the table that exists.
+    """
+    cmdline = ['--logger-log-level', 'logstor=debug', '--smp=1']
+    cfg = {'experimental_features': ['logstor']}
+    servers = await manager.servers_add(1, cmdline=cmdline, config=cfg)
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "WITH tablets={'initial':1}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.dropped (pk int PRIMARY KEY, v int) WITH storage_engine = 'logstor'")
+        await cql.run_async(f"CREATE TABLE {ks}.kept (pk int PRIMARY KEY, v int) WITH storage_engine = 'logstor'")
+        dropped_id = (await cql.run_async(f"SELECT id FROM system_schema.tables WHERE keyspace_name = '{ks}' AND table_name = 'dropped'"))[0].id
+
+        num_keys = 20
+        for i in range(num_keys):
+            await cql.run_async(f"INSERT INTO {ks}.dropped (pk, v) VALUES ({i}, {i})")
+            await cql.run_async(f"INSERT INTO {ks}.kept (pk, v) VALUES ({i}, {i})")
+        await manager.api.logstor_flush(servers[0].ip_addr)
+
+        await cql.run_async(f"DROP TABLE {ks}.dropped")
+
+        server_log = await manager.server_open_log(servers[0].server_id)
+        log_mark = await server_log.mark()
+        await manager.server_stop_gracefully(servers[0].server_id)
+        await manager.server_start(servers[0].server_id)
+        cql, _ = await manager.get_ready_cql(servers)
+
+        assert await server_log.grep(f"Recovery: dropping the column mapping of schema version .* of table {dropped_id}", from_mark=log_mark)
+        assert await server_log.grep("Recovery: kept 1 of 2 column mappings", from_mark=log_mark)
+
+        for i in range(num_keys):
+            rows = await cql.run_async(f"SELECT pk, v FROM {ks}.kept WHERE pk = {i} BYPASS CACHE")
+            assert len(rows) == 1, f"Key {i} not found after recovery"
+            assert rows[0].v == i, f"Key {i} has wrong v {rows[0].v} after recovery"
+
+async def test_recovery_drops_column_mapping_of_unused_schema_version(manager: ScyllaClusterManager):
+    """
+    Test that recovery does not keep the column mapping of a schema version with no live records.
+
+    Every row written under the first schema version is overwritten under the second one, and
+    compaction frees the segments of the first version. Their data stays on disk, so recovery
+    registers the first version, and then drops it, as no used segment lists it.
+    """
+    cmdline = ['--logger-log-level', 'logstor=debug', '--smp=1']
+    cfg = {'experimental_features': ['logstor']}
+    servers = await manager.servers_add(1, cmdline=cmdline, config=cfg)
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "WITH tablets={'initial':1}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v int) WITH storage_engine = 'logstor'")
+
+        num_keys = 20
+        for i in range(num_keys):
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, v) VALUES ({i}, {i})")
+        await manager.api.logstor_flush(servers[0].ip_addr)
+
+        await cql.run_async(f"ALTER TABLE {ks}.test ADD v2 int")
+        for i in range(num_keys):
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, v, v2) VALUES ({i}, {i}, {i * 10})")
+        await manager.api.logstor_flush(servers[0].ip_addr)
+
+        async def get_segments() -> int:
+            metrics = await manager.metrics.query(servers[0].ip_addr)
+            return int(metrics.get("scylla_column_family_logstor_segments", {'ks': ks, 'cf': 'test'}) or 0)
+
+        # A compaction request returns before the compaction runs, so request one until only the
+        # segment of the second version is left.
+        async def compacted() -> bool:
+            if await get_segments() == 1:
+                return True
+            await manager.api.logstor_compaction(servers[0].ip_addr)
+        await wait_for(compacted, time.time() + 60)
+
+        server_log = await manager.server_open_log(servers[0].server_id)
+        log_mark = await server_log.mark()
+        await manager.server_stop_gracefully(servers[0].server_id)
+        await manager.server_start(servers[0].server_id)
+        cql, _ = await manager.get_ready_cql(servers)
+
+        assert await server_log.grep("Recovery: kept 1 of 2 column mappings", from_mark=log_mark)
+
+        for i in range(num_keys):
+            rows = await cql.run_async(f"SELECT pk, v, v2 FROM {ks}.test WHERE pk = {i} BYPASS CACHE")
+            assert len(rows) == 1, f"Key {i} not found after recovery"
+            assert rows[0].v == i and rows[0].v2 == i * 10, f"Key {i} has wrong values {rows[0]} after recovery"
 
 async def test_grow_logstor_disk_size(manager: ScyllaClusterManager):
     """
