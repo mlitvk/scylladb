@@ -19,14 +19,17 @@
 
 #include "dht/i_partitioner.hh"
 #include "mutation/mutation.hh"
+#include "replica/logstor/column_mapping_registry.hh"
 #include "replica/logstor/ondisk.hh"
 #include "replica/logstor/record_value.hh"
 #include "replica/logstor/segment_io.hh"
 #include "replica/logstor/single_row_partition.hh"
+#include "replica/logstor/write_buffer.hh"
 #include "schema/schema_builder.hh"
 
 // This header gives the records for the logstor unit tests: a key-value schema, its mutations and
-// records, and readers of the chunks that the records end up in.
+// records, the registry that the tests write the records through, and readers of the chunks that the
+// records end up in.
 namespace tests::logstor {
 
 inline schema_ptr make_kv_schema() {
@@ -51,8 +54,21 @@ inline mutation make_kv_mutation(schema_ptr schema, sstring pk, sstring value, a
     return make_kv_mutation(std::move(schema), key, std::move(value), ts);
 }
 
+// The registry the tests write and read records through.
+inline replica::logstor::column_mapping_registry& test_registry() {
+    static replica::logstor::column_mapping_registry registry;
+    return registry;
+}
+
+inline replica::logstor::log_record_writer make_writer(replica::logstor::log_record record) {
+    const auto* mapping = test_registry().find(record.header.schema_version);
+    BOOST_REQUIRE(mapping);
+    return replica::logstor::log_record_writer(std::move(record), *mapping);
+}
+
 inline replica::logstor::log_record make_log_record(schema_ptr schema, sstring pk, sstring value, api::timestamp_type ts = api::min_timestamp) {
     auto m = make_kv_mutation(schema, std::move(pk), std::move(value), ts);
+    test_registry().add(*schema);
     return replica::logstor::log_record {
         .header = {
             .key = m.decorated_key(),
