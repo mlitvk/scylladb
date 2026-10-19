@@ -31,6 +31,42 @@ void log_record_bytes_writer::write_frame(seastar::simple_memory_output_stream& 
     ondisk::write_record_frame(out, log_record_bytes_view{_header_bytes, _value_bytes});
 }
 
+// chunk_schema_table
+
+size_t chunk_schema_table::growth(const schema_mapping& mapping) const noexcept {
+    // The match is by version and not by the entry pointer, because the table lists each version
+    // once. The last version that was added is the most likely match, so the loop checks it first.
+    for (auto it = _entries.rbegin(); it != _entries.rend(); ++it) {
+        if ((*it)->schema_version == mapping.schema_version) {
+            return 0;
+        }
+    }
+    return ondisk::schema_table_entry_size(mapping.serialized.size());
+}
+
+void chunk_schema_table::add(const schema_mapping& mapping, size_t growth) {
+    if (growth > 0) {
+        _entries.push_back(&mapping);
+        _size += growth;
+    }
+}
+
+void chunk_schema_table::clear() noexcept {
+    _entries.clear();
+    _size = ondisk::schema_table_header_size;
+}
+
+void chunk_schema_table::write(seastar::simple_memory_output_stream& out) const {
+    ser::serializer<uint32_t>::write(out, static_cast<uint32_t>(_entries.size()));
+    for (const auto* mapping : _entries) {
+        ondisk::write_schema_table_entry(out, ondisk::schema_table_entry{
+            .table = mapping->table,
+            .schema_version = mapping->schema_version,
+            .mapping = bytes_view(mapping->serialized),
+        });
+    }
+}
+
 // chunk_builder
 
 chunk_builder::chunk_builder(size_t buffer_size, segment_kind kind)
@@ -48,6 +84,7 @@ void chunk_builder::reset() {
     _record_count = 0;
     _min_token = std::nullopt;
     _max_token = std::nullopt;
+    _schema_table.clear();
     _finished_body = std::nullopt;
     _sealed = false;
 }
@@ -61,9 +98,18 @@ void chunk_builder::validate_append(const Writer& writer) const {
         on_internal_error(logstor_logger, fmt::format("Record header size {} is outside the range [{}, {}]",
                 header_size, ondisk::record_header_fixed_size, ondisk::max_record_header_size));
     }
-    if (const size_t frame_size = record_frame_size(writer); !fits_frame(frame_size)) {
-        throw std::runtime_error(fmt::format("Record frame of {} bytes, {} with its padding, does not fit the {} bytes left in the buffer",
-                frame_size, align_up(frame_size, ondisk::record_alignment), _stream.size()));
+    const auto& header = writer.header();
+    const auto& mapping = writer.mapping();
+    if (mapping.schema_version != header.schema_version || mapping.table != header.table) {
+        on_internal_error(logstor_logger, fmt::format("Record of table {} schema version {} appended with the column mapping of table {} schema version {}",
+                header.table, header.schema_version, mapping.table, mapping.schema_version));
+    }
+    const size_t frame_size = record_frame_size(writer);
+    const size_t schema_table_growth = _schema_table.growth(mapping);
+    if (!fits_frame(frame_size, schema_table_growth)) {
+        throw std::runtime_error(fmt::format("Record frame of {} bytes, {} with its padding, does not fit the {} bytes left in the buffer, of which the schema table takes {} ({} for schema version {})",
+                frame_size, align_up(frame_size, ondisk::record_alignment), _stream.size(),
+                _schema_table.size() + schema_table_growth, schema_table_growth, header.schema_version));
     }
 }
 
@@ -71,7 +117,10 @@ template <log_record_writer_concept Writer>
 frame_extent chunk_builder::append(const Writer& writer) {
     validate_append(writer);
 
+    const auto& header = writer.header();
+    const auto& mapping = writer.mapping();
     const size_t frame_size = record_frame_size(writer);
+    const size_t schema_table_growth = _schema_table.growth(mapping);
     const size_t padded_size = align_up(frame_size, ondisk::record_alignment);
     const size_t frame_offset = write_offset();
 
@@ -85,9 +134,13 @@ frame_extent chunk_builder::append(const Writer& writer) {
         on_internal_error(logstor_logger, fmt::format("Record frame of {} bytes left {} unwritten", frame_size, frame_out.size()));
     }
     out.fill('\0', out.size());
+    // The version goes into the schema table before the stream moves past the frame. So an append
+    // that throws leaves the table unchanged too, and the chunk has no frame whose version the
+    // table does not list.
+    _schema_table.add(mapping, schema_table_growth);
     _stream.skip(padded_size);
 
-    const auto token = writer.header().key.token();
+    const auto token = header.key.token();
     _record_bytes += frame_size;
     _record_count++;
     _min_token = _min_token ? std::min(*_min_token, token) : token;
@@ -103,16 +156,25 @@ size_t chunk_builder::finish() {
     if (_finished_body) {
         return _finished_body->chunk_size;
     }
-    const size_t records_end = write_offset();
-    const size_t records_size = records_end - chunk_header_size();
-    const auto body_crc = ondisk::calculate_body_crc(std::span(_buffer.get() + chunk_header_size(), records_size));
+    const size_t records_size = write_offset() - chunk_header_size();
 
-    const size_t chunk_size = align_up(records_end, ondisk::block_alignment);
-    _stream.fill('\0', chunk_size - records_end);
+    // fits_frame() reserved the room for the table as the records were appended.
+    auto table_out = _stream.write_substream(_schema_table.size());
+    _schema_table.write(table_out);
+    if (table_out.size() != 0) {
+        on_internal_error(logstor_logger, fmt::format("Schema table of {} bytes left {} unwritten", _schema_table.size(), table_out.size()));
+    }
+
+    const size_t body_end = write_offset();
+    const auto body_crc = ondisk::calculate_body_crc(std::span(_buffer.get() + chunk_header_size(), body_end - chunk_header_size()));
+
+    const size_t chunk_size = align_up(body_end, ondisk::block_alignment);
+    _stream.fill('\0', chunk_size - body_end);
 
     _finished_body = finished_body{
         .chunk_size = chunk_size,
         .records_size = static_cast<uint32_t>(records_size),
+        .schema_table_size = static_cast<uint32_t>(_schema_table.size()),
         .body_crc = body_crc,
     };
 
@@ -144,7 +206,7 @@ bytes_view chunk_builder::do_seal(segment_sequence segment_seq, std::optional<ta
         .flags = 0,
         .records_size = _finished_body->records_size,
         .body_crc = _finished_body->body_crc,
-        .schema_table_size = 0,
+        .schema_table_size = _finished_body->schema_table_size,
     };
 
     switch (_segment_kind) {
@@ -166,10 +228,12 @@ bytes_view chunk_builder::do_seal(segment_sequence segment_seq, std::optional<ta
     return bytes_view(reinterpret_cast<const int8_t*>(_buffer.get()), _finished_body->chunk_size);
 }
 
-bool chunk_builder::fits_frame(size_t frame_size) const noexcept {
+bool chunk_builder::fits_frame(size_t frame_size, size_t schema_table_growth) const noexcept {
     // A finished chunk takes no more frames, also when the padding of finish() leaves room in the
-    // buffer. The frame is followed by the padding to record_alignment.
-    return !_finished_body && align_up(frame_size, ondisk::record_alignment) <= _stream.size();
+    // buffer. The frame is followed by the padding to record_alignment, and the last frame is
+    // followed by the schema table, which is also padded to record_alignment.
+    const size_t table_size = align_up(_schema_table.size() + schema_table_growth, ondisk::record_alignment);
+    return !_finished_body && align_up(frame_size, ondisk::record_alignment) + table_size <= _stream.size();
 }
 
 template frame_extent chunk_builder::append<log_record_writer>(const log_record_writer&);
@@ -669,10 +733,12 @@ future<buffered_write_result> write_buffer_ring::write_to_buffer(log_record_writ
     // later rewrites it into, so it is bounded by whichever of the two takes less: one that only
     // fits the buffer it is written to first would be accepted here and then never fit anywhere the
     // separator could put it.
-    const size_t max_size = chunk_layout::max_record_size_any_kind(head_buf().buffer_size());
+    const size_t max_size = chunk_layout::max_record_size_any_kind(head_buf().buffer_size(), writer.mapping());
     if (writer.record_size() > max_size) [[unlikely]] {
-        return make_exception_future<buffered_write_result>(std::runtime_error(
-                fmt::format("Write size {} exceeds the maximum record size {}", writer.record_size(), max_size)));
+        return make_exception_future<buffered_write_result>(std::runtime_error(fmt::format(
+                "Write size {} exceeds the maximum record size {} of a {} byte buffer, whose schema table takes {} bytes for schema version {}",
+                writer.record_size(), max_size, head_buf().buffer_size(),
+                chunk_layout::single_version_schema_table_size(writer.mapping()), writer.header().schema_version)));
     }
     const size_t key_size = ondisk::record_key_size(writer.header_size());
     if (key_size > ondisk::max_key_size) [[unlikely]] {

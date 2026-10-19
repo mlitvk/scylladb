@@ -122,13 +122,37 @@ inline std::optional<replica::logstor::ondisk::chunk_header> read_chunk_header(c
     return replica::logstor::ondisk::parse_chunk_header(common, chunk_header_rest(buf, common.kind));
 }
 
+// A schema table entry that owns its column mapping, for a test that reads the table of a chunk.
+struct schema_table_entry_copy {
+    table_id table;
+    table_schema_version schema_version;
+    bytes mapping;
+};
+
+inline std::vector<schema_table_entry_copy> read_schema_table(bytes_view chunk, const replica::logstor::ondisk::chunk_header& ch) {
+    const auto* table = chunk.data() + replica::logstor::ondisk::chunk_header_size(ch.kind()) + ch.records_size;
+    std::vector<schema_table_entry_copy> entries;
+    replica::logstor::ondisk::for_each_schema_table_entry(bytes_view(table, ch.schema_table_size), [&entries] (const replica::logstor::ondisk::schema_table_entry& e) {
+        entries.push_back(schema_table_entry_copy{
+            .table = e.table,
+            .schema_version = e.schema_version,
+            .mapping = bytes(e.mapping.begin(), e.mapping.end()),
+        });
+    });
+    return entries;
+}
+
 // A record that a scan of a segment found, and its location.
 struct scanned_record {
     replica::logstor::record_location location;
     replica::logstor::log_record record;
 };
 
-inline std::vector<scanned_record> scan_buffer_records(const temporary_buffer<char>& buf, replica::logstor::log_segment_id segment_id) {
+// Returns the records that a scan of the segment in `buf` gives. If `registry` is set, the scan adds
+// the entries of the schema table of each chunk to `registry` first, as a scan of the segment
+// manager does.
+inline std::vector<scanned_record> scan_buffer_records(const temporary_buffer<char>& buf, replica::logstor::log_segment_id segment_id,
+        replica::logstor::column_mapping_registry* registry = nullptr) {
     temporary_buffer<char> copy(buf.size());
     std::copy_n(buf.get(), buf.size(), copy.get_write());
     auto in = seastar::util::as_input_stream(std::move(copy));
@@ -136,6 +160,11 @@ inline std::vector<scanned_record> scan_buffer_records(const temporary_buffer<ch
 
     replica::logstor::segment_scanner scanner(in, segment_id, buf.size());
     while (auto* chunk = scanner.next_chunk().get()) {
+        if (registry) {
+            for (const auto& e : chunk->schema_table()) {
+                registry->add(e.table, e.schema_version, e.mapping);
+            }
+        }
         for (const auto& record : chunk->records()) {
             records.push_back(scanned_record{.location = record.location, .record = record.to_log_record()});
         }

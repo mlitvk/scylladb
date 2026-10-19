@@ -12,6 +12,7 @@
 #include <utility>
 #include <vector>
 #include <seastar/core/abort_source.hh>
+#include <seastar/core/align.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/aligned_buffer.hh>
@@ -27,6 +28,7 @@
 #include "replica/logstor/column_mapping_registry.hh"
 #include "replica/logstor/ondisk.hh"
 #include "timeout_config.hh"
+#include "utils/small_vector.hh"
 
 namespace replica {
 
@@ -48,8 +50,8 @@ struct write_target {
 
 // Writer for log records that handles serialization and size computation.
 //
-// The writer also holds the registry entry of the record's schema version. The registry never
-// erases an entry that a writer holds.
+// The writer also holds the registry entry of the record's schema version, for the schema table of
+// the chunk that the buffer builds. The registry never erases an entry that a writer holds.
 class log_record_writer {
     log_record _record;
     const schema_mapping* _mapping;
@@ -79,15 +81,18 @@ class log_record_bytes_writer {
     record_header _header;
     bytes_view _header_bytes;
     bytes_view _value_bytes;
+    const schema_mapping* _mapping;
 
 public:
-    log_record_bytes_writer(record_header header, log_record_bytes_view record_view)
+    log_record_bytes_writer(record_header header, log_record_bytes_view record_view, const schema_mapping& mapping)
         : _header(std::move(header))
         , _header_bytes(record_view.header)
         , _value_bytes(record_view.value)
+        , _mapping(&mapping)
     {}
 
     const record_header& header() const { return _header; }
+    const schema_mapping& mapping() const noexcept { return *_mapping; }
 
     size_t header_size() const { return _header_bytes.size(); }
     size_t value_size() const { return _value_bytes.size(); }
@@ -99,6 +104,7 @@ public:
 template <typename T>
 concept log_record_writer_concept = requires(const T& w, seastar::simple_memory_output_stream& out) {
     { w.header() } -> std::convertible_to<const record_header&>;
+    { w.mapping() } -> std::convertible_to<const schema_mapping&>;
     { w.header_size() } -> std::convertible_to<size_t>;
     { w.value_size() } -> std::convertible_to<size_t>;
     { w.record_size() } -> std::convertible_to<size_t>;
@@ -131,26 +137,57 @@ inline record_location locate_record(segment_position chunk_position, frame_exte
 
 namespace chunk_layout {
 
-// Returns the largest record_size that fits an empty chunk of `kind` in a buffer of `buffer_size`
-// bytes. The chunk header of a full segment is larger than the chunk header of a mixed segment, so
-// a record can fit a chunk of one kind and not a chunk of the other kind.
-constexpr size_t max_record_size(size_t buffer_size, segment_kind kind) noexcept {
-    const size_t overhead = ondisk::chunk_header_size(kind) + ondisk::record_frame_header_size;
+// Returns the size of the schema table of a chunk whose records all have the schema version of
+// `mapping`.
+inline size_t single_version_schema_table_size(const schema_mapping& mapping) noexcept {
+    return ondisk::schema_table_header_size + ondisk::schema_table_entry_size(mapping.serialized.size());
+}
+
+// Returns the largest record_size of the schema version of `mapping` that fits an empty chunk of
+// `kind` in a buffer of `buffer_size` bytes. The chunk header of a full segment is larger than the
+// chunk header of a mixed segment, so a record can fit a chunk of one kind and not a chunk of the
+// other kind.
+inline size_t max_record_size(size_t buffer_size, segment_kind kind, const schema_mapping& mapping) noexcept {
+    const size_t overhead = ondisk::chunk_header_size(kind) + ondisk::record_frame_header_size
+            + align_up(single_version_schema_table_size(mapping), ondisk::record_alignment);
     return buffer_size > overhead ? buffer_size - overhead : 0;
 }
 
-// Returns the largest record_size that fits an empty chunk of each kind in a buffer of
-// `buffer_size` bytes. The separator rewrites the records of a mixed segment into full segments, so
-// a record that logstor accepts must fit both kinds.
-constexpr size_t max_record_size_any_kind(size_t buffer_size) noexcept {
-    return std::min(max_record_size(buffer_size, segment_kind::mixed),
-                    max_record_size(buffer_size, segment_kind::full));
+// Returns the largest record_size of the schema version of `mapping` that fits an empty chunk of
+// each kind in a buffer of `buffer_size` bytes. The separator rewrites the records of a mixed
+// segment into full segments, so a record that logstor accepts must fit both kinds.
+inline size_t max_record_size_any_kind(size_t buffer_size, const schema_mapping& mapping) noexcept {
+    return std::min(max_record_size(buffer_size, segment_kind::mixed, mapping),
+                    max_record_size(buffer_size, segment_kind::full, mapping));
 }
 
 }
 
 struct buffered_write_result {
     future<record_location_with_holder> persisted;
+};
+
+// The schema table of a chunk that a buffer builds: the registry entry of each schema version of
+// the chunk's records, once, in the order the versions were first added, and the size the table
+// takes on disk.
+class chunk_schema_table {
+    utils::small_vector<const schema_mapping*, 2> _entries;
+    size_t _size{ondisk::schema_table_header_size};
+
+public:
+    // The bytes the table grows by for a record of the version of `mapping`: its entry if the
+    // version is new to the table, nothing otherwise.
+    size_t growth(const schema_mapping& mapping) const noexcept;
+
+    // Adds the version of `mapping` if it is new. `growth` is what growth() returned for it.
+    void add(const schema_mapping& mapping, size_t growth);
+
+    size_t size() const noexcept { return _size; }
+
+    void clear() noexcept;
+
+    // Writes the table. `out` has exactly size() bytes.
+    void write(seastar::simple_memory_output_stream& out) const;
 };
 
 // Builds one chunk in memory, in a buffer of buffer_size() bytes:
@@ -162,6 +199,8 @@ struct buffered_write_result {
 //                         |   record frame   |  each padded to record_alignment
 //                         |       ...        |
 //   + records_size        +------------------+
+//                         |   schema_table   |  finish()
+//   + schema_table_size   +------------------+
 //                         |   zero padding   |  finish(), to block_alignment
 //   chunk size            +------------------+
 //                         |      unused      |
@@ -169,10 +208,12 @@ struct buffered_write_result {
 //
 // reset() reserves the space for the header, so the records start at chunk_header_size().
 // The header of a full segment also holds the table and the token range of the records. The
-// record frames are the body of the chunk, which the body CRC covers.
+// schema table lists the column mapping of each schema version of the records once. The
+// record frames and the schema table are the body of the chunk, which the body CRC covers.
 //
-// finish() computes the body CRC and pads the chunk, and the size that finish() returns does not
-// change after this. seal() then writes the chunk header, which holds the segment_seq of the
+// append() also reserves the room for the schema table entry of a new schema version, so the table
+// always fits. finish() writes the schema table, computes the body CRC and pads the chunk, and the
+// size that finish() returns does not change after this. seal() then writes the chunk header, which holds the segment_seq of the
 // segment that receives the chunk. So a caller can reserve room for the chunk in a segment before
 // it knows the segment_seq.
 class chunk_builder {
@@ -194,8 +235,8 @@ public:
     template <log_record_writer_concept Writer>
     frame_extent append(const Writer& writer);
 
-    // Ends the appends, pads the chunk to block_alignment and computes the body CRC. Returns the
-    // size of the chunk, which does not change after this.
+    // Ends the appends, writes the schema table, pads the chunk to block_alignment and computes the
+    // body CRC. Returns the size of the chunk, which does not change after this.
     size_t finish();
 
     // Finishes the chunk if finish() was not called, writes the chunk header and returns the chunk.
@@ -204,9 +245,11 @@ public:
     bytes_view seal(segment_sequence segment_seq);
     bytes_view seal(segment_sequence segment_seq, table_id table);
 
+    // Returns true when the record of `writer` fits, together with the schema table entry that the
+    // record adds when its schema version is not in the chunk yet.
     template <log_record_writer_concept Writer>
     bool fits(const Writer& writer) const noexcept {
-        return fits_frame(record_frame_size(writer));
+        return fits_frame(record_frame_size(writer), _schema_table.growth(writer.mapping()));
     }
 
     bool has_data() const noexcept { return _record_count > 0; }
@@ -239,26 +282,30 @@ private:
     std::optional<dht::token> _min_token;
     std::optional<dht::token> _max_token;
 
-    // Holds the values that finish() computes: the size of the chunk, and the size and the CRC of
-    // the chunk body for the chunk header.
+    chunk_schema_table _schema_table;
+
+    // Holds the values that finish() computes: the size of the chunk, and, for the chunk header, the
+    // size of the records, the size of the schema table and the CRC of the chunk body.
     struct finished_body {
         size_t chunk_size;
         uint32_t records_size;
+        uint32_t schema_table_size;
         uint32_t body_crc;
     };
     std::optional<finished_body> _finished_body;
     bool _sealed{false};
 
-    // Fails with an internal error if the chunk is finished, or if a record frame header cannot
-    // describe the record header of `writer`.
+    // Fails with an internal error if the chunk is finished, if a record frame header cannot
+    // describe the record header of `writer`, or if the column mapping of `writer` is not the one
+    // of the table and the schema version of its record.
     // Throws std::runtime_error if the buffer has no room for the record frame of `writer` and its
-    // padding.
+    // padding, together with the schema table entry that the record adds.
     template <log_record_writer_concept Writer>
     void validate_append(const Writer& writer) const;
 
-    bool fits_frame(size_t frame_size) const noexcept;
+    bool fits_frame(size_t frame_size, size_t schema_table_growth) const noexcept;
 
-    // Returns the chunk offset at which the next record frame or padding goes.
+    // Returns the chunk offset at which the next record frame, schema table or padding goes.
     size_t write_offset() const noexcept { return _buffer_size - _stream.size(); }
 
     bytes_view do_seal(segment_sequence segment_seq, std::optional<table_id> table);

@@ -213,6 +213,131 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_chunk_builder_record_and_header_serializat
     BOOST_REQUIRE_EQUAL(full.table, schema->id());
     BOOST_REQUIRE_EQUAL(full.first_token, expected.header.key.token());
     BOOST_REQUIRE_EQUAL(full.last_token, expected.header.key.token());
+
+    // The schema table follows the records and lists the one version the record was written under.
+    const auto& mapping = *test_registry().find(schema->version());
+    BOOST_REQUIRE_EQUAL(ch->schema_table_size, chunk_layout::single_version_schema_table_size(mapping));
+    auto entries = read_schema_table(chunk, *ch);
+    BOOST_REQUIRE_EQUAL(entries.size(), 1u);
+    BOOST_REQUIRE_EQUAL(entries[0].table, schema->id());
+    BOOST_REQUIRE_EQUAL(entries[0].schema_version, schema->version());
+    BOOST_REQUIRE(entries[0].mapping == mapping.serialized);
+}
+
+// Checks that the size finish() returns covers the schema table. The records end at every offset
+// of a block, also close enough to its end for the table to push the chunk into the next block.
+SEASTAR_THREAD_TEST_CASE(test_logstor_chunk_builder_finish_counts_the_schema_table) {
+    auto schema = make_kv_schema();
+    const auto table_size = chunk_layout::single_version_schema_table_size(test_registry().add(*schema));
+    BOOST_REQUIRE_LT(table_size, ondisk::block_alignment);
+
+    for (size_t value_size = 1; value_size <= ondisk::block_alignment; value_size += ondisk::record_alignment) {
+        chunk_builder wb(4 * ondisk::block_alignment, segment_kind::mixed);
+        wb.append(make_writer(make_log_record(schema, "pk0", sstring(value_size, 'x'), api::timestamp_type(1))));
+        const auto size = wb.finish();
+        const auto ch = read_chunk_header(copy_chunk(wb.seal(segment_sequence{1}))).value();
+        BOOST_REQUIRE_EQUAL(ch.schema_table_size, table_size);
+        BOOST_REQUIRE_EQUAL(size, align_up(wb.chunk_header_size() + ch.records_size + ch.schema_table_size, ondisk::block_alignment));
+    }
+}
+
+// Checks that a buffer lists each schema version its records were written under once, in the
+// order they were first appended, and that a scan hands the entries of the table to a registry.
+SEASTAR_THREAD_TEST_CASE(test_logstor_chunk_builder_lists_each_schema_version_once) {
+    auto schema = make_kv_schema();
+    auto altered = schema_builder(schema).with_column("w", int32_type).build();
+    BOOST_REQUIRE(altered->version() != schema->version());
+
+    chunk_builder wb(32 * 1024, segment_kind::mixed);
+    wb.append(make_writer(make_log_record(schema, "pk0", "v0", api::timestamp_type(1))));
+    wb.append(make_writer(make_log_record(schema, "pk1", "v1", api::timestamp_type(2))));
+    wb.append(make_writer(make_log_record(altered, "pk2", "v2", api::timestamp_type(3))));
+    wb.append(make_writer(make_log_record(schema, "pk3", "v3", api::timestamp_type(4))));
+    const auto chunk = wb.seal(segment_sequence{5});
+
+    auto ch = read_chunk_header(copy_chunk(chunk)).value();
+    const auto& mapping = *test_registry().find(schema->version());
+    const auto& altered_mapping = *test_registry().find(altered->version());
+    BOOST_REQUIRE_EQUAL(ch.schema_table_size, ondisk::schema_table_header_size
+            + ondisk::schema_table_entry_size(mapping.serialized.size())
+            + ondisk::schema_table_entry_size(altered_mapping.serialized.size()));
+
+    auto entries = read_schema_table(chunk, ch);
+    BOOST_REQUIRE_EQUAL(entries.size(), 2u);
+    BOOST_REQUIRE_EQUAL(entries[0].schema_version, schema->version());
+    BOOST_REQUIRE(entries[0].mapping == mapping.serialized);
+    BOOST_REQUIRE_EQUAL(entries[1].schema_version, altered->version());
+    BOOST_REQUIRE(entries[1].mapping == altered_mapping.serialized);
+
+    // A scan hands the entries of the table to an empty registry.
+    column_mapping_registry recovered;
+    auto serialized = copy_chunk(chunk);
+    auto records = scan_buffer_records(serialized, log_segment_id{9}, &recovered);
+    BOOST_REQUIRE_EQUAL(recovered.size(), 2u);
+    BOOST_REQUIRE(recovered.find(schema->version())->mapping == mapping.mapping);
+    BOOST_REQUIRE(recovered.find(altered->version())->mapping == altered_mapping.mapping);
+    BOOST_REQUIRE_EQUAL(records.size(), 4u);
+}
+
+// Checks that a buffer lists a schema version once when its records come with the entries of two
+// registries.
+SEASTAR_THREAD_TEST_CASE(test_logstor_chunk_builder_lists_a_schema_version_once_across_registries) {
+    auto schema = make_kv_schema();
+
+    column_mapping_registry first;
+    column_mapping_registry second;
+    const auto& from_first = first.add(*schema);
+    const auto& from_second = second.add(*schema);
+    BOOST_REQUIRE(&from_first != &from_second);
+    BOOST_REQUIRE_EQUAL(from_first.schema_version, from_second.schema_version);
+
+    chunk_builder wb(32 * 1024, segment_kind::mixed);
+    wb.append(log_record_writer(make_log_record(schema, "pk0", "v0", api::timestamp_type(1)), from_first));
+    wb.append(log_record_writer(make_log_record(schema, "pk1", "v1", api::timestamp_type(2)), from_second));
+    const auto chunk = wb.seal(segment_sequence{7});
+
+    auto ch = read_chunk_header(copy_chunk(chunk)).value();
+    BOOST_REQUIRE_EQUAL(ch.schema_table_size, chunk_layout::single_version_schema_table_size(from_first));
+    auto entries = read_schema_table(chunk, ch);
+    BOOST_REQUIRE_EQUAL(entries.size(), 1u);
+    BOOST_REQUIRE_EQUAL(entries[0].schema_version, schema->version());
+}
+
+// Checks that the room a record's schema table entry takes is charged to the record that brings
+// the version into the buffer: a record that fits as one more of a version the buffer already
+// lists does not fit as the first of another version.
+SEASTAR_THREAD_TEST_CASE(test_logstor_chunk_builder_charges_the_schema_table_entry_to_the_first_record_of_a_version) {
+    auto schema = make_kv_schema();
+    auto altered = schema_builder(schema).with_column("w", int32_type).build();
+
+    chunk_builder wb(ondisk::block_alignment, segment_kind::mixed);
+    wb.append(make_writer(make_log_record(schema, "pk0", "v0", api::timestamp_type(1))));
+
+    // The largest record of the buffer's version that still fits.
+    sstring value;
+    while (wb.fits(make_writer(make_log_record(schema, "pk1", value + "x", api::timestamp_type(2))))) {
+        value += "x";
+    }
+    auto same_version = make_writer(make_log_record(schema, "pk1", value, api::timestamp_type(2)));
+    // The record value carries the column mapping of its version, and the mapping of the altered
+    // schema is larger. Shorten the value of the other record until the two are the same size.
+    auto other_value = value;
+    auto other_version = make_writer(make_log_record(altered, "pk1", other_value, api::timestamp_type(2)));
+    while (other_version.record_size() > same_version.record_size()) {
+        other_value.resize(other_value.size() - 1);
+        other_version = make_writer(make_log_record(altered, "pk1", other_value, api::timestamp_type(2)));
+    }
+    BOOST_REQUIRE_EQUAL(same_version.record_size(), other_version.record_size());
+
+    BOOST_REQUIRE(wb.fits(same_version));
+    BOOST_REQUIRE(!wb.fits(other_version));
+    BOOST_REQUIRE_THROW(wb.append(other_version), std::runtime_error);
+
+    // The same record fits an empty buffer, whose max_record_size() accounts for its entry.
+    chunk_builder empty(ondisk::block_alignment, segment_kind::mixed);
+    BOOST_REQUIRE_LE(other_version.record_size(),
+            chunk_layout::max_record_size(ondisk::block_alignment, segment_kind::mixed, other_version.mapping()));
+    BOOST_REQUIRE(empty.fits(other_version));
 }
 
 // Checks that a chunk builder can hold and seal a record whose serialized size is exactly max_record_size().
@@ -220,11 +345,11 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_chunk_builder_accepts_record_at_max_record
     auto schema = make_kv_schema();
 
     chunk_builder wb(ondisk::block_alignment, segment_kind::mixed);
-    auto max_size = chunk_layout::max_record_size(ondisk::block_alignment, segment_kind::mixed);
 
     sstring value;
     auto record = make_log_record(schema, "pk", "", api::timestamp_type(27));
     auto writer = make_writer(record);
+    auto max_size = chunk_layout::max_record_size(ondisk::block_alignment, segment_kind::mixed, writer.mapping());
 
     while (writer.record_size() < max_size) {
         value += "x";
@@ -347,7 +472,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_chunk_builder_bytes_writer_writes_the_same
     BOOST_REQUIRE_EQUAL(in.size(), 0u);
 
     chunk_builder rewritten(32 * 1024, segment_kind::full);
-    const auto bytes_writer = log_record_bytes_writer(parsed->header, parsed->bytes);
+    const auto bytes_writer = log_record_bytes_writer(parsed->header, parsed->bytes, writer.mapping());
     BOOST_REQUIRE_EQUAL(bytes_writer.record_size(), writer.record_size());
     const auto rewritten_frame = rewritten.append(bytes_writer);
 
