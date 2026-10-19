@@ -107,8 +107,8 @@ static_assert(std::is_same_v<api::timestamp_type, int64_t>, "The timestamp must 
 // A segment holds one or more chunks, each starting at a block_alignment boundary and padded to
 // a multiple of it. A chunk is the chunk header and the chunk's body: the record frames and the
 // schema table that follows them. Chunks are appended to a mixed segment one at a time; a full
-// segment is a single chunk. A write buffer builds a chunk in memory and seals it - pads it and
-// fills in its header - before it is written.
+// segment is a single chunk. A write buffer builds a chunk in memory and seals it - writes its
+// schema table, pads it and fills in its header - before it is written.
 //
 // The chunk header has a layout that depends on the kind of the segment. chunk_header_common is the
 // start of the header in every kind, and chunk_header_full_part follows it in a full segment. The
