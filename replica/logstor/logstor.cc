@@ -168,7 +168,7 @@ future<> logstor::do_write(const schema& s, dht::decorated_key dk, api::timestam
             .schema_version = s.version(),
         },
         .value = std::move(value),
-    });
+    }, _segment_manager.column_mappings().add(s));
 
     auto [location, op] = co_await coroutine::try_future(
             _write_buffer.write(std::move(writer), timeout, std::move(target)));
