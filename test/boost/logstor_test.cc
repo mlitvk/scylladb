@@ -530,6 +530,12 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_ondisk_layout) {
         .value_size = 0xcafebabe,
     }, "0b0a" "0d0c" "bebafeca");
 
+    check_ondisk_layout("schema_table_entry_fixed", ondisk::schema_table_entry_fixed {
+        .table = table,
+        .schema_version = table_schema_version(utils::UUID(int64_t(0x2132435465768798), int64_t(0xa9bacbdcedfe0f10))),
+        .mapping_size = 0x13572468,
+    }, "8877665544332211" "00ffeeddccbbaa99" "9887766554433221" "100ffeeddccbbaa9" "68245713");
+
     BOOST_TEST_CONTEXT("record_header") {
         const record_header header {
             .key = dht::decorated_key(dht::token::from_int64(-0x0123456789abcdef), partition_key::from_bytes(bytes("pk"))),
