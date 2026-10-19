@@ -122,7 +122,7 @@ struct segment_header;
 // a multiple of it. A chunk is this header, the segment_header in a full segment, and the chunk's
 // body: the record frames and the schema table that follows them. Chunks are appended to a mixed
 // segment one at a time; a full segment is a single chunk. A write buffer builds a chunk in memory
-// and seals it - pads it and fills in its header - before it is written.
+// and seals it - writes its schema table, pads it and fills in its header - before it is written.
 //
 // The chunk header, 16 bytes a row, little-endian:
 //

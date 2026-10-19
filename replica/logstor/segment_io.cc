@@ -8,12 +8,19 @@
 
 #include "replica/logstor/segment_io.hh"
 
+#include <algorithm>
+#include <optional>
+#include <span>
+#include <stdexcept>
+
+#include <fmt/format.h>
 #include <seastar/core/align.hh>
 #include <seastar/core/on_internal_error.hh>
 #include <seastar/core/simple-stream.hh>
 #include <seastar/util/log.hh>
 
 #include "serializer_impl.hh"
+#include "utils/small_vector.hh"
 
 namespace replica::logstor {
 
@@ -98,10 +105,16 @@ segment_info make_segment_info(const chunk_headers& headers) {
     return seg_info;
 }
 
-// The body of a chunk, and whether it matches the body CRC of the chunk header.
+// The body of a chunk - its records, then its schema table - and whether it matches the body CRC
+// of the chunk header.
 struct chunk_body {
     temporary_buffer<char> buf;
+    size_t records_size;
     bool valid;
+
+    bytes_view schema_table() const {
+        return {reinterpret_cast<const int8_t*>(buf.get()) + records_size, buf.size() - records_size};
+    }
 };
 
 // The records, then the schema table.
@@ -118,7 +131,26 @@ future<std::optional<chunk_body>> read_chunk_body(segment_reader& reader, const 
         co_return std::nullopt;
     }
     const bool valid = ondisk::validate_chunk_body(ch, std::span(body.get(), body.size()));
-    co_return chunk_body{std::move(body), valid};
+    co_return chunk_body{std::move(body), ch.records_size, valid};
+}
+
+// Parses the schema table of a chunk whose body passed its CRC check. The mapping views of the
+// entries point into `table`.
+//
+// The body CRC covers the table, so a table that does not parse, or a record whose version the table
+// does not list, comes from a writer bug or from corruption that the CRC does not catch. The scan
+// fails, so recovery fails and the node does not start, and no record is lost without notice.
+schema_table_entries parse_schema_table(bytes_view table, size_t records_position, log_segment_id segment_id) {
+    schema_table_entries entries;
+    try {
+        ondisk::for_each_schema_table_entry(table, [&] (const ondisk::schema_table_entry& e) {
+            entries.push_back(e);
+        });
+    } catch (const std::runtime_error& e) {
+        throw std::runtime_error(fmt::format("The schema table of the chunk in {} with records at {} is not valid: {}",
+                segment_id, records_position, e.what()));
+    }
+    return entries;
 }
 
 } // anonymous namespace
@@ -140,6 +172,17 @@ void chunk_records::iterator::read_next() {
     auto record = ondisk::try_read_record_frame(_records);
     if (!record) {
         return;
+    }
+
+    // Compaction and the separator take the mapping of the record's version from the registry, which
+    // has the versions that the schema table lists.
+    const auto& header = record->header;
+    const bool listed = std::ranges::any_of(_chunk->_schema_table, [&] (const ondisk::schema_table_entry& e) {
+        return e.schema_version == header.schema_version && e.table == header.table;
+    });
+    if (!listed) [[unlikely]] {
+        throw std::runtime_error(fmt::format("The record at {} in {} of table {} has schema version {}, which the schema table of its chunk does not list",
+                record_offset, _chunk->_segment_id, header.table, header.schema_version));
     }
 
     const auto segment_id = _chunk->_segment_id;
@@ -217,18 +260,22 @@ future<std::optional<scanned_chunk>> segment_scanner::read_chunk() {
                 "The segment is corrupt; the records of the chunk are lost.", _segment_id, chunk_body_size(ch), body_position);
         _state = scan_state::last;
         _last_chunk_failed = false;
-        co_return scanned_chunk(_segment_id, std::move(seg_info), {}, 0, body_position, false);
+        co_return scanned_chunk::without_body(_segment_id, std::move(seg_info), body_position);
     }
     auto body = co_await read_chunk_body(_reader, ch);
     if (!body) {
         _state = scan_state::last;
         _last_chunk_failed = true;
         ++_failed_chunks;
-        co_return scanned_chunk(_segment_id, std::move(seg_info), {}, 0, body_position, false);
+        co_return scanned_chunk::without_body(_segment_id, std::move(seg_info), body_position);
     }
 
+    schema_table_entries schema_table;
     if (body->valid) {
         _last_chunk_failed = false;
+        // The schema table follows the records. It is parsed before the chunk is returned, so that a
+        // table that does not parse fails the scan before any record of the chunk is given.
+        schema_table = parse_schema_table(body->schema_table(), body_position, _segment_id);
     } else {
         // The valid header gives the size of the chunk, so the scan continues at the next chunk.
         // After a torn chunk, what follows is not a valid chunk or is a chunk of an earlier use of
@@ -236,7 +283,8 @@ future<std::optional<scanned_chunk>> segment_scanner::read_chunk() {
         _last_chunk_failed = true;
         ++_failed_chunks;
     }
-    co_return scanned_chunk(_segment_id, std::move(seg_info), std::move(body->buf), ch.records_size, body_position, body->valid);
+    co_return scanned_chunk(_segment_id, std::move(seg_info), std::move(body->buf), body->records_size, body_position, body->valid,
+            std::move(schema_table));
 }
 
 void segment_scanner::report_failed_chunks() const {

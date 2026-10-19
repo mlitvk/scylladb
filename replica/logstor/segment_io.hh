@@ -13,6 +13,7 @@
 #include <optional>
 #include <span>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include <seastar/core/fstream.hh>
@@ -20,6 +21,7 @@
 #include <seastar/core/temporary_buffer.hh>
 
 #include "replica/logstor/ondisk.hh"
+#include "utils/small_vector.hh"
 
 namespace replica::logstor {
 
@@ -97,11 +99,15 @@ struct chunk_record : ondisk::parsed_record_frame {
     }
 };
 
+// The entries of the schema table of a chunk. Their mapping views point into the chunk's body.
+using schema_table_entries = utils::small_vector<ondisk::schema_table_entry, 2>;
+
 class scanned_chunk;
 
 // The records of a chunk body, in order. The range ends at the first record frame that does not
 // parse. An increment of the iterator throws std::runtime_error at a record with an unknown flag,
-// as parse_record_frame() does.
+// as parse_record_frame() does, or at a record whose schema version the chunk does not list for
+// the record's table.
 class chunk_records {
 public:
     class iterator {
@@ -146,6 +152,9 @@ public:
     // a torn chunk can hold records of an earlier use of the segment that parse cleanly.
     bool body_valid() const noexcept { return _body_valid; }
     chunk_records records() const noexcept { return chunk_records(*this); }
+    // The entries of the schema table, or none if the body is not valid. Each record of the chunk
+    // has the schema version and the table of one of them.
+    std::span<const ondisk::schema_table_entry> schema_table() const noexcept { return _schema_table; }
 
 private:
     log_segment_id _segment_id;
@@ -156,6 +165,7 @@ private:
     // Where the body starts in the segment. Record locations are relative to the segment.
     size_t _body_position;
     bool _body_valid;
+    schema_table_entries _schema_table;
 
     friend class segment_scanner;
     friend class chunk_records::iterator;
@@ -165,14 +175,21 @@ private:
         return _body_valid ? std::span<const char>(_body.get(), _records_size) : std::span<const char>();
     }
 
-    scanned_chunk(log_segment_id segment_id, segment_info info, temporary_buffer<char> body, size_t records_size, size_t body_position, bool body_valid)
+    scanned_chunk(log_segment_id segment_id, segment_info info, temporary_buffer<char> body, size_t records_size, size_t body_position,
+            bool body_valid, schema_table_entries schema_table)
         : _segment_id(segment_id)
         , _info(std::move(info))
         , _body(std::move(body))
         , _records_size(records_size)
         , _body_position(body_position)
         , _body_valid(body_valid)
+        , _schema_table(std::move(schema_table))
     {}
+
+    // A chunk whose body is not read: it is cut short, or it goes past the end of the segment.
+    static scanned_chunk without_body(log_segment_id segment_id, segment_info info, size_t body_position) {
+        return scanned_chunk(segment_id, std::move(info), {}, 0, body_position, false, {});
+    }
 };
 
 // Scans the chunks of a segment in order. The scanner reads from the stream, and does not close
@@ -188,6 +205,10 @@ private:
 //   - At a chunk that has the segment_seq of the segment and a format version that this code does
 //     not read or an unknown flag, next_chunk() throws std::runtime_error. Such a chunk is from
 //     another release and does not mark the end of the segment.
+//
+// The scanner parses the schema table of a chunk whose body is valid before it returns the chunk,
+// and next_chunk() throws std::runtime_error if the table does not parse. The records of the chunk
+// throw if the table does not list their version.
 class segment_scanner {
 public:
     segment_scanner(seastar::input_stream<char>& in, log_segment_id segment_id, size_t segment_size);
