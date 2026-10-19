@@ -23,6 +23,7 @@
 #include <seastar/core/timed_out_error.hh>
 #include <seastar/core/timer.hh>
 
+#include "replica/logstor/column_mapping_registry.hh"
 #include "replica/logstor/ondisk.hh"
 #include "timeout_config.hh"
 
@@ -44,19 +45,25 @@ struct write_target {
     seastar::gate::holder alive_holder;
 };
 
-// Writer for log records that handles serialization and size computation
+// Writer for log records that handles serialization and size computation.
+//
+// The writer also holds the registry entry of the record's schema version. The registry never
+// erases an entry, so the reference outlives the writer.
 class log_record_writer {
     using ostream = seastar::simple_memory_output_stream;
 
     log_record _record;
+    const schema_mapping* _mapping;
 
 public:
-    explicit log_record_writer(log_record record)
+    log_record_writer(log_record record, const schema_mapping& mapping)
         : _record(std::move(record))
+        , _mapping(&mapping)
     {}
 
     const log_record& record() const { return _record; }
     const record_header& header() const { return _record.header; }
+    const schema_mapping& mapping() const noexcept { return *_mapping; }
 
     size_t header_size() const { return ondisk::record_header_size(_record.header); }
     size_t value_size() const { return _record.value.size(); }

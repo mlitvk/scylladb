@@ -778,7 +778,7 @@ public:
             _serialization_buffer->append(log_record_writer(log_record{
                 .header = make_record_header(_mutation->decorated_key()),
                 .value = encode_record_value(*_mutation),
-            }));
+            }, column_mappings().add(*_mutation->schema())));
         }
     }
 
@@ -948,6 +948,10 @@ private:
         return *_cached_keys[tests::random::get_int<size_t>(_cached_keys.size() - 1)];
     }
 
+    column_mapping_registry& column_mappings() noexcept {
+        return _logstor->get_segment_manager().column_mappings();
+    }
+
     record_header make_record_header(const dht::decorated_key& key) const {
         return record_header{
             .key = key,
@@ -1001,7 +1005,7 @@ private:
             .header = make_record_header(_mutation->decorated_key()),
             .value = encode_record_value(*_mutation),
         });
-        _record_writer.emplace(*_record);
+        _record_writer.emplace(*_record, column_mappings().add(*_schema));
         _serialization_buffer->reset();
         auto appended = _serialization_buffer->append(*_record_writer);
         _serialized_record = temporary_buffer<char>(_serialization_buffer->data() + appended.frame_offset,

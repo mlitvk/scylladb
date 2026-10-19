@@ -660,6 +660,8 @@ class segment_manager_impl {
     future<> _reserve_replenisher{make_ready_future<>()};
     seastar::condition_variable _segment_freed_cv;
 
+    column_mapping_registry _column_mappings;
+
     write_buffer_pool _compaction_buffer_pool;
     write_buffer_pool _separator_buffer_pool;
     abort_source _separator_buffer_abort;
@@ -692,6 +694,9 @@ public:
     future<> write_full_segment(write_buffer&, logstor_group&, write_source);
 
     future<log_record> read(record_location);
+
+    column_mapping_registry& column_mappings() noexcept { return _column_mappings; }
+    const column_mapping_registry& column_mappings() const noexcept { return _column_mappings; }
 
     void on_add_record(record_location) noexcept;
     void on_free_record(record_location) noexcept;
@@ -2487,6 +2492,14 @@ future<> segment_manager::write(write_buffer& wb) {
 
 future<log_record> segment_manager::read(const index_read_guard&, record_location location) {
     return _impl->read(location);
+}
+
+column_mapping_registry& segment_manager::column_mappings() noexcept {
+    return _impl->column_mappings();
+}
+
+const column_mapping_registry& segment_manager::column_mappings() const noexcept {
+    return _impl->column_mappings();
 }
 
 compaction_manager& segment_manager::get_compaction_manager() noexcept {
