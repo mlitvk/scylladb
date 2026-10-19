@@ -39,6 +39,14 @@ The `write_buffer` manages a buffer of log records and handles the serialization
 
 The `buffered_writer` manages multiple write buffers for user writes, an active buffer and multiple flushing ones, to batch writes and manage backpressure.
 
+#### Column Mapping Registry
+
+The `column_mapping_registry` keeps in memory the column mapping of each schema version that records on disk were written under. There is one registry per shard.
+
+- A write adds the mapping of the schema version of its record.
+- A segment scan adds the mappings that the schema table of each chunk lists (see [Schema Table](#schema-table)).
+- Compaction and the separator rewrite records from their bytes, without a schema. They take the mapping of each record version from the registry, and list it in the schema table of the new chunk.
+
 ### Data Flow
 
 **Write Path:**
@@ -191,8 +199,8 @@ what a run has to get right are in the comment at the top of
 This section describes the parts of the format and the purpose of each part. See these files for
 the exact layout, the field types and the encodings:
 
-- [replica/logstor/ondisk.hh](../../replica/logstor/ondisk.hh) for the headers and the record
-  frame.
+- [replica/logstor/ondisk.hh](../../replica/logstor/ondisk.hh) for the headers, the record frame
+  and the schema table.
 - the `raw_write_buffer` comment in
   [replica/logstor/write_buffer.hh](../../replica/logstor/write_buffer.hh) for the layout of a
   chunk.
@@ -229,10 +237,11 @@ these parts, in this order:
 - the **segment header**, in a full segment only, which gives the table and the token range of the
   records.
 - the **record frames**, one after the other.
+- the **schema table**.
 - zero padding to the block boundary.
 
-The record frames are the body of the chunk. The body CRC lets a reader find a chunk whose header
-is durable but whose body was only partly written.
+The record frames and the schema table are the body of the chunk. The body CRC lets a reader find a
+chunk whose header is durable but whose body was only partly written.
 
 ### Record Frames
 
@@ -266,3 +275,14 @@ them are otherwise easy to confuse:
 | `frame_size`   | `record_frame_header_size + record_size`, the frame without its padding. This is what `record_location::size` holds. |
 | `records_size` | All the frames of one chunk, their padding included. Stored in the chunk header. |
 | `record_bytes` | The frame sizes of a set of records summed, their padding excluded. What a `segment_descriptor` and the `live_record_bytes` metric count. |
+
+### Schema Table
+
+The schema table follows the record frames. It lists the column mapping of each schema version that
+the records of the chunk were written under, once per version (see
+[Column Mapping Registry](#column-mapping-registry)). The mappings are on disk because the schema
+history in the system tables keeps superseded versions only for a while.
+
+The body CRC covers the table. If the table of a chunk that passes the CRC check does not parse,
+lists a mapping that does not parse, or does not list the version of a record of the chunk, the
+segment scan fails, so recovery fails and the node does not start.

@@ -23,6 +23,7 @@
 #include <array>
 #include <chrono>
 #include <concepts>
+#include <exception>
 #include <system_error>
 #include <type_traits>
 #include <seastar/core/file.hh>
@@ -624,6 +625,7 @@ class segment_manager_impl {
 
     seastar::condition_variable _segment_freed_cv;
 
+    // Declared ahead of the buffer pools, because their buffers and writers point into it.
     column_mapping_registry _column_mappings;
 
     write_buffer_pool _compaction_buffer_pool;
@@ -659,10 +661,23 @@ public:
     column_mapping_registry& column_mappings() noexcept { return _column_mappings; }
     const column_mapping_registry& column_mappings() const noexcept { return _column_mappings; }
 
+    // The registry entry of the schema version of a record that is rewritten from its bytes. A scan
+    // delivers a record only after the registry took the entry of its version, so a missing entry
+    // is an internal error.
+    const schema_mapping& mapping_for_rewrite(const record_header& header, record_location location) const {
+        const auto* mapping = _column_mappings.find(header.schema_version);
+        if (!mapping) [[unlikely]] {
+            on_internal_error(logstor_logger, fmt::format("Record at {} of table {} names schema version {} which has no column mapping",
+                    location, header.table, header.schema_version));
+        }
+        return *mapping;
+    }
+
     void on_add_record(record_location) noexcept;
     void on_free_record(record_location) noexcept;
 
-    // Calls `fn` for each chunk of the segment, in order.
+    // Calls `fn` for each chunk of the segment, in order. The registry takes the entries of the
+    // chunk's schema table before `fn` is called, so that the records of the chunk can be rewritten.
     template <typename Func>
         requires std::same_as<std::invoke_result_t<Func&, const scanned_chunk&>, future<>>
     future<> for_each_chunk(log_segment_id segment_id, Func fn) {
@@ -670,9 +685,23 @@ public:
         co_await with_segment_input_stream(segment_id, buffer_size, [&] (seastar::input_stream<char>& in) -> future<> {
             segment_scanner scanner(in, segment_id, _cfg.segment_size);
             while (auto* chunk = co_await scanner.next_chunk()) {
+                register_column_mappings(*chunk, segment_id);
                 co_await fn(*chunk);
             }
         });
+    }
+
+    // Adds the entries of the schema table of `chunk` to the registry. Throws std::runtime_error if
+    // the registry rejects one: the chunk passed its CRC check, so this is a writer bug or
+    // corruption that the CRC does not catch, and the scan fails.
+    void register_column_mappings(const scanned_chunk& chunk, log_segment_id segment_id) {
+        for (const auto& e : chunk.schema_table()) {
+            try {
+                _column_mappings.add(e.table, e.schema_version, e.mapping);
+            } catch (const std::runtime_error&) {
+                std::throw_with_nested(std::runtime_error(fmt::format("The schema table of a chunk in {} is not valid", segment_id)));
+            }
+        }
     }
 
     // Calls `fn` for each chunk of the segments, in the order of the segment ids.
@@ -1861,7 +1890,7 @@ struct compaction_buffer {
         auto* index_ptr = &index;
         auto key = header.index_key();
 
-        auto writer = log_record_bytes_writer(header, record_view);
+        auto writer = log_record_bytes_writer(header, record_view, sm.mapping_for_rewrite(header, read_location));
 
         if (!buf->can_fit(writer)) {
             co_await flush();
@@ -2463,7 +2492,7 @@ future<> segment_manager_impl::separate_segment_records(recovery_catalog& catalo
     auto write_to_separator_failed = defer([seg_ref] mutable noexcept {
         seg_ref.set_flush_failure();
     });
-    co_await for_each_record(seg_id, [seg_ref, &catalog, &stats] (const chunk_record& record) {
+    co_await for_each_record(seg_id, [this, seg_ref, &catalog, &stats] (const chunk_record& record) {
         const auto& header = record.header;
         auto key = header.index_key();
         auto* index = catalog.index(header.table);
@@ -2480,7 +2509,7 @@ future<> segment_manager_impl::separate_segment_records(recovery_catalog& catalo
             index->erase(key, record.location);
             return make_ready_future<>();
         }
-        auto writer = log_record_bytes_writer(header, record.bytes);
+        auto writer = log_record_bytes_writer(header, record.bytes, mapping_for_rewrite(header, record.location));
 
         return cg->write_to_separator(std::move(writer), seg_ref, std::nullopt,
             separator_index_update {
