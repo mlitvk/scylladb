@@ -9,6 +9,7 @@
 #pragma once
 
 #include <array>
+#include <concepts>
 #include <limits>
 #include <optional>
 #include <span>
@@ -31,7 +32,7 @@ namespace replica::logstor::ondisk {
 //   - the field<> encodings of the field types that the format uses;
 //   - the fixed-size types, each derived from fixed_layout, and their sizes;
 //   - the checks of the fixed-size types;
-//   - the variable-size parts: the record header and the record frame.
+//   - the variable-size parts: the record header, the record frame and the schema table.
 //
 // fixed_serializer writes the fields of a fixed-size type one after another in declaration order,
 // so the order of the members is the on-disk layout, and the serialized size is the sum of the
@@ -217,6 +218,15 @@ struct record_header_fixed : fixed_layout {
     table_schema_version schema_version;
 };
 
+// The start of an entry of the schema table. The column mapping follows it, `mapping_size` bytes.
+struct schema_table_entry_fixed : fixed_layout {
+    table_id table;
+    table_schema_version schema_version;
+    uint32_t mapping_size;
+
+    bool operator==(const schema_table_entry_fixed& other) const noexcept = default;
+};
+
 // These constants are the on-disk sizes, which fixed_size calculates from the fields of each type.
 inline constexpr size_t chunk_header_size = fixed_size<chunk_header>;
 inline constexpr size_t segment_header_size = fixed_size<segment_header>;
@@ -225,6 +235,7 @@ inline constexpr size_t record_header_fixed_size = fixed_size<record_header_fixe
 // min_record_frame_size is the size of the smallest record frame, which holds a
 // record_frame_header and a record header with an empty key.
 inline constexpr size_t min_record_frame_size = record_frame_header_size + record_header_fixed_size;
+inline constexpr size_t schema_table_entry_fixed_size = fixed_size<schema_table_entry_fixed>;
 
 static_assert(chunk_header_size % record_alignment == 0, "Chunk header size must be aligned by record_alignment");
 static_assert(segment_header_size % record_alignment == 0, "Segment header size must be aligned by record_alignment");
@@ -431,6 +442,73 @@ inline std::optional<parsed_record_frame> try_read_record_frame(seastar::simple_
             .bytes = bytes,
         };
     });
+}
+
+// The schema table of a chunk lists the column mapping of every schema version the records of
+// the chunk were written under, once per version. The table follows the records of the chunk,
+// because which versions a chunk holds is only known once its buffer is finished, and
+// chunk_header carries its size. Its encoding:
+//
+//   u32  entry count
+//   per entry:
+//     schema_table_entry_fixed   the table id, the schema version and the mapping size
+//     column_mapping             ser::serializer<column_mapping>, from idl/mutation.idl.hh
+//
+// Every record of a chunk names a version that the table has an entry for, with the record's own
+// table, and a scan checks that.
+struct schema_table_entry {
+    table_id table;
+    table_schema_version schema_version;
+    bytes_view mapping; // the IDL-serialized column_mapping
+
+    bool operator==(const schema_table_entry& other) const noexcept = default;
+};
+
+inline constexpr size_t schema_table_header_size = sizeof(uint32_t);
+
+constexpr size_t schema_table_entry_size(size_t mapping_size) noexcept {
+    return schema_table_entry_fixed_size + mapping_size;
+}
+
+template <typename Output>
+void write_schema_table_entry(Output& out, const schema_table_entry& e) {
+    ser::serializer<schema_table_entry_fixed>::write(out, schema_table_entry_fixed {
+        .table = e.table,
+        .schema_version = e.schema_version,
+        .mapping_size = static_cast<uint32_t>(e.mapping.size()),
+    });
+    out.write(reinterpret_cast<const char*>(e.mapping.data()), e.mapping.size());
+}
+
+// Calls `f(const schema_table_entry&)` for each entry of the schema table in `table`, whose
+// mapping views point into `table`. Throws std::runtime_error if the table is malformed, and
+// whatever `f` throws.
+template <std::invocable<const schema_table_entry&> F>
+void for_each_schema_table_entry(bytes_view table, F&& f) {
+    auto in = seastar::simple_memory_input_stream(reinterpret_cast<const char*>(table.data()), table.size());
+    if (in.size() < schema_table_header_size) {
+        throw std::runtime_error(fmt::format("Schema table of {} bytes is shorter than its header", table.size()));
+    }
+    const auto count = ser::serializer<uint32_t>::read(in);
+    for (uint32_t i = 0; i < count; ++i) {
+        if (in.size() < schema_table_entry_fixed_size) {
+            throw std::runtime_error(fmt::format("Schema table entry {} of {} is truncated", i, count));
+        }
+        const auto fixed = ser::serializer<schema_table_entry_fixed>::read(in);
+        if (in.size() < fixed.mapping_size) {
+            throw std::runtime_error(fmt::format("Schema table entry {} of {} claims a mapping of {} bytes with {} left", i, count, fixed.mapping_size, in.size()));
+        }
+        auto mapping = bytes_view(reinterpret_cast<const int8_t*>(in.begin()), fixed.mapping_size);
+        in.skip(fixed.mapping_size);
+        f(schema_table_entry{
+            .table = fixed.table,
+            .schema_version = fixed.schema_version,
+            .mapping = mapping,
+        });
+    }
+    if (in.size() != 0) {
+        throw std::runtime_error(fmt::format("Schema table has {} bytes past its {} entries", in.size(), count));
+    }
 }
 
 } // namespace replica::logstor::ondisk
