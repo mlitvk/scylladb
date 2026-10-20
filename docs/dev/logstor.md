@@ -151,12 +151,21 @@ compaction reclaims them.
 |--------|-------|-----------|
 | Space of the segments a group owns | `compaction_group::live_disk_space_used()`, the `live_disk_space` and `logstor_segments` table metrics | the disk space of a table (nodetool, the `column_family` API) |
 | Live record bytes of the segments a group owns | `compaction_group::data_size()`, the `owned_segments_live_record_bytes` metric | tablet sizes, the table size for split and merge |
-| Live record bytes the index refers to, the records in mixed segments included | the `logstor_live_record_bytes` table metric, the `live_record_bytes` metric | metrics only |
+| Live record bytes the index refers to, the records in mixed segments included | the `logstor_live_record_bytes` table metric, the `live_record_bytes` metric, `segment_manager::pool_utilization()` | the pool-critical level |
 | Segments that hold records | `segment_bytes_in_use`, the `segments_in_use` metric | the load of the node (`database::disk_space_used()`) |
 | Files allocated for segments | `disk_usage`, the `disk_usage` metric; `segment_bytes_in_use` with sparse files (`space_on_disk`) | the capacity of the node for the tablet balancer |
 
 A write counts in the live record bytes of a group only after the separator moves it into a segment
 of the group.
+
+Two settings act on the pool of a shard:
+
+- `logstor_compaction_trigger_threshold`: compaction starts when the free segments fall below this
+  fraction of the pool.
+- `logstor_critical_utilization_level` (0.85 by default): when the live records take more than this
+  fraction of the pool, the shard refuses streamed tablets, and the node reports the shard as
+  critical to the topology coordinator, which rolls a logstor migration into it back and does not
+  plan another. User writes are not affected.
 
 ## Tablet Streaming
 
@@ -185,6 +194,10 @@ record of its key in the index, because a write of the write-both stage came fir
 segment as dead space. Only whole segments reach the disk: when a stream fails, the sink drops the
 records in its buffer, and the segments it wrote are sealed and indexed in their group. A migration
 that is rolled back erases them with the rest of the tablet.
+
+A shard whose pool is above `logstor_critical_utilization_level` refuses a stream: it does not make
+a sink, and an open sink fails before it writes its next segment. The exception is
+`critical_disk_utilization_exception`, as for an sstable stream on a full disk.
 
 A shard receives at most `tablet_streaming_write_concurrency_per_shard` streams at once, because each
 sink holds a write buffer for its life. The `stream_records_sent`, `stream_records_received` and
