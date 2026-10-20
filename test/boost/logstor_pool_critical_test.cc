@@ -13,7 +13,15 @@
 
 #include "db/config.hh"
 #include "replica/database.hh"
+#include "service/storage_service.hh"
 #include "test/lib/cql_test_env.hh"
+
+class storage_service_test {
+public:
+    static future<locator::load_stats> load_stats_for_tablet_based_tables(service::storage_service& ss) {
+        return ss.load_stats_for_tablet_based_tables();
+    }
+};
 
 namespace {
 
@@ -70,5 +78,34 @@ SEASTAR_TEST_CASE(test_pool_critical_follows_the_level) {
         e.db().invoke_on_all([] (replica::database& db) {
             BOOST_REQUIRE(!db.logstor_pool_critical());
         }).get();
+    }, make_logstor_env_config());
+}
+
+SEASTAR_TEST_CASE(test_pool_critical_marks_the_shards) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        create_table(e);
+        write_rows(e);
+        auto& ss = e.get_storage_service().local();
+        const auto host = e.db().local().get_token_metadata().get_my_id();
+
+        auto stats = storage_service_test::load_stats_for_tablet_based_tables(ss).get();
+        BOOST_REQUIRE(stats.logstor_pool_critical.at(host).empty());
+        BOOST_REQUIRE(!stats.critical_disk_utilization.at(host));
+
+        set_critical_level(e, "0.000001");
+        auto shards_with_records = e.db().map_reduce0([] (replica::database& db) {
+            const bool has_records = db.find_column_family("ks", "t").logstor_live_record_bytes() > 0;
+            return has_records ? std::vector<shard_id>{this_shard_id()} : std::vector<shard_id>{};
+        }, std::vector<shard_id>{}, [] (std::vector<shard_id> a, std::vector<shard_id> b) {
+            a.insert(a.end(), b.begin(), b.end());
+            return a;
+        }).get();
+        std::ranges::sort(shards_with_records);
+        BOOST_REQUIRE(!shards_with_records.empty());
+
+        stats = storage_service_test::load_stats_for_tablet_based_tables(ss).get();
+        BOOST_REQUIRE(stats.logstor_pool_critical.at(host) == shards_with_records);
+        // The pool of a shard says nothing about the disk.
+        BOOST_REQUIRE(!stats.critical_disk_utilization.at(host));
     }, make_logstor_env_config());
 }
