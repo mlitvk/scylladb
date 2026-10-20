@@ -413,3 +413,53 @@ async def test_pool_critical_rolls_back_migration(manager: ScyllaClusterManager)
         rows = await cql.run_async(f"SELECT pk, v FROM {ks}.test WHERE pk IN ({', '.join(map(str, moved_keys))})")
         assert sorted(r.pk for r in rows) == sorted(moved_keys)
         assert all(r.v == value for r in rows)
+
+
+async def test_balancer_avoids_critical_pool(manager: ScyllaClusterManager):
+    """
+    One node holds more live data than the other, whose logstor pool is critical. The balancer
+    wants to move a logstor tablet into the critical node, and must not plan it: the shard would
+    refuse the stream, the coordinator would roll the migration back, and the next plan would pick
+    the same node again. Once the level is raised, the balancer moves a tablet into it.
+    """
+    value = 'x' * (60 * 1024)
+    # 10 keys of 60KB in each of the eight tablets of the heavy node take about 4.8MB of its 8MB
+    # pool, below its level of 0.85; 6 keys in each of the eight tablets of the critical node take
+    # about 2.9MB, above its level of 0.25. The tablets are small against the difference, so a move
+    # does not invert the loads, which the balancer refuses.
+    heavy_keys_per_tablet = 10
+    critical_keys_per_tablet = 6
+
+    servers = await manager.servers_add(2, cmdline=cmdline, config=cfg, property_file={'dc': 'dc1', 'rack': 'r1'})
+    cql = manager.get_cql()
+    await manager.disable_tablet_balancing()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'initial': 16}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v text) WITH storage_engine = 'logstor'")
+
+        heavy_host = await manager.get_host_id(servers[0].server_id)
+        critical_host = await manager.get_host_id(servers[1].server_id)
+        tablets = await keys_by_tablet(manager, servers[0], ks, 'test', heavy_keys_per_tablet)
+        assert sorted(host for _, host, _ in tablets) == sorted([heavy_host] * 8 + [critical_host] * 8), f"expected 8 tablets on each node, got {tablets}"
+        keys = [pk for _, host, tablet_keys in tablets for pk in (tablet_keys if host == heavy_host else tablet_keys[:critical_keys_per_tablet])]
+        await write(cql, ks, keys, value)
+        await manager.server_update_config(servers[1].server_id, 'logstor_critical_utilization_level', 0.25)
+        await flush_and_refresh(manager, servers)
+        before = await placement(manager, servers[0], ks)
+
+        coordinator = await manager.find_server_by_host_id(servers, await get_topology_coordinator(manager))
+        coordinator_log = await manager.server_open_log(coordinator.server_id)
+        coordinator_mark = await coordinator_log.mark()
+        await manager.enable_tablet_balancing()
+        await manager.api.quiesce_topology(servers[0].ip_addr)
+        assert await placement(manager, servers[0], ks) == before, "expected no tablet to move into the critical node"
+        skips = await coordinator_log.grep('Migration skipped because the logstor pool of', from_mark=coordinator_mark)
+        assert skips, "expected the balancer to skip a migration into the critical node"
+
+        await manager.server_update_config(servers[1].server_id, 'logstor_critical_utilization_level', 0.85)
+        await flush_and_refresh(manager, servers)
+        await manager.api.quiesce_topology(servers[0].ip_addr)
+        assert await placement(manager, servers[0], ks) != before, "expected a tablet to move once the level is raised"
+
+        rows = await cql.run_async(f"SELECT pk FROM {ks}.test")
+        assert sorted(r.pk for r in rows) == sorted(keys)
