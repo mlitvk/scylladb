@@ -56,6 +56,7 @@
 #include "utils/error_injection.hh"
 #include "utils/serialized_action.hh"
 #include "replica/logstor/recovery_catalog.hh"
+#include "replica/exceptions.hh"
 
 namespace replica::logstor {
 
@@ -2703,10 +2704,22 @@ future<std::unique_ptr<record_stream_source>> segment_manager_impl::make_record_
             _stream_stats);
 }
 
+// A streamed tablet takes the space that compaction needs. The check reads the live records over the
+// pool and not the free segments, because compaction can reclaim the dead records and not the live
+// ones. The exception is the one that an sstable stream fails with on a full disk. The node reports
+// the shard as critical in its load stats, so the topology coordinator rolls the migration back and
+// does not retry it.
+static std::exception_ptr streamed_segment_refused() {
+    return std::make_exception_ptr(replica::critical_disk_utilization_exception("rejected streamed logstor segment"));
+}
+
 future<std::unique_ptr<record_stream_sink>> segment_manager_impl::make_record_stream_sink(table_id table,
         record_stream_sink::target_resolver resolve_target) {
     // Taken before the buffer, so that a sink is never made while the segment manager stops.
     auto segment_manager_holder = _async_gate.hold();
+    if (pool_critical()) {
+        co_await coroutine::return_exception_ptr(streamed_segment_refused());
+    }
     // Not requested at stop: stop() waits at the gate for the sinks, so a sink that waits for its
     // buffers gets them when another sink ends. The sink takes all its buffers in one call, because
     // sinks that each hold a part of their buffers and wait for the rest would wait forever.
@@ -2714,6 +2727,12 @@ future<std::unique_ptr<record_stream_sink>> segment_manager_impl::make_record_st
     auto buffers = co_await _stream_buffer_pool.allocate_many(record_stream_sink_buffers, never_aborted);
     co_return std::make_unique<record_stream_sink>(table, std::move(resolve_target), std::move(buffers),
             [this] (write_buffer& wb, logstor_group& group) {
+                // The level can rise during a long stream. The records of a segment count in the
+                // live records when the segment is written, so each open sink writes at most one
+                // segment above the level.
+                if (pool_critical()) {
+                    return make_exception_future<>(streamed_segment_refused());
+                }
                 return write_full_segment(wb, group, write_source::streaming);
             },
             std::move(segment_manager_holder), _stream_stats);

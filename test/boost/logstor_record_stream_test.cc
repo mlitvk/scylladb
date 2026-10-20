@@ -27,6 +27,7 @@
 #include <seastar/util/memory-data-source.hh>
 #include <seastar/testing/thread_test_case.hh>
 
+#include "replica/exceptions.hh"
 #include "replica/logstor/index.hh"
 #include "replica/logstor/logstor.hh"
 #include "replica/logstor/ondisk.hh"
@@ -40,6 +41,7 @@
 #include "test/lib/mutation_assertions.hh"
 #include "test/lib/tmpdir.hh"
 #include "utils/UUID_gen.hh"
+#include "utils/updateable_value.hh"
 
 using namespace replica::logstor;
 using namespace tests::logstor;
@@ -837,6 +839,49 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_sink_failed_close_releases_the_sink
     gates.close();
     for (const auto& r : records) {
         BOOST_REQUIRE(!low.logstor_index().get(index_key_of(schema, r)));
+    }
+}
+
+SEASTAR_THREAD_TEST_CASE(test_logstor_record_sink_refuses_when_the_pool_is_critical) {
+    auto schema = make_schema();
+    utils::updateable_value_source<double> critical_level(1);
+    logstor_env env([&] (segment_manager_config& cfg) {
+        cfg.critical_utilization_level = utils::updateable_value<double>(critical_level);
+    });
+    test_logstor_group group(schema, env.ls);
+    auto compaction_guard = env.ls.get_compaction_manager().disable_compaction(group).get();
+    target_gates gates;
+    auto& sm = env.ls.get_segment_manager();
+    auto resolve = [&] (dht::token) { return gates.target(group); };
+
+    const auto records = make_records(150, 2000);
+    const auto starts = segment_starts(schema, records);
+    BOOST_REQUIRE_GE(starts.size(), 3);
+    // The records of the first segment and the first record of the second one: the sink writes the
+    // first segment and keeps the record in its buffer.
+    const size_t before_level_change = starts[1] + 1;
+    auto first = make_chunks(schema, std::span(records).first(before_level_change), 7);
+    auto rest = make_chunks(schema, std::span(records).subspan(before_level_change), 7);
+
+    auto sink = sm.make_record_stream_sink(schema->id(), resolve).get();
+    sink->put(first).get();
+    BOOST_REQUIRE_EQUAL(group.logstor_segments().segment_count(), 1);
+
+    // The live records of the first segment are above a level of 0.
+    critical_level.set(0);
+    BOOST_REQUIRE_THROW(sink->put(rest).get(), replica::critical_disk_utilization_exception);
+    sink->abort().get();
+    sink.reset();
+    BOOST_REQUIRE_THROW(sm.make_record_stream_sink(schema->id(), resolve).get(), replica::critical_disk_utilization_exception);
+    gates.close();
+
+    BOOST_REQUIRE_EQUAL(group.logstor_segments().segment_count(), 1);
+    for (size_t i = 0; i < records.size(); ++i) {
+        if (i < starts[1]) {
+            require_reads_back(env.ls, schema, group.logstor_index(), records[i]);
+        } else {
+            BOOST_REQUIRE(!group.logstor_index().get(index_key_of(schema, records[i])));
+        }
     }
 }
 
