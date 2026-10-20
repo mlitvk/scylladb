@@ -71,8 +71,9 @@ struct segment_manager_config {
     utils::updateable_value<double> compaction_min_utilization_threshold{default_compaction_min_utilization_threshold};
     seastar::scheduling_group compaction_sg;
     utils::updateable_value<float> compaction_static_shares;
-    // The shares of the compaction scheduling group at or above the threshold anchor, and at the
-    // space floor, see compaction_rate_controller.
+    // The shares of the compaction scheduling group when compaction is idle or throttled above the
+    // threshold anchor, and when it cannot use its rate or the disk is at the space floor, see
+    // compaction_rate_controller.
     utils::updateable_value<float> compaction_min_shares{50};
     utils::updateable_value<float> compaction_max_shares{2000};
     seastar::scheduling_group separator_sg;

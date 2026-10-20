@@ -249,9 +249,10 @@ future<> writeable_segment::do_write(segment_position pos, bytes_view data) {
 using seg_ptr = lw_shared_ptr<writeable_segment>;
 
 // Maps the shares demand of the rate controller, in [0, 1], to CPU shares:
-// logstor_compaction_min_shares at 0, at or above the threshold anchor, and
-// logstor_compaction_max_shares at 1, at the space floor. The function is linear, because the
-// demand already has the shape of the shares ramp, see compaction_rate_controller.
+// logstor_compaction_min_shares at 0, when compaction is idle or throttled above the threshold
+// anchor, and logstor_compaction_max_shares at 1, when compaction cannot use its rate or the disk
+// is at the space floor. The function is linear, because the demand already has the shape of the
+// shares ramp, see compaction_rate_controller.
 class compaction_shares_controller : public backlog_controller {
 public:
     // Below this the scheduling group's shares stop being meaningful, so a floor this low is treated
@@ -406,10 +407,14 @@ public:
     compaction_reenabler disable_compaction_no_wait(logstor_group&) override;
     // `limits` bound the batch that the job selects: the limits of the automatic policy, or any
     // batch with a net gain for a compaction that was asked for explicitly.
-    future<> submit_normal_compaction(logstor_group&, compaction_batch_limits limits) override;
+    future<uint64_t> submit_normal_compaction(logstor_group&, compaction_batch_limits limits) override;
     future<> submit_split_compaction(logstor_group&, mutation_writer::classify_by_token_group, split_target_group) override;
 
 private:
+    // The segments taken from the pool that compaction must reclaim, cumulative. See
+    // compaction_rate_controller::sample::segments_allocated.
+    uint64_t reclaimable_segments_allocated() const noexcept;
+
     // compaction_driver::host
     future<compaction_driver::ranking> find_top_compaction_candidates(const compaction_batch_limits&, size_t max_candidates) override;
     bool can_start(const logstor_group*) const noexcept override;
@@ -419,7 +424,8 @@ private:
     void enable_compaction(logstor_group&) noexcept;
 
     future<> submit_group_compaction(logstor_group&, std::function<future<>(group_compaction_state&)>, scheduling_group);
-    future<> do_compaction(logstor_group&, compaction_batch_limits, abort_source&);
+    // Returns `n_in - n_out`: the segments that the job freed.
+    future<uint64_t> do_compaction(logstor_group&, compaction_batch_limits, abort_source&);
     future<> do_split_compaction(logstor_group&, mutation_writer::classify_by_token_group, split_target_group, abort_source&);
 
     group_compaction_state& get_group_state(logstor_group&);
@@ -872,6 +878,12 @@ private:
     friend class segment_stream_sink_impl;
 };
 
+uint64_t compaction_manager_impl::reclaimable_segments_allocated() const noexcept {
+    const auto& segments_get = _sm._segment_pool.get_stats().segments_get;
+    return segments_get[static_cast<size_t>(write_source::separator)]
+            + segments_get[static_cast<size_t>(write_source::streaming)];
+}
+
 future<> compaction_manager_impl::start() {
     _driver.start({
         .segment_count = _sm._configured_max_segments,
@@ -885,6 +897,7 @@ compaction_driver::shard_sample compaction_manager_impl::sample() const noexcept
         .available_segments = _sm.available_segment_count(write_source::normal_write),
         .utilization = _sm._segment_stats.utilization,
         .dead_segments = _sm._segment_stats.dead_segments,
+        .reclaimable_segments_allocated = reclaimable_segments_allocated(),
     };
 }
 
@@ -1588,10 +1601,15 @@ future<> compaction_manager_impl::submit_group_compaction(logstor_group& cg, std
     co_await coroutine::return_exception(std::runtime_error("logstor compaction submission is closed"));
 }
 
-future<> compaction_manager_impl::submit_normal_compaction(logstor_group& cg, compaction_batch_limits limits) {
-    co_await submit_group_compaction(cg, [this, &cg, limits] (group_compaction_state& state) {
-        return do_compaction(cg, limits, state.as);
+future<uint64_t> compaction_manager_impl::submit_normal_compaction(logstor_group& cg, compaction_batch_limits limits) {
+    // submit_group_compaction() waits for the job, so the job can write to this frame.
+    uint64_t reclaimed = 0;
+    co_await submit_group_compaction(cg, [this, &cg, limits, &reclaimed] (group_compaction_state& state) {
+        return do_compaction(cg, limits, state.as).then([&reclaimed] (uint64_t n) {
+            reclaimed = n;
+        });
     }, _cfg.compaction_sg);
+    co_return reclaimed;
 }
 
 future<> compaction_manager_impl::submit_split_compaction(logstor_group& src, mutation_writer::classify_by_token_group classifier, split_target_group target_group) {
@@ -1601,7 +1619,7 @@ future<> compaction_manager_impl::submit_split_compaction(logstor_group& src, mu
 }
 
 void compaction_manager_impl::submit(logstor_group& cg) {
-    (void)submit_normal_compaction(cg, _driver.explicit_batch_limits()).handle_exception([table_id = cg.table_id()] (std::exception_ptr ep) {
+    (void)submit_normal_compaction(cg, _driver.explicit_batch_limits()).discard_result().handle_exception([table_id = cg.table_id()] (std::exception_ptr ep) {
         logstor_logger.debug("logstor compaction for table {} failed: {}. Ignored", table_id, ep);
     });
 }
@@ -1671,6 +1689,7 @@ compaction_reenabler compaction_manager_impl::disable_compaction_no_wait(logstor
 future<compaction_driver::ranking>
 compaction_manager_impl::find_top_compaction_candidates(const compaction_batch_limits& limits, size_t max_candidates) {
     top_compaction_candidates<compaction_driver::candidate> best_candidates(max_candidates);
+    bool skipped_busy = false;
 
     std::vector<logstor_group*> group_snapshot;
     group_snapshot.reserve(_groups.size());
@@ -1687,7 +1706,14 @@ compaction_manager_impl::find_top_compaction_candidates(const compaction_batch_l
         }
 
         auto& state = *it->second;
-        if (state.running() || state.compaction_disabled_counter > 0) {
+        if (state.running()) {
+            skipped_busy = true;
+            continue;
+        }
+        // A group with compaction disabled, for example while it is streamed, truncated or split,
+        // does not count as busy, because otherwise the shares demand would increase for candidates
+        // that cannot run. The driver ranks it again after the wait timeout.
+        if (state.compaction_disabled_counter > 0) {
             continue;
         }
 
@@ -1699,6 +1725,7 @@ compaction_manager_impl::find_top_compaction_candidates(const compaction_batch_l
 
     co_return compaction_driver::ranking{
         .candidates = std::move(best_candidates).take_sorted(),
+        .skipped_busy_group = skipped_busy,
     };
 }
 
@@ -1828,11 +1855,11 @@ struct split_buffer_pair {
     }
 };
 
-future<> compaction_manager_impl::do_compaction(logstor_group& cg, compaction_batch_limits limits, abort_source& as) {
+future<uint64_t> compaction_manager_impl::do_compaction(logstor_group& cg, compaction_batch_limits limits, abort_source& as) {
     const auto segment_size = _sm.get_segment_size();
     auto batch = select_compaction_batch(cg.logstor_segments(), segment_size, limits);
     if (!batch) {
-        co_return;
+        co_return 0;
     }
     auto segments = batch->segments
             | std::views::transform([this] (const segment_descriptor* desc) { return _sm.desc_to_segment_id(*desc); })
@@ -1896,6 +1923,7 @@ future<> compaction_manager_impl::do_compaction(logstor_group& cg, compaction_ba
     _stats.records_rewritten += cb_stats.records_rewritten;
     _stats.records_skipped += cb_stats.records_skipped;
     _stats.bytes_read += nonempty_segments.size() * _sm.get_segment_size();
+    co_return compaction_segments_in > compaction_segments_out ? compaction_segments_in - compaction_segments_out : 0;
 }
 
 future<> compaction_manager_impl::do_split_compaction(logstor_group& src, mutation_writer::classify_by_token_group classifier, split_target_group target_group, abort_source& as) {

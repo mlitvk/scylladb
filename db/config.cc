@@ -1020,14 +1020,14 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     , logstor_compaction_utilization_threshold(this, "logstor_compaction_utilization_threshold", liveness::LiveUpdate, value_status::Used, 0.5,
         "A logstor segment is compacted when the fraction of it that holds live data is below this value, while twice logstor_compaction_space_floor of the disk is free. "
         "When less of the disk is free, compaction also takes fuller segments. When more is free, it takes only segments under logstor_compaction_min_utilization_threshold. "
-        "A higher value frees space sooner, at a higher write amplification. 0 compacts only segments with no live data, and 1 or more disables automatic compaction.")
+        "Compaction runs at a rate that follows the write rate. A higher value frees space sooner, at a higher write amplification. 0 compacts only segments with no live data, and 1 or more disables automatic compaction.")
     , logstor_compaction_min_utilization_threshold(this, "logstor_compaction_min_utilization_threshold", liveness::LiveUpdate, value_status::Used, 0.1,
         "The utilization threshold of logstor compaction while more than twice logstor_compaction_space_floor of the disk is free. It limits the space that segments with a few long-lived records hold, "
         "at a lower write amplification than logstor_compaction_utilization_threshold. A value at or above logstor_compaction_utilization_threshold keeps that threshold also when more of the disk is free.")
     , logstor_compaction_min_shares(this, "logstor_compaction_min_shares", liveness::LiveUpdate, value_status::Used, 50,
-        "CPU shares of the logstor compaction scheduling group while twice logstor_compaction_space_floor or more of the disk is free.")
+        "CPU shares that the logstor compaction scheduling group decreases to while compaction is idle or throttled and twice logstor_compaction_space_floor or more of the disk is free.")
     , logstor_compaction_max_shares(this, "logstor_compaction_max_shares", liveness::LiveUpdate, value_status::Used, 2000,
-        "Maximum CPU shares of the logstor compaction scheduling group, reached at logstor_compaction_space_floor. As the free space falls from twice the space floor to the space floor, the shares increase linearly.")
+        "Maximum CPU shares of the logstor compaction scheduling group, reached when compaction cannot keep up with the write rate or at logstor_compaction_space_floor. As the free space falls from twice the space floor to the space floor, the shares increase at least linearly to this value.")
     , file_cache_size_in_mb(this, "file_cache_size_in_mb", value_status::Unused, 512,
         "Total memory to use for SSTable-reading buffers.")
     , memtable_flush_queue_size(this, "memtable_flush_queue_size", value_status::Unused, 4,
