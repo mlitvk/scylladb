@@ -510,6 +510,12 @@ struct load_stats {
     // Size-based load balancing data
     tablet_load_stats_map tablet_stats;
 
+    // The shards of each host whose logstor pool is critical: the live records take more of the
+    // pool than logstor_critical_utilization_level, so the shard refuses streamed logstor tablets.
+    // A host that reports is present with an empty vector when none of its shards is critical.
+    // Last, as in the IDL: the deserializer constructs the struct by position.
+    std::unordered_map<locator::host_id, std::vector<shard_id>> logstor_pool_critical;
+
     // Distinguishes a default-constructed (null) load_stats from one that has
     // been aggregated via operator+=.  A null element contributes nothing when
     // merged, while an aggregated-but-empty stats (e.g. from a node that

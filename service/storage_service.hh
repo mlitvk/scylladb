@@ -60,6 +60,7 @@ class node_ops_cmd_response;
 class node_ops_info;
 class repair_service;
 class protocol_server;
+class storage_service_test;
 
 namespace cql3 { class query_processor; }
 
@@ -1156,6 +1157,7 @@ public:
     friend class topo::global_topology_request_virtual_task;
     friend class vnodes_to_tablets::migration_virtual_task;
     friend class vnodes_to_tablets::pow2_convergence_virtual_task;
+    friend class ::storage_service_test;
 };
 
 }
