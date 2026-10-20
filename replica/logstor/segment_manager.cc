@@ -53,6 +53,7 @@
 #include "utils/dynamic_bitset.hh"
 #include "utils/serialized_action.hh"
 #include "replica/database.hh"
+#include "replica/exceptions.hh"
 
 namespace replica::logstor {
 
@@ -2594,16 +2595,34 @@ future<std::unique_ptr<record_stream_source>> segment_manager_impl::make_record_
             _stream_stats);
 }
 
+// A streamed tablet takes the space that compaction needs. The check reads the live records over the
+// pool and not the free segments, because compaction can reclaim the dead records and not the live
+// ones. The exception is the one that an sstable stream fails with on a full disk. The node reports
+// the shard as critical in its load stats, so the topology coordinator rolls the migration back and
+// does not retry it.
+static std::exception_ptr streamed_segment_refused() {
+    return std::make_exception_ptr(replica::critical_disk_utilization_exception("rejected streamed logstor segment"));
+}
+
 future<std::unique_ptr<record_stream_sink>> segment_manager_impl::make_record_stream_sink(table_id table,
         record_stream_sink::target_resolver resolve_target) {
     // Taken before the buffer, so that a sink is never made while the segment manager stops.
     auto holder = _async_gate.hold();
+    if (pool_critical()) {
+        co_await coroutine::return_exception_ptr(streamed_segment_refused());
+    }
     // Not requested at stop: stop() waits at the gate for the sinks, so a sink that waits for a
     // buffer gets one when another sink ends.
     abort_source never_aborted;
     auto buffer = co_await _stream_buffer_pool.allocate(never_aborted);
     co_return std::make_unique<record_stream_sink>(table, std::move(resolve_target), std::move(buffer),
             [this] (write_buffer& wb, logstor_group& cg) {
+                // The level can rise during a long stream. The records of a segment count in the
+                // live records when the segment is written, so each open sink writes at most one
+                // segment above the level.
+                if (pool_critical()) {
+                    return make_exception_future<>(streamed_segment_refused());
+                }
                 return write_full_segment(wb, cg, write_source::streaming);
             },
             std::move(holder), _stream_stats);
