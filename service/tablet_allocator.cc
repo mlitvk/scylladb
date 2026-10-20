@@ -1588,7 +1588,7 @@ public:
                 auto& tmap = tmeta.get_tablet_map(source_tablets.table());
                 auto mig_streaming_info = get_migration_streaming_infos(topo, tmap, mig);
                 pick(*_load_sketch, dst.host, dst.shard, source_tablets);
-                if (can_accept_load(nodes, mig_streaming_info)) {
+                if (can_accept_load(nodes, mig_streaming_info) && can_stream_to(source_tablets.table(), mig_streaming_info)) {
                     apply_load(nodes, mig_streaming_info);
                     lblogger.debug("Adding migration: {}", mig);
                     mark_as_scheduled(mig);
@@ -1966,7 +1966,7 @@ public:
                         };
                         auto mig_streaming_info = get_migration_streaming_info(topo, ti, mig);
                         pick(*_load_sketch, dst.host, dst.shard, source_tablets);
-                        if (can_accept_load(nodes, mig_streaming_info)) {
+                        if (can_accept_load(nodes, mig_streaming_info) && can_stream_to(gid.table, mig_streaming_info)) {
                             lblogger.debug("Starting rebuild_v2 transition to {}.{} of tablet {}; new_replica = {}", dc, rack, gid, pending_replica);
                             apply_load(nodes, mig_streaming_info);
                             mark_as_scheduled(mig);
@@ -2237,7 +2237,7 @@ public:
 
                 auto mig = create_migration_info(t2_id, src, dst);
                 auto mig_streaming_info = get_migration_streaming_info(_tm->get_topology(), *t2.info, mig);
-                if (!can_accept_load(nodes, mig_streaming_info)) {
+                if (!can_accept_load(nodes, mig_streaming_info) || !can_stream_to(t2_id.table, mig_streaming_info)) {
                     // FIXME: we can try another pair of non-colocated replicas of same sibling tablets.
                     lblogger.debug("Load limit reached, unable to emit migration for replica ({}, {}) to co-habit the replica ({}, {})",
                         t2_id, src, t1_id, dst);
@@ -3098,6 +3098,33 @@ public:
         return can_accept_load(nodes, info);
     }
 
+    // Whether every replica the migration streams into accepts the stream. A shard whose logstor
+    // pool is critical refuses streamed logstor tablets: the coordinator would roll the migration
+    // back, and the next plan would pick the shard again.
+    bool can_stream_to(table_id table, const tablet_migration_streaming_info& info) {
+        if (!_table_load_stats || _table_load_stats->logstor_pool_critical.empty()) {
+            return true;
+        }
+        for (auto r : info.written_to) {
+            auto it = _table_load_stats->logstor_pool_critical.find(r.host);
+            if (it == _table_load_stats->logstor_pool_critical.end() || std::ranges::find(it->second, r.shard) == it->second.end()) {
+                continue;
+            }
+            auto t = _db.get_tables_metadata().get_table_if_exists(table);
+            if (t && t->uses_logstor()) {
+                lblogger.debug("Migration skipped because the logstor pool of {} is critical", r);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Precondition: all migration streaming info have the same destination, and the tablets
+    // of a migration set belong to one table, so the first info answers for all of them.
+    bool can_stream_to(table_id table, const migration_streaming_info_vector& infos) {
+        return can_stream_to(table, infos[0]);
+    }
+
     bool in_shuffle_mode() const {
         return utils::get_local_injector().enter("tablet_allocator_shuffle");
     }
@@ -3566,7 +3593,7 @@ public:
             auto& tmap = tmeta.get_tablet_map(tablets.table());
             auto mig_streaming_info = get_migration_streaming_infos(_tm->get_topology(), tmap, mig);
 
-            if (!can_accept_load(nodes, mig_streaming_info)) {
+            if (!can_accept_load(nodes, mig_streaming_info) || !can_stream_to(tablets.table(), mig_streaming_info)) {
                 _current_stats->migrations_skipped++;
                 lblogger.debug("Unable to balance {}: load limit reached", host);
                 break;
@@ -4299,7 +4326,7 @@ public:
 
             pick(*_load_sketch, dst.host, dst.shard, source_tablets);
 
-            if (can_accept_load(nodes, mig_streaming_info)) {
+            if (can_accept_load(nodes, mig_streaming_info) && can_stream_to(source_tablets.table(), mig_streaming_info)) {
                 apply_load(nodes, mig_streaming_info);
                 lblogger.debug("Adding migration: {} size: {}", mig, source_tablets.tablet_set_disk_size);
                 _current_stats->migrations_produced++;
