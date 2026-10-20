@@ -824,7 +824,8 @@ async def test_automatic_compaction_follows_the_utilization_threshold(manager: S
     always gets a segment, and once the writes stop the dead segments are freed and the configured
     threshold applies again.
 
-    A disk of 64 segments cannot show how smoothly the rate is held.
+    A disk of 64 segments cannot show how smoothly the rate is held, so
+    test/manual/logstor_compaction_sim.cc measures that instead.
     """
     disk_size_mb = 8
     file_size_mb = 1
