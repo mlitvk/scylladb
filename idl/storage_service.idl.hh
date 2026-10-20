@@ -47,6 +47,7 @@ struct load_stats {
     std::unordered_map<locator::host_id, uint64_t> capacity;
     std::unordered_map<locator::host_id, bool> critical_disk_utilization [[version 2025.3]];
     std::unordered_map<locator::host_id, locator::tablet_load_stats> tablet_stats [[version 2026.1]];
+    std::unordered_map<locator::host_id, std::vector<unsigned>> logstor_pool_critical [[version 2026.4]];
 };
 
 }

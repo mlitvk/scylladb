@@ -6387,6 +6387,7 @@ future<locator::load_stats> storage_service::load_stats_for_tablet_based_tables(
     struct alignas(64) shard_load {
         uint64_t sstable_tablet_sizes = 0;
         uint64_t logstor_space = 0;
+        bool logstor_pool_critical = false;
     };
     std::vector<shard_load> load_per_shard(this_smp_shard_count());
 
@@ -6412,12 +6413,23 @@ future<locator::load_stats> storage_service::load_stats_for_tablet_based_tables(
             co_await coroutine::maybe_yield();
         }
         load_per_shard[this_shard_id()].logstor_space = db.logstor_space_on_disk();
+        load_per_shard[this_shard_id()].logstor_pool_critical = db.logstor_pool_critical();
 
         co_return std::move(load_stats);
     }, locator::load_stats{}, std::plus<locator::load_stats>());
 
     load_stats.capacity[this_host] = _disk_space_monitor->space().capacity;
     load_stats.critical_disk_utilization[this_host] = _disk_space_monitor->disk_utilization() > _db.local().get_config().critical_disk_utilization_level();
+    // A shard whose logstor pool is critical refuses streamed logstor tablets. The topology
+    // coordinator rolls a logstor migration into such a shard back instead of retrying it, and the
+    // balancer does not plan one. The filesystem flag above stays what it is: the pool of one shard
+    // says nothing about the disk the other shards and the sstables share.
+    auto& critical_shards = load_stats.logstor_pool_critical[this_host];
+    for (shard_id shard = 0; shard < load_per_shard.size(); ++shard) {
+        if (load_per_shard[shard].logstor_pool_critical) {
+            critical_shards.push_back(shard);
+        }
+    }
 
     const std::filesystem::space_info si = _disk_space_monitor->space();
     load_stats.capacity[this_host] = si.capacity;

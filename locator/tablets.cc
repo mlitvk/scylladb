@@ -1345,6 +1345,9 @@ load_stats& load_stats::operator+=(const load_stats& s) {
     for (auto& [host, cdu] : s.critical_disk_utilization) {
         critical_disk_utilization[host] = cdu;
     }
+    for (auto& [host, shards] : s.logstor_pool_critical) {
+        logstor_pool_critical[host] = shards;
+    }
     for (auto& [host, tablet_ls] : s.tablet_stats) {
         tablet_stats[host].effective_capacity = tablet_ls.effective_capacity;
         tablet_stats[host].add_tablet_sizes(tablet_ls);
