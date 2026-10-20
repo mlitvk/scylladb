@@ -292,8 +292,8 @@ async def test_threshold_policy(simulator_path):
         report, r"policy\s+utilization threshold ([\d.]+) at (\d+) free, 1 at the space floor of (\d+), (.*)")
     assert threshold == "0.5"
     assert int(anchor) == 2 * int(space_floor)
-    # The minimum defaults to 1, which keeps the threshold constant above the anchor.
-    assert ceiling == "constant above the anchor"
+    # The ceiling and the minimum default to the database defaults: a segment above the anchor, and 0.1.
+    assert ceiling == f"0.1 at {int(anchor) + 1}"
 
     report = await run_ok(simulator_path, [*SMALL_DISK, *THRESHOLD, "--utilization", "0.4",
             "--threshold-anchor", "0.15", "--threshold-ceiling", "0.3", "--min-utilization-threshold", "0"])
@@ -301,10 +301,9 @@ async def test_threshold_policy(simulator_path):
     assert report_value(report, r"policy\s+utilization threshold 0.5 at (\d+) free, .*, 0 at (\d+)") == (
             str(round(0.15 * SEGMENTS)), str(round(0.3 * SEGMENTS)))
 
-    # The ceiling defaults to a segment above the anchor.
-    report = await run_ok(simulator_path, [*SMALL_DISK, *THRESHOLD, "--utilization", "0.4", "--min-utilization-threshold", "0.1"])
+    report = await run_ok(simulator_path, [*SMALL_DISK, *THRESHOLD, "--utilization", "0.4", "--min-utilization-threshold", "1"])
     check_report(report, 0.4)
-    assert report_value(report, r"policy\s+.*, 0.1 at (\d+)")[0] == str(int(anchor) + 1)
+    assert "constant above the anchor" in report
 
 
 async def test_utilization_threshold(simulator_path):

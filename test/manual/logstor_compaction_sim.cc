@@ -259,12 +259,12 @@ struct sim_params {
     double space_floor = 1.0 / 32;
     // Where on the free level the threshold applies and where it has fallen to its minimum, as
     // fractions of the disk, 0 for the engine's defaults - an anchor at twice the space floor and a
-    // ceiling a segment above it - and the minimum, which at or above the threshold keeps the
-    // threshold constant above the anchor. The ceiling is the stiffness: one just above the anchor
-    // holds the free level there, which is what the relay does, made continuous.
+    // ceiling a segment above it - and the minimum, the database default. The ceiling is the
+    // stiffness: one just above the anchor holds the free level there, which is what the relay did,
+    // made continuous, and a minimum at the threshold is a constant threshold.
     double threshold_anchor = 0;
     double threshold_ceiling = 0;
-    double min_utilization_threshold = 1;
+    double min_utilization_threshold = 0.1;
     // The fewest candidates a job is run on while there is no space pressure, 0 for the engine's
     // effective_min_batch(). Under the threshold policy candidates arrive one at a time, so without
     // a floor a job is two or three segments.
