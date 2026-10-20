@@ -60,6 +60,7 @@
 #include "utils/exceptions.hh"
 #include "utils/serialized_action.hh"
 #include "replica/logstor/table_catalog.hh"
+#include "replica/exceptions.hh"
 
 namespace replica::logstor {
 
@@ -2547,11 +2548,23 @@ future<std::unique_ptr<record_stream_source>> segment_manager_impl::make_record_
             _stream_stats);
 }
 
+// A streamed tablet takes the space that compaction needs. The check reads the live records over the
+// pool and not the free segments, because compaction can reclaim the dead records and not the live
+// ones. The exception is the one that an sstable stream fails with on a full disk. The node reports
+// the shard as critical in its load stats, so the topology coordinator rolls the migration back and
+// does not retry it.
+static std::exception_ptr streamed_segment_refused() {
+    return std::make_exception_ptr(replica::critical_disk_utilization_exception("rejected streamed logstor segment"));
+}
+
 future<std::unique_ptr<record_stream_sink>> segment_manager_impl::make_record_stream_sink(table_id table,
         utils::phased_barrier::operation table_stream) {
     // This function holds the gate before it allocates buffers, so that no sink is made while the
     // segment manager stops.
     auto segment_manager_holder = _async_gate.hold();
+    if (pool_critical()) {
+        co_await coroutine::return_exception_ptr(streamed_segment_refused());
+    }
     // Nothing aborts the wait for the buffers at stop, because stop() waits at the gate for the
     // sinks, so a sink that waits for its buffers gets them when another sink ends.
     // The sink takes all its buffers in one call, because sinks that each hold a part of their
@@ -2560,6 +2573,12 @@ future<std::unique_ptr<record_stream_sink>> segment_manager_impl::make_record_st
     auto buffers = co_await _stream_buffer_pool.allocate_many(record_stream_sink_buffers, never_aborted);
     co_return std::make_unique<record_stream_sink>(table, _catalog, std::move(buffers),
             [this] (write_buffer& wb, logstor_group& group) {
+                // The level can rise during a long stream. The records of a segment count in the
+                // live records when the segment is written, so each open sink writes at most one
+                // segment above the level.
+                if (pool_critical()) {
+                    return make_exception_future<>(streamed_segment_refused());
+                }
                 // The sink waits for a segment with no abort source, as normal writes and the
                 // separator do. When the pool has no free segment, the sink waits until the pool
                 // gets one or until the replenisher fails.
