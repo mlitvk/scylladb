@@ -2970,11 +2970,16 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
 
                         bool critical_disk_utilization = false;
                         if (auto stats = _tablet_allocator.get_load_stats()) {
+                            const auto& pending = *trinfo.pending_replica;
                             const auto& util = stats->critical_disk_utilization;
-                            auto it = util.find(trinfo.pending_replica->host);
+                            auto it = util.find(pending.host);
                             critical_disk_utilization = (it != util.end() && it->second);
                             if (critical_disk_utilization) {
-                                rollback = fmt::format("critical disk utilization on {}", trinfo.pending_replica->host);
+                                rollback = fmt::format("critical disk utilization on {}", pending.host);
+                            } else if (logstor_pool_critical(*stats, gid.table, pending)) {
+                                // The shard refuses streamed logstor tablets, so a retry fails the same way.
+                                critical_disk_utilization = true;
+                                rollback = fmt::format("critical logstor pool on {} shard {}", pending.host, pending.shard);
                             }
                         }
 
@@ -3561,6 +3566,17 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
                     .build());
         }
         co_await update_topology_state(std::move(guard), std::move(updates), "Finished tablet migration");
+    }
+
+    // Whether the table uses logstor and the shard of the replica reports its logstor pool as
+    // critical. A table dropped in the meantime reads as not logstor.
+    bool logstor_pool_critical(const locator::load_stats& stats, table_id table, locator::tablet_replica replica) const {
+        auto t = _db.get_tables_metadata().get_table_if_exists(table);
+        if (!t || !t->uses_logstor()) {
+            return false;
+        }
+        auto it = stats.logstor_pool_critical.find(replica.host);
+        return it != stats.logstor_pool_critical.end() && std::ranges::find(it->second, replica.shard) != it->second.end();
     }
 
     // Migrates tablet size from leaving to pending host after migration,

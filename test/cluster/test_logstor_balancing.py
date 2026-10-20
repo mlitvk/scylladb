@@ -19,7 +19,7 @@ from cassandra.murmur3 import murmur3
 
 from test.pylib.rest_client import read_barrier
 from test.pylib.scylla_cluster_manager import ScyllaClusterManager
-from test.pylib.tablets import get_all_tablet_replicas, get_tablet_count
+from test.pylib.tablets import get_all_tablet_replicas, get_tablet_count, get_tablet_replica
 from test.pylib.util import wait_for
 from test.cluster.util import get_topology_coordinator, new_test_keyspace
 
@@ -364,3 +364,73 @@ async def test_tablet_sizes_reach_coordinator(manager: ScyllaClusterManager):
         assert load.effective_capacity >= disk_usage
         assert load.storage_load == size
         assert 0 <= load.storage_utilization < 1
+
+
+async def test_pool_critical_rolls_back_migration(manager: ScyllaClusterManager):
+    """
+    The live records of a node take more of its logstor pool than logstor_critical_utilization_level.
+    A logstor tablet moved into it must be refused, and the topology coordinator must roll the
+    migration back rather than retry it, because the node reports the shard as critical. The stream
+    of an sstable tablet into the same node that fails once is retried, not rolled back: the pool of
+    a shard says nothing about the disk. Once the level is raised, the logstor move succeeds.
+    """
+    value = 'x' * (60 * 1024)
+    # 25 keys of 60KB in each of the two tablets of the critical node take about 3MB of its 8MB
+    # pool, above the level of 0.25. The tablet to move holds a few keys, so it has records to
+    # stream: a tablet with no live record streams nothing, and nothing would be refused.
+    keys_per_tablet = 25
+    keys_to_move = 4
+    critical_cfg = cfg | {'logstor_critical_utilization_level': 0.25}
+    critical_cmdline = cmdline + ['--logger-log-level', 'stream_blob=debug']
+
+    servers = await manager.servers_add(2, cmdline=critical_cmdline, config=critical_cfg, property_file={'dc': 'dc1', 'rack': 'r1'})
+    cql = manager.get_cql()
+    await manager.disable_tablet_balancing()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'initial': 4}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v text) WITH storage_engine = 'logstor'")
+        await cql.run_async(f"CREATE TABLE {ks}.sst (pk int PRIMARY KEY, v text)")
+
+        source_host = await manager.get_host_id(servers[0].server_id)
+        target_host = await manager.get_host_id(servers[1].server_id)
+        tablets = await keys_by_tablet(manager, servers[0], ks, 'test', keys_per_tablet)
+        assert sorted(host for _, host, _ in tablets) == sorted([source_host] * 2 + [target_host] * 2), f"expected 2 tablets on each node, got {tablets}"
+        moved_token, _, moved_keys = next(t for t in tablets if t[1] == source_host)
+        moved_keys = moved_keys[:keys_to_move]
+        await write(cql, ks, [pk for _, host, keys in tablets if host == target_host for pk in keys] + moved_keys, value)
+        await flush_and_refresh(manager, servers)
+
+        target_log = await manager.server_open_log(servers[1].server_id)
+        target_mark = await target_log.mark()
+        coordinator = await manager.find_server_by_host_id(servers, await get_topology_coordinator(manager))
+        coordinator_log = await manager.server_open_log(coordinator.server_id)
+        coordinator_mark = await coordinator_log.mark()
+
+        try:
+            await manager.api.move_tablet(servers[0].ip_addr, ks, 'test', source_host, 0, target_host, 0, moved_token)
+        except Exception as e:
+            logger.info(f"move_tablet failed: {e}")
+        await target_log.wait_for('rejected streamed logstor segment', from_mark=target_mark, timeout=60)
+        await coordinator_log.wait_for(f'critical logstor pool on {target_host} shard 0', from_mark=coordinator_mark, timeout=60)
+        await manager.api.quiesce_topology(servers[0].ip_addr)
+        assert await get_tablet_replica(manager, servers[0], ks, 'test', moved_token) == (source_host, 0)
+
+        # The injection fails the stream of the next migration once, before it starts. Without a
+        # critical node the coordinator retries, and the second attempt streams the tablet.
+        sst_token = next(t for t in await get_all_tablet_replicas(manager, servers[0], ks, 'sst') if t.replicas[0][0] == source_host).last_token
+        coordinator_mark = await coordinator_log.mark()
+        await manager.api.enable_injection(coordinator.ip_addr, 'stream_tablet_fail', one_shot=True)
+        await manager.api.move_tablet(servers[0].ip_addr, ks, 'sst', source_host, 0, target_host, 0, sst_token)
+        assert await get_tablet_replica(manager, servers[0], ks, 'sst', sst_token) == (target_host, 0)
+        rollbacks = await coordinator_log.grep('Will set tablet .* stage to .*critical', from_mark=coordinator_mark)
+        assert rollbacks == [], f"the sstable migration was rolled back: {[line for line, _ in rollbacks]}"
+
+        for s in servers:
+            await manager.server_update_config(s.server_id, 'logstor_critical_utilization_level', 0.85)
+        await flush_and_refresh(manager, servers)
+        await manager.api.move_tablet(servers[0].ip_addr, ks, 'test', source_host, 0, target_host, 0, moved_token)
+        assert await get_tablet_replica(manager, servers[0], ks, 'test', moved_token) == (target_host, 0)
+
+        rows = await cql.run_async(f"SELECT pk, v FROM {ks}.test WHERE pk IN ({', '.join(map(str, moved_keys))})")
+        assert sorted(r.pk for r in rows) == sorted(moved_keys)
+        assert all(r.v == value for r in rows)
