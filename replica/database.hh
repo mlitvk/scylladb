@@ -1908,7 +1908,10 @@ public:
     db::schema_ctxt get_schema_ctxt();
     future<> init_commitlog();
     future<> init_logstor();
-    future<> recover_logstor();
+    // Recovers the logstor of the shard and starts it. Returns nothing when logstor is not used.
+    future<std::optional<logstor::recovery_summary>> recover_logstor();
+    // Recovers the logstor of every shard, and logs what the recovery of the node took.
+    static future<> recover_logstor_on_all_shards(sharded<database>& sharded_db);
     const gms::feature_service& features() const { return _feat; }
     future<> apply_in_memory(const frozen_mutation& m, schema_ptr m_schema, db::rp_handle&&,
                                db::timeout_clock::time_point timeout,

@@ -1210,6 +1210,7 @@ async def test_recovery_after_tablet_migration(manager: ScyllaClusterManager):
 
         matches = await server_log.grep(r"Recovery dropped (\d+) records", from_mark=log_mark)
         assert sum(int(m.group(1)) for _, m in matches) >= nrows
+        assert await server_log.grep(r"Recovery of 2 shards complete in", from_mark=log_mark)
 
 @pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
 async def test_tablet_migration_with_compaction(manager: ScyllaClusterManager):

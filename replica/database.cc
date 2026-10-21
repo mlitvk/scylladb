@@ -1054,17 +1054,49 @@ database::init_logstor() {
     co_return;
 }
 
-future<>
+future<std::optional<logstor::recovery_summary>>
 database::recover_logstor() {
     if (!_logstor) {
-        co_return;
+        co_return std::nullopt;
     }
 
-    co_await _logstor->do_recovery(*_logstor_catalog);
+    auto summary = co_await _logstor->do_recovery(*_logstor_catalog);
 
     co_await _logstor->start();
 
     _dirty_memory_threshold_controller.arm_periodic(std::chrono::seconds(5));
+    co_return summary;
+}
+
+// The shards recover at the same time from the same disk, so the node waits for the slowest
+// shard, and the rate of the node is what all shards read in that time.
+future<> database::recover_logstor_on_all_shards(sharded<database>& sharded_db) {
+    const auto summaries = co_await sharded_db.map([] (database& db) {
+        return db.recover_logstor();
+    });
+    std::optional<shard_id> slowest;
+    uint64_t segments = 0;
+    uint64_t records = 0;
+    uint64_t read_bytes = 0;
+    for (shard_id shard = 0; shard < summaries.size(); ++shard) {
+        const auto& summary = summaries[shard];
+        if (!summary) {
+            continue;
+        }
+        if (!slowest || summary->duration > summaries[*slowest]->duration) {
+            slowest = shard;
+        }
+        segments += summary->counters.segments_scanned;
+        records += summary->counters.records_read;
+        read_bytes += summary->step(logstor::recovery_step::index).read_bytes;
+    }
+    if (!slowest) {
+        co_return;
+    }
+    const auto seconds = std::chrono::duration<double>(summaries[*slowest]->duration).count();
+    logstor::logstor_logger.info("Recovery of {} shards complete in {:.3f}s, the time of shard {}: scanned {} segments ({:.1f} GiB, {:.1f} MiB/s) "
+            "and {} records", summaries.size(), seconds, *slowest, segments, double(read_bytes) / (1024 * 1024 * 1024),
+            seconds > 0 ? double(read_bytes) / (1024 * 1024) / seconds : 0, records);
 }
 
 future<> database::modify_keyspace_on_all_shards(sharded<database>& sharded_db, std::function<future<>(replica::database&)> func) {
