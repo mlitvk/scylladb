@@ -37,7 +37,9 @@
 #include <seastar/core/scheduling.hh>
 #include <seastar/core/when_all.hh>
 #include <seastar/core/on_internal_error.hh>
+#include <seastar/core/reactor.hh>
 #include <seastar/core/shard_id.hh>
+#include <seastar/core/thread_cputime_clock.hh>
 #include <seastar/coroutine/parallel_for_each.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/coroutine/exception.hh>
@@ -2389,6 +2391,37 @@ future<> compaction_manager_impl::flush_separator_buffer(separator_buffer& buf, 
     co_await buf.release();
 }
 
+namespace {
+
+double to_seconds(std::chrono::steady_clock::duration d) noexcept {
+    return std::chrono::duration<double>(d).count();
+}
+
+double per_second(double count, std::chrono::steady_clock::duration d) noexcept {
+    const auto seconds = to_seconds(d);
+    return seconds > 0 ? count / seconds : 0;
+}
+
+double to_mib(uint64_t bytes) noexcept {
+    return double(bytes) / (1024 * 1024);
+}
+
+std::string_view recovery_step_name(recovery_step step) noexcept {
+    switch (step) {
+    case recovery_step::open_files: return "open files";
+    case recovery_step::load_erased_ranges: return "load erased ranges";
+    case recovery_step::index: return "index";
+    case recovery_step::place: return "place";
+    case recovery_step::retire_files: return "retire files";
+    case recovery_step::resume_sequence: return "resume sequence";
+    case recovery_step::drop_obsolete_erased_ranges: return "drop obsolete erased ranges";
+    case recovery_step::finish_files: return "finish files";
+    }
+    return "unknown";
+}
+
+} // anonymous namespace
+
 // One recovery of the segments of the shard. do_recovery() makes one and runs it. The steps run in
 // the order of run(), and each step starts from the state that the step before it leaves.
 class segment_manager_impl::recovery {
@@ -2416,6 +2449,36 @@ public:
     future<recovery_summary> run();
 
 private:
+    // The clocks and the I/O counters of the shard at one point of a recovery.
+    struct sample {
+        std::chrono::steady_clock::time_point wall;
+        thread_cputime_clock::time_point cpu;
+        reactor::io_stats io;
+
+        static sample now() {
+            return {std::chrono::steady_clock::now(), thread_cputime_clock::now(), engine().get_io_stats()};
+        }
+    };
+
+    template <typename Func>
+    future<> run_step(recovery_step step, Func func) {
+        const auto start = sample::now();
+        co_await futurize_invoke(func);
+        const auto end = sample::now();
+        _summary.steps[static_cast<size_t>(step)] = recovery_step_stats{
+            .wall = end.wall - start.wall,
+            .cpu = end.cpu - start.cpu,
+            .reads = end.io.aio_reads - start.io.aio_reads,
+            .read_bytes = end.io.aio_read_bytes - start.io.aio_read_bytes,
+            .writes = end.io.aio_writes - start.io.aio_writes,
+            .write_bytes = end.io.aio_write_bytes - start.io.aio_write_bytes,
+            .stream_read_bytes = end.io.fstream_read_bytes - start.io.fstream_read_bytes,
+            .stream_read_bytes_waited = end.io.fstream_read_bytes_blocked - start.io.fstream_read_bytes_blocked,
+        };
+    }
+
+    void log_summary() const;
+
     future<> open_found_files();
     future<> load_erased_ranges();
     future<> index_found_segments();
@@ -2427,21 +2490,46 @@ private:
 
 future<recovery_summary> segment_manager_impl::recovery::run() {
     logstor_logger.info("Starting recovery for shard {} in directory {}", this_shard_id(), _sm._cfg.base_dir.string());
+    const auto start = std::chrono::steady_clock::now();
 
-    co_await open_found_files();
-    co_await load_erased_ranges();
-    co_await index_found_segments();
-    co_await place_found_segments();
-    co_await retire_unused_files();
-    resume_segment_sequence();
-    co_await drop_obsolete_erased_ranges();
-    co_await _files.finish();
+    co_await run_step(recovery_step::open_files, [this] { return open_found_files(); });
+    co_await run_step(recovery_step::load_erased_ranges, [this] { return load_erased_ranges(); });
+    co_await run_step(recovery_step::index, [this] { return index_found_segments(); });
+    co_await run_step(recovery_step::place, [this] { return place_found_segments(); });
+    co_await run_step(recovery_step::retire_files, [this] { return retire_unused_files(); });
+    co_await run_step(recovery_step::resume_sequence, [this] { resume_segment_sequence(); });
+    co_await run_step(recovery_step::drop_obsolete_erased_ranges, [this] { return drop_obsolete_erased_ranges(); });
+    co_await run_step(recovery_step::finish_files, [this] { return _files.finish(); });
 
-    logstor_logger.info("Recovery complete: {} live records in {} used segments, {} free segments, {} found segments, "
-            "{} dropped records, {} erased records, {} full segments to separate, next segment sequence {}",
-            _sm._stats.live_record_count, _summary.used_segments, _summary.free_segments, _summary.found_segments,
-            _summary.counters.dropped_records, _summary.counters.records_erased, _summary.counters.separated_segments, _summary.next_segment_seq);
+    _summary.duration = std::chrono::steady_clock::now() - start;
+    log_summary();
     co_return _summary;
+}
+
+// One info line with what a recovery of the shard found and took, and a debug line for each step.
+void segment_manager_impl::recovery::log_summary() const {
+    const auto& c = _summary.counters;
+    const auto& index = _summary.step(recovery_step::index);
+    const auto& place = _summary.step(recovery_step::place);
+    logstor_logger.info("Recovery complete in {:.3f}s: {} live records in {} used segments, {} free segments, {} found segments, "
+            "next segment sequence {}; index {:.3f}s, place {:.3f}s, other {:.3f}s; "
+            "scanned {} segments ({:.0f}/s, {:.1f} MiB/s, {} empty) and {} records ({:.0f}/s: {} new keys, {} replaced, {} superseded, "
+            "{} of gone tables, {} erased, {} dropped records); placed {} full segments, listed {} mixed and {} full segments for separation",
+            to_seconds(_summary.duration), _sm._stats.live_record_count, _summary.used_segments, _summary.free_segments,
+            _summary.found_segments, _summary.next_segment_seq,
+            to_seconds(index.wall), to_seconds(place.wall), to_seconds(_summary.duration - index.wall - place.wall),
+            c.segments_scanned, per_second(c.segments_scanned, index.wall), per_second(to_mib(index.read_bytes), index.wall), c.empty_segments,
+            c.records_read, per_second(c.records_read, index.wall), c.records_new_key, c.records_replaced, c.records_superseded,
+            c.records_of_gone_tables, c.records_erased, c.dropped_records,
+            c.full_segments_placed, c.mixed_segments_separated, c.separated_segments);
+    for (size_t i = 0; i < recovery_step_count; ++i) {
+        const auto& s = _summary.steps[i];
+        logstor_logger.debug("Recovery step {}: {:.3f}s, cpu {:.3f}s, {} reads ({:.1f} MiB, {:.1f} MiB/s), {} writes ({:.1f} MiB), "
+                "streams gave {:.1f} MiB, {:.1f} MiB of it after a wait",
+                recovery_step_name(recovery_step(i)), to_seconds(s.wall), std::chrono::duration<double>(s.cpu).count(),
+                s.reads, to_mib(s.read_bytes), per_second(to_mib(s.read_bytes), s.wall), s.writes, to_mib(s.write_bytes),
+                to_mib(s.stream_read_bytes), to_mib(s.stream_read_bytes_waited));
+    }
 }
 
 // Opens the found files, and makes every segment in them an empty segment that is not new.
@@ -2734,6 +2822,7 @@ future<> segment_manager_impl::separate_recovered_segments() {
     // with no owner. Nothing frees them: no group owns them and no reference holds them, and the
     // segment that failed keeps its reference with the flush failure set. The index still points
     // into them, so no record is lost, and the next recovery lists them again.
+    const auto start = std::chrono::steady_clock::now();
     separation_counters counters;
     for (auto seg_id : recovered.to_separate) {
         co_await separate_segment_records(*recovered.catalog, seg_id, counters);
@@ -2741,8 +2830,10 @@ future<> segment_manager_impl::separate_recovered_segments() {
     if (counters.dropped_records) {
         logstor_logger.warn("Dropped {} records of recovered segments that belong to no compaction group of this shard", counters.dropped_records);
     }
-    logstor_logger.info("Separated the records of {} recovered segments: {} records, {} bytes",
-            recovered.to_separate.size(), counters.records, counters.record_bytes);
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    logstor_logger.info("Separated the records of {} recovered segments in {:.3f}s: {} records ({:.0f}/s), {:.1f} MiB",
+            recovered.to_separate.size(), to_seconds(elapsed), counters.records, per_second(counters.records, elapsed),
+            to_mib(counters.record_bytes));
 }
 
 future<> segment_manager_impl::separate_segment_records(recovery_catalog& catalog, log_segment_id seg_id, separation_counters& counters) {
