@@ -22,5 +22,6 @@ class segment_set;
 struct segment_snapshot;
 class segment_stream_sink;
 class recovery_catalog;
+struct recovery_summary;
 
 } // namespace replica::logstor

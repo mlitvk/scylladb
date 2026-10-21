@@ -2368,9 +2368,7 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             replica::distributed_loader::init_non_system_keyspaces(db, proxy, sys_ks, group0_client, stop_signal.as_local_abort_source()).get();
 
             checkpoint(stop_signal, "recovering logstor");
-            db.invoke_on_all([] (replica::database& db) {
-                return db.recover_logstor();
-            }).get();
+            replica::database::recover_logstor_on_all_shards(db).get();
 
             checkpoint(stop_signal, "starting commit log");
             auto cl = db.local().commitlog();

@@ -1364,6 +1364,7 @@ async def test_recovery_after_tablet_migration(manager: ScyllaClusterManager):
         await assert_no_dropped_records(server_log, log_mark)
         matches = await server_log.grep(r"Recovery complete .*, (\d+) erased, \d+ dropped records", from_mark=log_mark)
         assert sum(int(m.group(1)) for _, m in matches) >= nrows
+        assert await server_log.grep(r"Recovery of 2 shards complete in", from_mark=log_mark)
         metrics = await manager.metrics.query(s1.ip_addr)
         assert (metrics.get("scylla_logstor_sm_erased_ranges") or 0) >= 1
 
