@@ -24,6 +24,7 @@
 #include <concepts>
 #include <system_error>
 #include <type_traits>
+#include <variant>
 #include <seastar/core/file.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/fstream.hh>
@@ -514,6 +515,157 @@ static sstring write_source_to_string(write_source src) {
     return "unknown";
 }
 
+// Chooses the segment that the reserve replenisher allocates next: a new segment while there are
+// configured segments that were never allocated, else a free segment, else it waits for a segment
+// to be freed. Only the replenisher allocates, so one allocate() runs at a time.
+class segment_allocator {
+public:
+    // The allocator uses this interface to check and open segments, and to ask for compaction.
+    class source {
+    public:
+        virtual ~source() = default;
+        // Returns true if open() can open the segment without a wait for the format of its file.
+        virtual bool is_ready(log_segment_id) = 0;
+        // Opens a segment for writes, and waits for the format of the file of a new segment. It can
+        // fail, for example when the file cannot be allocated.
+        virtual future<seg_ptr> open(log_segment_id) = 0;
+        // The allocator calls this when it must use the free segments, because the new segments are
+        // used up or cannot be allocated now.
+        virtual void need_free_segments() = 0;
+    };
+
+    // allocate() returns this when stop_waiting() ends its wait for a free segment.
+    struct stopped {};
+    using allocate_result = std::variant<seg_ptr, stopped>;
+
+private:
+    // Compaction can fail to free segments now and succeed later, when more records become dead.
+    // Thus a wait for a free segment ends after this timeout, and the next attempt schedules
+    // compaction again.
+    static constexpr auto free_segment_wait_timeout = std::chrono::seconds(1);
+
+    const uint64_t _configured_segment_count;
+    uint64_t _next_new_segment_id{0};
+    // Holds only segments below the configured count, and the constructor reserves room for all of
+    // them.
+    seastar::circular_buffer<log_segment_id> _free_segments;
+    seastar::condition_variable _segment_freed;
+    bool _stop_waiting{false};
+    source& _source;
+
+public:
+    segment_allocator(uint64_t configured_segment_count, source& src)
+        : _configured_segment_count(configured_segment_count)
+        , _source(src)
+    {
+        _free_segments.reserve(static_cast<size_t>(_configured_segment_count));
+    }
+
+    future<allocate_result> allocate();
+
+    // Puts the segment on the free list, and returns true. A segment at or above the configured
+    // count is retired, and this returns false.
+    bool free(log_segment_id segment_id) noexcept {
+        if (segment_id.value >= _configured_segment_count) {
+            return false;
+        }
+        // The free list has room for every configured segment, so this does not allocate.
+        _free_segments.push_back(segment_id);
+        _segment_freed.signal();
+        return true;
+    }
+
+    // Sets the count of segments that recovery found. These segments are not new, so the next new
+    // segment comes after them.
+    void set_found_segment_count(uint64_t found_segment_count) noexcept {
+        _next_new_segment_id = found_segment_count;
+    }
+
+    // Ends the wait of allocate() for a free segment, and the waits after it.
+    void stop_waiting() noexcept {
+        _stop_waiting = true;
+        _segment_freed.signal();
+    }
+
+    uint64_t free_count() const noexcept {
+        return _free_segments.size();
+    }
+
+    // Returns the count of configured segments that were never allocated.
+    uint64_t new_count() const noexcept {
+        return _next_new_segment_id < _configured_segment_count ? _configured_segment_count - _next_new_segment_id : 0;
+    }
+
+    // Returns the count of segments that the allocator can still give: the free ones and the new
+    // ones.
+    uint64_t available_count() const noexcept {
+        return free_count() + new_count();
+    }
+
+private:
+    // Returns true if stop_waiting() ended the wait.
+    future<bool> wait_for_free_segment();
+};
+
+// Allocates the next segment. The allocator goes to the next new segment only after the current new
+// segment is allocated, so after a failure the next attempt tries the same segment again. A skipped
+// segment can be the first segment of a file, and then the allocation of the next file fails. The
+// file of the new segment can be unavailable for a while, because its format failed or is not done.
+// Then this uses a free segment if there is one, so that the store continues with the files it has,
+// and waits for the format only if there is no free segment.
+future<segment_allocator::allocate_result> segment_allocator::allocate() {
+    while (true) {
+        const log_segment_id new_seg_id(_next_new_segment_id);
+        const bool allocate_new = new_count() > 0 && (_free_segments.empty() || _source.is_ready(new_seg_id));
+        if (allocate_new) {
+            auto seg_f = co_await coroutine::as_future(_source.open(new_seg_id));
+            if (!seg_f.failed()) {
+                ++_next_new_segment_id;
+                co_return seg_f.get();
+            }
+            auto ex = seg_f.get_exception();
+            if (_free_segments.empty()) {
+                co_await coroutine::return_exception_ptr(std::move(ex));
+            }
+            static thread_local logger::rate_limit new_segment_failure_rate_limit(std::chrono::seconds(10));
+            logstor_logger.log(log_level::warn, new_segment_failure_rate_limit, "Cannot allocate the new {}: {:t}. Using a free segment", new_seg_id, ex);
+        }
+
+        _source.need_free_segments();
+
+        if (!_free_segments.empty()) {
+            // If the allocation fails, the segment goes back to the free list.
+            auto seg_id = _free_segments.front();
+            _free_segments.pop_front();
+            auto seg_f = co_await coroutine::as_future(_source.open(seg_id));
+            if (seg_f.failed()) {
+                _free_segments.push_back(seg_id);
+                co_await coroutine::return_exception_ptr(seg_f.get_exception());
+            }
+            co_return seg_f.get();
+        }
+
+        if (co_await wait_for_free_segment()) {
+            co_return stopped{};
+        }
+    }
+}
+
+// Waits for a freed segment. The usual result is the timeout, so the wait returns the timeout as a
+// value and does not throw.
+future<bool> segment_allocator::wait_for_free_segment() {
+    auto f = co_await coroutine::as_future(_segment_freed.wait(free_segment_wait_timeout, [this] {
+        return _stop_waiting || !_free_segments.empty();
+    }));
+    if (f.failed()) {
+        auto ep = f.get_exception();
+        if (!try_catch<seastar::condition_variable_timed_out>(ep)) {
+            co_await coroutine::return_exception_ptr(std::move(ep));
+        }
+    }
+    co_return _stop_waiting;
+}
+
 // Holds the segments that are ready for writes. The reserve replenisher is the only producer, and
 // it keeps the pool full. The last segments in the pool are the compaction reserve, and only
 // compaction takes them, because compaction must always get a segment to free segments. A consumer
@@ -672,8 +824,6 @@ class segment_manager_impl {
     // at or above this count is retired and not allocated again.
     uint64_t _configured_max_segments;
 
-    uint64_t _next_new_segment_id{0};
-
     stats _stats;
     // The statistics of the segments that the groups of this shard own, with their distribution by
     // utilization. Each segment_set of the shard adds its changes to them, see segment_set.
@@ -686,9 +836,18 @@ class segment_manager_impl {
     // grows it to the segments that it finds, and keeps the descriptors of the files that it
     // retires, which are not used again.
     std::vector<segment_descriptor> _segment_descs;
-    // Holds only segments below the configured count, and the constructor reserves room for all of
-    // them.
-    seastar::circular_buffer<log_segment_id> _free_segments;
+
+    // Gives the segments of this shard to the segment allocator.
+    class allocator_source final : public segment_allocator::source {
+        segment_manager_impl& _sm;
+    public:
+        explicit allocator_source(segment_manager_impl& sm) noexcept : _sm(sm) {}
+        bool is_ready(log_segment_id segment_id) override { return _sm.is_segment_ready(segment_id); }
+        future<seg_ptr> open(log_segment_id segment_id) override { return _sm.open_segment(segment_id); }
+        void need_free_segments() override { _sm._compaction_mgr.schedule_auto_compaction(); }
+    };
+    allocator_source _allocator_source{*this};
+    segment_allocator _allocator;
 
     seg_ptr _active_segment;
     segment_pool _segment_pool;
@@ -699,8 +858,8 @@ class segment_manager_impl {
     // The reserve replenisher keeps `_segment_pool` full.
     future<> _reserve_replenisher{make_ready_future<>()};
     bool _replenisher_stopping{false};
-    // Wakes the replenisher. Signal it when a segment goes out of the pool, when a segment becomes
-    // free, and when the replenisher must stop.
+    // Wakes the replenisher. Signal it when a segment goes out of the pool, and when the replenisher
+    // must stop.
     seastar::condition_variable _replenisher_wakeup;
 
     write_buffer_pool _compaction_buffer_pool;
@@ -843,12 +1002,8 @@ public:
     future<seastar::input_stream<char>> create_segment_input_stream(log_segment_id segment_id, const seastar::file_input_stream_options& opts);
     future<std::unique_ptr<segment_stream_sink>> create_segment_output_stream(replica::database&);
 
-    uint64_t allocatable_new_segment_count() const noexcept {
-        return _next_new_segment_id < _configured_max_segments ? _configured_max_segments - _next_new_segment_id : 0;
-    }
-
     uint64_t available_segment_count() const noexcept {
-        return static_cast<uint64_t>(_free_segments.size()) + static_cast<uint64_t>(_segment_pool.size()) + allocatable_new_segment_count();
+        return _allocator.available_count() + static_cast<uint64_t>(_segment_pool.size());
     }
 
     // The segments on disk: the configured segments, and the segments in the files from an earlier,
@@ -864,14 +1019,14 @@ public:
     }
 
     uint64_t available_segment_count(write_source src) const noexcept {
-        return static_cast<uint64_t>(_free_segments.size()) + static_cast<uint64_t>(_segment_pool.available_segment_count(src)) + allocatable_new_segment_count();
+        return _allocator.available_count() + static_cast<uint64_t>(_segment_pool.available_segment_count(src));
     }
 
 private:
 
     future<> replenish_reserve();
-    // Returns an empty pointer if the replenisher must stop while it waits for a free segment.
-    future<seg_ptr> allocate_segment();
+    // Opens a segment for writes. The first segment of a file allocates the file.
+    future<seg_ptr> open_segment(log_segment_id);
     // Returns true if the segment can be opened without a wait for the format of its file.
     bool is_segment_ready(log_segment_id);
 
@@ -1045,6 +1200,7 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
     , _segments_per_file(config.file_size / config.segment_size)
     , _configured_max_segments((config.disk_size / config.file_size) * _segments_per_file)
     , _segment_descs(static_cast<size_t>(_configured_max_segments))
+    , _allocator(_configured_max_segments, _allocator_source)
     // A compaction job takes one segment from the pool per flush, so the reserve that keeps normal
     // writes from draining the pool is one segment per concurrent job.
     , _segment_pool(segment_pool_size, max_compaction_parallelism)
@@ -1091,8 +1247,6 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
     if (_configured_max_segments == 0) {
         throw exceptions::configuration_exception(fmt::format("Disk size {} must be greater than or equal to file size {}", config.disk_size, config.file_size));
     }
-
-    _free_segments.reserve(static_cast<size_t>(_configured_max_segments));
 
     namespace sm = seastar::metrics;
 
@@ -1247,6 +1401,7 @@ future<> segment_manager_impl::stop() {
     logstor_logger.debug("Stopping reserve replenisher and segment pool");
     _replenisher_stopping = true;
     _replenisher_wakeup.signal();
+    _allocator.stop_waiting();
     co_await std::move(_reserve_replenisher);
     co_await _segment_pool.stop();
 
@@ -1491,7 +1646,7 @@ future<> segment_manager_impl::replenish_reserve() {
             break;
         }
 
-        auto seg_f = co_await coroutine::as_future(allocate_segment());
+        auto seg_f = co_await coroutine::as_future(_allocator.allocate());
         if (seg_f.failed()) {
             auto ex = seg_f.get_exception();
             ++_stats.segment_allocation_failures;
@@ -1506,11 +1661,12 @@ future<> segment_manager_impl::replenish_reserve() {
             continue;
         }
 
-        auto seg = seg_f.get();
+        auto result = seg_f.get();
+        auto* seg = std::get_if<seg_ptr>(&result);
         if (!seg) {
             break;
         }
-        _segment_pool.put(std::move(seg));
+        _segment_pool.put(std::move(*seg));
     }
 
     logstor_logger.debug("Reserve replenisher stopped");
@@ -1520,74 +1676,17 @@ bool segment_manager_impl::is_segment_ready(log_segment_id seg_id) {
     return _file_mgr.check_file_ready_for_new_segment(segment_id_to_file_location(seg_id).file_id);
 }
 
-future<seg_ptr> segment_manager_impl::allocate_segment() {
-    auto make_segment = [this] (log_segment_id seg_id) -> future<seg_ptr> {
-        utils::get_local_injector().inject("logstor_allocate_segment_fail", [] {
-            throw std::runtime_error("segment allocation failed by injection");
-        });
+future<seg_ptr> segment_manager_impl::open_segment(log_segment_id seg_id) {
+    utils::get_local_injector().inject("logstor_allocate_segment_fail", [] {
+        throw std::runtime_error("segment allocation failed by injection");
+    });
 
-        auto seg_loc = segment_id_to_file_location(seg_id);
-        auto file = co_await _file_mgr.get_file_for_new_segment(seg_loc.file_id);
-        auto seg = make_lw_shared<writeable_segment>(seg_id, std::move(file), seg_loc.file_offset, _cfg.segment_size);
-        get_segment_descriptor(seg_id).reset(_cfg.segment_size);
-        _stats.segments_allocated++;
-        co_return std::move(seg);
-    };
-
-    while (true) {
-        // first, allocate all new segments sequentially
-        // Go to the next new segment only after this one is allocated. If the allocation fails,
-        // the next attempt tries the same segment again. A skipped segment can be the first segment
-        // of a file, and then the allocation of the file after it fails. The file of the new segment
-        // can be unavailable for a while, because its format failed or is not done. Then use a free
-        // segment if there is one, so that the store continues with the files it has, and wait for
-        // the format only if there is no free segment.
-        const log_segment_id new_seg_id(_next_new_segment_id);
-        const bool allocate_new = _next_new_segment_id < _configured_max_segments && (_free_segments.empty() || is_segment_ready(new_seg_id));
-        if (allocate_new) {
-            auto seg_f = co_await coroutine::as_future(make_segment(new_seg_id));
-            if (!seg_f.failed()) {
-                ++_next_new_segment_id;
-                co_return seg_f.get();
-            }
-            auto ex = seg_f.get_exception();
-            if (_free_segments.empty()) {
-                co_return coroutine::exception(std::move(ex));
-            }
-            static thread_local logger::rate_limit new_segment_failure_rate_limit(std::chrono::seconds(10));
-            logstor_logger.log(log_level::warn, new_segment_failure_rate_limit, "Cannot allocate new segment {}: {}. Using a free segment", new_seg_id, ex);
-        }
-
-        _compaction_mgr.schedule_auto_compaction();
-
-        // reuse freed segments
-        if (!_free_segments.empty()) {
-            auto seg_id = _free_segments.front();
-            _free_segments.pop_front();
-            auto seg_f = co_await coroutine::as_future(make_segment(seg_id));
-            if (seg_f.failed()) {
-                _free_segments.push_back(seg_id);
-                co_return coroutine::exception(seg_f.get_exception());
-            }
-            co_return seg_f.get();
-        }
-
-        // Compaction can fail to free segments now and succeed later, when more records are dead.
-        // So the wait for a free segment has a timeout, and the next iteration schedules compaction
-        // again. The timeout is the usual result, so the wait does not throw it.
-        auto f = co_await coroutine::as_future(_replenisher_wakeup.wait(std::chrono::seconds(1), [this] {
-            return _replenisher_stopping || !_free_segments.empty();
-        }));
-        if (f.failed()) {
-            auto ep = f.get_exception();
-            if (!try_catch<seastar::condition_variable_timed_out>(ep)) {
-                co_await coroutine::return_exception_ptr(std::move(ep));
-            }
-        }
-        if (_replenisher_stopping) {
-            co_return nullptr;
-        }
-    }
+    auto seg_loc = segment_id_to_file_location(seg_id);
+    auto file = co_await _file_mgr.get_file_for_new_segment(seg_loc.file_id);
+    auto seg = make_lw_shared<writeable_segment>(seg_id, std::move(file), seg_loc.file_offset, _cfg.segment_size);
+    get_segment_descriptor(seg_id).reset(_cfg.segment_size);
+    _stats.segments_allocated++;
+    co_return std::move(seg);
 }
 
 void segment_manager_impl::free_segment(log_segment_id segment_id) noexcept {
@@ -1606,13 +1705,7 @@ void segment_manager_impl::free_segment(log_segment_id segment_id) noexcept {
     if (desc.ref_count != 0) {
         on_fatal_internal_error(logstor_logger, format("Freeing segment {} with non-zero reference count", segment_id));
     }
-    if (segment_id.value < _configured_max_segments) {
-        // _free_segments is pre-reserved to fit every configured segment (see the constructor), so
-        // this should never grow the vector.
-        _free_segments.push_back(segment_id);
-        _replenisher_wakeup.signal();
-    }
-
+    _allocator.free(segment_id);
     _stats.segments_freed++;
 }
 
@@ -2328,7 +2421,7 @@ future<> segment_manager_impl::do_recovery(replica::database& db) {
     // recovery fills the free list, so that no segment counts as both free and new, and
     // segments_in_use() does not go below zero while recovery runs. A retired file is at or above
     // the configured count, and a new segment is only below it, so retiring files changes nothing.
-    _next_new_segment_id = found_segment_count;
+    _allocator.set_found_segment_count(found_segment_count);
 
     std::vector<segment_sequence> segment_seqs(static_cast<size_t>(found_segment_count), segment_sequence(0));
     segment_sequence max_segment_seq = segment_sequence(0);
@@ -2384,8 +2477,7 @@ future<> segment_manager_impl::do_recovery(replica::database& db) {
         co_await coroutine::maybe_yield();
         log_segment_id seg_id(seg_idx);
         if (!used_segments.test(seg_idx)) {
-            if (seg_idx < _configured_max_segments) {
-                _free_segments.push_back(seg_id);
+            if (_allocator.free(seg_id)) {
                 free_segment_count++;
             }
         } else {
