@@ -4323,7 +4323,9 @@ uint64_t segment_manager_metric(std::string_view name) {
     return value;
 }
 
-// Checks that a store whose reserve replenisher keeps failing to allocate a segment still stops.
+// Checks that a store whose segment pool keeps failing to refill still stops. Nothing waits for a
+// segment, so the stop waits only for the refill of the pool, which it stops between two of its
+// attempts.
 SEASTAR_THREAD_TEST_CASE(test_logstor_stops_while_segment_allocation_fails) {
     if constexpr (!std::is_same_v<utils::error_injection_type, utils::error_injection<true>>) {
         return;
@@ -4332,8 +4334,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_stops_while_segment_allocation_fails) {
     auto schema = make_kv_schema();
     tmpdir dir;
 
-    // The store has more segments than the segment pool holds, so that the replenisher allocates
-    // new segments and does not wait for a freed one.
+    // The store has more segments than the pool holds, so when a write takes a segment from the
+    // pool, the pool allocates a new segment and does not wait for a freed segment.
     constexpr size_t segment_size = 128 * 1024;
     constexpr size_t file_size = 32 * segment_size;
     shared_logstor_cache cache;
@@ -4355,14 +4357,14 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_stops_while_segment_allocation_fails) {
         test_logstor_group cg(schema, ls);
         write_and_flush_segment(ls, cg, make_kv_mutation(schema, "pk0", "value"));
     }
-    // The replenisher tries to replace the segments the write took, fails, and waits before the next
+    // The pool tries to replace the segments that the write took, fails, and waits before the next
     // attempt. The count grows before that wait, so the stop starts during it.
     BOOST_REQUIRE(eventually_true([] { return segment_manager_metric("segment_allocation_failures") > 0; }));
 
     ls.stop().get();
 }
 
-// Checks that a write that waits for a segment fails when the replenisher cannot allocate one, and
+// Checks that a write that waits for a segment fails when the segment pool cannot allocate one, and
 // does not wait forever. The write gets the error of the failed allocation. When allocation works
 // again, writes succeed again.
 SEASTAR_THREAD_TEST_CASE(test_logstor_write_fails_when_segment_allocation_fails) {
@@ -4373,8 +4375,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_fails_when_segment_allocation_fails)
     auto schema = make_kv_schema();
     tmpdir dir;
 
-    // The store has more segments than the segment pool holds, so that the replenisher allocates
-    // new segments while the writes take segments from the pool.
+    // The store has more segments than the pool holds, so the pool allocates new segments while the
+    // writes take segments from the pool.
     constexpr size_t segment_size = 128 * 1024;
     constexpr size_t file_size = 32 * segment_size;
     shared_logstor_cache cache;
@@ -4398,8 +4400,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_fails_when_segment_allocation_fails)
     });
 
     // Each write takes most of a segment, so each write takes at least one segment from the pool.
-    // The replenisher cannot replace them, so a write must wait for a segment after some writes.
-    // That write gets the error of the failed allocation.
+    // The pool cannot replace them, thus a write must wait for a segment after some writes. That
+    // write gets the error of the failed allocation.
     const auto value = sstring(segment_size * 5 / 8, 'x');
     std::exception_ptr write_error;
     for (size_t i = 0; i < 1000 && !write_error; ++i) {
@@ -4429,8 +4431,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_fails_when_segment_allocation_fails)
 }
 
 // Checks that the store continues with free segments when it cannot allocate a new segment, because
-// the format of its file failed. The replenisher tries the new segment again on each allocation, but
-// it uses a free segment when the new segment fails. When the format works again, the next
+// the format of its file failed. The segment pool tries the new segment again on each allocation,
+// but it uses a free segment when the new segment fails. When the format works again, the next
 // allocation of a file after the retry interval formats the file, and the store grows again.
 SEASTAR_THREAD_TEST_CASE(test_logstor_uses_free_segments_when_file_format_fails) {
     if constexpr (!std::is_same_v<utils::error_injection_type, utils::error_injection<true>>) {
@@ -4460,9 +4462,9 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_uses_free_segments_when_file_format_fails)
         return (dir.path() / fmt::format("ls_{}-{}-Data.db", this_shard_id(), file_id)).string();
     };
 
-    // The replenisher fills the pool, which allocates the first files. Wait for the background
+    // The segment pool fills itself, which allocates the first files. Wait for the background
     // format of the next file, and then make each later format fail. The format checks the injection
-    // before it creates the file, so the format of that file is not affected.
+    // before it creates the file, thus the format of that file is not affected.
     BOOST_REQUIRE(eventually_true([&] { return sm.get_usage().disk_usage >= 5 * file_size; }));
     const auto allocated_files = sm.get_usage().disk_usage / file_size;
     BOOST_REQUIRE(eventually_true([&] { return seastar::file_exists(file_path(allocated_files)).get(); }));
@@ -4473,14 +4475,14 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_uses_free_segments_when_file_format_fails)
 
     // Each write takes two segments: a mixed segment, which is free again after the separator flush,
     // and a segment for the group. The pool and the new segments of the formatted files are not
-    // sufficient for these writes, so the replenisher must also use free segments.
+    // sufficient for these writes, thus the pool must also use free segments.
     const auto value = sstring(segment_size * 5 / 8, 'x');
     for (size_t i = 0; i < 150; ++i) {
         write_and_flush_segment(ls, cg, make_kv_mutation(schema, seastar::format("pk{}", i), value));
     }
 
     // The file after the formatted files was not allocated, because its format failed. The count is
-    // exact because the replenisher was idle, with a full pool, when the injection was enabled.
+    // exact because the refill of the pool was idle, with a full pool, when the injection was enabled.
     BOOST_REQUIRE_EQUAL(sm.get_usage().disk_usage, (allocated_files + 1) * file_size);
 
     // When the format works again, the allocation of the next file tries the format again after the
