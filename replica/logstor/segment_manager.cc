@@ -39,6 +39,7 @@
 #include <seastar/core/on_internal_error.hh>
 #include <seastar/coroutine/parallel_for_each.hh>
 #include <seastar/coroutine/maybe_yield.hh>
+#include <seastar/coroutine/try_future.hh>
 #include <seastar/coroutine/exception.hh>
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/circular_buffer.hh>
@@ -51,7 +52,6 @@
 #include <seastar/util/closeable.hh>
 #include <seastar/core/condition-variable.hh>
 #include <seastar/coroutine/as_future.hh>
-#include <seastar/coroutine/try_future.hh>
 #include "replica/logstor/write_buffer.hh"
 #include "utils/disk-error-handler.hh"
 #include "utils/error_injection.hh"
@@ -458,9 +458,9 @@ static sstring write_source_to_string(write_source src) {
     return "unknown";
 }
 
-// Chooses the segment that the reserve replenisher allocates next: a new segment while there are
+// Chooses the segment that the segment pool allocates next: a new segment while there are
 // configured segments that were never allocated, else a free segment, else it waits for a segment
-// to be freed. Only the replenisher allocates, so one allocate() runs at a time.
+// to be freed. Only the refill of the pool allocates, so one allocate() runs at a time.
 class segment_allocator {
 public:
     // The allocator uses this interface to check and open segments.
@@ -603,26 +603,35 @@ future<bool> segment_allocator::wait_for_free_segment() {
     co_return _stop_waiting;
 }
 
-// Holds the segments that are ready for writes. The reserve replenisher is the only producer, and
-// it keeps the pool full. The last segments in the pool are the compaction reserve, and only
-// compaction takes them, because compaction must always get a segment to free segments. A consumer
-// that waits for a segment fails when an attempt to replenish the pool fails while it waits, so
-// that a write does not wait for a segment that possibly does not come. A compaction that fails
-// this way runs again later.
+// Holds the segments that are ready for writes. The pool refills itself in the background from
+// the segment allocator, and keeps itself full. The last segments in the pool are the compaction
+// reserve, and only compaction takes them, because compaction must always get a segment to free
+// segments. A consumer that waits for a segment fails when an attempt to refill the pool fails
+// while it waits, so that a write does not wait for a segment that possibly does not come. A
+// compaction that fails this way runs again later.
 class segment_pool {
+    // After a failed refill, the next attempt comes after this delay.
+    static constexpr auto refill_retry_delay = std::chrono::seconds(1);
 
+    segment_allocator& _allocator;
     seastar::circular_buffer<seg_ptr> _segments;
     size_t _capacity;
     size_t _reserved_for_compaction;
     seastar::condition_variable _segment_available;
-    uint64_t _failed_replenish_count{0};
-    std::exception_ptr _replenish_error;
+    uint64_t _failed_refill_count{0};
+    std::exception_ptr _refill_error;
+
+    future<> _refill{make_ready_future<>()};
+    bool _stopping{false};
+    // Wakes the refill. Signal it when a segment goes out of the pool, and when the pool stops.
+    seastar::condition_variable _refill_needed;
 
 public:
     struct stats {
         uint64_t segments_put{0};
         std::array<uint64_t, write_source_count> segments_taken{0};
         std::array<uint64_t, write_source_count> segments_wait{0};
+        uint64_t refill_failures{0};
     };
 
 private:
@@ -633,23 +642,11 @@ private:
         return src == write_source::compaction ? 0 : _reserved_for_compaction;
     }
 
-public:
-    segment_pool(size_t pool_size, size_t reserved_for_compaction)
-        : _capacity(pool_size)
-        , _reserved_for_compaction(reserved_for_compaction)
-    {}
-
-    // The caller must stop the consumers and the replenisher first. A consumer that still waits is
-    // a bug, and broken() fails it.
-    future<> stop() {
-        _segment_available.broken();
-        _segments.clear();
-        co_return;
-    }
-
     bool full() const noexcept {
         return _segments.size() >= _capacity;
     }
+
+    future<> refill();
 
     void put(seg_ptr seg) {
         if (full()) [[unlikely]] {
@@ -660,13 +657,39 @@ public:
         _stats.segments_put++;
     }
 
-    // The replenisher calls this when it cannot allocate a segment. Each consumer that waits for a
+    // The refill calls this when it cannot allocate a segment. Each consumer that waits for a
     // segment at this time fails with the error. A consumer that starts to wait after this call
     // waits for the next attempt.
     void fail_waiters(std::exception_ptr ex) noexcept {
-        _replenish_error = std::move(ex);
-        ++_failed_replenish_count;
+        _refill_error = std::move(ex);
+        ++_failed_refill_count;
         _segment_available.broadcast();
+    }
+
+public:
+    segment_pool(size_t pool_size, size_t reserved_for_compaction, segment_allocator& allocator)
+        : _allocator(allocator)
+        , _capacity(pool_size)
+        , _reserved_for_compaction(reserved_for_compaction)
+    {}
+
+    // Starts the refill in the background.
+    void start(scheduling_group sg) {
+        _refill = with_scheduling_group(sg, [this] {
+            return refill();
+        });
+    }
+
+    // Call this after all the consumers stop. It stops the refill after the allocation that it does
+    // at this time. A consumer that still waits after that is a bug, and broken() makes it fail and
+    // not wait forever.
+    future<> stop() {
+        _stopping = true;
+        _refill_needed.signal();
+        _allocator.stop_waiting();
+        co_await std::move(_refill);
+        _segment_available.broken();
+        _segments.clear();
     }
 
     // Takes a segment for `src`, or waits for one. If `as` is given and aborted, the wait fails
@@ -682,21 +705,22 @@ public:
         }
         // A put wakes each waiter, and the first one takes the segment. The others wait again.
         while (_segments.size() <= reserved) {
-            const auto failed_replenish_count = _failed_replenish_count;
-            co_await coroutine::try_future(_segment_available.wait([this, reserved, failed_replenish_count, as] {
-                return _segments.size() > reserved || _failed_replenish_count != failed_replenish_count
+            const auto failed_refill_count = _failed_refill_count;
+            co_await coroutine::try_future(_segment_available.wait([this, reserved, failed_refill_count, as] {
+                return _segments.size() > reserved || _failed_refill_count != failed_refill_count
                         || (as && as->abort_requested());
             }));
             if (as && as->abort_requested()) {
                 co_await coroutine::return_exception(abort_requested_exception());
             }
-            if (_failed_replenish_count != failed_replenish_count && _segments.size() <= reserved) {
-                co_await coroutine::return_exception_ptr(_replenish_error);
+            if (_failed_refill_count != failed_refill_count && _segments.size() <= reserved) {
+                co_await coroutine::return_exception_ptr(_refill_error);
             }
         }
         _stats.segments_taken[static_cast<size_t>(src)]++;
         auto seg = std::move(_segments.front());
         _segments.pop_front();
+        _refill_needed.signal();
         co_return seg;
     }
 
@@ -713,6 +737,42 @@ public:
         return _stats;
     }
 };
+
+// Each wait of the refill also ends when the pool stops. Thus the refill stops after the allocation
+// that it does at that time, and does not start a new one.
+future<> segment_pool::refill() {
+    while (true) {
+        co_await _refill_needed.wait([this] { return _stopping || !full(); });
+        if (_stopping) {
+            break;
+        }
+
+        auto seg_f = co_await coroutine::as_future(_allocator.allocate());
+        if (seg_f.failed()) {
+            auto ex = seg_f.get_exception();
+            ++_stats.refill_failures;
+            static thread_local logger::rate_limit refill_failure_rate_limit(std::chrono::seconds(10));
+            logstor_logger.log(log_level::warn, refill_failure_rate_limit, "Cannot refill the segment pool: {:t}. Trying again", ex);
+            fail_waiters(std::move(ex));
+            // The usual result of the wait is the timeout, and the loop continues after any result,
+            // so ignore it.
+            auto wait_f = co_await coroutine::as_future(_refill_needed.wait(refill_retry_delay, [this] {
+                return _stopping;
+            }));
+            wait_f.ignore_ready_future();
+            continue;
+        }
+
+        auto result = seg_f.get();
+        auto* seg = std::get_if<seg_ptr>(&result);
+        if (!seg) {
+            break;
+        }
+        put(std::move(*seg));
+    }
+
+    logstor_logger.debug("Segment pool refill stopped");
+}
 
 struct separator_task {
     std::vector<write_buffer::record_in_buffer> records;
@@ -739,7 +799,6 @@ class segment_manager_impl {
         uint64_t bytes_read{0};
         uint64_t bytes_freed{0};
         uint64_t segments_allocated{0};
-        uint64_t segment_allocation_failures{0};
         uint64_t segments_freed{0};
         uint64_t compaction_bytes_written{0};
         uint64_t compaction_data_bytes_written{0};
@@ -793,8 +852,6 @@ class segment_manager_impl {
     segment_sequence _next_segment_seq{1};
 
     seastar::gate _async_gate;
-    // The reserve replenisher keeps `_segment_pool` full.
-    future<> _reserve_replenisher{make_ready_future<>()};
 
     // The used segments that recovery could not give whole to a compaction group, and the catalog
     // to separate their records through. start() separates them, because a separator flush needs
@@ -813,11 +870,6 @@ class segment_manager_impl {
 
     // Fails with an internal error when the segment manager is not at the expected stage.
     void check_lifecycle(lifecycle expected, std::string_view call) const;
-
-    bool _replenisher_stopping{false};
-    // Wakes the replenisher. Signal it when a segment goes out of the pool, and when the replenisher
-    // must stop.
-    seastar::condition_variable _replenisher_wakeup;
 
     write_buffer_pool _compaction_buffer_pool;
     write_buffer_pool _separator_buffer_pool;
@@ -1024,7 +1076,6 @@ public:
 
 private:
 
-    future<> replenish_reserve();
     // Opens a segment for writes. The first segment of a file allocates the file.
     future<seg_ptr> open_segment(log_segment_id);
     // Returns true if the segment can be opened without a wait for the format of its file.
@@ -1068,8 +1119,7 @@ private:
     }
 
     future<seg_ptr> take_segment(write_source src, abort_source* as = nullptr) {
-        seg_ptr seg = co_await _segment_pool.take(src, as);
-        _replenisher_wakeup.signal();
+        seg_ptr seg = co_await coroutine::try_future(_segment_pool.take(src, as));
         auto& desc = get_segment_descriptor(seg->id());
         desc.seq = allocate_segment_seq();
         seg->start(make_segment_ref(seg->id()), desc.seq);
@@ -1202,7 +1252,7 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
     , _allocator(_configured_max_segments, _allocator_source)
     // A compaction job takes one segment from the pool per flush, so the reserve that keeps normal
     // writes from draining the pool is one segment per concurrent job.
-    , _segment_pool(segment_pool_size, max_compaction_parallelism)
+    , _segment_pool(segment_pool_size, max_compaction_parallelism, _allocator)
     // Compaction concurrency is limited by buffer availability. Normal compaction
     // uses one buffer; split compaction allocates two buffers. The buffers are built up front and
     // all of them are kept, so that a compaction never waits for memory to build one.
@@ -1277,8 +1327,8 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
                        sm::description("Counts number of data bytes freed.")),
         sm::make_counter("segments_allocated", _stats.segments_allocated,
                        sm::description("Counts number of segments allocated.")),
-        sm::make_counter("segment_allocation_failures", _stats.segment_allocation_failures,
-                       sm::description("Counts the failed attempts to allocate a segment for the segment pool.")),
+        sm::make_counter("segment_allocation_failures", _segment_pool.get_stats().refill_failures,
+                       sm::description("Counts the failed attempts of the segment pool refill to allocate a segment.")),
         sm::make_counter("segments_freed", _stats.segments_freed,
                        sm::description("Counts number of segments freed.")),
         sm::make_gauge("disk_usage", [this] { return get_disk_usage(); },
@@ -1366,10 +1416,8 @@ future<> segment_manager_impl::start() {
     // A start that fails is not repeated, so the stage changes before the work starts.
     _lifecycle = lifecycle::started;
 
-    // Start background replenisher before creating initial segment
-    _reserve_replenisher = with_scheduling_group(_cfg.compaction_sg, [this] {
-        return replenish_reserve();
-    });
+    // The first segment comes from the pool, so the refill of the pool starts first.
+    _segment_pool.start(_cfg.compaction_sg);
 
     co_await _compaction_mgr.start();
 
@@ -1420,12 +1468,8 @@ future<> segment_manager_impl::stop() {
     co_await _compaction_buffer_pool.stop();
     co_await _separator_buffer_pool.stop();
 
-    // All the consumers of the segment pool stopped. Stop the producer next, and then the pool.
-    logstor_logger.debug("Stopping reserve replenisher and segment pool");
-    _replenisher_stopping = true;
-    _replenisher_wakeup.signal();
-    _allocator.stop_waiting();
-    co_await std::move(_reserve_replenisher);
+    // All the consumers of the segment pool stopped.
+    logstor_logger.debug("Stopping segment pool");
     co_await _segment_pool.stop();
 
     co_await _file_mgr.stop();
@@ -1658,41 +1702,6 @@ future<> segment_manager_impl::switch_active_segment() {
     }
 
     logstor_logger.trace("Switched active segment to {} seq {}", _active_segment->id(), _active_segment->seq_num());
-}
-
-// Allocates segments into the pool until the replenisher must stop. At a stop, the allocation in
-// progress completes, and no new one starts.
-future<> segment_manager_impl::replenish_reserve() {
-    while (true) {
-        co_await _replenisher_wakeup.wait([this] { return _replenisher_stopping || !_segment_pool.full(); });
-        if (_replenisher_stopping) {
-            break;
-        }
-
-        auto seg_f = co_await coroutine::as_future(_allocator.allocate());
-        if (seg_f.failed()) {
-            auto ex = seg_f.get_exception();
-            ++_stats.segment_allocation_failures;
-            static thread_local logger::rate_limit replenish_failure_rate_limit(std::chrono::seconds(10));
-            logstor_logger.log(log_level::warn, replenish_failure_rate_limit, "Cannot allocate a segment for the segment pool: {:t}. Trying again", ex);
-            _segment_pool.fail_waiters(std::move(ex));
-            // The timeout is the usual result, so the wait does not throw it.
-            auto wait_f = co_await coroutine::as_future(_replenisher_wakeup.wait(std::chrono::seconds(1), [this] {
-                return _replenisher_stopping;
-            }));
-            wait_f.ignore_ready_future();
-            continue;
-        }
-
-        auto result = seg_f.get();
-        auto* seg = std::get_if<seg_ptr>(&result);
-        if (!seg) {
-            break;
-        }
-        _segment_pool.put(std::move(*seg));
-    }
-
-    logstor_logger.debug("Reserve replenisher stopped");
 }
 
 bool segment_manager_impl::is_segment_ready(log_segment_id seg_id) {
