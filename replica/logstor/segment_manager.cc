@@ -1292,6 +1292,16 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
         throw exceptions::configuration_exception(fmt::format("Disk size {} must be greater than or equal to file size {}", config.disk_size, config.file_size));
     }
 
+    // Normal writes and the separator take a segment only while the segment pool holds more than
+    // the compaction reserve. The first write needs the active segment, and its separation needs one
+    // more segment, so a smaller store waits for a segment forever. This count is a minimum, and a
+    // usable store also needs room for its data and for the segments that writes use at the same
+    // time.
+    if (const auto min_segments = max_compaction_parallelism + 2; _configured_max_segments < min_segments) {
+        throw exceptions::configuration_exception(fmt::format("Disk size {} holds {} segments of {} bytes. It must hold at least {}: the {} that are kept for compaction, the active segment and one segment for the separator",
+                config.disk_size, _configured_max_segments, config.segment_size, min_segments, max_compaction_parallelism));
+    }
+
     namespace sm = seastar::metrics;
 
     _metrics.add_group("logstor_sm", {

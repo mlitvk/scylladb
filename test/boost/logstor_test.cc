@@ -30,6 +30,7 @@
 
 #include "mutation/canonical_mutation.hh"
 #include "replica/exceptions.hh"
+#include "replica/logstor/compaction_policy.hh"
 #include "replica/logstor/index.hh"
 #include "replica/logstor/logstor.hh"
 #include "replica/logstor/ondisk.hh"
@@ -46,6 +47,7 @@
 #include "db/config.hh"
 #include "db/schema_tables.hh"
 #include "gms/feature_service.hh"
+#include "exceptions/exceptions.hh"
 #include "init.hh"
 #include <seastar/core/simple-stream.hh>
 #include "partition_slice_builder.hh"
@@ -4067,6 +4069,45 @@ uint64_t segment_manager_metric(std::string_view name) {
         }
     }
     return value;
+}
+
+// Checks that a store that cannot hold the compaction reserve, the active segment and one segment for
+// the separator is rejected, because it would wait for a segment forever, and that a store of that
+// size takes a write and stops.
+SEASTAR_THREAD_TEST_CASE(test_logstor_rejects_a_store_smaller_than_its_reserved_segments) {
+    auto schema = make_kv_schema();
+    constexpr size_t segment_size = 128 * 1024;
+    constexpr size_t min_segments = replica::logstor::max_compaction_parallelism + 2;
+    shared_logstor_cache cache;
+
+    {
+        tmpdir dir;
+        constexpr size_t file_size = (min_segments - 1) * segment_size;
+        BOOST_REQUIRE_THROW(logstor(make_test_logstor_config(dir.path(), {
+            .segment_size = segment_size,
+            .file_size = file_size,
+            .disk_size = file_size,
+        }), cache.shared_tracker), exceptions::configuration_exception);
+    }
+
+    tmpdir dir;
+    constexpr size_t file_size = min_segments * segment_size;
+    logstor ls(make_test_logstor_config(dir.path(), {
+        .segment_size = segment_size,
+        .file_size = file_size,
+        .disk_size = file_size,
+    }), cache.shared_tracker);
+    test_recovery_catalog no_tables;
+    ls.do_recovery(no_tables).get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+    const auto m = make_kv_mutation(schema, "pk0", "value");
+    write_and_flush_segment(ls, cg, m);
+    auto actual = read_mutation(ls, schema, cg.logstor_index(), m.decorated_key(), schema->full_slice()).get();
+    BOOST_REQUIRE(actual);
+    assert_that(*actual).is_equal_to(m);
 }
 
 // Checks that a store whose segment pool keeps failing to refill still stops. Nothing waits for a
