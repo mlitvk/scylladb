@@ -514,10 +514,12 @@ static sstring write_source_to_string(write_source src) {
     return "unknown";
 }
 
-// Holds the segments that are ready for writes. The reserve replenisher is the only producer. The
-// last segments in the pool are the compaction reserve, and only compaction takes them, because
-// compaction must always get a segment to free segments. When the replenisher cannot allocate a
-// segment, a compaction that waits fails like the other consumers, and runs again later.
+// Holds the segments that are ready for writes. The reserve replenisher is the only producer, and
+// it keeps the pool full. The last segments in the pool are the compaction reserve, and only
+// compaction takes them, because compaction must always get a segment to free segments. A consumer
+// that waits for a segment fails when an attempt to replenish the pool fails while it waits, so
+// that a write does not wait for a segment that possibly does not come. A compaction that fails
+// this way runs again later.
 class segment_pool {
 
     seastar::circular_buffer<seg_ptr> _segments;
@@ -536,6 +538,11 @@ public:
 
 private:
     stats _stats;
+
+    // Returns the count of segments that a consumer of this source must leave in the pool.
+    size_t reserve_for(write_source src) const noexcept {
+        return src == write_source::compaction ? 0 : _reserved_for_compaction;
+    }
 
 public:
     segment_pool(size_t pool_size, size_t reserved_for_compaction)
@@ -564,9 +571,9 @@ public:
         _stats.segments_put++;
     }
 
-    // Fails each consumer that waits for a segment now with `ex`, so that a write does not wait for
-    // a segment that may never come. A consumer that starts to wait after this call waits for the
-    // next attempt.
+    // The replenisher calls this when it cannot allocate a segment. Each consumer that waits for a
+    // segment at this time fails with the error. A consumer that starts to wait after this call
+    // waits for the next attempt.
     void fail_waiters(std::exception_ptr ex) noexcept {
         _replenish_error = std::move(ex);
         ++_failed_replenish_count;
@@ -576,7 +583,7 @@ public:
     // Takes a segment for `src`, or waits for one. If `as` is given and aborted, the wait fails
     // with abort_requested_exception.
     future<seg_ptr> take(write_source src, abort_source* as = nullptr) {
-        const size_t reserved = src == write_source::compaction ? 0 : _reserved_for_compaction;
+        const size_t reserved = reserve_for(src);
         if (_segments.size() <= reserved) {
             _stats.segments_wait[static_cast<size_t>(src)]++;
         }
@@ -605,14 +612,8 @@ public:
     }
 
     size_t available_segment_count(write_source src) const noexcept {
-        switch (src) {
-            case write_source::compaction:
-                return _segments.size();
-            case write_source::normal:
-            case write_source::separator:
-            case write_source::streaming:
-                return _segments.size() > _reserved_for_compaction ? _segments.size() - _reserved_for_compaction : 0;
-        }
+        const size_t reserved = reserve_for(src);
+        return _segments.size() > reserved ? _segments.size() - reserved : 0;
     }
 
     size_t size() const noexcept {
