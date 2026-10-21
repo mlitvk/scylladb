@@ -7,6 +7,8 @@
  */
 #pragma once
 
+#include <array>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -103,6 +105,37 @@ struct recovery_counters {
     bool operator==(const recovery_counters&) const = default;
 };
 
+// The steps of a recovery, in the order that it runs them.
+enum class recovery_step {
+    open_files,
+    load_erased_ranges,
+    index,
+    place,
+    retire_files,
+    resume_sequence,
+    drop_obsolete_erased_ranges,
+    finish_files,
+};
+
+inline constexpr size_t recovery_step_count = static_cast<size_t>(recovery_step::finish_files) + 1;
+
+// What one recovery step took. The I/O counts are the reactor's, so they cover all the I/O of the
+// shard while the step runs, which at startup is the I/O of recovery.
+struct recovery_step_stats {
+    std::chrono::steady_clock::duration wall{};
+    // The CPU time of the shard's thread. It includes the polling of the reactor, so while the step
+    // waits for I/O it goes toward `wall`: it is an upper bound of the CPU that the step uses.
+    std::chrono::nanoseconds cpu{};
+    uint64_t reads{0};
+    uint64_t read_bytes{0};
+    uint64_t writes{0};
+    uint64_t write_bytes{0};
+    // The bytes that the input streams of the step gave out, and those of them that a stream did
+    // not have ready, so that its reader waited for the disk.
+    uint64_t stream_read_bytes{0};
+    uint64_t stream_read_bytes_waited{0};
+};
+
 // What a recovery found on disk, and what it did with it.
 struct recovery_summary {
     uint64_t found_segments{0};
@@ -115,6 +148,12 @@ struct recovery_summary {
     recovery_counters counters;
     // The sequence of the first segment that is allocated after recovery.
     segment_sequence next_segment_seq{0};
+    std::chrono::steady_clock::duration duration{};
+    std::array<recovery_step_stats, recovery_step_count> steps{};
+
+    const recovery_step_stats& step(recovery_step s) const noexcept {
+        return steps[static_cast<size_t>(s)];
+    }
 };
 
 // What the logstor of one shard is using. Every field is shard wide and covers every table, unlike

@@ -29,7 +29,7 @@ async def count_logstor_data_files(manager: ScyllaClusterManager, server_id: int
 
 async def assert_no_dropped_records(server_log: ScyllaLogFile, from_mark: int):
     """Asserts that each recovery after `from_mark` logged its completion and dropped no record."""
-    matches = await server_log.grep(r"Recovery complete: .*, (\d+) dropped records", from_mark=from_mark)
+    matches = await server_log.grep(r"Recovery complete .*, (\d+) dropped records", from_mark=from_mark)
     assert matches and all(int(m.group(1)) == 0 for _, m in matches)
 
 async def test_config_option_consistency(manager: ScyllaClusterManager):
