@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <optional>
 #include <random>
 #include <span>
@@ -141,6 +142,18 @@ void require_consistent_counters(const recovery_summary& summary) {
             c.records_new_key + c.records_replaced + c.records_superseded + c.records_of_gone_tables + c.dropped_records);
 }
 
+// The steps run one after the other within the recovery. No duration is checked against a value.
+void require_consistent_steps(const recovery_summary& summary) {
+    std::chrono::steady_clock::duration steps{};
+    for (const auto& step : summary.steps) {
+        BOOST_REQUIRE(step.wall >= std::chrono::steady_clock::duration::zero());
+        BOOST_REQUIRE(step.cpu >= std::chrono::nanoseconds::zero());
+        BOOST_REQUIRE_LE(step.stream_read_bytes_waited, step.stream_read_bytes);
+        steps += step.wall;
+    }
+    BOOST_REQUIRE(steps <= summary.duration);
+}
+
 } // anonymous namespace
 
 SEASTAR_THREAD_TEST_CASE(test_logstor_recovery_of_an_empty_directory) {
@@ -158,6 +171,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_recovery_of_an_empty_directory) {
     BOOST_REQUIRE_EQUAL(summary.free_segments, 0u);
     BOOST_REQUIRE(summary.counters == recovery_counters{});
     BOOST_REQUIRE_EQUAL(summary.next_segment_seq.value, 1u);
+    require_consistent_steps(summary);
 }
 
 // Recovery returns the newest record of each key, for two tables: an overwrite with a newer
@@ -219,6 +233,11 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_recovery_restores_the_newest_records) {
     BOOST_REQUIRE_EQUAL(summary.counters.dropped_records, 0u);
     BOOST_REQUIRE_EQUAL(summary.counters.full_segments_placed, 2u);
     BOOST_REQUIRE_EQUAL(summary.counters.separated_segments, 0u);
+    require_consistent_steps(summary);
+    // The scan reads the found segments through input streams.
+    const auto& index = summary.step(recovery_step::index);
+    BOOST_REQUIRE_GT(index.read_bytes, 0u);
+    BOOST_REQUIRE_GT(index.stream_read_bytes, 0u);
     BOOST_REQUIRE_EQUAL(group_a.logstor_segments().segment_count(), 1u);
     BOOST_REQUIRE_EQUAL(group_b.logstor_segments().segment_count(), 1u);
     BOOST_REQUIRE_EQUAL(group_a.logstor_index().get_key_count(), 2u);
