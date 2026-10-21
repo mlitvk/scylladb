@@ -4160,9 +4160,10 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_fails_when_segment_allocation_fails)
 }
 
 // Checks that the store continues with free segments when it cannot allocate a new segment, because
-// the format of its file failed. The replenisher tries the new segment again on each allocation, but
-// it uses a free segment when the new segment fails. When the format works again, the next
-// allocation of a file after the retry interval formats the file, and the store grows again.
+// the format of its file failed. The segment allocator tries the new segment again on each
+// allocation, but it uses a free segment when the new segment fails. When the format works
+// again, the next allocation of a file after the retry interval formats the file, and the store
+// grows again.
 SEASTAR_THREAD_TEST_CASE(test_logstor_uses_free_segments_when_file_format_fails) {
     if constexpr (!std::is_same_v<utils::error_injection_type, utils::error_injection<true>>) {
         return;
