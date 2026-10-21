@@ -136,6 +136,15 @@ bool on_disk(const sstring& path) {
     return seastar::file_exists(path).get();
 }
 
+// Every found segment is scanned, and every record read lands in one count.
+void require_consistent_counters(const recovery_summary& summary) {
+    const auto& c = summary.counters;
+    BOOST_REQUIRE_EQUAL(c.segments_scanned, summary.found_segments);
+    BOOST_REQUIRE_LE(c.empty_segments + summary.used_segments, c.segments_scanned);
+    BOOST_REQUIRE_EQUAL(c.records_read,
+            c.records_new_key + c.records_replaced + c.records_superseded + c.records_of_gone_tables + c.records_erased + c.dropped_records);
+}
+
 } // anonymous namespace
 
 SEASTAR_THREAD_TEST_CASE(test_logstor_recovery_of_an_empty_directory) {
@@ -151,8 +160,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_recovery_of_an_empty_directory) {
     BOOST_REQUIRE_EQUAL(summary.found_segments, 0u);
     BOOST_REQUIRE_EQUAL(summary.used_segments, 0u);
     BOOST_REQUIRE_EQUAL(summary.free_segments, 0u);
-    BOOST_REQUIRE_EQUAL(summary.dropped_records, 0u);
-    BOOST_REQUIRE_EQUAL(summary.separated_segments, 0u);
+    BOOST_REQUIRE(summary.counters == recovery_counters{});
     BOOST_REQUIRE_EQUAL(summary.next_segment_seq.value, 1u);
 }
 
@@ -206,8 +214,14 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_recovery_restores_the_newest_records) {
     // segment holds only copies that the full segments replaced.
     BOOST_REQUIRE_EQUAL(summary.used_segments, 2u);
     BOOST_REQUIRE_EQUAL(summary.free_segments + summary.used_segments, summary.found_segments);
-    BOOST_REQUIRE_EQUAL(summary.dropped_records, 0u);
-    BOOST_REQUIRE_EQUAL(summary.separated_segments, 0u);
+    require_consistent_counters(summary);
+    // One new key each for a0, a1 and b0; every other record read is an older or a newer version,
+    // or a copy, of one of them.
+    BOOST_REQUIRE_EQUAL(summary.counters.records_new_key, 3u);
+    BOOST_REQUIRE_EQUAL(summary.counters.records_of_gone_tables, 0u);
+    BOOST_REQUIRE_EQUAL(summary.counters.dropped_records, 0u);
+    BOOST_REQUIRE_EQUAL(summary.counters.full_segments_placed, 2u);
+    BOOST_REQUIRE_EQUAL(summary.counters.separated_segments, 0u);
     BOOST_REQUIRE_EQUAL(group_a.logstor_segments().segment_count(), 1u);
     BOOST_REQUIRE_EQUAL(group_b.logstor_segments().segment_count(), 1u);
     BOOST_REQUIRE_EQUAL(group_a.logstor_index().get_key_count(), 2u);
@@ -260,7 +274,10 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_recovery_places_segments_by_their_kind) {
     ls.start().get();
 
     BOOST_REQUIRE_EQUAL(summary.used_segments, 3u);
-    BOOST_REQUIRE_EQUAL(summary.separated_segments, 0u);
+    require_consistent_counters(summary);
+    BOOST_REQUIRE_EQUAL(summary.counters.full_segments_placed, 2u);
+    BOOST_REQUIRE_EQUAL(summary.counters.mixed_segments_separated, 1u);
+    BOOST_REQUIRE_EQUAL(summary.counters.separated_segments, 0u);
     BOOST_REQUIRE_EQUAL(left.logstor_segments().segment_count(), 1u);
     BOOST_REQUIRE_EQUAL(right.logstor_segments().segment_count(), 1u);
 
@@ -307,7 +324,10 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_recovery_leaves_out_a_table_that_is_gone) 
 
     BOOST_REQUIRE_EQUAL(summary.used_segments, 1u);
     BOOST_REQUIRE_EQUAL(summary.free_segments + summary.used_segments, summary.found_segments);
-    BOOST_REQUIRE_EQUAL(summary.dropped_records, 0u);
+    require_consistent_counters(summary);
+    // Both copies of b0, as for the dropped records below.
+    BOOST_REQUIRE_EQUAL(summary.counters.records_of_gone_tables, 2u);
+    BOOST_REQUIRE_EQUAL(summary.counters.dropped_records, 0u);
     BOOST_REQUIRE_EQUAL(group_a.logstor_index().get_key_count(), 1u);
     require_value(ls, group_a.logstor_index(), a0);
 }
@@ -347,8 +367,9 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_recovery_drops_the_records_of_a_tablet_tha
 
     // Both copies of right_record: the one in the mixed segment it was written to, and the one the
     // separator made in a full segment of the right group.
-    BOOST_REQUIRE_EQUAL(summary.dropped_records, 2u);
+    BOOST_REQUIRE_EQUAL(summary.counters.dropped_records, 2u);
     BOOST_REQUIRE_EQUAL(summary.used_segments, 1u);
+    require_consistent_counters(summary);
     BOOST_REQUIRE_EQUAL(summary.free_segments + summary.used_segments, summary.found_segments);
     BOOST_REQUIRE_EQUAL(left.logstor_segments().segment_count(), 1u);
     require_value(ls, left.logstor_index(), left_record);
@@ -442,9 +463,11 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_recovery_separates_a_full_segment_that_fit
     const auto summary = ls.do_recovery(catalog).get();
     ls.start().get();
 
-    BOOST_REQUIRE_EQUAL(summary.separated_segments, 1u);
+    BOOST_REQUIRE_EQUAL(summary.counters.separated_segments, 1u);
     BOOST_REQUIRE_EQUAL(summary.used_segments, 1u);
-    BOOST_REQUIRE_EQUAL(summary.dropped_records, 0u);
+    require_consistent_counters(summary);
+    BOOST_REQUIRE_EQUAL(summary.counters.dropped_records, 0u);
+    BOOST_REQUIRE_EQUAL(summary.counters.full_segments_placed, 0u);
 
     left.flush_separator().get();
     right.flush_separator().get();
@@ -501,8 +524,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_recovery_separates_many_full_segments_that
 
     const auto summary = ls.do_recovery(catalog).get();
     BOOST_REQUIRE_EQUAL(summary.used_segments, segment_count);
-    BOOST_REQUIRE_EQUAL(summary.separated_segments, segment_count);
-    BOOST_REQUIRE_EQUAL(summary.dropped_records, 0u);
+    BOOST_REQUIRE_EQUAL(summary.counters.separated_segments, segment_count);
+    BOOST_REQUIRE_EQUAL(summary.counters.dropped_records, 0u);
     BOOST_REQUIRE_EQUAL(left.logstor_segments().segment_count(), 0u);
     BOOST_REQUIRE_EQUAL(right.logstor_segments().segment_count(), 0u);
 
@@ -625,6 +648,9 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_recovery_with_a_smaller_configuration) {
         BOOST_REQUIRE_EQUAL(summary.found_segments, 4 * segments_per_file);
         BOOST_REQUIRE_EQUAL(summary.used_segments, 1u);
         BOOST_REQUIRE_EQUAL(summary.free_segments, 2 * segments_per_file - 1);
+        require_consistent_counters(summary);
+        // Nothing was written to files 2 and 3.
+        BOOST_REQUIRE_GE(summary.counters.empty_segments, 2 * segments_per_file);
         BOOST_REQUIRE_EQUAL(disk_usage, smaller.disk_size);
         BOOST_REQUIRE(!file2_on_disk);
         BOOST_REQUIRE(!file3_on_disk);
@@ -638,6 +664,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_recovery_with_a_smaller_configuration) {
         BOOST_REQUIRE_EQUAL(summary.found_segments, 4 * segments_per_file);
         BOOST_REQUIRE_EQUAL(summary.used_segments, 1u);
         BOOST_REQUIRE_EQUAL(summary.free_segments, 2 * segments_per_file);
+        require_consistent_counters(summary);
         BOOST_REQUIRE_EQUAL(disk_usage, larger.disk_size);
         BOOST_REQUIRE(file2_on_disk);
         BOOST_REQUIRE(file3_on_disk);

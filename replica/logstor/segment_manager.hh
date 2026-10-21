@@ -73,6 +73,36 @@ struct segment_manager_config {
     seastar::scheduling_group split_compaction_sg;
 };
 
+// What one recovery, or the adoption of one streamed segment, read and did, record by record.
+struct recovery_counters {
+    // The segments the scan read, and those of them with no chunk whose headers are valid, which
+    // are the segments never written.
+    uint64_t segments_scanned{0};
+    uint64_t empty_segments{0};
+    // The chunks with valid headers.
+    uint64_t chunks{0};
+    // The records the scan read, and what the index did with them: a record of a key it did not
+    // hold, a record newer than the entry it held, and a record older than that entry.
+    uint64_t records_read{0};
+    uint64_t records_new_key{0};
+    uint64_t records_replaced{0};
+    uint64_t records_superseded{0};
+    // The records of a table that is gone or does not use logstor.
+    uint64_t records_of_gone_tables{0};
+    // The records that an erased range covers, which the scan leaves out.
+    uint64_t records_erased{0};
+    // The records of a tablet that is not on this shard, which are dropped.
+    uint64_t dropped_records{0};
+    // The used segments that the placement gives back to their compaction groups whole: full
+    // segments. And those whose records are separated one by one instead, which start() does: mixed
+    // segments, and full segments that fit no single compaction group of this shard.
+    uint64_t full_segments_placed{0};
+    uint64_t mixed_segments_separated{0};
+    uint64_t separated_segments{0};
+
+    bool operator==(const recovery_counters&) const = default;
+};
+
 // What a recovery found on disk, and what it did with it.
 struct recovery_summary {
     uint64_t found_segments{0};
@@ -82,13 +112,7 @@ struct recovery_summary {
     // The segments that recovery puts on the free list: the found segments below the configured
     // count that hold no record of an index.
     uint64_t free_segments{0};
-    // The records of a tablet that is not on this shard, which recovery drops.
-    uint64_t dropped_records{0};
-    // The records that an erased range covers, which recovery leaves out.
-    uint64_t erased_records{0};
-    // The full segments that fit no single compaction group of this shard. start() separates their
-    // records one by one.
-    uint64_t separated_segments{0};
+    recovery_counters counters;
     // The sequence of the first segment that is allocated after recovery.
     segment_sequence next_segment_seq{0};
 };
