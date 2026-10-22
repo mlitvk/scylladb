@@ -52,6 +52,7 @@
 #include <seastar/util/closeable.hh>
 #include <seastar/core/condition-variable.hh>
 #include <seastar/coroutine/as_future.hh>
+#include <boost/intrusive/list.hpp>
 #include "replica/logstor/write_buffer.hh"
 #include "utils/disk-error-handler.hh"
 #include "utils/error_injection.hh"
@@ -606,9 +607,10 @@ future<bool> segment_allocator::wait_for_free_segment() {
 // Holds the segments that are ready for writes. The pool refills itself in the background from
 // the segment allocator, and keeps itself full. The last segments in the pool are the compaction
 // reserve, and only compaction takes them, because compaction must always get a segment to free
-// segments. A consumer that waits for a segment fails when an attempt to refill the pool fails
-// while it waits, so that a write does not wait for a segment that possibly does not come. A
-// compaction that fails this way runs again later.
+// segments. A consumer that cannot take a segment waits in the queue of its tier, and a new segment
+// goes to the first consumer that can take it, compaction first. A consumer that waits fails when
+// an attempt to refill the pool fails, so that a write does not wait for a segment that possibly
+// does not come. A compaction that fails this way runs again later.
 class segment_pool {
     // After a failed refill, the next attempt comes after this delay.
     static constexpr auto refill_retry_delay = std::chrono::seconds(1);
@@ -617,9 +619,24 @@ class segment_pool {
     seastar::circular_buffer<seg_ptr> _segments;
     size_t _capacity;
     size_t _reserved_for_compaction;
-    seastar::condition_variable _segment_available;
-    uint64_t _failed_refill_count{0};
-    std::exception_ptr _refill_error;
+
+    // A tier groups the consumers that take segments under the same reserve.
+    enum class tier : size_t { compaction, other };
+    static constexpr size_t tier_count = 2;
+
+    // A waiter is a consumer that waits for a segment. It lives in the frame of wait_for_segment(),
+    // and it is in the queue of its tier until its promise is set.
+    struct waiter : public boost::intrusive::list_base_hook<> {
+        write_source src;
+        promise<seg_ptr> pr;
+
+        explicit waiter(write_source src) noexcept : src(src) {}
+    };
+    using waiter_list = boost::intrusive::list<waiter, boost::intrusive::constant_time_size<false>>;
+
+    // Holds one queue per tier of the consumers that wait for a segment, in arrival order. No
+    // consumer waits in a tier while the pool holds more segments than the reserve of the tier.
+    std::array<waiter_list, tier_count> _waiters;
 
     future<> _refill{make_ready_future<>()};
     bool _stopping{false};
@@ -637,9 +654,33 @@ public:
 private:
     stats _stats;
 
-    // Returns the count of segments that a consumer of this source must leave in the pool.
-    size_t reserve_for(write_source src) const noexcept {
-        return src == write_source::compaction ? 0 : _reserved_for_compaction;
+    static tier tier_of(write_source src) noexcept {
+        return src == write_source::compaction ? tier::compaction : tier::other;
+    }
+
+    // Returns the count of segments that a consumer of this tier must leave in the pool.
+    size_t reserve_of(tier t) const noexcept {
+        return t == tier::compaction ? 0 : _reserved_for_compaction;
+    }
+
+    seg_ptr pop(write_source src) noexcept {
+        _stats.segments_taken[static_cast<size_t>(src)]++;
+        auto seg = std::move(_segments.front());
+        _segments.pop_front();
+        _refill_needed.signal();
+        return seg;
+    }
+
+    // Gives the segments to the waiting consumers that can take them, compaction first.
+    void serve_waiters() noexcept {
+        for (size_t i = 0; i < tier_count; ++i) {
+            auto& waiters = _waiters[i];
+            while (!waiters.empty() && _segments.size() > reserve_of(tier(i))) {
+                auto& w = waiters.front();
+                waiters.pop_front();
+                w.pr.set_value(pop(w.src));
+            }
+        }
     }
 
     bool full() const noexcept {
@@ -653,17 +694,41 @@ private:
             on_internal_error(logstor_logger, "Attempted to put a segment into a full segment pool");
         }
         _segments.push_back(std::move(seg));
-        _segment_available.broadcast();
         _stats.segments_put++;
+        serve_waiters();
     }
 
-    // The refill calls this when it cannot allocate a segment. Each consumer that waits for a
-    // segment at this time fails with the error. A consumer that starts to wait after this call
-    // waits for the next attempt.
+    // Fails each consumer that waits for a segment now. The refill calls this when it cannot
+    // allocate a segment, and a consumer that starts to wait after this call waits for the next
+    // attempt.
     void fail_waiters(std::exception_ptr ex) noexcept {
-        _refill_error = std::move(ex);
-        ++_failed_refill_count;
-        _segment_available.broadcast();
+        for (auto& waiters : _waiters) {
+            while (!waiters.empty()) {
+                auto& w = waiters.front();
+                waiters.pop_front();
+                w.pr.set_exception(ex);
+            }
+        }
+    }
+
+    future<seg_ptr> wait_for_segment(write_source src, abort_source* as) {
+        auto& waiters = _waiters[static_cast<size_t>(tier_of(src))];
+        waiter w(src);
+        auto f = w.pr.get_future();
+        seastar::optimized_optional<abort_source::subscription> abort_subscription;
+        if (as) {
+            abort_subscription = as->subscribe([&waiters, &w] () noexcept {
+                if (w.is_linked()) {
+                    waiters.erase(waiters.iterator_to(w));
+                    w.pr.set_exception(abort_requested_exception());
+                }
+            });
+            if (!abort_subscription) {
+                co_await coroutine::return_exception(abort_requested_exception());
+            }
+        }
+        waiters.push_back(w);
+        co_return co_await coroutine::try_future(std::move(f));
     }
 
 public:
@@ -680,55 +745,43 @@ public:
         });
     }
 
-    // Call this after all the consumers stop. It stops the refill after the allocation that it does
-    // at this time. A consumer that still waits after that is a bug, and broken() makes it fail and
-    // not wait forever.
+    // Stops the refill after the allocation that the refill does at this time. Call this after all
+    // the consumers stop. A call to take() after stop() starts, or a wait that remains when the
+    // refill stops, is a bug in the caller, and it fails and does not wait forever.
     future<> stop() {
         _stopping = true;
         _refill_needed.signal();
         _allocator.stop_waiting();
         co_await std::move(_refill);
-        _segment_available.broken();
+        fail_waiters(std::make_exception_ptr(std::runtime_error("The segment pool is stopped")));
         _segments.clear();
     }
 
-    // Takes a segment for `src`, or waits for one. If `as` is given and aborted, the wait fails
-    // with abort_requested_exception.
-    future<seg_ptr> take(write_source src, abort_source* as = nullptr) {
-        const size_t reserved = reserve_for(src);
-        if (_segments.size() <= reserved) {
+    // Takes a segment, or waits for one that this source can take. If the caller gives `as` and
+    // `as` is aborted, the wait ends and take() fails with abort_requested_exception.
+    future<seg_ptr> take(write_source src, abort_source* as = nullptr) noexcept {
+        try {
+            if (_stopping) [[unlikely]] {
+                return make_exception_future<seg_ptr>(std::runtime_error("The segment pool is stopped"));
+            }
+            const auto t = tier_of(src);
+            if (_waiters[static_cast<size_t>(t)].empty() && _segments.size() > reserve_of(t)) {
+                return make_ready_future<seg_ptr>(pop(src));
+            }
             _stats.segments_wait[static_cast<size_t>(src)]++;
+            return wait_for_segment(src, as);
+        } catch (...) {
+            return current_exception_as_future<seg_ptr>();
         }
-        seastar::optimized_optional<abort_source::subscription> abort_subscription;
-        if (as && _segments.size() <= reserved) {
-            abort_subscription = as->subscribe([this] () noexcept { _segment_available.broadcast(); });
-        }
-        // A put wakes each waiter, and the first one takes the segment. The others wait again.
-        while (_segments.size() <= reserved) {
-            const auto failed_refill_count = _failed_refill_count;
-            co_await coroutine::try_future(_segment_available.wait([this, reserved, failed_refill_count, as] {
-                return _segments.size() > reserved || _failed_refill_count != failed_refill_count
-                        || (as && as->abort_requested());
-            }));
-            if (as && as->abort_requested()) {
-                co_await coroutine::return_exception(abort_requested_exception());
-            }
-            if (_failed_refill_count != failed_refill_count && _segments.size() <= reserved) {
-                co_await coroutine::return_exception_ptr(_refill_error);
-            }
-        }
-        _stats.segments_taken[static_cast<size_t>(src)]++;
-        auto seg = std::move(_segments.front());
-        _segments.pop_front();
-        _refill_needed.signal();
-        co_return seg;
     }
 
+    // Returns the count of segments that a consumer of this source can take now.
     size_t available_segment_count(write_source src) const noexcept {
-        const size_t reserved = reserve_for(src);
+        const size_t reserved = reserve_of(tier_of(src));
         return _segments.size() > reserved ? _segments.size() - reserved : 0;
     }
 
+    // Returns the count of segments in the pool, including the reserves.
     size_t size() const noexcept {
         return _segments.size();
     }
