@@ -320,7 +320,9 @@ private:
 struct separator_buffer {
     owned_write_buffer buf;
     utils::chunked_vector<future<>> pending_updates;
-    utils::chunked_vector<segment_ref> held_segments;
+    // Holds the guards of the source segments of the records. A successful flush releases the
+    // guards, else the guards keep the segments.
+    utils::chunked_vector<keep_on_release_guard> held_segments;
     std::optional<segment_sequence> min_seq_num;
 
     separator_buffer() = default;
@@ -336,8 +338,8 @@ struct separator_buffer {
     template <log_record_writer_concept Writer>
     void write(segment_ref seg_ref, std::optional<segment_sequence> segment_seq_num, Writer writer, separator_index_update after_written) {
         // The separator buffer holds a reference to the source segment until its updates are durable.
-        if (held_segments.empty() || held_segments.back().id() != seg_ref.id()) {
-            held_segments.push_back(std::move(seg_ref));
+        if (held_segments.empty() || held_segments.back().ref().id() != seg_ref.id()) {
+            held_segments.push_back(keep_on_release_guard(std::move(seg_ref)));
         }
 
         if (segment_seq_num && (!min_seq_num || *segment_seq_num < *min_seq_num)) {
@@ -380,6 +382,15 @@ struct separator_buffer {
     future<> release();
 
     future<> abort(std::exception_ptr);
+
+    // Releases the guards of the source segments without keep_on_release(), because the flush wrote
+    // the records. The last reference of each source segment then frees the segment.
+    void release_held_segments() noexcept {
+        for (auto& guard : held_segments) {
+            guard.release();
+        }
+        held_segments.clear();
+    }
 };
 
 class compaction_reenabler {
