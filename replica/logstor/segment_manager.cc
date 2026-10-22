@@ -1114,7 +1114,7 @@ private:
             },
             [this, seg_id] {
                 ++_stats.segment_free_failures;
-                logstor_logger.warn("Segment {} can't be freed", seg_id);
+                logstor_logger.warn("Cannot free {}, because records in it can still be needed", seg_id);
             }
         );
     }
@@ -1465,7 +1465,7 @@ future<> segment_manager_impl::run_separator_fiber() {
         }
 
         auto write_to_separator_failed = defer([seg_ref = task.seg_ref] mutable noexcept {
-            seg_ref.set_flush_failure();
+            seg_ref.keep_on_release();
         });
 
         try {
@@ -1512,7 +1512,7 @@ future<> segment_manager_impl::write(write_buffer& wb) {
 
         // if we wrote a record to the segment but failed to write it to the separator, the segment should not be freed.
         auto write_to_separator_failed = defer([seg_ref] mutable noexcept {
-            seg_ref.set_flush_failure();
+            seg_ref.keep_on_release();
         });
 
         logstor_logger.trace("Write active segment {} seq {}", seg->id(), seq_num);
@@ -1578,11 +1578,11 @@ future<> segment_manager_impl::write_full_segment(write_buffer& wb, logstor_grou
 
     // The records are on disk and the index already points into this segment, so if adding it to
     // the compaction group fails, the segment must not be freed when the reference below is
-    // released. Marking the reference as failed leaves it allocated instead, so the records stay
-    // readable, at the cost of the segment never being reclaimed.
+    // released. keep_on_release() leaves it allocated instead, so the records stay readable, at the
+    // cost of the segment never being reclaimed.
     auto seg_ref = seg->ref();
     auto add_to_group_failed = defer([seg_ref] mutable noexcept {
-        seg_ref.set_flush_failure();
+        seg_ref.keep_on_release();
         logstor_logger.warn("Failed to add segment {} to a compaction group, it will not be reclaimed", seg_ref.id());
     });
 
@@ -2596,7 +2596,7 @@ future<> segment_manager_impl::add_segment_to_compaction_group(replica::database
     if (need_separator) {
         auto seg_ref = make_segment_ref(seg_id);
         auto write_to_separator_failed = defer([seg_ref] mutable noexcept {
-            seg_ref.set_flush_failure();
+            seg_ref.keep_on_release();
         });
         co_await for_each_record(seg_id, [seg_ref, &db] (const chunk_record& record) {
             const auto& header = record.header;
@@ -2814,13 +2814,13 @@ separator_buffer::~separator_buffer() {
     logstor_logger.error("Destroying a logstor separator buffer that still holds {} segments,"
             " they will not be reclaimed", held_segments.size());
     for (auto& seg_ref : held_segments) {
-        seg_ref.set_flush_failure();
+        seg_ref.keep_on_release();
     }
 }
 
 future<> separator_buffer::abort(std::exception_ptr ep) {
     for (auto& seg_ref : held_segments) {
-        seg_ref.set_flush_failure();
+        seg_ref.keep_on_release();
     }
     if (!empty()) {
         co_await buf->abort_writes(std::move(ep));
