@@ -471,21 +471,20 @@ class segment_pool {
     std::exception_ptr _replenish_error;
 
 public:
-
     struct stats {
         uint64_t segments_put{0};
         std::array<uint64_t, write_source_count> segments_taken{0};
-        uint64_t normal_segments_wait{0};
-    } _stats;
+        std::array<uint64_t, write_source_count> segments_wait{0};
+    };
 
+private:
+    stats _stats;
+
+public:
     segment_pool(size_t pool_size, size_t reserved_for_compaction)
         : _capacity(pool_size)
         , _reserved_for_compaction(reserved_for_compaction)
     {}
-
-    future<> start() {
-        co_return;
-    }
 
     // The caller must stop the consumers and the replenisher first. A consumer that still waits is
     // a bug, and broken() fails it.
@@ -521,8 +520,8 @@ public:
     // with abort_requested_exception.
     future<seg_ptr> take(write_source src, abort_source* as = nullptr) {
         const size_t reserved = src == write_source::compaction ? 0 : _reserved_for_compaction;
-        if (_segments.size() <= reserved && src == write_source::normal) {
-            _stats.normal_segments_wait++;
+        if (_segments.size() <= reserved) {
+            _stats.segments_wait[static_cast<size_t>(src)]++;
         }
         seastar::optimized_optional<abort_source::subscription> abort_subscription;
         if (as && _segments.size() <= reserved) {
@@ -1116,7 +1115,7 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
                        sm::description("Counts number of segments taken from the segment pool for compaction.")),
         sm::make_counter("segment_pool_separator_segments_get", _segment_pool.get_stats().segments_taken[static_cast<size_t>(write_source::separator)],
                        sm::description("Counts number of segments taken from the segment pool for separator writes.")),
-        sm::make_counter("segment_pool_normal_segments_wait", _segment_pool.get_stats().normal_segments_wait,
+        sm::make_counter("segment_pool_normal_segments_wait", _segment_pool.get_stats().segments_wait[static_cast<size_t>(write_source::normal)],
                        sm::description("Counts number of times normal writes had to wait for a segment to become available in the segment pool.")),
         sm::make_counter("bytes_written", _stats.bytes_written[static_cast<size_t>(write_source::normal)],
                        sm::description("Counts number of bytes written to the disk.")),
