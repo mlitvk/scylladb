@@ -806,6 +806,16 @@ public:
 
     future<utils::chunked_vector<segment_snapshot>> make_snapshot(logstor_group&);
 
+    // Returns the ids of the segments that the group owns, in no particular order.
+    utils::chunked_vector<log_segment_id> segment_ids(const logstor_group& group) const {
+        utils::chunked_vector<log_segment_id> ids;
+        const auto& segments = group.logstor_segments();
+        for (size_t i = 0; i < segments.segment_count(); ++i) {
+            ids.push_back(desc_to_segment_id(segments.segment_at(i)));
+        }
+        return ids;
+    }
+
     future<seastar::input_stream<char>> create_segment_input_stream(log_segment_id segment_id, const seastar::file_input_stream_options& opts);
     future<std::unique_ptr<segment_stream_sink>> create_segment_output_stream(recovery_catalog&);
     future<std::unique_ptr<record_stream_source>> make_record_stream_source(logstor_group&);
@@ -2738,6 +2748,14 @@ future<std::unique_ptr<record_stream_sink>> segment_manager_impl::make_record_st
 
 future<utils::chunked_vector<segment_snapshot>> segment_manager::make_snapshot(logstor_group& cg) {
     return _impl->make_snapshot(cg);
+}
+
+utils::chunked_vector<log_segment_id> segment_manager::segment_ids_for_test(const logstor_group& group) const {
+    return _impl->segment_ids(group);
+}
+
+future<> segment_manager::for_each_record_for_test(log_segment_id segment_id, noncopyable_function<future<>(const chunk_record&)> fn) {
+    return _impl->for_each_record(segment_id, std::move(fn));
 }
 
 future<std::unique_ptr<segment_stream_sink>> segment_manager::create_segment_output_stream(recovery_catalog& catalog) {
