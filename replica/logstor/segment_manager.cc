@@ -805,6 +805,7 @@ public:
 
     future<seastar::input_stream<char>> create_segment_input_stream(log_segment_id segment_id, const seastar::file_input_stream_options& opts);
     future<std::unique_ptr<segment_stream_sink>> create_segment_output_stream();
+    future<std::unique_ptr<record_stream_source>> make_record_stream_source(logstor_group&);
     future<std::unique_ptr<record_stream_sink>> make_record_stream_sink(table_id, record_stream_sink::target_resolver);
 
     uint64_t allocatable_new_segment_count() const noexcept {
@@ -2626,6 +2627,31 @@ future<std::unique_ptr<segment_stream_sink>> segment_manager_impl::create_segmen
     co_return std::make_unique<segment_stream_sink_impl>(*this, std::move(holder), std::move(seg));
 }
 
+future<std::unique_ptr<record_stream_source>> segment_manager_impl::make_record_stream_source(logstor_group& cg) {
+    auto compaction_guard = co_await _compaction_mgr.disable_compaction(cg);
+
+    utils::chunked_vector<log_segment_id> segments;
+    const auto& segment_set = cg.logstor_segments();
+    for (size_t i = 0; i < segment_set.segment_count(); ++i) {
+        const auto& desc = segment_set.segment_at(i);
+        if (desc.record_count > 0) {
+            segments.push_back(desc_to_segment_id(desc));
+        }
+    }
+    if (segments.empty()) {
+        co_return nullptr;
+    }
+
+    co_return std::make_unique<record_stream_source>(cg.table_id(), cg.logstor_index(), std::move(compaction_guard),
+            std::move(segments), _cfg.segment_size,
+            [this] (log_segment_id segment_id, noncopyable_function<future<>(const scanned_chunk&)> fn) -> future<> {
+                // A read of a segment is work in progress, as for a read of a record, so that stop()
+                // does not close the files under it.
+                auto holder = _async_gate.hold();
+                co_await for_each_chunk(segment_id, std::move(fn));
+            });
+}
+
 future<std::unique_ptr<record_stream_sink>> segment_manager_impl::make_record_stream_sink(table_id table,
         record_stream_sink::target_resolver resolve_target) {
     // Taken before the buffer, so that a sink is never made while the segment manager stops.
@@ -2647,6 +2673,10 @@ future<utils::chunked_vector<segment_snapshot>> segment_manager::make_snapshot(l
 
 future<std::unique_ptr<segment_stream_sink>> segment_manager::create_segment_output_stream() {
     return _impl->create_segment_output_stream();
+}
+
+future<std::unique_ptr<record_stream_source>> segment_manager::make_record_stream_source(logstor_group& cg) {
+    return _impl->make_record_stream_source(cg);
 }
 
 future<std::unique_ptr<record_stream_sink>> segment_manager::make_record_stream_sink(table_id table,

@@ -171,6 +171,11 @@ public:
     // waits for it, and after stop() starts this fails with gate_closed_exception.
     future<std::unique_ptr<segment_stream_sink>> create_segment_output_stream();
 
+    // Makes a source that sends the live records of the group as a record stream. Returns nullptr
+    // if the group has no live record. Compaction of the group stays disabled until the source is
+    // destroyed.
+    future<std::unique_ptr<record_stream_source>> make_record_stream_source(logstor_group&);
+
     // Makes a sink that receives a record stream of the table. The sink is work in progress of the
     // segment manager until it is closed or aborted: stop() waits for it, and after stop() starts
     // this fails with gate_closed_exception. Waits while max_record_stream_sinks sinks are open.

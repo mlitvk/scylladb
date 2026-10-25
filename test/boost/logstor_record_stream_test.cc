@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <chrono>
 #include <optional>
+#include <set>
 #include <span>
 #include <stdexcept>
 #include <vector>
@@ -22,6 +23,8 @@
 #include <seastar/core/simple-stream.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/temporary_buffer.hh>
+#include <seastar/coroutine/as_future.hh>
+#include <seastar/util/memory-data-source.hh>
 #include <seastar/testing/thread_test_case.hh>
 
 #include "replica/logstor/index.hh"
@@ -215,6 +218,77 @@ void require_reads_back(logstor& ls, schema_ptr schema, const primary_index& ind
     auto actual = read_mutation(ls, schema, index, expected.decorated_key(), schema->full_slice()).get();
     BOOST_REQUIRE(actual);
     assert_that(*actual).is_equal_to(expected);
+}
+
+// Writes the records through the write path and flushes them into one segment of the group.
+void write_segment(logstor& ls, test_logstor_group& group, schema_ptr schema, std::span<const test_record> records) {
+    for (const auto& r : records) {
+        ls.write(make_mutation(schema, r), write_target(&group, {}), db::no_timeout).get();
+    }
+    ls.flush_to_separator().get();
+    group.flush_separator().get();
+}
+
+// Reads the source to its end. Only the last buffer is empty.
+std::vector<temporary_buffer<char>> read_all(record_stream_source& source) {
+    std::vector<temporary_buffer<char>> chunks;
+    while (true) {
+        auto buf = source.get().get();
+        if (buf.empty()) {
+            break;
+        }
+        chunks.push_back(std::move(buf));
+    }
+    BOOST_REQUIRE(source.get().get().empty());
+    return chunks;
+}
+
+// The timestamps of the records in the chunks. Every record of a test has a timestamp of its own.
+std::multiset<api::timestamp_type> timestamps_in(const std::vector<temporary_buffer<char>>& chunks) {
+    std::multiset<api::timestamp_type> timestamps;
+    for (const auto& bytes : chunks) {
+        auto chunk = parse_chunk(copy_of(bytes)).get();
+        BOOST_REQUIRE(chunk);
+        for (const auto& record : chunk->records()) {
+            timestamps.insert(record.header.timestamp);
+        }
+    }
+    return timestamps;
+}
+
+std::multiset<api::timestamp_type> timestamps_of(std::initializer_list<std::span<const test_record>> record_sets) {
+    std::multiset<api::timestamp_type> timestamps;
+    for (const auto& records : record_sets) {
+        for (const auto& r : records) {
+            timestamps.insert(r.timestamp);
+        }
+    }
+    return timestamps;
+}
+
+// The records with new values and timestamps for the same keys.
+std::vector<test_record> overwrite(std::span<const test_record> records, api::timestamp_type first_timestamp) {
+    std::vector<test_record> result;
+    for (const auto& r : records) {
+        result.push_back(test_record{.pk = r.pk, .value = r.value + "-new", .timestamp = first_timestamp++});
+    }
+    return result;
+}
+
+// Gives the chunks of a segment that is in memory, as the segment manager gives the chunks of a
+// segment on disk.
+record_stream_source::chunk_reader memory_chunk_reader(temporary_buffer<char> segment) {
+    return [segment = std::move(segment)] (log_segment_id segment_id, noncopyable_function<future<>(const scanned_chunk&)> fn) -> future<> {
+        auto in = seastar::util::as_input_stream(copy_of(segment));
+        segment_scanner scanner(in, segment_id, segment.size());
+        auto f = co_await coroutine::as_future([&] -> future<> {
+            while (auto* chunk = co_await scanner.next_chunk()) {
+                co_await fn(*chunk);
+            }
+        }());
+        co_await in.close();
+        co_return co_await std::move(f);
+    };
 }
 
 } // anonymous namespace
@@ -575,4 +649,172 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_stop_waits_for_record_stream_sink) {
     sink->abort().get();
     sink.reset();
     stop_f.get();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_logstor_record_source_sends_only_live_records) {
+    auto schema = make_schema();
+    logstor_env env;
+    test_logstor_group group(schema, env.ls);
+    auto setup_guard = std::make_optional(env.ls.get_compaction_manager().disable_compaction(group).get());
+
+    const auto first = make_records(20, 100);
+    const auto second = make_records(20, 100, 20);
+    const auto overwritten = overwrite(std::span(first).first(10), 2000);
+    write_segment(env.ls, group, schema, first);
+    write_segment(env.ls, group, schema, second);
+    write_segment(env.ls, group, schema, overwritten);
+    setup_guard.reset();
+
+    auto source = env.ls.get_segment_manager().make_record_stream_source(group).get();
+    BOOST_REQUIRE(source);
+    const auto chunks = read_all(*source);
+
+    BOOST_REQUIRE_EQUAL(chunks.size(), 3);
+    BOOST_REQUIRE(timestamps_in(chunks) == timestamps_of({std::span(first).subspan(10), second, overwritten}));
+}
+
+SEASTAR_THREAD_TEST_CASE(test_logstor_record_source_is_not_made_for_a_group_without_live_records) {
+    auto schema = make_schema();
+    logstor_env env;
+    test_logstor_group group(schema, env.ls);
+    auto& sm = env.ls.get_segment_manager();
+
+    BOOST_REQUIRE(!sm.make_record_stream_source(group).get());
+
+    const auto records = make_records(10, 100);
+    write_segment(env.ls, group, schema, records);
+    for (const auto& r : records) {
+        BOOST_REQUIRE(group.logstor_index().erase(index_key_of(schema, r), group.logstor_index().get(index_key_of(schema, r))->location));
+    }
+    BOOST_REQUIRE_EQUAL(group.logstor_segments().segment_count(), 1);
+    BOOST_REQUIRE(!sm.make_record_stream_source(group).get());
+}
+
+SEASTAR_THREAD_TEST_CASE(test_logstor_record_source_does_not_send_records_overwritten_after_it_was_made) {
+    auto schema = make_schema();
+    logstor_env env;
+    test_logstor_group group(schema, env.ls);
+
+    const auto first = make_records(10, 100);
+    const auto second = make_records(10, 100, 10);
+    write_segment(env.ls, group, schema, first);
+    write_segment(env.ls, group, schema, second);
+
+    auto source = env.ls.get_segment_manager().make_record_stream_source(group).get();
+    BOOST_REQUIRE(source);
+    // The old records are dead, and the new ones are in a segment that is not in the list of the
+    // source. The write path sends the new ones to the receiver.
+    write_segment(env.ls, group, schema, overwrite(first, 2000));
+    BOOST_REQUIRE_EQUAL(group.logstor_segments().segment_count(), 3);
+
+    const auto chunks = read_all(*source);
+    BOOST_REQUIRE_EQUAL(chunks.size(), 1);
+    BOOST_REQUIRE(timestamps_in(chunks) == timestamps_of({second}));
+}
+
+SEASTAR_THREAD_TEST_CASE(test_logstor_record_source_keeps_compaction_disabled) {
+    auto schema = make_schema();
+    logstor_env env;
+    test_logstor_group group(schema, env.ls);
+    auto& cm = env.ls.get_compaction_manager();
+    auto setup_guard = std::make_optional(cm.disable_compaction(group).get());
+
+    const auto first = make_records(10, 100);
+    write_segment(env.ls, group, schema, first);
+    write_segment(env.ls, group, schema, overwrite(first, 2000));
+    write_segment(env.ls, group, schema, make_records(10, 100, 10));
+    setup_guard.reset();
+
+    auto source = env.ls.get_segment_manager().make_record_stream_source(group).get();
+    BOOST_REQUIRE(source);
+    cm.submit(group);
+    // Waits for a compaction that runs.
+    cm.disable_compaction(group).get();
+    BOOST_REQUIRE_EQUAL(group.logstor_segments().segment_count(), 3);
+
+    source.reset();
+    cm.submit(group);
+    cm.disable_compaction(group).get();
+    BOOST_REQUIRE_LT(group.logstor_segments().segment_count(), 3);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_logstor_record_source_fails_on_a_segment_that_is_not_of_the_group) {
+    auto schema = make_schema();
+    logstor_env env;
+    test_logstor_group group(schema, env.ls);
+    const auto records = make_records(3, 100);
+
+    auto make_source = [&] (temporary_buffer<char> segment) {
+        utils::chunked_vector<log_segment_id> segments;
+        segments.push_back(log_segment_id{0});
+        return record_stream_source(schema->id(), group.logstor_index(), compaction_reenabler(), std::move(segments), segment_size,
+                memory_chunk_reader(std::move(segment)));
+    };
+    auto make_segment = [&] (segment_kind kind, table_id table) {
+        raw_write_buffer buf(segment_size, kind);
+        for (const auto& r : records) {
+            buf.append(log_record_writer(make_log_record(schema, r, table)));
+        }
+        buf.seal(segment_sequence{1}, table, ondisk::block_alignment);
+        return temporary_buffer<char>(reinterpret_cast<const char*>(buf.chunk().data()), buf.chunk().size());
+    };
+
+    temporary_buffer<char> empty(ondisk::block_alignment);
+    std::fill_n(empty.get_write(), empty.size(), 0);
+    BOOST_REQUIRE_THROW(make_source(std::move(empty)).get().get(), record_stream_error);
+
+    BOOST_REQUIRE_THROW(make_source(make_segment(segment_kind::mixed, schema->id())).get().get(), record_stream_error);
+
+    BOOST_REQUIRE_THROW(make_source(make_segment(segment_kind::full, table_id(utils::UUID_gen::get_time_UUID()))).get().get(),
+            record_stream_error);
+
+    auto corrupt = make_segment(segment_kind::full, schema->id());
+    flip_byte(corrupt, ondisk::chunk_header_size + ondisk::segment_header_size + 10);
+    BOOST_REQUIRE_THROW(make_source(std::move(corrupt)).get().get(), record_stream_error);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_logstor_record_stream_round_trip) {
+    auto schema = make_schema();
+    logstor_env env;
+    test_logstor_group sender(schema, env.ls);
+    test_logstor_group receiver(schema, env.ls);
+    auto setup_guard = std::make_optional(env.ls.get_compaction_manager().disable_compaction(sender).get());
+    target_gates gates;
+
+    // Every segment of the sender is half dead.
+    const auto records = make_records(150, 2000);
+    std::vector<test_record> live;
+    for (size_t i = 0; i < records.size(); i += 30) {
+        const auto batch = std::span(records).subspan(i, 30);
+        write_segment(env.ls, sender, schema, batch);
+        const auto newer = overwrite(batch.first(15), 3000 + i);
+        write_segment(env.ls, sender, schema, newer);
+        live.insert(live.end(), newer.begin(), newer.end());
+        live.insert(live.end(), batch.begin() + 15, batch.end());
+    }
+    setup_guard.reset();
+
+    auto source = env.ls.get_segment_manager().make_record_stream_source(sender).get();
+    BOOST_REQUIRE(source);
+    auto sink = env.ls.get_segment_manager().make_record_stream_sink(schema->id(), [&] (dht::token) {
+        return gates.target(receiver);
+    }).get();
+    auto receiver_compaction_guard = env.ls.get_compaction_manager().disable_compaction(receiver).get();
+    while (true) {
+        auto buf = source->get().get();
+        if (buf.empty()) {
+            break;
+        }
+        sink->put(std::span(&buf, 1)).get();
+    }
+    sink->close().get();
+    sink.reset();
+    source.reset();
+    gates.close();
+
+    BOOST_REQUIRE_EQUAL(receiver.logstor_segments().live_record_bytes(), sender.logstor_segments().live_record_bytes());
+    BOOST_REQUIRE_LT(receiver.logstor_segments().segment_count(), sender.logstor_segments().segment_count());
+    for (const auto& r : live) {
+        require_reads_back(env.ls, schema, receiver.logstor_index(), r);
+    }
 }
