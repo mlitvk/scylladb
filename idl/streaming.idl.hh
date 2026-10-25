@@ -84,6 +84,7 @@ enum class stream_blob_cmd : uint8_t {
 enum class file_ops : uint16_t {
     stream_sstables,
     load_sstables,
+    stream_logstor_records,
 };
 
 class stream_blob_data {

@@ -90,22 +90,6 @@ struct segment_manager_usage {
     size_t memory_usage{0};
 };
 
-struct segment_snapshot {
-    log_segment_id segment_id;
-    segment_ref seg_ref;
-    noncopyable_function<future<seastar::input_stream<char>>(const file_input_stream_options&)> source;
-};
-
-class segment_stream_sink {
-public:
-    virtual ~segment_stream_sink() = default;
-    virtual log_segment_id segment_id() const noexcept = 0;
-    virtual future<output_stream<char>> output() = 0;
-    // Seals the segment and loads its records into the index of their table.
-    virtual future<> close(replica::database&) = 0;
-    virtual future<> abort() = 0;
-};
-
 class segment_manager_impl;
 class log_index;
 
@@ -163,19 +147,11 @@ public:
 
     future<> await_pending_writes();
 
-    future<utils::chunked_vector<segment_snapshot>> make_snapshot(logstor_group& cg);
-
     // The segments that the group owns, in no particular order. For tests.
     utils::chunked_vector<log_segment_id> segment_ids_for_test(const logstor_group&) const;
 
     // Calls `fn` with each record of the segment, the dead records too. For tests.
     future<> for_each_record_for_test(log_segment_id, noncopyable_function<future<>(const chunk_record&)> fn);
-
-    // Create an output stream to write a segment (for receiving from remote node)
-    // Allocates a new local segment and returns an output stream for writing to the segment.
-    // The sink is work in progress of the segment manager until it is closed or aborted: stop()
-    // waits for it, and after stop() starts this fails with gate_closed_exception.
-    future<std::unique_ptr<segment_stream_sink>> create_segment_output_stream();
 
     // Makes a source that sends the live records of the group as a record stream. Returns nullptr
     // if the group has no live record. Compaction of the group stays disabled until the source is

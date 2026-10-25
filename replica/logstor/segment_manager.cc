@@ -736,7 +736,6 @@ public:
         });
     }
 
-    future<> load_segment(replica::database&, log_segment_id);
     // Calls `on_chunk` with each chunk of the segment, before it inserts the records of the chunk
     // into the index.
     template <typename Func>
@@ -801,8 +800,6 @@ public:
         return _writes_phaser.advance_and_await();
     }
 
-    future<utils::chunked_vector<segment_snapshot>> make_snapshot(logstor_group&);
-
     // The segments that the group owns, in no particular order.
     utils::chunked_vector<log_segment_id> segment_ids(const logstor_group& cg) const {
         utils::chunked_vector<log_segment_id> ids;
@@ -814,7 +811,6 @@ public:
     }
 
     future<seastar::input_stream<char>> create_segment_input_stream(log_segment_id segment_id, const seastar::file_input_stream_options& opts);
-    future<std::unique_ptr<segment_stream_sink>> create_segment_output_stream();
     future<std::unique_ptr<record_stream_source>> make_record_stream_source(logstor_group&);
     future<std::unique_ptr<record_stream_sink>> make_record_stream_sink(table_id, record_stream_sink::target_resolver);
 
@@ -933,7 +929,6 @@ private:
 
     friend class compaction_manager_impl;
     friend struct compaction_buffer;
-    friend class segment_stream_sink_impl;
 };
 
 float compaction_manager_impl::compaction_pressure() const noexcept {
@@ -2454,31 +2449,6 @@ future<> segment_manager_impl::add_segment_to_compaction_group(replica::database
     }
 }
 
-future<utils::chunked_vector<segment_snapshot>> segment_manager_impl::make_snapshot(logstor_group& cg) {
-    auto compaction_disable_guard = co_await _compaction_mgr.disable_compaction(cg);
-
-    auto& segments = cg.logstor_segments();
-
-    // iterate the segment list by index - safe to do with yields.
-    // segments may be added to the end of the list, but not removed since compaction is disabled.
-    const auto segment_count = segments.segment_count();
-    utils::chunked_vector<segment_snapshot> snp;
-    snp.reserve(segment_count);
-    for (size_t i = 0; i < segment_count; ++i) {
-        auto seg_id = desc_to_segment_id(segments.segment_at(i));
-        snp.push_back(segment_snapshot{
-            .segment_id = seg_id,
-            .seg_ref = make_segment_ref(seg_id),
-            .source = [this, seg_id] (const file_input_stream_options& opts) {
-                return create_segment_input_stream(seg_id, opts);
-            }
-        });
-        co_await coroutine::maybe_yield();
-    }
-
-    co_return std::move(snp);
-}
-
 // segment_manager wrapper
 
 segment_manager::segment_manager(segment_manager_config config)
@@ -2560,81 +2530,10 @@ future<> segment_manager::await_pending_writes() {
     return _impl->await_pending_writes();
 }
 
-class segment_data_sink_impl : public data_sink_impl {
-    seg_ptr _segment;
-    streamed_segment_rewriter _rewriter;
-public:
-    segment_data_sink_impl(seg_ptr segment)
-        : _segment(std::move(segment))
-        , _rewriter(_segment->id(), _segment->seq_num(), [segment = _segment] (bytes_view data) {
-            return segment->append(data).discard_result();
-        })
-    {}
-
-    virtual future<> put(std::span<temporary_buffer<char>> data) override {
-        co_await _rewriter.put(data);
-    }
-
-    virtual future<> close() override {
-        co_await _rewriter.close();
-    }
-
-    virtual size_t buffer_size() const noexcept override {
-        return _rewriter.buffer_size();
-    }
-};
-
 future<seastar::input_stream<char>> segment_manager_impl::create_segment_input_stream(log_segment_id segment_id, const seastar::file_input_stream_options& opts) {
     auto [file_id, file_offset] = segment_id_to_file_location(segment_id);
     auto stream = make_file_input_stream(_file_mgr.get_open_file(file_id), file_offset, _cfg.segment_size, opts);
     co_return std::move(stream);
-}
-
-// The sink is work of the segment manager that is in progress until it is closed or aborted. It
-// holds the gate of the segment manager for that time, so that stop() waits for it, as it waits for
-// a write. The segment comes from the segment pool, which stops after the gate is closed.
-class segment_stream_sink_impl : public segment_stream_sink {
-    segment_manager_impl& _sm;
-    seastar::gate::holder _holder;
-    seg_ptr _seg;
-public:
-    segment_stream_sink_impl(segment_manager_impl& sm, seastar::gate::holder holder, seg_ptr seg)
-        : _sm(sm), _holder(std::move(holder)), _seg(std::move(seg))
-    {}
-public:
-    log_segment_id segment_id() const noexcept override {
-        return _seg->id();
-    }
-    future<output_stream<char>> output() override {
-        auto sink = std::make_unique<segment_data_sink_impl>(_seg);
-        auto stream = output_stream<char>(data_sink(std::move(sink)));
-        co_return std::move(stream);
-    }
-    future<> close(replica::database& db) override {
-        co_await _seg->stop();
-        co_await _sm.load_segment(db, _seg->id());
-        _holder.release();
-    }
-    future<> abort() override {
-        co_await _seg->stop();
-        _holder.release();
-    }
-};
-
-future<> segment_manager_impl::load_segment(replica::database& db, log_segment_id seg_id) {
-    // read the segment and populate the index
-    co_await recover_segment(db, seg_id, primary_index::default_entry_cmp{}, [] (const scanned_chunk&) {});
-
-    auto& desc = get_segment_descriptor(seg_id);
-    co_await add_segment_to_compaction_group(db, desc);
-}
-
-future<std::unique_ptr<segment_stream_sink>> segment_manager_impl::create_segment_output_stream() {
-    // Taken before the segment, so that a sink is never made while the segment manager stops. If
-    // the gate is closed, this fails with gate_closed_exception, and no stream starts.
-    auto holder = _async_gate.hold();
-    auto seg = co_await get_segment(write_source::streaming);
-    co_return std::make_unique<segment_stream_sink_impl>(*this, std::move(holder), std::move(seg));
 }
 
 future<std::unique_ptr<record_stream_source>> segment_manager_impl::make_record_stream_source(logstor_group& cg) {
@@ -2677,20 +2576,12 @@ future<std::unique_ptr<record_stream_sink>> segment_manager_impl::make_record_st
             std::move(holder));
 }
 
-future<utils::chunked_vector<segment_snapshot>> segment_manager::make_snapshot(logstor_group& cg) {
-    return _impl->make_snapshot(cg);
-}
-
 utils::chunked_vector<log_segment_id> segment_manager::segment_ids_for_test(const logstor_group& cg) const {
     return _impl->segment_ids(cg);
 }
 
 future<> segment_manager::for_each_record_for_test(log_segment_id segment_id, noncopyable_function<future<>(const chunk_record&)> fn) {
     return _impl->for_each_record(segment_id, std::move(fn));
-}
-
-future<std::unique_ptr<segment_stream_sink>> segment_manager::create_segment_output_stream() {
-    return _impl->create_segment_output_stream();
 }
 
 future<std::unique_ptr<record_stream_source>> segment_manager::make_record_stream_source(logstor_group& cg) {

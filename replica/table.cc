@@ -1317,12 +1317,6 @@ future<> compaction_group::flush_separator(std::optional<logstor::segment_sequen
     co_await _logstor_state->flush_separator(seq_num);
 }
 
-future<utils::chunked_vector<logstor::segment_snapshot>> compaction_group::take_logstor_snapshot() {
-    auto& logstor_cg = as_logstor_group();
-    auto snp = co_await get_logstor_segment_manager().make_snapshot(logstor_cg);
-    co_return std::move(snp);
-}
-
 future<> storage_group::split(compaction::compaction_type_options::split opt, tasks::task_info tablet_split_task_info) {
     if (set_split_mode()) {
         co_return;
@@ -1360,26 +1354,6 @@ lw_shared_ptr<const sstables::sstable_set> storage_group::make_sstable_set() con
         underlying.emplace_back(cg->make_sstable_set());
     }
     return make_lw_shared(sstables::make_compound_sstable_set(schema, std::move(underlying)));
-}
-
-future<utils::chunked_vector<logstor::segment_snapshot>> storage_group::take_logstor_snapshot() const {
-    if (_split_ready_groups.empty() && _merging_groups.empty()) {
-        co_return co_await _main_cg->take_logstor_snapshot();
-    }
-    utils::chunked_vector<logstor::segment_snapshot> snp;
-    auto append = [&snp] (utils::chunked_vector<logstor::segment_snapshot> cg_snp) {
-        snp.insert(snp.end(), std::make_move_iterator(cg_snp.begin()), std::make_move_iterator(cg_snp.end()));
-    };
-    append(co_await _main_cg->take_logstor_snapshot());
-    for (const auto& cg : _merging_groups) {
-        if (!cg->empty()) {
-            append(co_await cg->take_logstor_snapshot());
-        }
-    }
-    for (const auto& cg : _split_ready_groups) {
-        append(co_await cg->take_logstor_snapshot());
-    }
-    co_return std::move(snp);
 }
 
 lw_shared_ptr<const sstables::sstable_set> storage_group::make_repaired_sstable_set() const {
@@ -1796,50 +1770,33 @@ future<utils::chunked_vector<sstables::shared_sstable>> table::take_sstable_set_
     co_return result;
 }
 
-future<utils::chunked_vector<logstor::segment_snapshot>> table::take_logstor_snapshot(dht::token_range tr) {
+future<std::vector<std::unique_ptr<logstor::record_stream_source>>> table::make_logstor_record_sources(dht::token_range tr) {
     co_await _logstor->flush_to_separator();
 
-    utils::chunked_vector<logstor::segment_snapshot> snp;
+    std::vector<std::unique_ptr<logstor::record_stream_source>> sources;
     for (auto& sg : storage_groups_for_token_range(tr)) {
         co_await sg->flush_separator();
-
+        // Held so that no split or merge changes the groups between the flush and the sources.
         auto deletion_guard = co_await get_sstable_list_permit();
-
-        auto sg_snp = co_await sg->take_logstor_snapshot();
-        snp.insert(snp.end(), std::make_move_iterator(sg_snp.begin()), std::make_move_iterator(sg_snp.end()));
+        for (auto& cg : sg->compaction_groups_immediate()) {
+            if (auto source = co_await get_logstor_segment_manager().make_record_stream_source(cg->as_logstor_group())) {
+                sources.push_back(std::move(source));
+            }
+        }
     }
-    co_return std::move(snp);
+    co_return sources;
 }
 
-// The sink of a streamed logstor segment, with the stream kept in progress for the table until the
-// sink is closed or aborted. Thus stop() and await_pending_ops() of the table wait for it.
-class logstor_segment_sink_of_table final : public logstor::segment_stream_sink {
-    std::unique_ptr<logstor::segment_stream_sink> _sink;
-    utils::phased_barrier::operation _stream_op;
-public:
-    logstor_segment_sink_of_table(std::unique_ptr<logstor::segment_stream_sink> sink, utils::phased_barrier::operation stream_op)
-        : _sink(std::move(sink)), _stream_op(std::move(stream_op))
-    {}
-    logstor::log_segment_id segment_id() const noexcept override {
-        return _sink->segment_id();
-    }
-    future<output_stream<char>> output() override {
-        return _sink->output();
-    }
-    future<> close(replica::database& db) override {
-        co_await _sink->close(db);
-        _stream_op = {};
-    }
-    future<> abort() override {
-        co_await _sink->abort();
-        _stream_op = {};
-    }
-};
-
-future<std::unique_ptr<logstor::segment_stream_sink>> table::create_logstor_segment_sink() {
-    auto stream_op = stream_in_progress();
-    auto sink = co_await get_logstor_segment_manager().create_segment_output_stream();
-    co_return std::make_unique<logstor_segment_sink_of_table>(std::move(sink), std::move(stream_op));
+future<std::unique_ptr<logstor::record_stream_sink>> table::make_logstor_record_sink() {
+    // The resolver holds the stream in progress for the table, and the sink drops the resolver
+    // when it is closed or aborted. Thus stop() and await_pending_ops() of the table wait for it.
+    return get_logstor_segment_manager().make_record_stream_sink(schema()->id(),
+            [this, stream_op = stream_in_progress()] (dht::token token) {
+        auto& cg = compaction_group_for_token(token);
+        auto holder = cg.async_gate().hold();
+        auto ss_holder = cg.sstable_add_gate().hold();
+        return logstor::write_target(&cg.as_logstor_group(), std::move(ss_holder), std::move(holder));
+    });
 }
 
 future<utils::chunked_vector<sstables::entry_descriptor>>

@@ -19,6 +19,7 @@
 
 #include "replica/logstor/index.hh"
 #include "serializer.hh"
+#include "utils/error_injection.hh"
 
 namespace replica::logstor {
 
@@ -183,7 +184,7 @@ future<> record_stream_sink::close() {
                 "Record stream of table {} ended inside a chunk", _table)));
     }
     co_await flush();
-    co_await release_buffer();
+    co_await release();
 }
 
 future<> record_stream_sink::abort() {
@@ -194,7 +195,7 @@ future<> record_stream_sink::abort() {
     for (auto& update : std::exchange(_index_updates, {})) {
         co_await std::move(update).handle_exception([] (std::exception_ptr) {});
     }
-    co_await release_buffer();
+    co_await release();
 }
 
 future<> record_stream_sink::write_chunk(temporary_buffer<char> bytes) {
@@ -240,6 +241,9 @@ future<> record_stream_sink::write_record(const chunk_record& record) {
 future<> record_stream_sink::flush() {
     if (_buffer->has_data()) {
         co_await _write_segment(*_buffer, *_target.cg);
+        utils::get_local_injector().inject("logstor_stream_sink_after_flush", [] {
+            throw std::runtime_error("logstor_stream_sink_after_flush injection");
+        });
     }
     auto updates = std::exchange(_index_updates, {});
     co_await when_all_succeed(updates.begin(), updates.end());
@@ -248,13 +252,14 @@ future<> record_stream_sink::flush() {
     _target = {};
 }
 
-future<> record_stream_sink::release_buffer() noexcept {
+future<> record_stream_sink::release() noexcept {
     if (_buffer) {
         // The pool takes back only a closed buffer.
         co_await _buffer->close();
         _buffer.reset();
     }
     _target = {};
+    _resolve_target = {};
     _segment_manager_holder.release();
 }
 

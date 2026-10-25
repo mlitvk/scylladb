@@ -19,7 +19,7 @@ class logstor_group;
 class segment_manager;
 class compaction_manager;
 class segment_set;
-struct segment_snapshot;
-class segment_stream_sink;
+class record_stream_source;
+class record_stream_sink;
 
 } // namespace replica::logstor
