@@ -270,6 +270,7 @@ struct failing_sink {
     }};
     seastar::abort_source as;
     seastar::gate segment_manager_gate;
+    record_stream_stats stats;
     std::unique_ptr<record_stream_sink> sink;
 
     failing_sink(schema_ptr schema, table_catalog& catalog) {
@@ -278,7 +279,7 @@ struct failing_sink {
                 [] (write_buffer&, logstor_group&) -> future<> {
                     return make_exception_future<>(std::runtime_error("injected segment write failure"));
                 },
-                segment_manager_gate.hold(), utils::phased_barrier::operation());
+                segment_manager_gate.hold(), utils::phased_barrier::operation(), stats);
     }
 
     // Destroys the sink and checks that it gave back its buffers and its gate holder.
@@ -645,7 +646,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_sink_writes_out_a_group_that_the_ca
 }
 
 // A streamed record that is older than the local record of the same key does not replace the local
-// record in the index.
+// record in the index, and the stream stats count it as superseded.
 SEASTAR_THREAD_TEST_CASE(test_logstor_record_sink_keeps_a_newer_local_record) {
     auto schema = make_schema();
     logstor_env env;
@@ -659,6 +660,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_sink_keeps_a_newer_local_record) {
     const auto local_entry = lookup_location(group.logstor_index(), index_key_of(schema, local), *schema);
     BOOST_REQUIRE(local_entry);
     const auto live_bytes_before = group.logstor_segments().live_record_bytes();
+    const auto received_before = segment_manager_metric("stream_records_received");
+    const auto superseded_before = segment_manager_metric("stream_records_superseded");
 
     const std::vector<test_record> streamed{
         {.pk = "pk0", .value = "streamed", .timestamp = 1000},
@@ -680,6 +683,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_sink_keeps_a_newer_local_record) {
     require_reads_back(env.ls, schema, group.logstor_index(), streamed[1]);
     // The older record is dead space in the streamed segment.
     BOOST_REQUIRE_EQUAL(group.logstor_segments().live_record_bytes(), live_bytes_before + frame_size_of(schema, streamed[1]));
+    BOOST_REQUIRE_EQUAL(segment_manager_metric("stream_records_received") - received_before, 2);
+    BOOST_REQUIRE_EQUAL(segment_manager_metric("stream_records_superseded") - superseded_before, 1);
 }
 
 // A corrupt chunk fails put(), and after abort() the group has no segment and no record of the
@@ -970,6 +975,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_sink_failed_segment_write_releases_
     BOOST_REQUIRE_THROW(fs.sink->put(chunks).get(), std::runtime_error);
     fs.sink->abort().get();
 
+    BOOST_REQUIRE_EQUAL(fs.stats.records_received, 0);
     fs.require_released();
     group.close_gates().get();
     for (const auto& r : records) {
@@ -995,6 +1001,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_sink_failed_close_releases_the_sink
     failing_sink fs(schema, env.catalog);
     fs.sink->put(chunks).get();
     BOOST_REQUIRE_THROW(fs.sink->close().get(), std::runtime_error);
+    BOOST_REQUIRE_EQUAL(fs.stats.records_received, 0);
     // A close() that fails releases the sink, so the sink is destroyed without abort(), and its
     // destructor must not find an open buffer.
     fs.require_released();
@@ -1046,7 +1053,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_sink_waits_for_the_buffers_of_anoth
 }
 
 // The source sends only the live records of the group, one chunk for each segment that holds live
-// records.
+// records, and the stream stats count each record that it sends.
 SEASTAR_THREAD_TEST_CASE(test_logstor_record_source_sends_only_live_records) {
     auto schema = make_schema();
     logstor_env env;
@@ -1065,8 +1072,10 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_source_sends_only_live_records) {
     BOOST_REQUIRE(source);
     const auto chunks = read_all(*source);
 
+    const auto live = timestamps_of({std::span(first).subspan(10), second, overwritten});
     BOOST_REQUIRE_EQUAL(chunks.size(), 3);
-    BOOST_REQUIRE(timestamps_in(chunks) == timestamps_of({std::span(first).subspan(10), second, overwritten}));
+    BOOST_REQUIRE(timestamps_in(chunks) == live);
+    BOOST_REQUIRE_EQUAL(segment_manager_metric("stream_records_sent"), live.size());
 }
 
 // The segment manager makes no source for a group that has no segment, or whose segments hold no
@@ -1237,11 +1246,12 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_source_fails_on_a_segment_that_is_n
     test_logstor_group group(schema, env.ls);
     const auto records = make_records(3, 100);
 
+    record_stream_stats stats;
     auto make_source = [&] (temporary_buffer<char> segment) {
         utils::chunked_vector<log_segment_id> segments;
         segments.push_back(log_segment_id{0});
         return record_stream_source(schema->id(), group.logstor_index(), compaction_reenabler(), compaction_reenabler(),
-                std::move(segments), segment_size, memory_chunk_reader(std::move(segment)));
+                std::move(segments), segment_size, memory_chunk_reader(std::move(segment)), stats);
     };
     auto make_segment = [&] (segment_kind kind, table_id table) {
         raw_write_buffer buf(segment_size, kind);
@@ -1311,6 +1321,9 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_stream_round_trip) {
     receiver.close_gates().get();
 
     BOOST_REQUIRE_EQUAL(receiver.logstor_segments().live_record_bytes(), sender.logstor_segments().live_record_bytes());
+    BOOST_REQUIRE_EQUAL(segment_manager_metric("stream_records_sent"), live.size());
+    BOOST_REQUIRE_EQUAL(segment_manager_metric("stream_records_received"), live.size());
+    BOOST_REQUIRE_EQUAL(segment_manager_metric("stream_records_superseded"), 0);
     BOOST_REQUIRE_LT(receiver.logstor_segments().segment_count(), sender.logstor_segments().segment_count());
     for (const auto& r : live) {
         require_reads_back(env.ls, schema, receiver.logstor_index(), r);

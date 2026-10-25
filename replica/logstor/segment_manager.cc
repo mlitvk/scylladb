@@ -455,6 +455,7 @@ class segment_manager_impl {
     uint64_t _next_new_segment_id{0};
 
     stats _stats;
+    record_stream_stats _stream_stats;
     // The statistics of the segments that the groups of this shard own, with their distribution by
     // utilization. Each segment_set of the shard adds its changes to them, see segment_set.
     segment_stats _segment_stats;
@@ -1016,6 +1017,16 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config, table_
                        sm::description("Counts number of times the separator had to wait for a write buffer to become available.")),
         sm::make_counter("separator_buffers_dropped", _separator_buffer_pool.get_stats().buffers_dropped,
                        sm::description("Counts number of separator write buffers permanently removed from the pool after they could not be reclaimed.")),
+        sm::make_counter("stream_bytes_written", _stats.bytes_written[static_cast<size_t>(write_source::streaming)],
+                       sm::description("Counts the bytes that this shard writes to the disk for the record streams that it receives.")),
+        sm::make_counter("stream_data_bytes_written", _stats.data_bytes_written[static_cast<size_t>(write_source::streaming)],
+                       sm::description("Counts the record bytes that this shard writes to the disk for the record streams that it receives.")),
+        sm::make_counter("stream_records_sent", _stream_stats.records_sent,
+                       sm::description("Counts the records that the record streams of this shard sent.")),
+        sm::make_counter("stream_records_received", _stream_stats.records_received,
+                       sm::description("Counts the records that this shard received in record streams and wrote to segments.")),
+        sm::make_counter("stream_records_superseded", _stream_stats.records_superseded,
+                       sm::description("Counts the received records that were older than the record of their key in the index, so they were dead when they were written.")),
         sm::make_gauge("kept_segments", _stats.kept_segments,
                        sm::description("Number of segments that are not freed until the node restarts, because the index can still point into them.")),
         sm::make_gauge("separator_task_queue_size", [this]() { return _separator_task_queue.size(); },
@@ -2523,7 +2534,8 @@ future<std::unique_ptr<record_stream_source>> segment_manager_impl::make_record_
             std::move(merge_target_guard), std::move(segments), _cfg.segment_size,
             [this] (log_segment_id segment_id, noncopyable_function<future<>(const scanned_chunk&)> fn) {
                 return read_chunks(segment_id, std::move(fn));
-            });
+            },
+            _stream_stats);
 }
 
 future<std::unique_ptr<record_stream_sink>> segment_manager_impl::make_record_stream_sink(table_id table,
@@ -2546,7 +2558,7 @@ future<std::unique_ptr<record_stream_sink>> segment_manager_impl::make_record_st
                 // as they wait for a normal write.
                 return write_full_segment(wb, group, write_source::streaming);
             },
-            std::move(segment_manager_holder), std::move(table_stream));
+            std::move(segment_manager_holder), std::move(table_stream), _stream_stats);
 }
 
 // segment_manager wrapper

@@ -21,7 +21,6 @@
 #include <fmt/format.h>
 #include <seastar/core/byteorder.hh>
 #include <seastar/core/memory.hh>
-#include <seastar/core/metrics_api.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/util/closeable.hh>
@@ -4150,19 +4149,6 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_range_reader_serves_a_reversed_read) {
             env.make_reader(query::full_partition_range, bypassing));
     BOOST_REQUIRE_EQUAL(stats.partition_hits, hits + ms.size());
     BOOST_REQUIRE_EQUAL(stats.partition_misses, misses);
-}
-
-// Returns the value of the segment manager metric `name` on this shard.
-uint64_t segment_manager_metric(std::string_view name) {
-    uint64_t value = 0;
-    for (const auto& [family_name, family] : seastar::metrics::impl::get_value_map()) {
-        for (const auto& [labels, metric] : family) {
-            if (metric && metric->get_id().group_name() == "logstor_sm" && metric->get_id().name() == name) {
-                value += metric->get_function()().ui();
-            }
-        }
-    }
-    return value;
 }
 
 // Checks that a store whose reserve replenisher keeps failing to allocate a segment still stops.

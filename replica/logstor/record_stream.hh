@@ -43,6 +43,17 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+// Counts the records of the record streams of a shard.
+struct record_stream_stats {
+    // Counts the records that the sources of the shard sent.
+    uint64_t records_sent{0};
+    // Counts the records that the sinks of the shard wrote to segments.
+    uint64_t records_received{0};
+    // Counts the received records that were older than the record of their key in the index, so
+    // they were dead when they were written.
+    uint64_t records_superseded{0};
+};
+
 // The sender of a record stream. It gives one chunk for each segment in its list that has live
 // records, and then an empty buffer. A record is live if the index points at it when the source
 // reads its segment.
@@ -67,7 +78,7 @@ public:
 
     record_stream_source(table_id table, const primary_index& index, compaction_reenabler compaction_guard,
             compaction_reenabler merge_target_guard, utils::chunked_vector<log_segment_id> segments, size_t segment_size,
-            chunk_reader read_chunks);
+            chunk_reader read_chunks, record_stream_stats& stats);
 
     future<temporary_buffer<char>> get() override;
 
@@ -79,6 +90,7 @@ private:
     utils::chunked_vector<log_segment_id> _segments;
     size_t _next_segment = 0;
     chunk_reader _read_chunks;
+    record_stream_stats& _stats;
     raw_write_buffer _buffer;
 
     future<> collect_live_records(log_segment_id segment_id);
@@ -138,7 +150,7 @@ public:
     // `buffers` holds record_stream_sink_buffers buffers.
     record_stream_sink(table_id table, table_catalog& catalog, std::vector<owned_write_buffer> buffers,
             segment_writer write_segment, seastar::gate::holder segment_manager_holder,
-            utils::phased_barrier::operation table_stream);
+            utils::phased_barrier::operation table_stream, record_stream_stats& stats);
     record_stream_sink(const record_stream_sink&) = delete;
     record_stream_sink& operator=(const record_stream_sink&) = delete;
     ~record_stream_sink();
@@ -177,6 +189,7 @@ private:
     seastar::gate::holder _segment_manager_holder;
     // Keeps the stream in progress for the table.
     utils::phased_barrier::operation _table_stream;
+    record_stream_stats& _stats;
     // Each buffer goes back to the pool of the segment manager at its destruction, so the
     // declaration of the buffers comes after the gate holder.
     std::array<group_buffer, record_stream_sink_buffers> _buffers;

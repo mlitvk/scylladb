@@ -14,6 +14,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -21,6 +22,7 @@
 #include <fmt/format.h>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/gate.hh>
+#include <seastar/core/metrics_api.hh>
 #include <seastar/core/scheduling.hh>
 #include <seastar/coroutine/as_future.hh>
 
@@ -76,6 +78,19 @@ inline std::optional<replica::logstor::record_location> lookup_location(const re
 inline std::set<replica::logstor::log_segment_id> segment_ids(replica::logstor::logstor& ls, replica::logstor::logstor_group& cg) {
     const auto ids = ls.get_segment_manager().segment_ids(cg).get();
     return std::set<replica::logstor::log_segment_id>(ids.begin(), ids.end());
+}
+
+// Returns the value of the segment manager metric `name` on this shard.
+inline uint64_t segment_manager_metric(std::string_view name) {
+    uint64_t value = 0;
+    for (const auto& [family_name, family] : seastar::metrics::impl::get_value_map()) {
+        for (const auto& [labels, metric] : family) {
+            if (metric && metric->get_id().group_name() == "logstor_sm" && metric->get_id().name() == name) {
+                value += metric->get_function()().ui();
+            }
+        }
+    }
+    return value;
 }
 
 struct shared_logstor_cache {
