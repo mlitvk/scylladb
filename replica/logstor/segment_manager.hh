@@ -165,6 +165,12 @@ public:
 
     future<utils::chunked_vector<segment_snapshot>> make_snapshot(logstor_group& cg);
 
+    // The segments that the group owns, in no particular order. For tests.
+    utils::chunked_vector<log_segment_id> segment_ids_for_test(const logstor_group&) const;
+
+    // Calls `fn` with each record of the segment, the dead records too. For tests.
+    future<> for_each_record_for_test(log_segment_id, noncopyable_function<future<>(const chunk_record&)> fn);
+
     // Create an output stream to write a segment (for receiving from remote node)
     // Allocates a new local segment and returns an output stream for writing to the segment.
     // The sink is work in progress of the segment manager until it is closed or aborted: stop()

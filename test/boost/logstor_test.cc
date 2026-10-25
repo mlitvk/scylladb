@@ -353,12 +353,10 @@ void assert_records_in_order(schema_ptr schema, const std::vector<scanned_record
     }
 }
 
-std::set<log_segment_id> snapshot_segment_ids(const utils::chunked_vector<segment_snapshot>& snapshot) {
-    std::set<log_segment_id> ids;
-    for (const auto& seg : snapshot) {
-        ids.insert(seg.segment_id);
-    }
-    return ids;
+// The segments that the group owns.
+std::set<log_segment_id> segment_ids(logstor& ls, const test_logstor_group& cg) {
+    const auto ids = ls.get_segment_manager().segment_ids_for_test(cg);
+    return std::set<log_segment_id>(ids.begin(), ids.end());
 }
 
 // Writes all the mutations and flushes the group's separator once, so that they all end up in a
@@ -389,23 +387,15 @@ std::vector<sstring> make_token_ordered_keys(schema_ptr schema, size_t count) {
     return keys;
 }
 
-// Scans every segment of the snapshot and counts the records it holds by their timestamp, which is
+// Scans the segments and counts the records they hold by their timestamp, which is
 // what the tests give each record version to tell them apart.
-std::map<api::timestamp_type, size_t> count_records_by_timestamp(logstor& ls, utils::chunked_vector<segment_snapshot>& snapshot) {
+std::map<api::timestamp_type, size_t> count_records_by_timestamp(logstor& ls, const std::set<log_segment_id>& segments) {
     std::map<api::timestamp_type, size_t> counts;
-    const auto segment_size = ls.get_segment_manager().get_segment_size();
-    for (auto& snap : snapshot) {
-        auto in = snap.source(seastar::file_input_stream_options{
-            .buffer_size = std::min<size_t>(segment_size, 128 * 1024),
-            .read_ahead = 1,
+    for (const auto segment_id : segments) {
+        ls.get_segment_manager().for_each_record_for_test(segment_id, [&counts] (const chunk_record& record) {
+            counts[record.header.timestamp]++;
+            return make_ready_future<>();
         }).get();
-        segment_scanner scanner(in, snap.segment_id, segment_size);
-        while (auto* chunk = scanner.next_chunk().get()) {
-            for (const auto& record : chunk->records()) {
-                counts[record.header.timestamp]++;
-            }
-        }
-        in.close().get();
     }
     return counts;
 }
@@ -2656,13 +2646,13 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_and_separator_flush) {
     BOOST_REQUIRE_EQUAL(cg.separator_held_segment_count(), 0u);
     BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 1u);
 
-    auto snapshot = ls.get_segment_manager().make_snapshot(cg).get();
-    BOOST_REQUIRE_EQUAL(snapshot.size(), 1u);
+    const auto ids = segment_ids(ls, cg);
+    BOOST_REQUIRE_EQUAL(ids.size(), 1u);
 
     auto entry_after_flush = cg.logstor_index().get(make_index_key(*schema, key));
     BOOST_REQUIRE(entry_after_flush);
     BOOST_REQUIRE(entry_after_flush->location.segment != entry_before_flush->location.segment);
-    BOOST_REQUIRE_EQUAL(entry_after_flush->location.segment.value, snapshot.front().segment_id.value);
+    BOOST_REQUIRE_EQUAL(entry_after_flush->location.segment.value, ids.begin()->value);
 
     auto actual = read_mutation(ls, schema, cg.logstor_index(), key, schema->full_slice()).get();
     BOOST_REQUIRE(actual);
@@ -3323,17 +3313,15 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_group_compaction_rewrites_live_records) {
     BOOST_REQUIRE(live_pk1_before);
     BOOST_REQUIRE(live_pk2_before);
 
-    auto old_snapshot = ls.get_segment_manager().make_snapshot(cg).get();
-    BOOST_REQUIRE_EQUAL(old_snapshot.size(), 5u);
-    const auto old_segment_ids = snapshot_segment_ids(old_snapshot);
+    const auto old_segment_ids = segment_ids(ls, cg);
+    BOOST_REQUIRE_EQUAL(old_segment_ids.size(), 5u);
 
     setup_guard.reset();
     ls.get_compaction_manager().submit(cg);
     auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
 
-    auto new_snapshot = ls.get_segment_manager().make_snapshot(cg).get();
-    BOOST_REQUIRE_EQUAL(new_snapshot.size(), 1u);
-    const auto new_segment_ids = snapshot_segment_ids(new_snapshot);
+    const auto new_segment_ids = segment_ids(ls, cg);
+    BOOST_REQUIRE_EQUAL(new_segment_ids.size(), 1u);
 
     auto live_pk0_after = cg.logstor_index().get(pk0);
     auto live_pk1_after = cg.logstor_index().get(pk1);
@@ -3373,7 +3361,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_group_compaction_rewrites_live_records) {
     // Scan all segments after compaction and verify they contain exactly the live records.
     // Live records (pk0_v1 ts=4, pk1_v1 ts=5, pk2_v0 ts=3) must appear exactly once;
     // overwritten records (pk0_v0 ts=1, pk1_v0 ts=2) must not appear at all.
-    auto record_counts = count_records_by_timestamp(ls, new_snapshot);
+    auto record_counts = count_records_by_timestamp(ls, new_segment_ids);
 
     // Each live record appears exactly once.
     BOOST_REQUIRE_EQUAL(record_counts[api::timestamp_type(3)], 1u); // pk2_v0 - untouched
@@ -3424,15 +3412,12 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_disabled_group_does_not_compact_on_submit)
     BOOST_REQUIRE(live_pk1_before);
     BOOST_REQUIRE(live_pk2_before);
 
-    auto snapshot_before = ls.get_segment_manager().make_snapshot(cg).get();
-    const auto segment_ids_before = snapshot_segment_ids(snapshot_before);
+    const auto segment_ids_before = segment_ids(ls, cg);
 
     ls.get_compaction_manager().submit(cg);
 
-    auto snapshot_after = ls.get_segment_manager().make_snapshot(cg).get();
-    const auto segment_ids_after = snapshot_segment_ids(snapshot_after);
+    const auto segment_ids_after = segment_ids(ls, cg);
 
-    BOOST_REQUIRE_EQUAL(snapshot_after.size(), snapshot_before.size());
     BOOST_REQUIRE(segment_ids_after == segment_ids_before);
 
     auto live_pk0_after = cg.logstor_index().get(pk0);
@@ -3540,10 +3525,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_split_compaction_splits_segments_between_t
     // Every segment of the group being split ends up in one of the target groups.
     BOOST_REQUIRE_EQUAL(src.logstor_segments().segment_count(), 0u);
 
-    auto left_snapshot = ls.get_segment_manager().make_snapshot(left).get();
-    auto right_snapshot = ls.get_segment_manager().make_snapshot(right).get();
-    const auto left_ids = snapshot_segment_ids(left_snapshot);
-    const auto right_ids = snapshot_segment_ids(right_snapshot);
+    const auto left_ids = segment_ids(ls, left);
+    const auto right_ids = segment_ids(ls, right);
 
     std::vector<record_location> locations_after;
     for (const auto& key : index_keys) {
@@ -3579,8 +3562,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_split_compaction_splits_segments_between_t
 
     // Each live record is held exactly once, by the group of its side, and the record the overwrite
     // of k2 made dead was not rewritten.
-    auto left_records = count_records_by_timestamp(ls, left_snapshot);
-    auto right_records = count_records_by_timestamp(ls, right_snapshot);
+    auto left_records = count_records_by_timestamp(ls, left_ids);
+    auto right_records = count_records_by_timestamp(ls, right_ids);
 
     const auto expected_left = std::map<api::timestamp_type, size_t>{
         {api::timestamp_type(1), 1}, // k0
