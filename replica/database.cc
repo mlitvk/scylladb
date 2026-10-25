@@ -1006,6 +1006,7 @@ database::init_logstor() {
             .compaction_max_shares = _cfg.logstor_compaction_max_shares,
             .separator_sg = _dbcfg.memtable_scheduling_group,
             .split_compaction_sg = _dbcfg.maintenance_scheduling_group,
+            .max_record_stream_sinks = _cfg.tablet_streaming_write_concurrency_per_shard(),
         },
         .flush_sg = _dbcfg.commitlog_scheduling_group,
         .max_queued_write_bytes = _dbcfg.available_memory * 1 / 100,

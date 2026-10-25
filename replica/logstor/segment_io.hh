@@ -151,6 +151,7 @@ private:
 
     friend class segment_scanner;
     friend class chunk_records::iterator;
+    friend future<std::optional<scanned_chunk>> parse_chunk(temporary_buffer<char>);
 
     // The record frames, or nothing if the body is not valid.
     std::span<const char> record_bytes() const noexcept {
@@ -165,6 +166,11 @@ private:
         , _body_valid(body_valid)
     {}
 };
+
+// The chunk that `chunk` holds, which is one whole chunk in memory, as a stream receives it. Returns
+// nothing if the headers or the body are not valid, or if `chunk` holds more or fewer bytes than the
+// chunk. The record locations are offsets in `chunk`, and their segment is not set.
+future<std::optional<scanned_chunk>> parse_chunk(temporary_buffer<char> chunk);
 
 // Scans the chunks of a segment in order. The scanner reads from the stream, and does not close
 // it.
