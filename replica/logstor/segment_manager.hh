@@ -211,6 +211,14 @@ public:
     // Allocates a new local segment and returns an output stream for writing to the segment.
     future<std::unique_ptr<segment_stream_sink>> create_segment_output_stream();
 
+    // Returns the ids of the segments that the group owns, in no particular order. Waits for a
+    // compaction of the group that runs, and keeps compaction of the group disabled during the walk.
+    future<utils::chunked_vector<log_segment_id>> segment_ids(logstor_group&);
+
+    // Returns a reference to the segment. The segment is not freed until the last copy of the
+    // reference goes.
+    segment_ref make_segment_ref(log_segment_id);
+
     // Calls `fn` with each chunk of the segment, in order, with all the records of the chunk, the
     // dead records too. The chunk is valid until `fn` returns.
     // Holds a reference to the segment during the read, so that the segment is not freed and used

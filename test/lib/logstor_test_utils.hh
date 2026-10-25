@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -67,6 +68,14 @@ inline std::optional<replica::logstor::primary_index::guarded_location> lookup_g
 inline std::optional<replica::logstor::record_location> lookup_location(const replica::logstor::primary_index& index,
         const replica::logstor::primary_index_key& key, const schema& s) {
     return lookup_guarded_location(index, key, s).transform([] (const auto& where) { return where.location; });
+}
+
+// Returns the ids of the segments that the group owns. Call it in a seastar thread.
+// The tests take the segment ids of a group only through this function, so a change of the way that
+// the tests list the segments changes only this function.
+inline std::set<replica::logstor::log_segment_id> segment_ids(replica::logstor::logstor& ls, replica::logstor::logstor_group& cg) {
+    const auto ids = ls.get_segment_manager().segment_ids(cg).get();
+    return std::set<replica::logstor::log_segment_id>(ids.begin(), ids.end());
 }
 
 struct shared_logstor_cache {
