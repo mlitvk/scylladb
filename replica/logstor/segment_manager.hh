@@ -211,6 +211,8 @@ public:
     // Waits while max_record_stream_sinks sinks are open.
     future<std::unique_ptr<record_stream_sink>> make_record_stream_sink(table_id, record_stream_sink::target_resolver);
 
+    const record_stream_stats& stream_stats() const noexcept;
+
     friend class segment_manager_impl;
 
 };
