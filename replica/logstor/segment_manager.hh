@@ -23,6 +23,7 @@
 #include "replica/logstor/segment_io.hh"
 #include "replica/logstor/write_buffer.hh"
 #include "replica/logstor/compaction.hh"
+#include "replica/logstor/record_stream.hh"
 #include "replica/logstor/segment_stats.hh"
 #include "types.hh"
 #include "utils/updateable_value.hh"
@@ -69,6 +70,9 @@ struct segment_manager_config {
     utils::updateable_value<float> compaction_max_shares{2000};
     seastar::scheduling_group separator_sg;
     seastar::scheduling_group split_compaction_sg;
+    // A shard receives at most this many record streams at once. Each stream holds a write buffer
+    // for its life, so a stream above the limit waits for one to end.
+    size_t max_record_stream_sinks = 2;
 };
 
 // What a recovery found on disk, and what it did with it.
@@ -108,8 +112,9 @@ struct segment_manager_usage {
     // blocks it wrote, which this does not count.
     uint64_t space_on_disk{0};
     // Memory the segment manager holds: the descriptors of every segment and the buffers of the
-    // compaction and separator pools. The indexes of the tables are not part of it, nor is the
-    // buffered writer of the write path, which logstor holds rather than the segment manager.
+    // compaction, separator and record stream pools. The indexes of the tables are not part of it,
+    // nor is the buffered writer of the write path, which logstor holds rather than the segment
+    // manager.
     size_t memory_usage{0};
 };
 
@@ -202,6 +207,11 @@ public:
     // The sink is work in progress of the segment manager until it is closed or aborted: stop()
     // waits for it, and after stop() starts this fails with gate_closed_exception.
     future<std::unique_ptr<segment_stream_sink>> create_segment_output_stream(recovery_catalog&);
+
+    // Makes a sink that receives a record stream of the table. The sink is work in progress of the
+    // segment manager until it is closed or aborted: stop() waits for it, and after stop() starts
+    // this fails with gate_closed_exception. Waits while max_record_stream_sinks sinks are open.
+    future<std::unique_ptr<record_stream_sink>> make_record_stream_sink(table_id, record_stream_sink::target_resolver);
 
     friend class segment_manager_impl;
 
