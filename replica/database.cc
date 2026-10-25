@@ -1018,6 +1018,11 @@ public:
         return t ? target{&t->logstor_index(), t->maybe_get_logstor_group(first, last)} : target{};
     }
 
+    logstor::write_target find_for_write(table_id id, dht::token token) override {
+        auto t = logstor_table(id);
+        return t ? t->logstor_write_target(token) : logstor::write_target{};
+    }
+
     sstring table_name(table_id id) override {
         auto t = _db.get_tables_metadata().get_table_if_exists(id);
         return t ? seastar::format("{}.{}", t->schema()->ks_name(), t->schema()->cf_name()) : seastar::format("{}", id);
@@ -1045,6 +1050,7 @@ database::init_logstor() {
             .compaction_max_shares = _cfg.logstor_compaction_max_shares,
             .separator_sg = _dbcfg.memtable_scheduling_group,
             .split_compaction_sg = _dbcfg.maintenance_scheduling_group,
+            .max_record_stream_sinks = _cfg.tablet_streaming_write_concurrency_per_shard(),
         },
         .flush_sg = _dbcfg.commitlog_scheduling_group,
     };

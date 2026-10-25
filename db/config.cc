@@ -1800,7 +1800,7 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     , tablet_streaming_read_concurrency_per_shard(this, "tablet_streaming_read_concurrency_per_shard", liveness::LiveUpdate, value_status::Used, 2,
          "Maximum number of tablets which may be leaving a shard at the same time. Effecting only on topology coordinator. Set to the same value on all nodes.")
     , tablet_streaming_write_concurrency_per_shard(this, "tablet_streaming_write_concurrency_per_shard", liveness::LiveUpdate, value_status::Used, 2,
-         "Maximum number of tablets which may be pending on a shard at the same time. Effecting only on topology coordinator. Set to the same value on all nodes.")
+         "Maximum number of tablets which may be pending on a shard at the same time. The topology coordinator uses the value to schedule migrations. Each node also reads it at start to size the buffers that receive the streams of logstor tables, so a live update does not change the number of these buffers. Set to the same value on all nodes.")
     , service_levels_interval(this, "service_levels_interval_ms", liveness::LiveUpdate, value_status::Used, 10000, "Controls how often service levels module polls configuration table")
 
     , audit(this, "audit", value_status::Used, "table",

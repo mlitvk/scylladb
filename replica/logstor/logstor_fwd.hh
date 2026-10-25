@@ -22,5 +22,6 @@ class segment_set;
 struct segment_snapshot;
 class segment_stream_sink;
 class table_catalog;
+struct write_target;
 
 } // namespace replica::logstor

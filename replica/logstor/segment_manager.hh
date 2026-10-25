@@ -24,6 +24,7 @@
 #include "replica/logstor/segment_io.hh"
 #include "replica/logstor/write_buffer.hh"
 #include "replica/logstor/compaction.hh"
+#include "replica/logstor/record_stream.hh"
 #include "replica/logstor/segment_stats.hh"
 #include "types.hh"
 #include "utils/updateable_value.hh"
@@ -73,6 +74,10 @@ struct segment_manager_config {
     utils::updateable_value<float> compaction_max_shares{2000};
     seastar::scheduling_group separator_sg;
     seastar::scheduling_group split_compaction_sg;
+    // A shard receives at most this many record streams at once. Each stream holds
+    // record_stream_sink_buffers write buffers for its life, so a stream above the limit waits for
+    // one to end.
+    size_t max_record_stream_sinks = 2;
 };
 
 // What a recovery found on disk, and what it did with it.
@@ -112,8 +117,9 @@ struct segment_manager_usage {
     // blocks it wrote, which this does not count.
     uint64_t space_on_disk{0};
     // Memory the segment manager holds: the descriptors of every segment and the buffers of the
-    // compaction and separator pools. The indexes of the tables are not part of it, nor is the
-    // buffered writer of the write path, which logstor holds rather than the segment manager.
+    // compaction, separator and record stream pools. The indexes of the tables are not part of it,
+    // nor is the buffered writer of the write path, which logstor holds rather than the segment
+    // manager.
     size_t memory_usage{0};
 };
 
@@ -204,6 +210,16 @@ public:
     // Create an output stream to write a segment (for receiving from remote node)
     // Allocates a new local segment and returns an output stream for writing to the segment.
     future<std::unique_ptr<segment_stream_sink>> create_segment_output_stream();
+
+    // Makes a sink that receives a record stream of the table. The sink finds the compaction group
+    // of each record in the table catalog.
+    // `table_stream` keeps the stream in progress for the table. The sink holds `table_stream`
+    // until the sink is closed or aborted.
+    // The sink is work in progress of the segment manager until it is closed or aborted, so stop()
+    // waits for it.
+    // Fails with gate_closed_exception after stop() starts.
+    // Waits while max_record_stream_sinks sinks are open.
+    future<std::unique_ptr<record_stream_sink>> make_record_stream_sink(table_id, utils::phased_barrier::operation table_stream);
 
     friend class segment_manager_impl;
 

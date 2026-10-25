@@ -14,6 +14,7 @@
 #include <seastar/core/on_internal_error.hh>
 #include <seastar/core/simple-stream.hh>
 #include <seastar/util/log.hh>
+#include <seastar/util/memory-data-source.hh>
 
 #include "serializer_impl.hh"
 
@@ -136,6 +137,22 @@ void chunk_records::iterator::read_next() {
     // The next record frame starts at a multiple of record_alignment.
     const size_t consumed = records_size - _records.size();
     _records.skip(std::min(align_up(consumed, ondisk::record_alignment) - consumed, _records.size()));
+}
+
+future<std::optional<scanned_chunk>> parse_chunk(temporary_buffer<char> chunk) {
+    const size_t chunk_size = chunk.size();
+    auto in = seastar::util::as_input_stream(std::move(chunk));
+    segment_reader reader(in);
+    std::optional<scanned_chunk> result;
+    if (auto header = co_await read_chunk_header(reader, log_segment_id{}, std::nullopt)) {
+        const size_t body_position = reader.position();
+        auto body = co_await read_chunk_body(reader, *header);
+        if (body && body->valid && reader.position() == chunk_size) {
+            result.emplace(scanned_chunk(log_segment_id{}, header->segment, std::move(body->buf), body_position, true));
+        }
+    }
+    co_await in.close();
+    co_return result;
 }
 
 segment_scanner::segment_scanner(seastar::input_stream<char>& in, log_segment_id segment_id, size_t segment_size)

@@ -657,6 +657,10 @@ public:
     // none.
     logstor::logstor_group* maybe_get_logstor_group(dht::token token);
     logstor::logstor_group* maybe_get_logstor_group(dht::token first_token, dht::token last_token);
+    // Returns the compaction group of the token on this shard, with the holders of a write to the
+    // group, or a target with no group when no group of this shard owns the token or the group
+    // stops.
+    logstor::write_target logstor_write_target(dht::token token);
 
     // Restricted to new sstables produced by external processes such as repair.
     // The sstable might undergo split if table is in split mode.
@@ -1858,7 +1862,8 @@ private:
             db::per_partition_rate_limit::info,
             bool /* skip_large_data_guardrails */> _apply_stage;
 
-    // The tables of this shard as logstor recovery and the adoption of a streamed segment see them.
+    // The tables of this shard as logstor recovery, the adoption of a streamed segment and the
+    // record stream sink see them.
     // The database makes this catalog before _logstor and destroys it after _logstor.
     std::unique_ptr<logstor::table_catalog> _logstor_catalog;
     // Declared ahead of the tables, since a logstor table holds a pointer to it and its compaction

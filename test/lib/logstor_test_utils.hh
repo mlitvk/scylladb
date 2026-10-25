@@ -19,6 +19,7 @@
 #include <boost/test/unit_test.hpp>
 #include <fmt/format.h>
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/gate.hh>
 #include <seastar/core/scheduling.hh>
 #include <seastar/coroutine/as_future.hh>
 
@@ -34,6 +35,7 @@
 #include "replica/logstor/segment_manager.hh"
 #include "replica/logstor/single_row_partition.hh"
 #include "replica/logstor/table_catalog.hh"
+#include "replica/logstor/write_buffer.hh"
 #include "schema/schema_fwd.hh"
 #include "utils/updateable_value.hh"
 
@@ -124,6 +126,10 @@ class test_logstor_group final : public replica::logstor::logstor_group {
     std::unique_ptr<replica::logstor::primary_index> _owned_index;
     replica::logstor::primary_index& _index;
     replica::logstor::compaction_manager& _cm;
+    // A write to the group holds these gates, as a write to a compaction_group holds
+    // sstable_add_gate() and async_gate().
+    seastar::gate _non_empty_gate;
+    seastar::gate _alive_gate;
 public:
     test_logstor_group(schema_ptr schema, replica::logstor::logstor& ls, bool cache_enabled = false)
         : logstor_group(ls.get_segment_manager().get_segment_size(), &ls.get_segment_manager().shard_segment_stats())
@@ -158,6 +164,22 @@ public:
 
     const replica::logstor::primary_index& logstor_index() const noexcept override {
         return _index;
+    }
+
+    seastar::gate& non_empty_gate() noexcept {
+        return _non_empty_gate;
+    }
+
+    seastar::gate& alive_gate() noexcept {
+        return _alive_gate;
+    }
+
+    // Closes the gates in the order of the stop of a compaction group, and waits for the holders
+    // of each gate. A test calls close_gates() at the end of the test, so that a holder that was
+    // not released makes the test hang.
+    future<> close_gates() {
+        co_await _alive_gate.close();
+        co_await _non_empty_gate.close();
     }
 
 protected:
@@ -202,11 +224,25 @@ inline future<mutation_opt> read_mutation(replica::logstor::logstor& ls, schema_
 class test_table_catalog final : public replica::logstor::table_catalog {
     struct table_groups {
         replica::logstor::primary_index* index;
-        std::vector<std::pair<dht::token_range, replica::logstor::logstor_group*>> groups;
+        std::vector<std::pair<dht::token_range, test_logstor_group*>> groups;
     };
     std::map<::table_id, table_groups> _tables;
+
+    // Returns the group that owns the whole token range, or null.
+    test_logstor_group* find_group(::table_id table, dht::token first, dht::token last) {
+        auto it = _tables.find(table);
+        if (it == _tables.end()) {
+            return nullptr;
+        }
+        for (auto& [range, group] : it->second.groups) {
+            if (range.contains(first, dht::token_comparator()) && range.contains(last, dht::token_comparator())) {
+                return group;
+            }
+        }
+        return nullptr;
+    }
 public:
-    void add(replica::logstor::logstor_group& group, dht::token_range range = dht::token_range::make_open_ended_both_sides()) {
+    void add(test_logstor_group& group, dht::token_range range = dht::token_range::make_open_ended_both_sides()) {
         auto& table = _tables[group.table_id()];
         if (table.index && table.index != &group.logstor_index()) {
             throw std::invalid_argument("test_table_catalog: the groups of a table must share one index");
@@ -220,6 +256,11 @@ public:
         table.groups.emplace_back(std::move(range), &group);
     }
 
+    // Removes the group from the catalog. The table stays in the catalog, with its index.
+    void remove(test_logstor_group& group) {
+        std::erase_if(_tables.at(group.table_id()).groups, [&] (const auto& entry) { return entry.second == &group; });
+    }
+
     replica::logstor::primary_index* index(::table_id table) override {
         auto it = _tables.find(table);
         return it != _tables.end() ? it->second.index : nullptr;
@@ -230,16 +271,22 @@ public:
     }
 
     target find(::table_id table, dht::token first, dht::token last) override {
-        auto it = _tables.find(table);
-        if (it == _tables.end()) {
+        return {index(table), find_group(table, first, last)};
+    }
+
+    // Holds the gates of the group with a try-hold, so a group whose gates are closed gives a
+    // target with no group, as a compaction group that stops does.
+    replica::logstor::write_target find_for_write(::table_id table, dht::token token) override {
+        auto* group = find_group(table, token, token);
+        if (!group) {
             return {};
         }
-        for (auto& [range, group] : it->second.groups) {
-            if (range.contains(first, dht::token_comparator()) && range.contains(last, dht::token_comparator())) {
-                return {it->second.index, group};
-            }
+        auto alive_holder = group->alive_gate().try_hold();
+        auto non_empty_holder = group->non_empty_gate().try_hold();
+        if (!alive_holder || !non_empty_holder) {
+            return {};
         }
-        return {it->second.index, nullptr};
+        return {.cg = group, .non_empty_holder = std::move(*non_empty_holder), .alive_holder = std::move(*alive_holder)};
     }
 
     sstring table_name(::table_id table) override {

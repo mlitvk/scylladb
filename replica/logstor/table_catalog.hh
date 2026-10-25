@@ -16,6 +16,7 @@ namespace replica::logstor {
 
 class primary_index;
 class logstor_group;
+struct write_target;
 
 // A table_catalog gives the index of a logstor table, and the compaction group of this shard
 // that owns a token or a token range of the table.
@@ -24,7 +25,8 @@ class logstor_group;
 // The catalog does not keep a table or a group alive, so the pointers that index() and find()
 // return are valid until the caller suspends.
 // A caller can keep a pointer over a suspension only when no group can stop in that time, which
-// is true during recovery and start().
+// is true during recovery and start(). Another caller uses find_for_write(), which holds the
+// group.
 class table_catalog {
 public:
     virtual ~table_catalog() = default;
@@ -44,6 +46,12 @@ public:
     // The index of the table, and the compaction group that owns the whole token range on this
     // shard or null when no single group of this shard owns it.
     virtual target find(table_id, dht::token first, dht::token last) = 0;
+
+    // Returns the compaction group that owns the token on this shard, with the holders that a
+    // write to the group takes.
+    // Returns a target with no group when the table does not exist, when no group of this shard
+    // owns the token, or when the group stops.
+    virtual write_target find_for_write(table_id, dht::token) = 0;
 
     virtual sstring table_name(table_id) = 0;
 };

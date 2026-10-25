@@ -2087,6 +2087,25 @@ logstor::logstor_group* table::maybe_get_logstor_group(dht::token first_token, d
     return cg ? &cg->as_logstor_group() : nullptr;
 }
 
+logstor::write_target table::logstor_write_target(dht::token token) {
+    auto* cg = _sg_manager->maybe_compaction_group_for_token(token);
+    if (!cg) {
+        return {};
+    }
+    auto group_holder = try_hold_gate(cg->async_gate());
+    if (!group_holder) {
+        return {};
+    }
+    // This hold cannot fail after the hold of async_gate(), because the stop of a group closes
+    // sstable_add_gate() only after async_gate() has no holder.
+    auto sstable_add_holder = try_hold_gate(cg->sstable_add_gate());
+    if (!sstable_add_holder) {
+        on_internal_error(tlogger, fmt::format("The sstable add gate of compaction group {} of table {}.{} is closed while its async gate is open",
+                cg->group_id(), _schema->ks_name(), _schema->cf_name()));
+    }
+    return logstor::write_target(&cg->as_logstor_group(), std::move(*sstable_add_holder), std::move(*group_holder));
+}
+
 // Handles permit management only, used for situations where we don't want to inform
 // the compaction manager about backlogs (i.e., tests)
 class permit_monitor : public sstables::write_monitor {

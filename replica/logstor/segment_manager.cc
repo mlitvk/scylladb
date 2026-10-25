@@ -477,6 +477,7 @@ class segment_manager_impl {
     write_buffer_pool _compaction_buffer_pool;
     write_buffer_pool _separator_buffer_pool;
     abort_source _separator_buffer_abort;
+    write_buffer_pool _stream_buffer_pool;
 
     static constexpr size_t separator_queue_depth = 16;
 
@@ -618,7 +619,8 @@ public:
     size_t get_memory_usage() const noexcept {
         return _segment_descs.capacity() * sizeof(segment_descriptor)
                 + _compaction_buffer_pool.memory_usage()
-                + _separator_buffer_pool.memory_usage();
+                + _separator_buffer_pool.memory_usage()
+                + _stream_buffer_pool.memory_usage();
     }
 
     uint64_t get_disk_usage() const noexcept {
@@ -657,6 +659,7 @@ public:
 
     future<seastar::input_stream<char>> create_segment_input_stream(log_segment_id segment_id, const seastar::file_input_stream_options& opts);
     future<std::unique_ptr<segment_stream_sink>> create_segment_output_stream();
+    future<std::unique_ptr<record_stream_sink>> make_record_stream_sink(table_id, utils::phased_barrier::operation table_stream);
 
     uint64_t allocatable_new_segment_count() const noexcept {
         return _next_new_segment_id < _geometry.segment_count() ? _geometry.segment_count() - _next_new_segment_id : 0;
@@ -864,6 +867,15 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config, table_
             .preallocate = 0,
             .max_cached = separator_flush_reserve,
       })
+    // Each record stream sink takes `record_stream_sink_buffers` buffers. The pool builds the
+    // buffers at the point of use, and it keeps the buffers of one sink for the next stream.
+    , _stream_buffer_pool(write_buffer_pool::config{
+            .capacity = record_stream_sink_buffers * std::max<size_t>(config.max_record_stream_sinks, 1),
+            .buffer_size = config.segment_size,
+            .kind = segment_kind::full,
+            .preallocate = 0,
+            .max_cached = record_stream_sink_buffers,
+      })
     , _separator_task_queue(separator_queue_depth)
     {
 
@@ -1062,6 +1074,7 @@ future<> segment_manager_impl::stop() {
     co_await _compaction_mgr.stop();
     co_await _compaction_buffer_pool.stop();
     co_await _separator_buffer_pool.stop();
+    co_await _stream_buffer_pool.stop();
 
     // All the consumers of the segment pool stopped. Stop the producer next, and then the pool.
     logstor_logger.debug("Stopping reserve replenisher and segment pool");
@@ -2428,6 +2441,29 @@ future<utils::chunked_vector<segment_snapshot>> segment_manager_impl::make_snaps
     co_return std::move(snp);
 }
 
+future<std::unique_ptr<record_stream_sink>> segment_manager_impl::make_record_stream_sink(table_id table,
+        utils::phased_barrier::operation table_stream) {
+    // This function holds the gate before it allocates buffers, so that no sink is made while the
+    // segment manager stops.
+    auto segment_manager_holder = _async_gate.hold();
+    // Nothing aborts the wait for the buffers at stop, because stop() waits at the gate for the
+    // sinks, so a sink that waits for its buffers gets them when another sink ends.
+    // The sink takes all its buffers in one call, because sinks that each hold a part of their
+    // buffers and wait for the rest would wait forever.
+    abort_source never_aborted;
+    auto buffers = co_await _stream_buffer_pool.allocate_many(record_stream_sink_buffers, never_aborted);
+    co_return std::make_unique<record_stream_sink>(table, _catalog, std::move(buffers),
+            [this] (write_buffer& wb, logstor_group& group) {
+                // The sink waits for a segment with no abort source, as normal writes and the
+                // separator do. When the pool has no free segment, the sink waits until the pool
+                // gets one or until the replenisher fails.
+                // The stop of the group and the stop of the table wait for the sink in that time,
+                // as they wait for a normal write.
+                return write_full_segment(wb, group, write_source::streaming);
+            },
+            std::move(segment_manager_holder), std::move(table_stream));
+}
+
 // segment_manager wrapper
 
 segment_manager::segment_manager(segment_manager_config config, table_catalog& catalog)
@@ -2631,6 +2667,11 @@ future<utils::chunked_vector<segment_snapshot>> segment_manager::make_snapshot(l
 
 future<std::unique_ptr<segment_stream_sink>> segment_manager::create_segment_output_stream() {
     return _impl->create_segment_output_stream();
+}
+
+future<std::unique_ptr<record_stream_sink>> segment_manager::make_record_stream_sink(table_id table,
+        utils::phased_barrier::operation table_stream) {
+    return _impl->make_record_stream_sink(table, std::move(table_stream));
 }
 
 separator_buffer::~separator_buffer() {
