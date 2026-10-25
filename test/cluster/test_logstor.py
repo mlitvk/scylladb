@@ -819,10 +819,10 @@ async def test_compaction(manager: ScyllaClusterManager):
 async def test_automatic_compaction_follows_the_utilization_threshold(manager: ScyllaClusterManager):
     """
     Automatic compaction compacts a segment once less than logstor_compaction_utilization_threshold
-    of the segment is live, with CPU shares that follow the space pressure. The test overwrites a
-    small disk several times and checks the whole loop: compaction runs without a request, the
-    write path always gets a segment, and once the writes stop the dead segments are freed and the
-    configured threshold applies again.
+    of the segment is live, and the reclaim rate controller paces it. The test overwrites a small
+    disk several times and checks the whole loop: compaction runs without a request, the write path
+    always gets a segment, and once the writes stop the dead segments are freed and the configured
+    threshold applies again.
 
     A disk of 64 segments cannot show how smoothly the rate is held.
     """
@@ -873,7 +873,9 @@ async def test_automatic_compaction_follows_the_utilization_threshold(manager: S
             free_segments = await get("free_segments")
             logger.info(f"round {round}: free_segments={free_segments} of {total_segments} "
                         f"reclaimed={await reclaimed()} "
-                        f"threshold={await get('compaction_utilization_threshold')}")
+                        f"threshold={await get('compaction_utilization_threshold')} "
+                        f"rate={await get('compaction_target_reclaim_rate')} "
+                        f"credit={await get('compaction_rate_credit')}")
             assert free_segments >= 1, "the write path was left with no segment to write into"
             assert free_segments <= total_segments
 
