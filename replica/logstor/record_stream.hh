@@ -9,13 +9,7 @@
 // A record stream moves the live records of a compaction group to another node, for a tablet
 // migration. The sender reads the segments of the group and sends the records that the index
 // still points at. The receiver packs the records into full segments of its own, and adds them to
-// its index.
-//
-// The stream is a sequence of chunks of segment_kind::full, one for each segment of the sender
-// that has live records. The sender seals a chunk at ondisk::record_alignment, so a chunk has no
-// padding to a block. The segment sequence of a chunk has no meaning on the wire, and the receiver
-// does not read it. The receiver checks each chunk with its CRCs, as recovery checks a chunk on
-// disk.
+// its index. The stream and its format are described in docs/dev/logstor.md, Tablet Streaming.
 
 #pragma once
 
