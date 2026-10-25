@@ -614,6 +614,7 @@ public:
 
     future<seastar::input_stream<char>> create_segment_input_stream(log_segment_id segment_id, const seastar::file_input_stream_options& opts);
     future<std::unique_ptr<segment_stream_sink>> create_segment_output_stream(recovery_catalog&);
+    future<utils::chunked_vector<log_segment_id>> segment_ids(logstor_group&);
     future<> read_chunks(log_segment_id, noncopyable_function<future<>(const scanned_chunk&)> fn);
     future<std::unique_ptr<record_stream_source>> make_record_stream_source(logstor_group&);
     future<std::unique_ptr<record_stream_sink>> make_record_stream_sink(table_id, record_stream_sink::target_resolver);
@@ -671,6 +672,9 @@ private:
     // the segment set stay valid while the walk yields.
     template <std::predicate<const segment_descriptor&> Filter>
     future<utils::chunked_vector<log_segment_id>> collect_segment_ids(logstor_group&, Filter filter);
+    // Returns the ids of all the segments of the group.
+    // The caller must keep compaction of the group disabled, as for the form with a filter.
+    future<utils::chunked_vector<log_segment_id>> collect_segment_ids(logstor_group&);
 
     segment_ref make_segment_ref(log_segment_id seg_id) {
         auto& desc = get_segment_descriptor(seg_id);
@@ -1443,6 +1447,10 @@ future<utils::chunked_vector<log_segment_id>> segment_manager_impl::collect_segm
         co_await coroutine::maybe_yield();
     }
     co_return ids;
+}
+
+future<utils::chunked_vector<log_segment_id>> segment_manager_impl::collect_segment_ids(logstor_group& group) {
+    return collect_segment_ids(group, [] (const segment_descriptor&) { return true; });
 }
 
 future<> compaction_manager_impl::submit_group_compaction(logstor_group& cg, std::function<future<>(group_compaction_state&)> op, scheduling_group sg) {
@@ -2338,6 +2346,11 @@ future<utils::chunked_vector<segment_snapshot>> segment_manager_impl::make_snaps
     co_return std::move(snp);
 }
 
+future<utils::chunked_vector<log_segment_id>> segment_manager_impl::segment_ids(logstor_group& group) {
+    auto compaction_guard = co_await _compaction_mgr.disable_compaction(group);
+    co_return co_await collect_segment_ids(group);
+}
+
 future<> segment_manager_impl::read_chunks(log_segment_id segment_id, noncopyable_function<future<>(const scanned_chunk&)> fn) {
     // A read of a segment is work in progress, as for a read of a record, so that stop() does not
     // close the files under it.
@@ -2584,6 +2597,10 @@ future<utils::chunked_vector<segment_snapshot>> segment_manager::make_snapshot(l
 
 future<std::unique_ptr<segment_stream_sink>> segment_manager::create_segment_output_stream(recovery_catalog& catalog) {
     return _impl->create_segment_output_stream(catalog);
+}
+
+future<utils::chunked_vector<log_segment_id>> segment_manager::segment_ids(logstor_group& group) {
+    return _impl->segment_ids(group);
 }
 
 future<> segment_manager::read_chunks(log_segment_id segment_id, noncopyable_function<future<>(const scanned_chunk&)> fn) {
