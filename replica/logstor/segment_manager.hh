@@ -153,6 +153,8 @@ public:
     // Calls `fn` with each record of the segment, the dead records too. For tests.
     future<> for_each_record_for_test(log_segment_id, noncopyable_function<future<>(const chunk_record&)> fn);
 
+    const record_stream_stats& stream_stats() const noexcept;
+
     // Makes a source that sends the live records of the group as a record stream. Returns nullptr
     // if the group has no live record. Compaction of the group stays disabled until the source is
     // destroyed.

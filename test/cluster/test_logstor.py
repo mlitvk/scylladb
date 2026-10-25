@@ -1273,6 +1273,11 @@ async def test_tablet_migration_sends_live_records(manager: ScyllaClusterManager
         assert dst_segments <= max_dst_segments
         # The chunk headers and the record padding are the only bytes above the live records.
         assert live_bytes <= stream_bytes <= 1.1 * live_bytes
+        src_metrics = await manager.metrics.query(src.ip_addr)
+        dst_metrics = await manager.metrics.query(dst.ip_addr)
+        assert int(src_metrics.get("scylla_logstor_sm_stream_records_sent") or 0) == nkeys
+        assert int(dst_metrics.get("scylla_logstor_sm_stream_records_received") or 0) == nkeys
+        assert int(dst_metrics.get("scylla_logstor_sm_stream_records_superseded") or 0) == 0
         await check_values(cql, ks, nkeys, f"3_{value}")
 
 @pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')

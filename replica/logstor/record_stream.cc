@@ -24,12 +24,14 @@
 namespace replica::logstor {
 
 record_stream_source::record_stream_source(table_id table, const primary_index& index, compaction_reenabler compaction_guard,
-        utils::chunked_vector<log_segment_id> segments, size_t segment_size, chunk_reader read_chunks)
+        utils::chunked_vector<log_segment_id> segments, size_t segment_size, chunk_reader read_chunks,
+        record_stream_stats& stats)
     : _table(table)
     , _index(index)
     , _compaction_guard(std::move(compaction_guard))
     , _segments(std::move(segments))
     , _read_chunks(std::move(read_chunks))
+    , _stats(stats)
     , _chunk(segment_size, segment_kind::full)
 {}
 
@@ -76,6 +78,7 @@ future<> record_stream_source::collect_live_records(log_segment_id segment_id) {
 temporary_buffer<char> record_stream_source::take_chunk() {
     // The receiver does not read the segment sequence.
     _chunk.seal(segment_sequence{0}, _table, ondisk::record_alignment);
+    _stats.records_sent += _chunk.record_count();
     const auto chunk = _chunk.chunk();
     temporary_buffer<char> buf(reinterpret_cast<const char*>(chunk.data()), chunk.size());
     _chunk.reset();
@@ -153,12 +156,13 @@ temporary_buffer<char> stream_chunk_assembler::take_front(size_t n) {
 }
 
 record_stream_sink::record_stream_sink(table_id table, target_resolver resolve_target, owned_write_buffer buffer,
-        segment_writer write_segment, seastar::gate::holder segment_manager_holder)
+        segment_writer write_segment, seastar::gate::holder segment_manager_holder, record_stream_stats& stats)
     : _table(table)
     , _resolve_target(std::move(resolve_target))
     , _buffer(std::move(buffer))
     , _write_segment(std::move(write_segment))
     , _segment_manager_holder(std::move(segment_manager_holder))
+    , _stats(stats)
 {}
 
 record_stream_sink::~record_stream_sink() {
@@ -233,8 +237,11 @@ future<> record_stream_sink::write_record(const chunk_record& record) {
 
     auto* index = &_target.cg->logstor_index();
     _index_updates.push_back(_buffer->write(std::move(writer)).then_unpack(
-            [index, key = std::move(key), timestamp = header.timestamp] (record_location location, seastar::gate::holder) {
-        index->insert(key, index_entry{.location = location, .timestamp = timestamp});
+            [stats = &_stats, index, key = std::move(key), timestamp = header.timestamp] (record_location location, seastar::gate::holder) {
+        ++stats->records_received;
+        if (!index->insert(key, index_entry{.location = location, .timestamp = timestamp}).inserted()) {
+            ++stats->records_superseded;
+        }
     }));
 }
 

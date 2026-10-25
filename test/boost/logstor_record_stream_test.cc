@@ -467,6 +467,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_sink_keeps_a_newer_local_record) {
     const auto local_entry = group.logstor_index().get(index_key_of(schema, local));
     BOOST_REQUIRE(local_entry);
     const auto live_bytes_before = group.logstor_segments().live_record_bytes();
+    const auto stats_before = env.ls.get_segment_manager().stream_stats();
 
     const std::vector<test_record> streamed{
         {.pk = "pk0", .value = "streamed", .timestamp = 1000},
@@ -490,6 +491,9 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_sink_keeps_a_newer_local_record) {
     require_reads_back(env.ls, schema, group.logstor_index(), streamed[1]);
     // The older record is dead space in the streamed segment.
     BOOST_REQUIRE_EQUAL(group.logstor_segments().live_record_bytes(), live_bytes_before + frame_size_of(schema, streamed[1]));
+    const auto& stats = env.ls.get_segment_manager().stream_stats();
+    BOOST_REQUIRE_EQUAL(stats.records_received - stats_before.records_received, 2);
+    BOOST_REQUIRE_EQUAL(stats.records_superseded - stats_before.records_superseded, 1);
 }
 
 SEASTAR_THREAD_TEST_CASE(test_logstor_record_sink_rejects_a_corrupt_chunk) {
@@ -613,15 +617,17 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_sink_failed_segment_write_releases_
     const auto records = make_records(150, 2000);
     auto chunks = make_chunks(schema, records, 7);
 
+    record_stream_stats stats;
     record_stream_sink sink(schema->id(), [&] (dht::token) { return gates.target(group); }, pool.allocate(as).get(),
             [] (write_buffer&, logstor_group&) -> future<> {
                 return make_exception_future<>(std::runtime_error("injected segment write failure"));
             },
-            segment_manager_gate.hold());
+            segment_manager_gate.hold(), stats);
     BOOST_REQUIRE_THROW(sink.put(chunks).get(), std::runtime_error);
     sink.abort().get();
 
     BOOST_REQUIRE_EQUAL(pool.used_buffer_count(), 0);
+    BOOST_REQUIRE_EQUAL(stats.records_received, 0);
     segment_manager_gate.close().get();
     gates.close();
     pool.stop().get();
@@ -669,8 +675,10 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_source_sends_only_live_records) {
     BOOST_REQUIRE(source);
     const auto chunks = read_all(*source);
 
+    const auto live = timestamps_of({std::span(first).subspan(10), second, overwritten});
     BOOST_REQUIRE_EQUAL(chunks.size(), 3);
-    BOOST_REQUIRE(timestamps_in(chunks) == timestamps_of({std::span(first).subspan(10), second, overwritten}));
+    BOOST_REQUIRE(timestamps_in(chunks) == live);
+    BOOST_REQUIRE_EQUAL(env.ls.get_segment_manager().stream_stats().records_sent, live.size());
 }
 
 SEASTAR_THREAD_TEST_CASE(test_logstor_record_source_is_not_made_for_a_group_without_live_records) {
@@ -744,11 +752,12 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_source_fails_on_a_segment_that_is_n
     test_logstor_group group(schema, env.ls);
     const auto records = make_records(3, 100);
 
+    record_stream_stats stats;
     auto make_source = [&] (temporary_buffer<char> segment) {
         utils::chunked_vector<log_segment_id> segments;
         segments.push_back(log_segment_id{0});
         return record_stream_source(schema->id(), group.logstor_index(), compaction_reenabler(), std::move(segments), segment_size,
-                memory_chunk_reader(std::move(segment)));
+                memory_chunk_reader(std::move(segment)), stats);
     };
     auto make_segment = [&] (segment_kind kind, table_id table) {
         raw_write_buffer buf(segment_size, kind);
@@ -813,6 +822,10 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_stream_round_trip) {
     gates.close();
 
     BOOST_REQUIRE_EQUAL(receiver.logstor_segments().live_record_bytes(), sender.logstor_segments().live_record_bytes());
+    const auto& stats = env.ls.get_segment_manager().stream_stats();
+    BOOST_REQUIRE_EQUAL(stats.records_sent, live.size());
+    BOOST_REQUIRE_EQUAL(stats.records_received, live.size());
+    BOOST_REQUIRE_EQUAL(stats.records_superseded, 0);
     BOOST_REQUIRE_LT(receiver.logstor_segments().segment_count(), sender.logstor_segments().segment_count());
     for (const auto& r : live) {
         require_reads_back(env.ls, schema, receiver.logstor_index(), r);

@@ -50,6 +50,17 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+// The record counts of the streams of a shard.
+struct record_stream_stats {
+    // The records that the sources of the shard sent.
+    uint64_t records_sent{0};
+    // The records that the sinks of the shard wrote to segments.
+    uint64_t records_received{0};
+    // The received records that were older than the record of their key in the index, and so dead
+    // when they were written.
+    uint64_t records_superseded{0};
+};
+
 // The sender of a record stream. It gives one chunk for each segment in its list that has live
 // records, and then an empty buffer. A record is live if the index points at it when the source
 // reads its segment.
@@ -65,7 +76,8 @@ public:
     using chunk_reader = noncopyable_function<future<>(log_segment_id, noncopyable_function<future<>(const scanned_chunk&)>)>;
 
     record_stream_source(table_id table, const primary_index& index, compaction_reenabler compaction_guard,
-            utils::chunked_vector<log_segment_id> segments, size_t segment_size, chunk_reader read_chunks);
+            utils::chunked_vector<log_segment_id> segments, size_t segment_size, chunk_reader read_chunks,
+            record_stream_stats& stats);
 
     future<temporary_buffer<char>> get() override;
 
@@ -76,6 +88,7 @@ private:
     utils::chunked_vector<log_segment_id> _segments;
     size_t _next_segment = 0;
     chunk_reader _read_chunks;
+    record_stream_stats& _stats;
     raw_write_buffer _chunk;
 
     future<> collect_live_records(log_segment_id segment_id);
@@ -126,7 +139,7 @@ public:
     using segment_writer = noncopyable_function<future<>(write_buffer&, logstor_group&)>;
 
     record_stream_sink(table_id table, target_resolver resolve_target, owned_write_buffer buffer,
-            segment_writer write_segment, seastar::gate::holder segment_manager_holder);
+            segment_writer write_segment, seastar::gate::holder segment_manager_holder, record_stream_stats& stats);
     record_stream_sink(const record_stream_sink&) = delete;
     record_stream_sink& operator=(const record_stream_sink&) = delete;
     ~record_stream_sink();
@@ -147,6 +160,7 @@ private:
     owned_write_buffer _buffer;
     segment_writer _write_segment;
     seastar::gate::holder _segment_manager_holder;
+    record_stream_stats& _stats;
     stream_chunk_assembler _assembler;
     // The group of the records in the buffer, with its holders. The holders stay until the segment
     // of the records is in the group, as for a normal write.
