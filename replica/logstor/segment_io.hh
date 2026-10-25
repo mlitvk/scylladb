@@ -121,7 +121,8 @@ private:
     const scanned_chunk& _chunk;
 };
 
-// A chunk with a valid header, of the same use of the segment as the first chunk.
+// Holds a chunk whose header is valid: a chunk of the same use of the segment as the first chunk,
+// which a segment_scanner reads, or a stream chunk, which parse_chunk() reads.
 class scanned_chunk {
 public:
     const segment_info& info() const noexcept { return _info; }
@@ -134,12 +135,14 @@ private:
     log_segment_id _segment_id;
     segment_info _info;
     temporary_buffer<char> _body;
-    // Where the body starts in the segment. Record locations are relative to the segment.
+    // Holds the offset of the body in the segment, or in the stream chunk that parse_chunk() read.
+    // The record locations are offsets from the same start.
     size_t _body_position;
     bool _body_valid;
 
     friend class segment_scanner;
     friend class chunk_records::iterator;
+    friend future<std::optional<scanned_chunk>> parse_chunk(temporary_buffer<char>);
 
     // The record frames, or nothing if the body is not valid.
     std::span<const char> record_bytes() const noexcept {
@@ -154,6 +157,16 @@ private:
         , _body_valid(body_valid)
     {}
 };
+
+// Returns the chunk that `chunk` holds, which is one whole chunk in memory, as a stream receives it.
+// Returns nothing if the chunk header or the body is not valid, or if `chunk` holds more or fewer
+// bytes than the chunk.
+// Throws std::runtime_error if the chunk has a format version or a flag that this release does not
+// read.
+//
+// The record locations are offsets in `chunk`. Their segment is `log_segment_id{}`, which is
+// segment 0 and not the segment of the records, so the caller must not use it.
+future<std::optional<scanned_chunk>> parse_chunk(temporary_buffer<char> chunk);
 
 // Scans the chunks of a segment in order. The scanner reads from the stream, and does not close
 // it. The scan handles a chunk in one of these ways:
