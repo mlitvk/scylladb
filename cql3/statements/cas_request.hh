@@ -36,7 +36,7 @@ struct cas_row_update {
  * Processed CAS conditions and update on potentially multiple rows of the same partition.
  */
 class cas_request: public service::cas_request {
-private:
+protected:
     std::vector<cas_row_update> _updates;
     schema_ptr _schema;
     update_parameters::prefetch_data _rows;
@@ -63,6 +63,8 @@ public:
     }
 
     lw_shared_ptr<query::read_command> read_command(query_processor& qp) const;
+    // The read command of the prepare round: null when the request reads the partition itself.
+    lw_shared_ptr<query::read_command> prepare_read_command(query_processor& qp) const;
 
     void add_row_update(const modification_statement& stmt_arg, modification_spec spec_arg,
         const query_options& options_arg);
@@ -80,7 +82,9 @@ public:
     build_cas_result_set(seastar::shared_ptr<cql3::metadata> metadata,
             const column_set& mask, bool is_applied) const;
 
-private:
+protected:
+    // The slice of the partition that the conditions and the updates read.
+    query::partition_slice read_slice() const;
     bool applies_to() const;
     std::optional<mutation> apply_updates(api::timestamp_type t) const;
     /// Find a row in prefetch_data which matches primary key identifying a given `cas_row_update`
@@ -90,5 +94,21 @@ private:
     };
     old_row find_old_row(const cas_row_update& op) const;
 };
+
+// The request of a conditional statement on a logstor table. A logstor write replaces the whole
+// partition, so the proposal is the partition the coordinator read with the updates applied
+// (replica::logstor::apply_update()), not the updates alone.
+class logstor_cas_request : public cas_request {
+public:
+    using cas_request::cas_request;
+
+    bool needs_partition() const override { return true; }
+
+    std::optional<mutation> apply_to_partition(std::optional<mutation> stored, api::timestamp_type ts,
+            cdc::per_request_options&) override;
+};
+
+// The request for a conditional statement on a table of `schema`.
+std::unique_ptr<cas_request> make_cas_request(schema_ptr schema);
 
 } // end of namespace "cql3::statements"
