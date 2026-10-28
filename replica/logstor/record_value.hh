@@ -31,6 +31,9 @@ struct single_row_partition;
 api::timestamp_type record_timestamp(const mutation& m);
 api::timestamp_type record_timestamp(const frozen_mutation& m);
 
+// The frozen form of mutation_partition::empty(): true if m represents no writes.
+bool is_empty(const frozen_mutation& m);
+
 // Encodes the partition of m as the value of a record whose header is built from m.
 record_value encode_record_value(const mutation& m);
 
