@@ -4324,13 +4324,13 @@ uint64_t segment_manager_metric(std::string_view name) {
     return value;
 }
 
-// Checks that a store that cannot hold the compaction reserve, the active segment and one segment for
-// the separator is rejected, because it would wait for a segment forever, and that a store of that
-// size takes a write and stops.
+// Checks that a store that cannot hold the compaction reserve, the separator reserve, the active
+// segment and one segment for the separator is rejected, because it would wait for a segment
+// forever, and that a store of that size takes a write and stops.
 SEASTAR_THREAD_TEST_CASE(test_logstor_rejects_a_store_smaller_than_its_reserved_segments) {
     auto schema = make_kv_schema();
     constexpr size_t segment_size = 128 * 1024;
-    constexpr size_t min_segments = replica::logstor::max_compaction_parallelism + 2;
+    constexpr size_t min_segments = replica::logstor::max_compaction_parallelism + replica::logstor::separator_segment_reserve + 2;
     shared_logstor_cache cache;
 
     {
