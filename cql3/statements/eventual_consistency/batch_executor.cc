@@ -141,7 +141,7 @@ future<shared_ptr<cql_transport::messages::result_message>> execute_with_conditi
         }
         if (!request) {
             schema = statement.s;
-            request = std::make_unique<cas_request>(schema);
+            request = make_cas_request(schema);
         } else if (spec.keys.size() != 1 || spec.keys.front().equal(request->key().front(), dht::ring_position_comparator(*schema)) == false) {
             throw exceptions::invalid_request_exception("BATCH with conditions cannot span multiple partitions");
         }
@@ -158,7 +158,7 @@ future<shared_ptr<cql_transport::messages::result_message>> execute_with_conditi
         co_return qp.bounce_to_shard(cas_shard.shard(), std::move(cached_fn_calls));
     }
 
-    service::storage_proxy::cas_result cas_result = co_await qp.proxy().cas(schema, std::move(cas_shard), *request, request->read_command(qp), request->key(),
+    service::storage_proxy::cas_result cas_result = co_await qp.proxy().cas(schema, std::move(cas_shard), *request, request->prepare_read_command(qp), request->key(),
             {read_timeout, qs.get_permit(), qs.get_client_state(), qs.get_trace_state()},
             std::move(cl_for_paxos).assume_value(), cl_for_learn, batch_timeout, cas_timeout);
     auto result = request->build_cas_result_set(batch.cas_result_metadata(), batch.columns_of_cas_result_set(), cas_result.is_applied);
