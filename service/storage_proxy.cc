@@ -5851,133 +5851,149 @@ protected:
         return _cmd->partition_limit;
     }
     virtual void adjust_targets_for_reconciliation() {}
+    // The reconciled result of a mutation-form read, with the resolver that holds the
+    // per-replica diffs for read repair.
+    struct reconciled_read {
+        reconcilable_result result;
+        data_resolver_ptr resolver;
+    };
+
+    // Reads cmd in mutation form from the targets and reconciles the versions. While the result
+    // is short, widens the limits and reads again.
+    future<result<reconciled_read>> read_and_reconcile(db::consistency_level cl, storage_proxy::clock_type::time_point timeout, lw_shared_ptr<query::read_command> cmd) {
+        auto exec = shared_from_this();
+        while (true) {
+            data_resolver_ptr data_resolver = ::make_shared<data_read_resolver>(_schema, cl, _targets.size(), timeout);
+
+            if (_proxy->features().empty_replica_mutation_pages) {
+                cmd->slice.options.set<query::partition_slice::option::allow_mutation_read_page_without_live_row>();
+            }
+
+            // Waited on through the resolver.
+            make_mutation_data_requests(cmd, data_resolver, _targets.begin(), _targets.end(), timeout);
+
+            result<> res = co_await data_resolver->done();
+            if (!res) {
+                co_return std::move(res).as_failure();
+            }
+            auto rr_opt = co_await data_resolver->resolve(*cmd, original_row_limit(), original_per_partition_row_limit(), original_partition_limit()); // reconciliation happens here
+
+            // We generate a retry if at least one node reply with count live columns but after merge we have less
+            // than the total number of column we are interested in (which may be < count on a retry).
+            // So in particular, if no host returned count live columns, we know it's not a short read due to
+            // row or partition limits being exhausted and retry is not needed.
+            if (rr_opt && (rr_opt->is_short_read()
+                           || data_resolver->all_reached_end()
+                           || rr_opt->row_count() >= original_row_limit()
+                           || data_resolver->live_partition_count() >= original_partition_limit())
+                    && !data_resolver->any_partition_short_read()) {
+                tracing::trace(_trace_state, "Read stage is done for read-repair");
+                mlogger.trace("reconciled: {}", rr_opt->pretty_printer(_schema));
+                co_return reconciled_read{std::move(*rr_opt), std::move(data_resolver)};
+            }
+
+            tracing::trace(_trace_state, "Not enough data, need a retry for read-repair");
+            _proxy->get_stats().read_retries++;
+            _retry_cmd = make_lw_shared<query::read_command>(*cmd);
+            // We asked t (= cmd->get_row_limit()) live columns and got l (=data_resolver->total_live_count) ones.
+            // From that, we can estimate that on this row, for x requested
+            // columns, only l/t end up live after reconciliation. So for next
+            // round we want to ask x column so that x * (l/t) == t, i.e. x = t^2/l.
+            auto x = [](uint64_t t, uint64_t l) -> uint64_t {
+                using uint128_t = unsigned __int128;
+                auto ret = std::min<uint128_t>(query::max_rows, l == 0 ? t + 1 : (uint128_t) t * t / l + 1);
+                return static_cast<uint64_t>(ret);
+            };
+            auto all_partitions_x = [](uint64_t x, uint32_t partitions) -> uint64_t {
+                using uint128_t = unsigned __int128;
+                auto ret = std::min<uint128_t>(query::max_rows, (uint128_t) x * partitions);
+                return static_cast<uint64_t>(ret);
+            };
+            if (data_resolver->any_partition_short_read() || data_resolver->increase_per_partition_limit()) {
+                // The number of live rows was bounded by the per partition limit.
+                auto new_partition_limit = x(cmd->slice.partition_row_limit(), data_resolver->max_per_partition_live_count());
+                _retry_cmd->slice.set_partition_row_limit(new_partition_limit);
+                auto new_limit = all_partitions_x(new_partition_limit, data_resolver->partition_count());
+                _retry_cmd->set_row_limit(std::max(cmd->get_row_limit(), new_limit));
+            } else {
+                // The number of live rows was bounded by the total row limit or partition limit.
+                if (cmd->partition_limit != query::max_partitions) {
+                    _retry_cmd->partition_limit = std::min<uint64_t>(query::max_partitions, x(cmd->partition_limit, data_resolver->live_partition_count()));
+                }
+                if (cmd->get_row_limit() != query::max_rows) {
+                    _retry_cmd->set_row_limit(x(cmd->get_row_limit(), data_resolver->total_live_count()));
+                }
+            }
+
+            // We may be unable to send a single live row because of replicas bailing out too early.
+            // If that is the case disallow short reads so that we can make progress.
+            if (!data_resolver->total_live_count()) {
+                _retry_cmd->slice.options.remove<query::partition_slice::option::allow_short_read>();
+            }
+
+            slogger.trace("Retrying query with command {} (previous is {})", *_retry_cmd, *cmd);
+            cmd = _retry_cmd;
+        }
+    }
+
     void reconcile(db::consistency_level cl, storage_proxy::clock_type::time_point timeout, lw_shared_ptr<query::read_command> cmd) {
         adjust_targets_for_reconciliation();
-        data_resolver_ptr data_resolver = ::make_shared<data_read_resolver>(_schema, cl, _targets.size(), timeout);
-        auto exec = shared_from_this();
-
-        if (_proxy->features().empty_replica_mutation_pages) {
-            cmd->slice.options.set<query::partition_slice::option::allow_mutation_read_page_without_live_row>();
-        }
 
         // Waited on indirectly.
-        make_mutation_data_requests(cmd, data_resolver, _targets.begin(), _targets.end(), timeout);
-
-        // Waited on indirectly.
-        (void)data_resolver->done().then_wrapped([this, exec_ = std::move(exec), data_resolver_ = std::move(data_resolver), cmd_ = std::move(cmd), cl_ = cl, timeout_ = timeout] (future<result<>> f) mutable -> future<> {
+        (void)read_and_reconcile(cl, timeout, std::move(cmd)).then_wrapped([this, exec_ = shared_from_this()] (future<result<reconciled_read>> f) mutable -> future<> {
             // move captures to coroutine stack frame
             // to prevent use after free
             auto exec = std::move(exec_);
-            auto data_resolver = std::move(data_resolver_);
-            auto cmd = std::move(cmd_);
-            auto cl = cl_;
-            auto timeout = timeout_;
             try {
-                result<> res = f.get();
+                result<reconciled_read> res = f.get();
                 if (!res) {
                     _result_promise.set_value(std::move(res).as_failure());
                     on_read_resolved();
                     co_return;
                 }
-                auto rr_opt = co_await data_resolver->resolve(*cmd, original_row_limit(), original_per_partition_row_limit(), original_partition_limit()); // reconciliation happens here
+                auto reconciled = std::move(res).value();
 
-                // We generate a retry if at least one node reply with count live columns but after merge we have less
-                // than the total number of column we are interested in (which may be < count on a retry).
-                // So in particular, if no host returned count live columns, we know it's not a short read due to
-                // row or partition limits being exhausted and retry is not needed.
-                if (rr_opt && (rr_opt->is_short_read()
-                               || data_resolver->all_reached_end()
-                               || rr_opt->row_count() >= original_row_limit()
-                               || data_resolver->live_partition_count() >= original_partition_limit())
-                        && !data_resolver->any_partition_short_read()) {
-                    tracing::trace(_trace_state, "Read stage is done for read-repair");
-                    mlogger.trace("reconciled: {}", rr_opt->pretty_printer(_schema));
+                auto result = ::make_foreign(::make_lw_shared<query::result>(
+                        co_await to_data_query_result(std::move(reconciled.result), _schema, _cmd->slice, _cmd->get_row_limit(), _cmd->partition_limit)));
+                qlogger.trace("reconciled: {}", result->pretty_printer(_schema, _cmd->slice));
 
-                    auto result = ::make_foreign(::make_lw_shared<query::result>(
-                            co_await to_data_query_result(std::move(*rr_opt), _schema, _cmd->slice, _cmd->get_row_limit(), _cmd->partition_limit)));
-                    qlogger.trace("reconciled: {}", result->pretty_printer(_schema, _cmd->slice));
-
-                    // Un-reverse mutations for reversed queries. When a mutation comes from a node in mixed-node cluster
-                    // it is reversed in make_mutation_data_request(). So we always deal here with reversed mutations for
-                    // reversed queries. No matter what format. Forward mutations are sent to spare replicas from reversing
-                    // them in the write-path.
-                    auto diffs = data_resolver->get_diffs_for_repair();
-                    if (_cmd->slice.is_reversed()) {
-                        for (auto&& [token, diff] : diffs) {
-                            for (auto&& [address, opt_mut] : diff) {
-                                if (opt_mut) {
-                                    opt_mut = reverse(std::move(opt_mut.value()));
-                                    co_await coroutine::maybe_yield();
-                                }
+                // Un-reverse mutations for reversed queries. When a mutation comes from a node in mixed-node cluster
+                // it is reversed in make_mutation_data_request(). So we always deal here with reversed mutations for
+                // reversed queries. No matter what format. Forward mutations are sent to spare replicas from reversing
+                // them in the write-path.
+                auto diffs = reconciled.resolver->get_diffs_for_repair();
+                if (_cmd->slice.is_reversed()) {
+                    for (auto&& [token, diff] : diffs) {
+                        for (auto&& [address, opt_mut] : diff) {
+                            if (opt_mut) {
+                                opt_mut = reverse(std::move(opt_mut.value()));
+                                co_await coroutine::maybe_yield();
                             }
                         }
                     }
-
-                    // wait for write to complete before returning result to prevent multiple concurrent read requests to
-                    // trigger repair multiple times and to prevent quorum read to return an old value, even after a quorum
-                    // another read had returned a newer value (but the newer value had not yet been sent to the other replicas)
-                    // Waited on indirectly.
-                    (void)_proxy->schedule_repair(_effective_replication_map_ptr, std::move(diffs), _cl, _trace_state, _permit).then(utils::result_wrap([this, result = std::move(result)] () mutable {
-                        _result_promise.set_value(std::move(result));
-                        return make_ready_future<::result<>>(bo::success());
-                    })).then_wrapped([this, exec] (future<::result<>>&& f) {
-                        // All errors are handled, it's OK to discard the result.
-                        (void)utils::result_try([&] {
-                            return f.get();
-                        },  utils::result_catch<mutation_write_timeout_exception>([&] (const auto&) -> ::result<> {
-                            // convert write error to read error
-                            _result_promise.set_value(read_timeout_exception(_schema->ks_name(), _schema->cf_name(), _cl, _block_for - 1, _block_for, true));
-                            return bo::success();
-                        }), utils::result_catch_dots([&] (auto&& handle) -> ::result<> {
-                            handle.forward_to_promise(_result_promise);
-                            return bo::success();
-                        }));
-                        on_read_resolved();
-                    });
-                } else {
-                    tracing::trace(_trace_state, "Not enough data, need a retry for read-repair");
-                    _proxy->get_stats().read_retries++;
-                    _retry_cmd = make_lw_shared<query::read_command>(*cmd);
-                    // We asked t (= cmd->get_row_limit()) live columns and got l (=data_resolver->total_live_count) ones.
-                    // From that, we can estimate that on this row, for x requested
-                    // columns, only l/t end up live after reconciliation. So for next
-                    // round we want to ask x column so that x * (l/t) == t, i.e. x = t^2/l.
-                    auto x = [](uint64_t t, uint64_t l) -> uint64_t {
-                        using uint128_t = unsigned __int128;
-                        auto ret = std::min<uint128_t>(query::max_rows, l == 0 ? t + 1 : (uint128_t) t * t / l + 1);
-                        return static_cast<uint64_t>(ret);
-                    };
-                    auto all_partitions_x = [](uint64_t x, uint32_t partitions) -> uint64_t {
-                        using uint128_t = unsigned __int128;
-                        auto ret = std::min<uint128_t>(query::max_rows, (uint128_t) x * partitions);
-                        return static_cast<uint64_t>(ret);
-                    };
-                    if (data_resolver->any_partition_short_read() || data_resolver->increase_per_partition_limit()) {
-                        // The number of live rows was bounded by the per partition limit.
-                        auto new_partition_limit = x(cmd->slice.partition_row_limit(), data_resolver->max_per_partition_live_count());
-                        _retry_cmd->slice.set_partition_row_limit(new_partition_limit);
-                        auto new_limit = all_partitions_x(new_partition_limit, data_resolver->partition_count());
-                        _retry_cmd->set_row_limit(std::max(cmd->get_row_limit(), new_limit));
-                    } else {
-                        // The number of live rows was bounded by the total row limit or partition limit.
-                        if (cmd->partition_limit != query::max_partitions) {
-                            _retry_cmd->partition_limit = std::min<uint64_t>(query::max_partitions, x(cmd->partition_limit, data_resolver->live_partition_count()));
-                        }
-                        if (cmd->get_row_limit() != query::max_rows) {
-                            _retry_cmd->set_row_limit(x(cmd->get_row_limit(), data_resolver->total_live_count()));
-                        }
-                    }
-
-                    // We may be unable to send a single live row because of replicas bailing out too early.
-                    // If that is the case disallow short reads so that we can make progress.
-                    if (!data_resolver->total_live_count()) {
-                        _retry_cmd->slice.options.remove<query::partition_slice::option::allow_short_read>();
-                    }
-
-                    slogger.trace("Retrying query with command {} (previous is {})", *_retry_cmd, *cmd);
-                    reconcile(cl, timeout, _retry_cmd);
                 }
 
+                // wait for write to complete before returning result to prevent multiple concurrent read requests to
+                // trigger repair multiple times and to prevent quorum read to return an old value, even after a quorum
+                // another read had returned a newer value (but the newer value had not yet been sent to the other replicas)
+                // Waited on indirectly.
+                (void)_proxy->schedule_repair(_effective_replication_map_ptr, std::move(diffs), _cl, _trace_state, _permit).then(utils::result_wrap([this, result = std::move(result)] () mutable {
+                    _result_promise.set_value(std::move(result));
+                    return make_ready_future<::result<>>(bo::success());
+                })).then_wrapped([this, exec] (future<::result<>>&& f) {
+                    // All errors are handled, it's OK to discard the result.
+                    (void)utils::result_try([&] {
+                        return f.get();
+                    },  utils::result_catch<mutation_write_timeout_exception>([&] (const auto&) -> ::result<> {
+                        // convert write error to read error
+                        _result_promise.set_value(read_timeout_exception(_schema->ks_name(), _schema->cf_name(), _cl, _block_for - 1, _block_for, true));
+                        return bo::success();
+                    }), utils::result_catch_dots([&] (auto&& handle) -> ::result<> {
+                        handle.forward_to_promise(_result_promise);
+                        return bo::success();
+                    }));
+                    on_read_resolved();
+                });
             } catch (...) {
                 _result_promise.set_exception(std::current_exception());
                 on_read_resolved();
@@ -6075,6 +6091,26 @@ public:
         });
 
         return _result_promise.get_future();
+    }
+
+    // Reads the partition in mutation form from the targets and returns it reconciled across
+    // them, without read repair: the caller writes the merged partition itself. The targets must
+    // hold no speculative replica, because the read waits for every target.
+    future<result<reconcilable_result>> execute_partition_read(storage_proxy::clock_type::time_point timeout) {
+        if (_targets.empty()) {
+            co_return reconcilable_result();
+        }
+        auto exec = shared_from_this();
+        auto f = co_await coroutine::as_future(read_and_reconcile(_cl, timeout, _cmd));
+        on_read_resolved();
+        if (f.failed()) {
+            co_return coroutine::exception(f.get_exception());
+        }
+        auto res = f.get();
+        if (!res) {
+            co_return std::move(res).as_failure();
+        }
+        co_return std::move(res).value().result;
     }
 
     lw_shared_ptr<replica::column_family>& get_cf() {
@@ -6212,9 +6248,10 @@ result<::shared_ptr<abstract_read_executor>> storage_proxy::get_read_executor(lw
         const host_id_vector_replica_set& preferred_endpoints,
         bool& is_read_non_local,
         service_permit permit,
-        node_local_only node_local_only) {
+        node_local_only node_local_only,
+        bool allow_speculative_retry) {
     const dht::token& token = partition_range.start()->value().token();
-    speculative_retry::type retry_type = schema->speculative_retry().get_type();
+    speculative_retry::type retry_type = allow_speculative_retry ? schema->speculative_retry().get_type() : speculative_retry::type::NONE;
     std::optional<locator::host_id> extra_replica;
 
     host_id_vector_replica_set all_replicas = get_endpoints_for_reading(*schema, *erm, token, node_local_only);
@@ -7012,6 +7049,25 @@ static mutation_write_failure_exception read_failure_to_write(read_failure_excep
  * The cas_shard must be created *before* selecting the shard, to protect against
  * concurrent tablet migrations.
  */
+std::optional<mutation> cas_request::apply_to_partition(std::optional<mutation>, api::timestamp_type, cdc::per_request_options&) {
+    on_internal_error(paxos::paxos_state::logger, "cas_request::apply_to_partition() called on a request that does not need the partition");
+}
+
+future<std::optional<mutation>> storage_proxy::read_partition_for_cas(schema_ptr schema, locator::effective_replication_map_ptr erm,
+        dht::partition_range pr, db::consistency_level cl, coordinator_query_options& query_options) {
+    auto cmd = make_lw_shared<query::read_command>(schema->id(), schema->version(), schema->full_slice(),
+            get_max_result_size(schema->full_slice()), query::tombstone_limit(get_tombstone_limit()));
+    bool is_read_non_local = false;
+    auto exec = co_await utils::result_into_future(get_read_executor(cmd, std::move(erm), schema, std::move(pr), cl,
+            db::read_repair_decision::NONE, query_options.trace_state, {}, is_read_non_local, query_options.permit,
+            query_options.node_local_only, false));
+    auto rr = co_await utils::result_into_future(co_await exec->execute_partition_read(query_options.timeout(*this)));
+    if (rr.partitions().empty()) {
+        co_return std::nullopt;
+    }
+    co_return rr.partitions().front().mut().unfreeze(schema);
+}
+
 future<storage_proxy::cas_result> storage_proxy::cas(schema_ptr schema, cas_shard cas_shard, cas_request& request, lw_shared_ptr<query::read_command> cmd,
         dht::partition_range_vector partition_ranges, storage_proxy::coordinator_query_options query_options,
         db::consistency_level cl_for_paxos, db::consistency_level cl_for_learn,
@@ -7103,11 +7159,20 @@ future<storage_proxy::cas_result> storage_proxy::cas(schema_ptr schema, cas_shar
             // a ballot (round identifier) which is a) unique b) has good chances of being
             // recent enough.
             auto [ballot, qr] = co_await handler->begin_and_repair_paxos(query_options.cstate, contentions, write);
-            // Read the current values and check they validate the conditions.
-            if (qr) {
+            const auto ballot_ts = utils::UUID_gen::micros_timestamp(ballot);
+            std::optional<::mutation> mutation;
+            if (request.needs_partition()) {
+                paxos::paxos_state::logger.debug("CAS[{}]: Reading the partition for a read-modify-write", handler->id());
+                tracing::trace(handler->tr_state, "Reading the partition for a read-modify-write");
+                // partition_ranges is copied from: it is reused during retry.
+                auto partition = co_await read_partition_for_cas(schema, handler->get_effective_replication_map(), partition_ranges[0], cl, query_options);
+                mutation = request.apply_to_partition(std::move(partition), ballot_ts, cdc_opts);
+            } else if (qr) {
+                // Read the current values and check they validate the conditions.
                 paxos::paxos_state::logger.debug("CAS[{}]: Using prefetched values for CAS precondition",
                         handler->id());
                 tracing::trace(handler->tr_state, "Using prefetched values for CAS precondition");
+                mutation = request.apply(std::move(qr), cmd->slice, ballot_ts, cdc_opts);
             } else {
                 paxos::paxos_state::logger.debug("CAS[{}]: Reading existing values for CAS precondition",
                         handler->id());
@@ -7116,10 +7181,8 @@ future<storage_proxy::cas_result> storage_proxy::cas(schema_ptr schema, cas_shar
 
                 auto pr = partition_ranges; // cannot move original because it can be reused during retry
                 auto cqr = co_await query(schema, cmd, std::move(pr), cl, query_options);
-                qr = std::move(cqr.query_result);
+                mutation = request.apply(std::move(cqr.query_result), cmd->slice, ballot_ts, cdc_opts);
             }
-
-            auto mutation = request.apply(std::move(qr), cmd->slice, utils::UUID_gen::micros_timestamp(ballot), cdc_opts);
             condition_met = true;
             if (!mutation) {
                 if (write) {

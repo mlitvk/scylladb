@@ -432,7 +432,12 @@ private:
             const host_id_vector_replica_set& preferred_endpoints,
             bool& is_bounced_read,
             service_permit permit,
-            node_local_only node_local_only);
+            node_local_only node_local_only,
+            bool allow_speculative_retry = true);
+    // Reads the partition of a CAS request in mutation form at cl, reconciled across the replicas
+    // and without read repair. Returns nullopt when no replica has the partition.
+    future<std::optional<mutation>> read_partition_for_cas(schema_ptr schema, locator::effective_replication_map_ptr erm,
+            dht::partition_range pr, db::consistency_level cl, coordinator_query_options& query_options);
     future<rpc::tuple<foreign_ptr<lw_shared_ptr<query::result>>, cache_temperature>> query_result_local(
             locator::effective_replication_map_ptr,
             schema_ptr,
