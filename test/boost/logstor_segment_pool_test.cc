@@ -89,9 +89,9 @@ struct test_pool {
     test_allocator ta;
     pool p;
 
-    test_pool(uint64_t configured_segment_count, size_t capacity, size_t reserved_for_compaction)
+    test_pool(uint64_t configured_segment_count, size_t capacity, size_t reserved_for_compaction, size_t reserved_for_separator = 0)
         : ta(configured_segment_count)
-        , p(capacity, reserved_for_compaction, ta.alloc)
+        , p(capacity, reserved_for_compaction, reserved_for_separator, ta.alloc)
     {
         p.start(default_scheduling_group());
         BOOST_REQUIRE(eventually_true([&] { return p.size() == capacity; }));
@@ -277,28 +277,77 @@ SEASTAR_THREAD_TEST_CASE(test_segment_pool_keeps_the_compaction_reserve) {
     BOOST_REQUIRE_EQUAL(tp.p.size(), 2);
 }
 
-// Checks that a new segment goes to a waiting compaction before a waiting normal write, and that
-// the waiters of a tier are served in arrival order.
-SEASTAR_THREAD_TEST_CASE(test_segment_pool_serves_compaction_first_and_then_in_arrival_order) {
+// Checks that the separator takes from the separator reserve and leaves the compaction reserve, and
+// that normal writes leave both.
+SEASTAR_THREAD_TEST_CASE(test_segment_pool_keeps_the_separator_reserve) {
+    test_pool tp(4, 4, 1, 1);
+    BOOST_REQUIRE_EQUAL(tp.p.reserve_for(write_source::normal), 2);
+    BOOST_REQUIRE_EQUAL(tp.p.reserve_for(write_source::separator), 1);
+    BOOST_REQUIRE_EQUAL(tp.p.reserve_for(write_source::compaction), 0);
+
+    auto n0 = tp.take_now(write_source::normal);
+    auto n1 = tp.take_now(write_source::normal);
+    auto nw = tp.p.take(write_source::normal);
+    BOOST_REQUIRE(!nw.available());
+    BOOST_REQUIRE_EQUAL(tp.p.available_segment_count(write_source::separator), 1);
+
+    auto s0 = tp.take_now(write_source::separator);
+    auto sw = tp.p.take(write_source::separator);
+    BOOST_REQUIRE(!sw.available());
+    BOOST_REQUIRE_EQUAL(tp.p.get_stats().segments_wait[static_cast<size_t>(write_source::separator)], 1);
+
+    auto c0 = tp.take_now(write_source::compaction);
+    BOOST_REQUIRE_EQUAL(tp.p.size(), 0);
+
+    // The pool serves the separator above the compaction reserve, and the normal write above both
+    // reserves.
+    tp.free(std::move(c0));
+    tp.wait_for_size(1);
+    BOOST_REQUIRE(!sw.available() && !nw.available());
+    tp.free(std::move(s0));
+    BOOST_REQUIRE(eventually_true([&] { return sw.available(); }));
+    sw.get();
+    BOOST_REQUIRE_EQUAL(tp.p.size(), 1);
+    BOOST_REQUIRE(!nw.available());
+    tp.free(std::move(n0));
+    tp.wait_for_size(2);
+    BOOST_REQUIRE(!nw.available());
+    tp.free(std::move(n1));
+    BOOST_REQUIRE(eventually_true([&] { return nw.available(); }));
+    nw.get();
+}
+
+// Checks that a new segment goes to a waiting compaction before a waiting separator flush, and to
+// the flush before a waiting normal write, and that the waiters of a tier are served in arrival
+// order.
+SEASTAR_THREAD_TEST_CASE(test_segment_pool_serves_the_tiers_in_order_and_then_in_arrival_order) {
     test_pool tp(2, 2, 1);
     auto n = tp.take_now(write_source::normal);
     auto c = tp.take_now(write_source::compaction);
 
     auto w1 = tp.p.take(write_source::normal);
+    auto sw = tp.p.take(write_source::separator);
     auto cw = tp.p.take(write_source::compaction);
     auto w2 = tp.p.take(write_source::streaming);
-    BOOST_REQUIRE(!w1.available() && !cw.available() && !w2.available());
+    BOOST_REQUIRE(!w1.available() && !sw.available() && !cw.available() && !w2.available());
 
     tp.free(std::move(n));
     BOOST_REQUIRE(eventually_true([&] { return cw.available(); }));
     auto c2 = cw.get();
-    BOOST_REQUIRE(!w1.available() && !w2.available());
+    BOOST_REQUIRE(!w1.available() && !sw.available() && !w2.available());
 
+    // Here the separator and the normal writes take segments above the same reserve, and the pool
+    // serves the separator first.
     tp.free(std::move(c));
     tp.wait_for_size(1);
-    BOOST_REQUIRE(!w1.available());
+    BOOST_REQUIRE(!w1.available() && !sw.available());
 
     tp.free(std::move(c2));
+    BOOST_REQUIRE(eventually_true([&] { return sw.available(); }));
+    auto s = sw.get();
+    BOOST_REQUIRE(!w1.available() && !w2.available());
+
+    tp.free(std::move(s));
     BOOST_REQUIRE(eventually_true([&] { return w1.available(); }));
     auto n1 = w1.get();
     BOOST_REQUIRE(!w2.available());
@@ -360,7 +409,7 @@ SEASTAR_THREAD_TEST_CASE(test_segment_pool_failed_refill_fails_the_waiters) {
 // when the pool stops fails.
 SEASTAR_THREAD_TEST_CASE(test_segment_pool_take_after_stop_fails) {
     test_allocator ta(1);
-    pool p(1, 0, ta.alloc);
+    pool p(1, 0, 0, ta.alloc);
     p.start(default_scheduling_group());
     BOOST_REQUIRE(eventually_true([&] { return p.size() == 1; }));
     auto seg = p.take(write_source::normal).get();

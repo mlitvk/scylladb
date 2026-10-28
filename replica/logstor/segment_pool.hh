@@ -218,10 +218,12 @@ future<bool> basic_segment_allocator<Segment>::wait_for_free_segment() {
 // Holds the segments that are ready for writes. The pool refills itself in the background from
 // the segment allocator, and keeps itself full. The last segments in the pool are the compaction
 // reserve, and only compaction takes them, because compaction must always get a segment to free
-// segments. A consumer that cannot take a segment waits in the queue of its tier, and a new segment
-// goes to the first consumer that can take it, compaction first. A consumer that waits fails when
-// an attempt to refill the pool fails, so that a write does not wait for a segment that possibly
-// does not come. A compaction that fails this way runs again later.
+// segments. The segments above the compaction reserve are the separator reserve, which normal
+// writes and streaming do not take (see separator_segment_reserve). A consumer that cannot take a
+// segment waits in the queue of its tier, and a new segment goes to the first consumer that can
+// take it, compaction first and then the separator. A consumer that waits fails when an attempt to
+// refill the pool fails, so that a write does not wait for a segment that possibly does not come. A
+// compaction that fails this way runs again later.
 template <typename Segment>
 class basic_segment_pool {
 public:
@@ -243,10 +245,12 @@ private:
     seastar::circular_buffer<seg_ptr> _segments;
     size_t _capacity;
     size_t _reserved_for_compaction;
+    size_t _reserved_for_separator;
 
-    // A tier groups the consumers that take segments under the same reserve.
-    enum class tier : size_t { compaction, other };
-    static constexpr size_t tier_count = 2;
+    // A tier groups the consumers that take segments under the same reserve. The pool serves the
+    // tiers in the order of this enum.
+    enum class tier : size_t { compaction, separator, other };
+    static constexpr size_t tier_count = 3;
 
     // A waiter is a consumer that waits for a segment. It lives in the frame of wait_for_segment(),
     // and it is in the queue of its tier until its promise is set. The hook is in safe_link mode,
@@ -271,12 +275,23 @@ private:
     stats _stats;
 
     static tier tier_of(write_source src) noexcept {
-        return src == write_source::compaction ? tier::compaction : tier::other;
+        switch (src) {
+        case write_source::compaction: return tier::compaction;
+        case write_source::separator: return tier::separator;
+        case write_source::normal:
+        case write_source::streaming: return tier::other;
+        }
+        return tier::other;
     }
 
     // Returns the count of segments that a consumer of this tier must leave in the pool.
     size_t reserve_of(tier t) const noexcept {
-        return t == tier::compaction ? 0 : _reserved_for_compaction;
+        switch (t) {
+        case tier::compaction: return 0;
+        case tier::separator: return _reserved_for_compaction;
+        case tier::other: return _reserved_for_compaction + _reserved_for_separator;
+        }
+        return _reserved_for_compaction + _reserved_for_separator;
     }
 
     seg_ptr pop(write_source src) noexcept {
@@ -287,7 +302,7 @@ private:
         return seg;
     }
 
-    // Gives the segments to the waiting consumers that can take them, compaction first.
+    // Gives the segments to the waiting consumers that can take them, in tier order.
     void serve_waiters() noexcept {
         for (size_t i = 0; i < tier_count; ++i) {
             auto& waiters = _waiters[i];
@@ -353,11 +368,17 @@ private:
 
 public:
     // The pool refers to the allocator, which must outlive it.
-    basic_segment_pool(size_t pool_size, size_t reserved_for_compaction, allocator_type& allocator)
+    basic_segment_pool(size_t pool_size, size_t reserved_for_compaction, size_t reserved_for_separator, allocator_type& allocator)
         : _allocator(allocator)
         , _capacity(pool_size)
         , _reserved_for_compaction(reserved_for_compaction)
+        , _reserved_for_separator(reserved_for_separator)
     {}
+
+    // Returns the count of segments that a consumer of this source must leave in the pool.
+    size_t reserve_for(write_source src) const noexcept {
+        return reserve_of(tier_of(src));
+    }
 
     // Starts the refill in the background.
     void start(scheduling_group sg) {
