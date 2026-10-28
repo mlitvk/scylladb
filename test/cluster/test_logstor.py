@@ -1072,14 +1072,13 @@ async def test_create_table_with_the_id_of_a_dropped_table(manager: ScyllaCluste
         assert sorted((row.pk, row.v) for row in rows) == [(1, 'new_1')]
 
 @pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
-@pytest.mark.parametrize("operation", ["drop", pytest.param("truncate", marks=pytest.mark.skip_bug(
-    link="https://scylladb.atlassian.net/browse/SCYLLADB-5484",
-    reason="logstor truncate is not implemented yet"))])
+@pytest.mark.parametrize("operation", ["drop", "truncate"])
 async def test_table_removal_during_logstor_compaction(manager: ScyllaClusterManager, operation: str):
     """
-    Both DROP and TRUNCATE discard the segments of the table's compaction groups, which has to
-    wait for an ongoing compaction of those groups, so that compaction cannot free a segment that
-    is being discarded, nor add a segment to a group after it was drained.
+    Both DROP and TRUNCATE erase the records of the table and free the segments of its compaction
+    groups. The erase has to wait for an ongoing compaction of those groups, so that compaction
+    cannot free a segment that the erase frees, nor add a segment to a group after the erase
+    drained the group.
 
     DROP runs the same truncate path and only then stops the table, so the two share this
     critical section, and DROP additionally tears down the already drained compaction groups.
