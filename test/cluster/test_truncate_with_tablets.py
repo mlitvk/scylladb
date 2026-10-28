@@ -18,13 +18,9 @@ import asyncio
 
 logger = logging.getLogger(__name__)
 
-LOGSTOR_TRUNCATE_NOT_IMPLEMENTED = pytest.mark.skip_bug(
-    link="https://scylladb.atlassian.net/browse/SCYLLADB-5484",
-    reason="logstor truncate is not implemented yet")
-
 
 @pytest.mark.parametrize("feature_config", feature_configs(FeatureConfigurations.EVENTUAL_CONSISTENCY,
-                                                           FeatureConfigurations.LOGSTOR_EVENTUAL_CONSISTENCY.with_marks(LOGSTOR_TRUNCATE_NOT_IMPLEMENTED)))
+                                                           FeatureConfigurations.LOGSTOR_EVENTUAL_CONSISTENCY))
 @pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
 async def test_truncate_while_migration(manager: ScyllaClusterManager, feature_config: FeatureConfig,
                                         storage_config: FeatureConfig):
@@ -136,9 +132,9 @@ async def test_truncate_with_concurrent_drop(manager: ScyllaClusterManager, stor
 
 
 @pytest.mark.parametrize("feature_config", feature_configs(FeatureConfigurations.EVENTUAL_CONSISTENCY,
-                                                           FeatureConfigurations.LOGSTOR_EVENTUAL_CONSISTENCY.with_marks(LOGSTOR_TRUNCATE_NOT_IMPLEMENTED),
+                                                           FeatureConfigurations.LOGSTOR_EVENTUAL_CONSISTENCY,
                                                            FeatureConfigurations.STRONG_CONSISTENCY,
-                                                           FeatureConfigurations.LOGSTOR_STRONG_CONSISTENCY.with_marks(LOGSTOR_TRUNCATE_NOT_IMPLEMENTED)))
+                                                           FeatureConfigurations.LOGSTOR_STRONG_CONSISTENCY))
 @pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
 async def test_truncate_while_node_restart(manager: ScyllaClusterManager, feature_config: FeatureConfig,
                                            storage_config: FeatureConfig):
@@ -239,7 +235,7 @@ async def test_truncate_with_coordinator_crash(manager: ScyllaClusterManager, st
 
 
 @pytest.mark.parametrize("feature_config", feature_configs(FeatureConfigurations.EVENTUAL_CONSISTENCY,
-                                                           FeatureConfigurations.LOGSTOR_EVENTUAL_CONSISTENCY.with_marks(LOGSTOR_TRUNCATE_NOT_IMPLEMENTED)))
+                                                           FeatureConfigurations.LOGSTOR_EVENTUAL_CONSISTENCY))
 @pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
 async def test_truncate_while_truncate_already_waiting(manager: ScyllaClusterManager, feature_config: FeatureConfig,
                                                        storage_config: FeatureConfig):
@@ -293,9 +289,9 @@ async def test_truncate_while_truncate_already_waiting(manager: ScyllaClusterMan
 
 # Reproduces https://github.com/scylladb/scylladb/issues/23771.
 @pytest.mark.parametrize("feature_config", feature_configs(FeatureConfigurations.EVENTUAL_CONSISTENCY,
-                                                           FeatureConfigurations.LOGSTOR_EVENTUAL_CONSISTENCY.with_marks(LOGSTOR_TRUNCATE_NOT_IMPLEMENTED),
+                                                           FeatureConfigurations.LOGSTOR_EVENTUAL_CONSISTENCY,
                                                            FeatureConfigurations.STRONG_CONSISTENCY,
-                                                           FeatureConfigurations.LOGSTOR_STRONG_CONSISTENCY.with_marks(LOGSTOR_TRUNCATE_NOT_IMPLEMENTED)))
+                                                           FeatureConfigurations.LOGSTOR_STRONG_CONSISTENCY))
 @pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
 async def test_replay_position_check_during_truncate(manager, feature_config: FeatureConfig,
                                                      storage_config: FeatureConfig):
@@ -335,7 +331,7 @@ async def test_replay_position_check_during_truncate(manager, feature_config: Fe
 
 
 @pytest.mark.parametrize("feature_config", feature_configs(FeatureConfigurations.EVENTUAL_CONSISTENCY,
-                                                           FeatureConfigurations.LOGSTOR_EVENTUAL_CONSISTENCY.with_marks(LOGSTOR_TRUNCATE_NOT_IMPLEMENTED)))
+                                                           FeatureConfigurations.LOGSTOR_EVENTUAL_CONSISTENCY))
 @pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
 async def test_parallel_truncate(manager: ScyllaClusterManager, feature_config: FeatureConfig,
                                  storage_config: FeatureConfig):
