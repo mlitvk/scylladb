@@ -135,6 +135,10 @@ future<> logstor::flush_to_separator() {
 
 future<> logstor::write(const mutation& m, write_target target, db::timeout_clock::time_point timeout) noexcept {
     try {
+        // Paxos learns an empty mutation when a condition fails, and there is nothing to store.
+        if (m.partition().empty()) {
+            return make_ready_future<>();
+        }
         return do_write(*m.schema(), m.decorated_key(), record_timestamp(m), encode_record_value(m),
                 std::move(target), timeout);
     } catch (...) {
@@ -145,6 +149,9 @@ future<> logstor::write(const mutation& m, write_target target, db::timeout_cloc
 future<> logstor::write(const frozen_mutation& m, const schema& s, write_target target, db::timeout_clock::time_point timeout) noexcept {
     try {
         check_schema_version(m.schema_version(), s);
+        if (is_empty(m)) {
+            return make_ready_future<>();
+        }
         return do_write(s, m.decorated_key(s), record_timestamp(m), encode_record_value(m, s),
                 std::move(target), timeout);
     } catch (...) {

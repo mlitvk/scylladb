@@ -908,6 +908,33 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_writes_a_frozen_mutation) {
             schema_mismatch_error);
 }
 
+// Checks that logstor::write() stores nothing for an empty mutation, in both forms. Paxos learns
+// an empty mutation when a condition fails, and that learn must succeed.
+SEASTAR_THREAD_TEST_CASE(test_logstor_write_of_an_empty_mutation_stores_nothing) {
+    auto schema = make_multi_column_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    ls.do_recovery_for_test().get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+
+    auto key = partition_key::from_single_value(*schema, serialized(sstring("pk0")));
+    mutation empty(schema, dht::decorate_key(*schema, key));
+    BOOST_REQUIRE(empty.partition().empty());
+
+    ls.write(empty, write_target(&cg, {}), db::no_timeout).get();
+    ls.write(freeze(empty), *schema, write_target(&cg, {}), db::no_timeout).get();
+    ls.flush_to_separator().get();
+    cg.flush_separator().get();
+
+    BOOST_REQUIRE(!read_mutation(ls, schema, cg.logstor_index(), empty.decorated_key(), schema->full_slice()).get());
+    BOOST_REQUIRE(cg.logstor_index().empty());
+}
+
 // Checks that a raw write buffer can hold and seal a record whose serialized size is exactly max_record_size().
 SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_accepts_record_at_max_record_size) {
     auto schema = make_kv_schema();

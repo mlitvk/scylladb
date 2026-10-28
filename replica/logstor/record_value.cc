@@ -164,6 +164,12 @@ api::timestamp_type record_timestamp(const frozen_mutation& m) {
     throw std::runtime_error("logstor mutation has no row marker or partition tombstone timestamp");
 }
 
+bool is_empty(const frozen_mutation& m) {
+    auto partition = frozen_partition(m);
+    return !tombstone(partition.tomb()) && partition.static_row().columns().size() == 0
+            && partition.range_tombstones().size() == 0 && partition.rows().size() == 0;
+}
+
 record_value encode_record_value(const mutation& m) {
     bytes_ostream out;
     write_record_value(out, *m.schema(), m.partition());
