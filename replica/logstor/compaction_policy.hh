@@ -28,6 +28,14 @@ class segment_set;
 // output segment available for every concurrent flush.
 constexpr size_t max_compaction_parallelism = 8;
 
+// The segment pool keeps this count of segments for the separator, above the compaction reserve.
+// Only a separator flush frees the mixed segments, so a flush must get a segment while normal
+// writes already wait. A flush frees a mixed segment only when all the records of the segment are
+// flushed and the segment is not active anymore, so the separator frees fewer segments than
+// compaction, and it must not take the compaction reserve. Two segments let the flushes continue,
+// but not at a high rate, because all the running flushes share the two segments.
+constexpr size_t separator_segment_reserve = 2;
+
 // The buffers a split compaction takes, and therefore the slots automatic compaction leaves free so
 // that a tablet split is never queued behind it.
 constexpr size_t split_compaction_buffers = 2;

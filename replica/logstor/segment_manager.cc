@@ -703,10 +703,12 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
     , _segment_descs(static_cast<size_t>(_geometry.segment_count()))
     , _allocator(_geometry.segment_count(), _allocator_opener)
     // A compaction job takes one segment from the pool per flush, so the reserve that keeps normal
-    // writes from draining the pool is one segment per concurrent job.
+    // writes from draining the pool is one segment per concurrent job. The separator reserve is
+    // added to the compaction reserve (see separator_segment_reserve).
     , _segment_pool(segment_pool::config{
             .capacity = segment_pool_capacity,
             .compaction_reserve = max_compaction_parallelism,
+            .separator_reserve = separator_segment_reserve,
       }, _allocator)
     // Compaction concurrency is limited by buffer availability. Normal compaction
     // uses one buffer; split compaction allocates two buffers. The buffers are built up front and
@@ -739,14 +741,13 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
                 config.segment_size, segment_descriptor_hist_options.max_size));
     }
 
-    // Normal writes and the separator take a segment only while the segment pool holds more than
-    // the compaction reserve. The first write needs the active segment, and its separation needs one
-    // more segment, so a smaller store waits for a segment forever. This count is a minimum, and a
-    // usable store also needs room for its data and for the segments that writes use at the same
-    // time.
-    if (const auto min_segments = max_compaction_parallelism + 2; _geometry.segment_count() < min_segments) {
-        throw exceptions::configuration_exception(fmt::format("Disk size {} holds {} segments of {} bytes. It must hold at least {}: the {} that are kept for compaction, the active segment and one segment for the separator",
-                config.disk_size, _geometry.segment_count(), config.segment_size, min_segments, max_compaction_parallelism));
+    // A normal write takes a segment only while the segment pool holds more than the reserves. The
+    // first write needs the active segment, and its separation needs one more segment, so a smaller
+    // store waits for a segment forever. This count is a minimum, and a usable store also needs
+    // room for its data and for the segments that writes use at the same time.
+    if (const auto min_segments = _segment_pool.reserve_for(write_source::normal) + 2; _geometry.segment_count() < min_segments) {
+        throw exceptions::configuration_exception(fmt::format("Disk size {} holds {} segments of {} bytes. It must hold at least {}: the {} kept for compaction, the {} kept for the separator, the active segment and the first separator segment",
+                config.disk_size, _geometry.segment_count(), config.segment_size, min_segments, max_compaction_parallelism, separator_segment_reserve));
     }
 
     namespace sm = seastar::metrics;
@@ -772,6 +773,8 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
                        sm::description("Counts number of segments taken from the segment pool for separator writes.")),
         sm::make_counter("segment_pool_normal_segments_wait", _segment_pool.get_stats().segments_wait[static_cast<size_t>(write_source::normal)],
                        sm::description("Counts number of times normal writes had to wait for a segment to become available in the segment pool.")),
+        sm::make_counter("segment_pool_separator_segments_wait", _segment_pool.get_stats().segments_wait[static_cast<size_t>(write_source::separator)],
+                       sm::description("Counts the times a separator flush waited for a segment from the segment pool.")),
         sm::make_counter("bytes_written", _stats.bytes_written[static_cast<size_t>(write_source::normal)],
                        sm::description("Counts number of bytes written to the disk.")),
         sm::make_counter("data_bytes_written", _stats.data_bytes_written[static_cast<size_t>(write_source::normal)],
