@@ -10,7 +10,7 @@
 import json
 
 import pytest
-from cassandra.protocol import ConfigurationException
+from cassandra.protocol import ConfigurationException, InvalidRequest
 from cassandra.query import SimpleStatement
 from .util import new_test_table
 
@@ -138,18 +138,30 @@ def test_logstor_two_columns_partial_insert(cql, test_keyspace):
         row = cql.execute(f"SELECT pk, v1, v2 FROM {table} WHERE pk = 1").one()
         assert row.v2 == 'replaced' and row.v1 is None
 
-# Test if we can do exactly the same as we did above with INSERT but using the
-# UPDATE statement instead of INSERT. Currently, this doesn't work, we get a
-# cassandra.WriteFailure. We mark this test xfail because we should decide
-# either this request should be not supported (and fail cleanly with an
-# InvalidRequest) or it should be supported and work the same as an INSERT.
-@pytest.mark.xfail(reason="Currently UPDATE is not supported on logstor tables, but we should decide whether to support it or reject it cleanly")
-def test_logstor_update(cql, test_keyspace):
+# A logstor write replaces the whole partition, so a plain UPDATE or a DELETE
+# of individual columns, which carry only cells, are rejected at prepare. The
+# conditional forms (IF ...) run as a read-modify-write and are tested in
+# test/cluster/test_logstor_lwt.py. A whole-partition DELETE and an INSERT
+# still work.
+def test_logstor_plain_update_rejected(cql, test_keyspace):
     with new_test_table(cql, test_keyspace, "pk int PRIMARY KEY, v int",
                         " WITH storage_engine = 'logstor'") as table:
-        cql.execute(f"UPDATE {table} SET v = 42 WHERE pk = 1")
+        cql.execute(f"INSERT INTO {table} (pk, v) VALUES (1, 1)")
+        update_msg = "UPDATE on a logstor table must have a condition"
+        with pytest.raises(InvalidRequest, match=update_msg):
+            cql.execute(f"UPDATE {table} SET v = 42 WHERE pk = 1")
+        with pytest.raises(InvalidRequest, match=update_msg):
+            cql.execute(f"BEGIN BATCH UPDATE {table} SET v = 42 WHERE pk = 1; APPLY BATCH")
+        with pytest.raises(InvalidRequest, match="Deleting individual columns on a logstor table must have a condition"):
+            cql.execute(f"DELETE v FROM {table} WHERE pk = 1")
         row = cql.execute(f"SELECT pk, v FROM {table} WHERE pk = 1").one()
-        assert row.pk == 1 and row.v == 42
+        assert row.pk == 1 and row.v == 1
+
+        cql.execute(f"DELETE FROM {table} WHERE pk = 1")
+        assert cql.execute(f"SELECT pk FROM {table} WHERE pk = 1").one() is None
+        cql.execute(f"INSERT INTO {table} (pk, v) VALUES (1, 3)")
+        row = cql.execute(f"SELECT pk, v FROM {table} WHERE pk = 1").one()
+        assert row.pk == 1 and row.v == 3
 
 # Test that clustering columns are not supported in logstor tables.
 # Attempting to create a logstor table with clustering columns should fail.

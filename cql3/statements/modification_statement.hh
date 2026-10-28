@@ -180,6 +180,9 @@ public:
     // a prefetch of the old cell.
     bool requires_read() const { return _requires_read; }
     bool has_column_operations() const { return !_column_operations.empty(); }
+    // Throws when the statement changes cells of a logstor table and has no condition: logstor
+    // writes whole rows, and only a conditional statement reads the row first.
+    void check_whole_row_write() const;
 
     // True if any of the update operations requires LWT for atomicity.
     bool requires_lwt() const { return _requires_lwt; }

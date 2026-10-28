@@ -269,6 +269,10 @@ batch_executor::commit(const batch_statement& batch, query_processor& qp, servic
         });
     }
 
+    for (const auto& statement : statements) {
+        statement.statement->check_whole_row_write();
+    }
+
     ++batch.stats().batches;
     batch.stats().statements_in_batches += statements.size();
 

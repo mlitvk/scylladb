@@ -460,6 +460,16 @@ bool modification_statement::depends_on(std::string_view ks_name, std::optional<
     return keyspace() == ks_name && (!cf_name || column_family() == *cf_name);
 }
 
+void modification_statement::check_whole_row_write() const {
+    // A logstor write replaces the whole partition. A conditional statement reads the partition
+    // first and writes it back whole; a plain cell-only change cannot be stored.
+    if (s->logstor_enabled() && !type.is_insert() && has_column_operations()) {
+        throw exceptions::invalid_request_exception(type.is_update()
+                ? "UPDATE on a logstor table must have a condition (IF ...): logstor writes whole rows"
+                : "Deleting individual columns on a logstor table must have a condition (IF ...): logstor writes whole rows");
+    }
+}
+
 void modification_statement::add_operation(std::unique_ptr<operation> op) {
     if (op->column.is_static()) {
         _sets_static_columns = true;

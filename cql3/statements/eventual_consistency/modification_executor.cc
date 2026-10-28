@@ -248,6 +248,8 @@ modification_executor::commit(const modification_statement& stmt, query_processo
         co_return result;
     }
 
+    stmt.check_whole_row_write();
+
     modification_spec spec(stmt, options);
 
     bool keys_size_one = spec.keys.size() == 1;
