@@ -132,7 +132,7 @@ execute_with_condition(const modification_statement& stmt, query_processor& qp, 
                     stmt.type.is_update() ? "update" : "deletion"));
     }
 
-    auto request = std::make_unique<cas_request>(stmt.s);
+    auto request = make_cas_request(stmt.s);
     auto* request_ptr = request.get();
     // cas_request can be used for batches as well single statements; Here we have just a single
     // modification in the list of CAS commands, since we're handling single-statement execution.
@@ -158,7 +158,7 @@ execute_with_condition(const modification_statement& stmt, query_processor& qp, 
         tablet_info = table.tablet_routing_info_for(token, qs.get_client_state().get_original_shard());
     }
 
-    return qp.proxy().cas(stmt.s, std::move(cas_shard), *request_ptr, request->read_command(qp), request->key(),
+    return qp.proxy().cas(stmt.s, std::move(cas_shard), *request_ptr, request->prepare_read_command(qp), request->key(),
             {read_timeout, qs.get_permit(), qs.get_client_state(), qs.get_trace_state()},
             std::move(cl_for_paxos).assume_value(), cl_for_learn, statement_timeout, cas_timeout, true, {},
             stmt.attrs->is_bypass_large_data_guardrails()).then([&stmt, request = std::move(request), tablet_info = std::move(tablet_info)] (service::storage_proxy::cas_result cas_result) mutable {

@@ -34,6 +34,7 @@
 #include "replica/logstor/ondisk.hh"
 #include "replica/logstor/record_value.hh"
 #include "replica/logstor/single_row_partition.hh"
+#include "replica/logstor/update.hh"
 #include "replica/logstor/write_buffer.hh"
 #include <seastar/testing/thread_test_case.hh>
 
@@ -906,6 +907,132 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_writes_a_frozen_mutation) {
     BOOST_REQUIRE(altered->version() != schema->version());
     BOOST_REQUIRE_THROW(ls.write(freeze(mutations.front()), *altered, write_target(&cg, {}), db::no_timeout).get(),
             schema_mismatch_error);
+}
+
+// Checks the partition that apply_update() builds for each shape of a conditional statement on a
+// logstor table: the record timestamp is the proposal's, untouched cells keep their timestamps, a
+// deleted column is a cell tombstone, a marker keeps its TTL, a created row expires with its
+// cells, and a partition tombstone stays under a re-created row.
+SEASTAR_THREAD_TEST_CASE(test_logstor_apply_update_shapes) {
+    auto schema = make_multi_column_schema();
+    const auto ts0 = api::timestamp_type(10);
+    const auto ts = api::timestamp_type(20);
+    const auto now = gc_clock::now();
+    const auto v_def = *schema->get_column_definition("v");
+    const auto w_def = *schema->get_column_definition("w");
+    const auto x_def = *schema->get_column_definition("x");
+    auto key = partition_key::from_single_value(*schema, serialized(sstring("pk0")));
+    auto dk = dht::decorate_key(*schema, key);
+
+    const auto row_of = [&] (mutation& m) -> deletable_row& {
+        return m.partition().clustered_row(*schema, clustering_key::make_empty());
+    };
+    const auto cell_of = [&] (const mutation& m, const column_definition& def) {
+        const auto* cell = m.partition().clustered_rows().begin()->row().cells().find_cell(def.id);
+        BOOST_REQUIRE(cell);
+        return cell->as_atomic_cell(def);
+    };
+    const auto marker_of = [&] (const mutation& m) -> const row_marker& {
+        return m.partition().clustered_rows().begin()->row().marker();
+    };
+    const auto live_cells = [&] (const column_definition& def, api::timestamp_type at, std::optional<std::chrono::seconds> ttl = std::nullopt) {
+        mutation m(schema, dk);
+        auto cell = ttl ? atomic_cell::make_live(*def.type, at, serialized(sstring("c")), now + *ttl, *ttl)
+                        : atomic_cell::make_live(*def.type, at, serialized(sstring("c")));
+        row_of(m).cells().apply(def, std::move(cell));
+        return m;
+    };
+
+    // An INSERT on a missing key: the proposal is the update, with its marker and its TTL.
+    {
+        mutation insert = live_cells(v_def, ts);
+        row_of(insert).apply(row_marker(ts, std::chrono::hours(1), now + std::chrono::hours(1)));
+        auto out = apply_update(std::nullopt, insert, ts, now);
+        assert_that(out).is_equal_to(insert);
+        BOOST_REQUIRE_EQUAL(record_timestamp(out), ts);
+    }
+
+    // An UPDATE of one column on a live row: the marker moves to ts, the other cells keep their
+    // timestamps, and the dead cell stays.
+    {
+        auto stored = make_multi_column_mutation(schema, "pk0", ts0);
+        auto out = apply_update(stored, live_cells(v_def, ts), ts, now);
+        BOOST_REQUIRE_EQUAL(record_timestamp(out), ts);
+        BOOST_REQUIRE(!marker_of(out).is_expiring());
+        BOOST_REQUIRE_EQUAL(cell_of(out, v_def).timestamp(), ts);
+        BOOST_REQUIRE_EQUAL(cell_of(out, w_def).timestamp(), ts0);
+        BOOST_REQUIRE(cell_of(out, w_def).is_live_and_has_ttl());
+        BOOST_REQUIRE(!cell_of(out, x_def).is_live());
+    }
+
+    // An UPDATE on a row whose marker expires: the marker keeps its TTL and expiry at ts.
+    {
+        auto stored = make_multi_column_mutation(schema, "pk0", ts0);
+        const auto expiry = now + std::chrono::hours(2);
+        row_of(stored).apply(row_marker(ts0, std::chrono::hours(2), expiry));
+        auto out = apply_update(stored, live_cells(v_def, ts), ts, now);
+        BOOST_REQUIRE_EQUAL(marker_of(out).timestamp(), ts);
+        BOOST_REQUIRE(marker_of(out).is_expiring());
+        BOOST_REQUIRE(marker_of(out).expiry() == expiry);
+        BOOST_REQUIRE(marker_of(out).ttl() == std::chrono::hours(2));
+    }
+
+    // A DELETE of one column on a live row: the column is a cell tombstone at ts.
+    {
+        auto stored = make_multi_column_mutation(schema, "pk0", ts0);
+        mutation del(schema, dk);
+        row_of(del).cells().apply(v_def, atomic_cell::make_dead(ts, now));
+        auto out = apply_update(stored, del, ts, now);
+        BOOST_REQUIRE_EQUAL(record_timestamp(out), ts);
+        BOOST_REQUIRE(!cell_of(out, v_def).is_live());
+        BOOST_REQUIRE_EQUAL(cell_of(out, v_def).timestamp(), ts);
+        BOOST_REQUIRE_EQUAL(cell_of(out, w_def).timestamp(), ts0);
+    }
+
+    // An UPDATE that creates the row: the marker is live without end when a cell is, else it
+    // expires with the longest-living cell, and it is dead when no cell is live.
+    {
+        auto out = apply_update(std::nullopt, live_cells(v_def, ts), ts, now);
+        BOOST_REQUIRE_EQUAL(record_timestamp(out), ts);
+        BOOST_REQUIRE(marker_of(out).is_live() && !marker_of(out).is_expiring());
+
+        mutation expiring = live_cells(v_def, ts, std::chrono::seconds(60));
+        expiring.apply(live_cells(w_def, ts, std::chrono::seconds(600)));
+        out = apply_update(std::nullopt, expiring, ts, now);
+        BOOST_REQUIRE(marker_of(out).is_expiring());
+        BOOST_REQUIRE(marker_of(out).ttl() == std::chrono::seconds(600));
+        BOOST_REQUIRE(marker_of(out).expiry() == now + std::chrono::seconds(600));
+
+        mutation del(schema, dk);
+        row_of(del).cells().apply(v_def, atomic_cell::make_dead(ts, now));
+        out = apply_update(std::nullopt, del, ts, now);
+        BOOST_REQUIRE_EQUAL(record_timestamp(out), ts);
+        BOOST_REQUIRE(!marker_of(out).is_live());
+        BOOST_REQUIRE(!out.partition().clustered_rows().begin()->row().is_live(*schema, column_kind::regular_column, tombstone(), now));
+    }
+
+    // An INSERT on a partition that is only a tombstone: the tombstone stays under the new row,
+    // and the record timestamp is the marker's.
+    {
+        mutation stored(schema, dk);
+        stored.partition().apply(tombstone(ts0, now));
+        mutation insert = live_cells(v_def, ts);
+        row_of(insert).apply(row_marker(ts));
+        auto out = apply_update(stored, insert, ts, now);
+        BOOST_REQUIRE_EQUAL(record_timestamp(out), ts);
+        BOOST_REQUIRE_EQUAL(out.partition().partition_tombstone().timestamp, ts0);
+        BOOST_REQUIRE(cell_of(out, v_def).is_live());
+    }
+
+    // A DELETE of the partition: the tombstone goes alone, the stored row is not carried under it.
+    {
+        auto stored = make_multi_column_mutation(schema, "pk0", ts0);
+        mutation del(schema, dk);
+        del.partition().apply(tombstone(ts, now));
+        auto out = apply_update(stored, del, ts, now);
+        assert_that(out).is_equal_to(del);
+        BOOST_REQUIRE_EQUAL(record_timestamp(out), ts);
+    }
 }
 
 // Checks that logstor::write() stores nothing for an empty mutation, in both forms. Paxos learns
