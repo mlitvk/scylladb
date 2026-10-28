@@ -51,6 +51,23 @@ The `buffered_writer` manages multiple write buffers for user writes, an active 
 
 Only step 4 writes to the disk - all other steps only update in-memory metadata.
 
+**Conditional statements (LWT):**
+1. The coordinator runs the Paxos prepare round as for any table; the round reads nothing.
+2. It reads the whole partition in mutation form from a quorum, reconciled across the replicas and without read repair.
+3. The conditions are evaluated against that partition, as the query result they see on an sstable table.
+4. When they hold, the statement's update is applied onto the partition and the row marker is set to the ballot timestamp; the whole partition is the Paxos proposal. A failed condition proposes an empty mutation, which logstor stores as nothing.
+5. Each replica learns the proposal through the write path above. The record timestamp is the ballot timestamp, so a learned image replaces the one before it and a late image is dropped.
+
+The proposal, by statement:
+
+| Statement | Proposal |
+|---|---|
+| `INSERT ... IF NOT EXISTS` on a missing key | the insert |
+| `UPDATE ... IF ...` or `DELETE col ... IF ...` on a row | the partition with the update applied; a deleted column is a cell tombstone, kept in every later image so that a lagging replica cannot bring the column back into a quorum read |
+| `UPDATE ... IF ...` on a missing key | the update under a marker derived from its cells: live without end, expiring with the longest-living cell, or dead when no cell is live, so the row is visible for as long as it is on an sstable table |
+| `INSERT` or `UPDATE` after a partition `DELETE` | the partition tombstone stays under the new row |
+| `DELETE ... WHERE pk ... IF ...` | the partition tombstone alone |
+
 **Read Path:**
 1. Application requests data for a partition key
 2. Index lookup returns the cached partition, if the cache has it, or the record location
@@ -105,7 +122,13 @@ INSERT INTO keyspace.table_name (pk, v) VALUES (2, 'value2');
 INSERT INTO keyspace.table_name (pk, v) VALUES (1, 'updated_value');
 ```
 
-Currently, updates must write the full row. Updating individual columns is not yet supported. Each write replaces the entire partition.
+A plain write replaces the whole partition: an `INSERT` that names some of the columns leaves the others null. A plain `UPDATE` or a `DELETE` of a column is rejected, because it carries only cells. A conditional statement (`IF ...`, LWT) updates the partition in place, see "Conditional statements" under Data Flow:
+
+```cql
+INSERT INTO keyspace.t (pk, a, b) VALUES (1, 'a1', 'b1') IF NOT EXISTS;
+UPDATE keyspace.t SET a = 'a2' WHERE pk = 1 IF b = 'b1';
+-- [applied] = true, the row is (1, 'a2', 'b1'): b keeps its value and its write time
+```
 
 **Select:**
 
