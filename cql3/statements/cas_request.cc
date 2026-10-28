@@ -19,6 +19,8 @@
 #include "types/map.hh"
 #include "service/storage_proxy.hh"
 #include "cql3/query_processor.hh"
+#include "mutation_query.hh"
+#include "replica/logstor/update.hh"
 
 namespace cql3::statements {
 
@@ -57,8 +59,7 @@ std::optional<mutation> cas_request::apply_updates(api::timestamp_type ts) const
     return mutation_set;
 }
 
-lw_shared_ptr<query::read_command> cas_request::read_command(query_processor& qp) const {
-
+query::partition_slice cas_request::read_slice() const {
     column_set columns_to_read(_schema->all_columns_count());
     std::vector<query::clustering_range> ranges;
 
@@ -93,8 +94,21 @@ lw_shared_ptr<query::read_command> cas_request::read_command(query_processor& qp
     options.set(query::partition_slice::option::always_return_static_content);
     query::partition_slice ps(std::move(ranges), *_schema, columns_to_read, options);
     ps.set_partition_row_limit(max_rows);
-    return make_lw_shared<query::read_command>(_schema->id(), _schema->version(), std::move(ps), qp.proxy().get_max_result_size(ps),
+    return ps;
+}
+
+lw_shared_ptr<query::read_command> cas_request::read_command(query_processor& qp) const {
+    auto ps = read_slice();
+    auto max_result_size = qp.proxy().get_max_result_size(ps);
+    return make_lw_shared<query::read_command>(_schema->id(), _schema->version(), std::move(ps), max_result_size,
             query::tombstone_limit(qp.proxy().get_tombstone_limit()));
+}
+
+lw_shared_ptr<query::read_command> cas_request::prepare_read_command(query_processor& qp) const {
+    if (needs_partition()) {
+        return nullptr;
+    }
+    return read_command(qp);
 }
 
 bool cas_request::applies_to() const {
@@ -119,6 +133,32 @@ std::optional<mutation> cas_request::apply(foreign_ptr<lw_shared_ptr<query::resu
     } else {
         return {};
     }
+}
+
+std::optional<mutation> logstor_cas_request::apply_to_partition(std::optional<mutation> stored, api::timestamp_type ts,
+        cdc::per_request_options&) {
+    const auto slice = read_slice();
+    // The conditions see the partition as the query result they see on an sstable table.
+    // query_mutation() consumes its mutation, and `stored` is the base of the proposal, so it
+    // gets a copy.
+    auto key = partition().front().start()->value().as_decorated_key();
+    mutation image = stored ? *stored : mutation(_schema, std::move(key));
+    _rows = update_parameters::build_prefetch_data(_schema, query_mutation(std::move(image), slice), slice);
+    if (!applies_to()) {
+        return std::nullopt;
+    }
+    auto update = apply_updates(ts);
+    if (!update) {
+        return std::nullopt;
+    }
+    return replica::logstor::apply_update(std::move(stored), std::move(*update), ts);
+}
+
+std::unique_ptr<cas_request> make_cas_request(schema_ptr schema) {
+    if (schema->logstor_enabled()) {
+        return std::make_unique<logstor_cas_request>(std::move(schema));
+    }
+    return std::make_unique<cas_request>(std::move(schema));
 }
 
 cas_request::old_row cas_request::find_old_row(const cas_row_update& op) const {
