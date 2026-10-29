@@ -185,6 +185,9 @@ ls_{shard_id}-{file_id}-Data.db
 
 Files are pre-formatted (zero-filled) before use.
 
+The segment offsets are computed from the configured file size, so recovery fails on a file whose
+size is not the configured one instead of reading its segments at wrong offsets.
+
 ### Segments
 
 Each segment is a contiguous fixed-size region within a file (default 128KB). A segment is identified by a `log_segment_id` (a 32-bit integer index), which maps to a file and offset within that file.
