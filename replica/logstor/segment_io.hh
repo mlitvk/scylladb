@@ -38,7 +38,8 @@ struct segment_info {
 };
 
 // The segment info of the chunk at the start of `in`, or nothing if its headers are not valid.
-// The chunk's body is not read, so a torn chunk is told apart only by a segment_scanner.
+// The chunk's body is not read, so a torn chunk is told apart only by a segment_scanner. Throws
+// std::runtime_error if the chunk is of a format version this code does not read.
 future<std::optional<segment_info>> read_chunk_info(seastar::input_stream<char>& in);
 
 // Reads a segment through its input stream, and keeps the position in the segment of what it
@@ -173,7 +174,9 @@ private:
 // not the one of the first chunk. That chunk is not returned. A chunk whose body is cut short is
 // returned with its info and no records, and the scan stops after it. A chunk whose body fails its
 // CRC check is returned with its info and no records, and the scan continues at the next chunk. The
-// scan also stops after the only chunk of a full segment.
+// scan also stops after the only chunk of a full segment. A chunk of the segment's segment_seq with
+// a format version this code does not read fails the scan with std::runtime_error: it is a store of
+// another release, not the end of the segment.
 class segment_scanner {
 public:
     segment_scanner(seastar::input_stream<char>& in, log_segment_id segment_id, size_t segment_size);

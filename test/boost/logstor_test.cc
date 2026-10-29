@@ -140,6 +140,22 @@ void flip_byte(temporary_buffer<char>& buf, size_t offset) {
     buf.get_write()[offset] ^= char(0x1);
 }
 
+// Rewrites the chunk header at the start of `buf` with `version` and a matching CRC, so that the
+// chunk reads as one written by a release of that format version.
+void set_chunk_version(temporary_buffer<char>& buf, uint8_t version) {
+    auto in = seastar::simple_memory_input_stream(buf.get(), ondisk::chunk_header_size);
+    auto ch = ser::deserialize(in, std::type_identity<ondisk::chunk_header>{});
+    std::optional<ondisk::segment_header> sh;
+    if (ch.kind == segment_kind::full) {
+        auto sh_in = seastar::simple_memory_input_stream(buf.get() + ondisk::chunk_header_size, ondisk::segment_header_size);
+        sh = ser::deserialize(sh_in, std::type_identity<ondisk::segment_header>{});
+    }
+    ch.version = version;
+    ch.crc = ch.calculate_crc(sh);
+    auto out = seastar::simple_memory_output_stream(buf.get_write(), ondisk::chunk_header_size);
+    ser::serialize(out, ch);
+}
+
 std::optional<segment_info> read_chunk_info_from_bytes(const temporary_buffer<char>& buf) {
     temporary_buffer<char> copy(buf.size());
     std::copy_n(buf.get(), buf.size(), copy.get_write());
@@ -1807,6 +1823,69 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_stops_on_corrupted_later_mixe
     BOOST_REQUIRE_EQUAL(seen_headers[1].timestamp, api::timestamp_type(92));
     assert_that(to_mutation(seen_records[0], schema)).is_equal_to(expected0);
     assert_that(to_mutation(seen_records[1], schema)).is_equal_to(expected1);
+}
+
+// A chunk of a format version this code does not read fails the scan and the segment info read: it
+// is a store of another release, and must not read as an empty segment that recovery frees.
+SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_fails_on_a_chunk_of_another_format_version) {
+    auto schema = make_kv_schema();
+
+    raw_write_buffer wb(64 * 1024, segment_kind::mixed);
+    wb.append(log_record_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(71))));
+    wb.seal(segment_sequence{81}, std::nullopt, ondisk::block_alignment);
+
+    auto serialized = copy_chunk(wb.chunk());
+    set_chunk_version(serialized, ondisk::current_version + 1);
+
+    BOOST_REQUIRE_THROW(read_chunk_info_from_bytes(serialized), std::runtime_error);
+
+    const auto segment_size = serialized.size();
+    auto in = seastar::util::as_input_stream(std::move(serialized));
+    auto close_in = seastar::defer([&in] noexcept { in.close().get(); });
+    segment_scanner scanner(in, log_segment_id{7}, segment_size);
+    BOOST_REQUIRE_THROW(scanner.next_chunk().get(), std::runtime_error);
+}
+
+// A free segment gets only its first block zeroed, so the tail of a reused segment holds the chunks
+// of an earlier use, which can be of a format version this code does not read. The segment_seq
+// tells such a chunk apart ahead of its version: the scan ends there, and does not fail.
+SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_stops_on_a_stale_chunk_of_another_format_version) {
+    auto schema = make_kv_schema();
+
+    raw_write_buffer wb0(64 * 1024, segment_kind::mixed);
+    raw_write_buffer wb1(64 * 1024, segment_kind::mixed);
+
+    auto expected0 = make_kv_mutation(schema, "pk0", "value0", api::timestamp_type(71));
+    wb0.append(log_record_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(71))));
+    wb1.append(log_record_writer(make_log_record(schema, "pk1", "value1", api::timestamp_type(72))));
+
+    wb0.seal(segment_sequence{81}, std::nullopt, ondisk::block_alignment);
+    wb1.seal(segment_sequence{80}, std::nullopt, ondisk::block_alignment);
+
+    auto serialized0 = copy_chunk(wb0.chunk());
+    auto serialized1 = copy_chunk(wb1.chunk());
+    set_chunk_version(serialized1, ondisk::current_version + 1);
+
+    auto segment = concat_chunks({&serialized0, &serialized1});
+    const auto segment_size = segment.size();
+    auto in = seastar::util::as_input_stream(std::move(segment));
+
+    std::vector<segment_info> seen_segment_infos;
+    std::vector<log_record> seen_records;
+
+    segment_scanner scanner(in, log_segment_id{8}, segment_size);
+    while (auto* chunk = scanner.next_chunk().get()) {
+        seen_segment_infos.push_back(chunk->info());
+        for (const auto& record : chunk->records()) {
+            seen_records.push_back(record.to_log_record());
+        }
+    }
+    in.close().get();
+
+    BOOST_REQUIRE_EQUAL(seen_segment_infos.size(), 1u);
+    BOOST_REQUIRE_EQUAL(seen_segment_infos.front().segment_seq.value, 81u);
+    BOOST_REQUIRE_EQUAL(seen_records.size(), 1u);
+    assert_that(to_mutation(seen_records[0], schema)).is_equal_to(expected0);
 }
 
 // Checks that the chunk header's CRC covers the segment header: a full segment whose segment header
