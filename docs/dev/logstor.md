@@ -224,7 +224,7 @@ A serialized form of `ondisk::chunk_header`.
 |--------|------|-------------|-------------|
 | 0      | 4    | `magic`     | `0x4C475342`. Used to detect valid chunks during recovery. |
 | 4      | 1    | `kind`      | Segment kind: `0` = mixed, `1` = full. |
-| 5      | 1    | `version`   | Version of the chunk format. |
+| 5      | 1    | `version`   | Version of the chunk format. Recovery fails on a chunk of another version: it is a store of another release, not an empty segment. A stale chunk of an earlier use of the segment is told apart by `segment_seq` first, whatever its version. |
 | 6      | 2    | `reserved`  | Reserved for future use. Currently written as zero and included in the CRC. |
 | 8      | 8    | `segment_seq` | Monotonic segment sequence number used during recovery and segment ordering checks. |
 | 16     | 4    | `records_size` | Size in bytes of the record frames following the header(s), their padding included. |

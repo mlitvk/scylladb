@@ -27,10 +27,25 @@ struct chunk_headers {
     std::optional<ondisk::segment_header> segment;
 };
 
-// Returns nullopt if the stream ends first or the headers are invalid.
-future<std::optional<chunk_headers>> read_chunk_headers(segment_reader& reader) {
+// Returns nullopt if the stream ends first, no chunk starts there, the chunk is of another use of
+// the segment - its segment_seq is not `expected_seq` - or the headers are invalid. Throws
+// std::runtime_error at a chunk of a format version this code does not read: it is a store of another
+// release, not the end of the segment, and recovery must not take it for an empty one. The seq is
+// checked ahead of the version, so that the stale tail of a reused segment does not fail the scan.
+future<std::optional<chunk_headers>> read_chunk_headers(segment_reader& reader, std::optional<segment_sequence> expected_seq) {
+    const auto position = reader.position();
     auto ch = co_await reader.read<ondisk::chunk_header>();
-    if (!ch || !ondisk::validate_chunk_header_fields(*ch)) {
+    if (!ch || ch->magic != ondisk::chunk_header_magic) {
+        co_return std::nullopt;
+    }
+    if (expected_seq && ch->segment_seq != *expected_seq) {
+        co_return std::nullopt;
+    }
+    if (ch->version != ondisk::current_version) {
+        throw std::runtime_error(fmt::format("Chunk at offset {} has format version {}, and this release reads version {} only",
+                position, ch->version, ondisk::current_version));
+    }
+    if (!ondisk::validate_chunk_header_fields(*ch)) {
         co_return std::nullopt;
     }
 
@@ -164,17 +179,12 @@ future<std::optional<scanned_chunk>> segment_scanner::read_chunk() {
 
     // A chunk with invalid headers, or a chunk of an earlier use of the segment, ends the scan.
     // Chunks are written in sequence, so no chunk of this use of the segment follows it.
-    auto headers = co_await read_chunk_headers(_reader);
+    auto headers = co_await read_chunk_headers(_reader, _segment_seq);
     if (!headers) {
         co_return std::nullopt;
     }
     const auto& ch = headers->chunk;
-
-    if (!_segment_seq) {
-        _segment_seq = ch.segment_seq;
-    } else if (ch.segment_seq != *_segment_seq) {
-        co_return std::nullopt;
-    }
+    _segment_seq = ch.segment_seq;
 
     // A chunk whose body is cut short still gives its segment info. Recovery takes the highest
     // segment_seq from it, and a segment_seq that is on disk must not go to a new segment again,
@@ -229,7 +239,7 @@ void segment_scanner::report_failed_chunks() const {
 
 future<std::optional<segment_info>> read_chunk_info(seastar::input_stream<char>& in) {
     segment_reader reader(in);
-    auto headers = co_await read_chunk_headers(reader);
+    auto headers = co_await read_chunk_headers(reader, std::nullopt);
     co_return headers.transform(make_segment_info);
 }
 
