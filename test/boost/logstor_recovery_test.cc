@@ -718,3 +718,32 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_recovery_reproduces_index_under_mixed_work
 
     BOOST_REQUIRE_EQUAL(recovery_divergence(ls, schema->id(), cg.logstor_index()), std::string());
 }
+
+// The segment offsets are computed from the configured file size, so recovery refuses a file of
+// another size instead of reading its segments at wrong offsets.
+SEASTAR_THREAD_TEST_CASE(test_logstor_recovery_rejects_a_file_of_another_size) {
+    constexpr size_t segment_size = 128 * 1024;
+    const logstor_params written{
+        .segment_size = segment_size,
+        .file_size = 16 * segment_size,
+        .disk_size = 32 * segment_size,
+    };
+    auto other = written;
+    other.file_size = 8 * segment_size;
+    tmpdir dir;
+
+    {
+        test_store store(dir, written);
+        auto& ls = store.ls();
+        test_recovery_catalog no_tables;
+        ls.do_recovery(no_tables).get();
+        ls.start().get();
+        ls.stop().get();
+    }
+
+    test_store store(dir, other);
+    auto& ls = store.ls();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+    test_recovery_catalog no_tables;
+    BOOST_REQUIRE_THROW(ls.do_recovery(no_tables).get(), std::runtime_error);
+}
