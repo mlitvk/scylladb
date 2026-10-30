@@ -54,7 +54,7 @@ inline noop_space_accounting_subscriber noop_space_accounting{};
 // not have the key. It looks the key up the way a read that bypasses the cache does.
 inline std::optional<replica::logstor::primary_index::guarded_location> lookup_guarded_location(
         const replica::logstor::primary_index& index, const replica::logstor::primary_index_key& key, const schema& s) {
-    auto result = index.lookup_for_read(key, s, replica::logstor::use_cache::no);
+    auto result = index.lookup_for_read(key, s, replica::logstor::use_cache::no, replica::logstor::column_filter());
     if (!result) {
         return std::nullopt;
     }

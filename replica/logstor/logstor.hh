@@ -98,7 +98,10 @@ public:
     // mutation was frozen with.
     future<> write(const frozen_mutation&, const schema& s, write_target target, db::timeout_clock::time_point timeout) noexcept;
 
-    // Creates a mutation reader for a partition range.
+    // Creates a mutation reader for a partition range. A row comes out with at least the columns that
+    // `slice` asks for. A cache hit can give only those (see single_row_partition::copy()), and a
+    // read from the log gives all, so a caller that writes back the whole partition it read must
+    // read with all columns.
     // The reader fails with key_mismatch_error if the record or the cached partition at the indexed
     // location holds a different key.
     mutation_reader make_reader(schema_ptr schema,

@@ -12,6 +12,7 @@
 #include "keys/keys.hh"
 #include "mutation/mutation.hh"
 #include "mutation/mutation_partition.hh"
+#include "query/query-request.hh"
 #include "schema/schema.hh"
 
 namespace replica::logstor {
@@ -46,6 +47,44 @@ single_row_partition to_single_row_partition(mutation_partition&& p, const schem
         // what mutation::consume() does with a row.
         partition.row.emplace(std::move(rows.begin()->row()));
     }
+    return partition;
+}
+
+column_filter::column_filter(const schema& s, const query::partition_slice& slice) {
+    const auto& requested = slice.regular_columns;
+    // A slice with as many ids as the table has columns asks for all of them, or names a column
+    // twice. The ids are not checked: to keep all cells is correct in both cases.
+    if (requested.size() >= s.regular_columns_count()) {
+        return;
+    }
+    _ids = std::span<const column_id>(requested.data(), requested.size());
+}
+
+bool single_row_partition::can_narrow(const column_filter& columns) const {
+    if (!row || columns.selects_all()) {
+        return false;
+    }
+    auto t = row->deleted_at().tomb();
+    t.apply(partition_tombstone);
+    // An expiring marker is not live at time_point::max(), so the row keeps all cells: the querier
+    // decides liveness at the time of the query, which is not known here.
+    return row->marker().is_live(t, gc_clock::time_point::max());
+}
+
+single_row_partition single_row_partition::copy(const schema& s, const column_filter& columns) const {
+    if (!can_narrow(columns)) {
+        return copy(s);
+    }
+    ::row cells;
+    for (const column_id id : columns.ids()) {
+        const auto* cell = row->cells().find_cell(id);
+        // The slice can name a column twice.
+        if (cell && !cells.find_cell(id)) {
+            cells.append_cell(id, cell->copy(*s.regular_column_at(id).type));
+        }
+    }
+    single_row_partition partition{.partition_tombstone = partition_tombstone};
+    partition.row.emplace(row_tombstone(row->deleted_at()), row_marker(row->marker()), std::move(cells));
     return partition;
 }
 

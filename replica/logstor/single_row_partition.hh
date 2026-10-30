@@ -8,6 +8,7 @@
 #pragma once
 
 #include <optional>
+#include <span>
 #include "dht/decorated_key.hh"
 #include "mutation/mutation_partition.hh"
 #include "mutation/tombstone.hh"
@@ -15,7 +16,31 @@
 
 class mutation;
 
+namespace query {
+class partition_slice;
+}
+
 namespace replica::logstor {
+
+// The regular columns that a read asks for, made once per read from its slice. The filter refers to
+// the ids of the slice, so the slice must not move or be destroyed while the filter is in use.
+class column_filter {
+    // The ids in the order of the slice, which can name a column twice, or nullopt when the read
+    // keeps all cells.
+    std::optional<std::span<const column_id>> _ids;
+public:
+    // All columns.
+    column_filter() = default;
+    column_filter(const schema& s, const query::partition_slice& slice);
+
+    bool selects_all() const noexcept {
+        return !_ids;
+    }
+    // Only when !selects_all().
+    std::span<const column_id> ids() const noexcept {
+        return *_ids;
+    }
+};
 
 // A logstor partition as the cache holds it, and as a reader pushes it into its buffer as fragments
 // out of the cache or the record decoder. A logstor table has no clustering columns, so its
@@ -36,6 +61,15 @@ struct single_row_partition {
         }
         return partition;
     }
+
+    // A copy with only the cells of the columns that `columns` selects, when the row marker alone
+    // keeps the row live. Otherwise a cell that `columns` does not select can be what keeps the row
+    // live, so the copy gets all cells. A cache hit reads with this copy. A read from the log keeps
+    // all cells of the decoded row: to remove cells costs more than the querier saves on them.
+    single_row_partition copy(const schema& s, const column_filter& columns) const;
+
+private:
+    bool can_narrow(const column_filter& columns) const;
 };
 
 // A cached partition together with its key, as a read of the cache hands it out. The index entry

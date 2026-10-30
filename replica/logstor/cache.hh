@@ -127,10 +127,12 @@ public:
 
     // The hit path of a read: touches the LRU, counts a hit or a miss, upgrades the entry in place,
     // and hands out the partition with its key. A reader turns the partition into fragments without
-    // a mutation in between. The index entry has only the hash of the key, so a point read compares
-    // the key it gets with its own. The schema is taken by reference, because only a hit that
-    // upgrades the entry needs a reference to it. Never yields.
-    std::optional<keyed_single_row_partition> read_partition(const primary_index_entry&, const schema& target_schema);
+    // a mutation in between. The partition is copied with single_row_partition::copy(s, columns).
+    // The index entry has only the hash of the key, so a point read compares the key it gets with
+    // its own. The schema is taken by reference, because only a hit that upgrades the entry needs a
+    // reference to it. Never yields.
+    std::optional<keyed_single_row_partition> read_partition(const primary_index_entry&, const schema& target_schema,
+            const column_filter& columns);
 
     // For introspection: a snapshot of the cached partition as a mutation, taken without
     // touching the LRU, without counting a hit or a miss and without upgrading the cached
