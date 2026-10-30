@@ -439,14 +439,16 @@ public:
     using read_lookup_result = std::variant<keyed_single_row_partition, guarded_location>;
 
     // Finds a key for a point read. Returns nullopt if the index does not have the key. If the
-    // read uses the cache and the cache has the key, returns the cached partition with its key. If
-    // not, returns the location of the record with a guard. The entry has only the hash of the key,
-    // so the caller compares the key of a cached partition with its own.
-    std::optional<read_lookup_result> lookup_for_read(const primary_index_key& key, const schema& target_schema, use_cache uses_cache) const {
+    // read uses the cache and the cache has the key, returns the cached partition with its key,
+    // with the columns that `columns` selects. If not, returns the location of the record with a
+    // guard. The entry has only the hash of the key, so the caller compares the key of a cached
+    // partition with its own.
+    std::optional<read_lookup_result> lookup_for_read(const primary_index_key& key, const schema& target_schema, use_cache uses_cache,
+            const column_filter& columns) const {
         logalloc::reclaim_lock lock(_region);
         return find_entry(key).transform([&] (const primary_index_entry& e) -> read_lookup_result {
             if (reads_cache() && uses_cache) {
-                if (auto cached = _cache_tracker->read_partition(e, target_schema)) {
+                if (auto cached = _cache_tracker->read_partition(e, target_schema, columns)) {
                     return std::move(*cached);
                 }
             }
@@ -531,15 +533,16 @@ public:
         primary_index_key key() const noexcept { return _e.key(); }
         index_entry entry() const noexcept { return _e.entry(); }
 
-        // Returns the cached partition of the entry, with its key. Returns nullopt when the cache
-        // does not hold the entry or when the index does not read the cache. Counts a hit or a miss
-        // and touches the LRU, like a point read does.
-        std::optional<keyed_single_row_partition> read_cached(const schema& target_schema) const {
+        // Returns the cached partition of the entry, with its key and with the columns that
+        // `columns` selects. Returns nullopt when the cache does not hold the entry or when the
+        // index does not read the cache. Counts a hit or a miss and touches the LRU, like a point
+        // read does.
+        std::optional<keyed_single_row_partition> read_cached(const schema& target_schema, const column_filter& columns) const {
             _index.assert_locked();
             if (!_index.reads_cache()) {
                 return std::nullopt;
             }
-            return _index._cache_tracker->read_partition(_e, target_schema);
+            return _index._cache_tracker->read_partition(_e, target_schema, columns);
         }
     };
 
