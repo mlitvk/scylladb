@@ -53,6 +53,7 @@ protected:
     // Decided once, from the slice: a slice with bypass_cache neither looks the cache up nor admits
     // what it reads from a segment.
     const use_cache _use_cache;
+    const column_filter _columns;
 
 private:
     // The partition whose fragments are going into the buffer, from its start being pushed until
@@ -66,6 +67,7 @@ protected:
         , _table_schema(slice.is_reversed() ? _schema->get_reversed() : _schema)
         , _slice(slice)
         , _use_cache(!_slice.options.contains(query::partition_slice::option::bypass_cache))
+        , _columns(*_table_schema, _slice)
     { }
 
     bool emitting() const noexcept {
@@ -202,7 +204,7 @@ public:
 
         try {
             primary_index_key key(_dk);
-            auto found = _index.lookup_for_read(key, *_table_schema, _use_cache);
+            auto found = _index.lookup_for_read(key, *_table_schema, _use_cache, _columns);
             if (!found) {
                 _end_of_stream = true;
                 return make_ready_future<>();
@@ -407,7 +409,7 @@ class logstor_range_reader : public logstor_reader_base {
         batch.slots.reserve(index_batch->entry_count);
         for (const auto& entry : index_batch->entries) {
             batch_slot slot{.location = entry.get().entry().location};
-            if (auto cached = _index.lookup_cached(entry.get(), *_table_schema, _use_cache)) {
+            if (auto cached = _index.lookup_cached(entry.get(), *_table_schema, _use_cache, _columns)) {
                 slot.partition = make_pending(std::move(cached->key), std::move(cached->partition));
             }
             batch.slots.push_back(std::move(slot));
