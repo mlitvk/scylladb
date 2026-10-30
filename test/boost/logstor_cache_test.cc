@@ -814,12 +814,14 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_cache_read_partition_copies_only_the_reque
 
     // Two of five, in either order of the slice.
     BOOST_REQUIRE_EQUAL(cell_count(f.read(select_columns(*f.schema, {"v4", "v0"}))), 2);
+    // Three of five is half of the columns or more, so every cell is copied.
+    BOOST_REQUIRE_EQUAL(cell_count(f.read(select_columns(*f.schema, {"v0", "v1", "v2"}))), 5);
     // The full slice copies every cell, and so does a slice that names them all.
     BOOST_REQUIRE_EQUAL(cell_count(f.read(f.schema->full_slice())), 5);
     BOOST_REQUIRE_EQUAL(cell_count(f.read(select_columns(*f.schema, {"v0", "v1", "v2", "v3", "v4"}))), 5);
-    // A column named twice is one column.
+    // A column named twice is one column, but counts twice against the half.
     BOOST_REQUIRE_EQUAL(cell_count(f.read(select_columns(*f.schema, {"v1", "v1"}))), 1);
-    BOOST_REQUIRE_EQUAL(cell_count(f.read(select_columns(*f.schema, {"v0", "v1", "v1", "v2"}))), 3);
+    BOOST_REQUIRE_EQUAL(cell_count(f.read(select_columns(*f.schema, {"v0", "v1", "v1"}))), 5);
 }
 
 // A column the row does not have is not a cell; the row still comes out, with its marker.

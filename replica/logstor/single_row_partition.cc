@@ -52,9 +52,10 @@ single_row_partition to_single_row_partition(mutation_partition&& p, const schem
 
 column_filter::column_filter(const schema& s, const query::partition_slice& slice) {
     const auto& requested = slice.regular_columns;
-    // A slice with as many ids as the table has columns asks for all of them, or names a column
-    // twice. The ids are not checked: to keep all cells is correct in both cases.
-    if (requested.size() >= s.regular_columns_count()) {
+    // To narrow a row costs more per kept cell than to copy the whole row, so it pays only when the
+    // read drops most of the cells. A read that asks for half of the columns or more keeps all
+    // cells. A column named twice counts twice: to keep all cells is always correct.
+    if (2 * requested.size() >= s.regular_columns_count()) {
         return;
     }
     _ids = std::span<const column_id>(requested.data(), requested.size());

@@ -4093,7 +4093,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_reader_hit_answers_a_narrow_query_like_the
             auto from_log = read_through(pr, bypassing);
 
             const auto& cached_row = from_cache.partition().clustered_row(*schema, clustering_key::make_empty());
-            BOOST_REQUIRE_LE(cached_row.cells().size(), names.size());
+            // A read of half of the columns or more keeps all cells.
+            BOOST_REQUIRE_LE(cached_row.cells().size(), 2 * names.size() < schema->regular_columns_count() ? names.size() : 3);
             assert_that(from_log).is_equal_to(m);
 
             auto cached_result = query_mutation(std::move(from_cache), slice, query::max_rows, now, opts);
