@@ -4914,6 +4914,36 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_erase_watermarks) {
         }
     }
 
+    // A watermark that later erases cover again, at sequences at least its own, decides nothing and
+    // goes; one that still shows through somewhere stays.
+    {
+        auto w = [&] (int64_t first, int64_t last, uint64_t seq) {
+            return erase_watermark{.table = table_c, .first_token = first, .last_token = last, .seq = segment_sequence(seq)};
+        };
+        using list = std::vector<erase_watermark>;
+        erase_watermarks set;
+        // Covered by a wider later erase.
+        set = set.with(w(100, 300, 100)).with(w(50, 500, 200));
+        BOOST_REQUIRE((set.all() == list{w(50, 500, 200)}));
+        // A narrower later erase leaves the wider one showing on both sides.
+        set = set.with(w(100, 300, 300));
+        BOOST_REQUIRE((set.all() == list{w(50, 500, 200), w(100, 300, 300)}));
+        // Covered by two later erases together.
+        set = set.with(w(50, 200, 400)).with(w(201, 500, 500));
+        BOOST_REQUIRE((set.all() == list{w(50, 200, 400), w(201, 500, 500)}));
+        // At one sequence the wider one decides, whichever came first, and a retry of the same
+        // erase is one watermark.
+        BOOST_REQUIRE(erase_watermarks().with(w(0, 100, 5)).with(w(10, 20, 5)).all() == list{w(0, 100, 5)});
+        BOOST_REQUIRE(erase_watermarks().with(w(10, 20, 5)).with(w(0, 100, 5)).all() == list{w(0, 100, 5)});
+        BOOST_REQUIRE(erase_watermarks().with(w(10, 20, 5)).with(w(10, 20, 5)).all() == list{w(10, 20, 5)});
+        // An erase of the whole ring leaves only itself for its table, and the other tables alone.
+        const auto whole = *erase_watermarks::make(table_c, dht::token_range(), segment_sequence(600));
+        set = set.with(*b).with(whole);
+        BOOST_REQUIRE((set.all() == list{*b, whole}));
+        BOOST_REQUIRE(set.erased(table_c, token(0), segment_sequence(600)));
+        BOOST_REQUIRE(!set.erased(table_c, token(0), segment_sequence(601)));
+    }
+
     watermarks.save(dir.path()).get();
     auto loaded = erase_watermarks::load(dir.path()).get();
     BOOST_REQUIRE(loaded.all() == watermarks.all());

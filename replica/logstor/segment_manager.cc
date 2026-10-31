@@ -1230,7 +1230,7 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
         sm::make_gauge("separator_task_queue_size", [this]() { return _separator_task_queue.size(); },
                        sm::description("Current number of pending tasks in the separator task queue.")),
         sm::make_gauge("erase_watermarks", [this] { return _erase_watermarks.size(); },
-                       sm::description("Number of erase watermarks kept for the next recovery: one per tablet cleanup or truncate whose erased records may still be on disk.")),
+                       sm::description("Number of erase watermarks kept for the next recovery: one per tablet cleanup or truncate whose erased records may still be on disk and which no later erase covers.")),
     });
 }
 
