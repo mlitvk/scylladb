@@ -204,7 +204,7 @@ file that does not parse or whose CRC does not match refuses to start.
 | 5      | 3      | `reserved`   | Written as zero. |
 | 8      | 4      | `count`      | Number of watermarks that follow. |
 | 12     | 8      | `seq_floor`  | The highest `seq` of every watermark the shard ever had. Dropping a watermark does not lower it. |
-| 20     | 40 × n | `watermarks` | One per erase, see below. |
+| 20     | 40 × n | `watermarks` | One per erase that still decides something, see below. An erase whose whole range later erases cover again, at sequences at least its own, is dropped at the next save. |
 | 20+40n | 4      | `crc`        | CRC32 of all preceding bytes. |
 
 Each watermark:

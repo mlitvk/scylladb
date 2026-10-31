@@ -212,55 +212,70 @@ erase_watermarks erase_watermarks::with(erase_watermark w) const {
 
 void erase_watermarks::rebuild_steps() {
     _steps.clear();
-    std::unordered_map<table_id, std::vector<const erase_watermark*>> by_table;
-    for (const auto& w : _watermarks) {
-        by_table[w.table].push_back(&w);
+    std::unordered_map<table_id, std::vector<size_t>> by_table;
+    for (size_t i = 0; i < _watermarks.size(); ++i) {
+        by_table[_watermarks[i].table].push_back(i);
     }
-    for (auto& [table, watermarks] : by_table) {
+    std::vector<bool> decides(_watermarks.size(), false);
+    for (auto& [table, indexes] : by_table) {
         // A sweep over the raw token space, O(k log k) for k watermarks. The function can only
         // change where a range starts or just past where one ends, so those are the points visited,
         // in order. The ranges are sorted by start and enter a heap keyed by sequence as the sweep
-        // reaches them; the top of the heap that has not ended yet is the value at the point.
+        // reaches them; the top of the heap that has not ended yet is the value at the point, and
+        // the watermark that put it there decides the step.
         std::vector<int64_t> bounds;
-        bounds.reserve(2 * watermarks.size() + 1);
+        bounds.reserve(2 * indexes.size() + 1);
         bounds.push_back(min_raw_token);
-        for (const auto* w : watermarks) {
-            bounds.push_back(w->first_token);
-            if (w->last_token < max_raw_token) {
-                bounds.push_back(w->last_token + 1);
+        for (const auto i : indexes) {
+            bounds.push_back(_watermarks[i].first_token);
+            if (_watermarks[i].last_token < max_raw_token) {
+                bounds.push_back(_watermarks[i].last_token + 1);
             }
         }
         std::ranges::sort(bounds);
         const auto [duplicates_begin, duplicates_end] = std::ranges::unique(bounds);
         bounds.erase(duplicates_begin, duplicates_end);
-        std::ranges::sort(watermarks, {}, [] (const erase_watermark* w) { return w->first_token; });
+        std::ranges::sort(indexes, {}, [this] (size_t i) { return _watermarks[i].first_token; });
 
+        // Of two watermarks at the same sequence, the one that ends later is on top, so that one
+        // nested in the other, or a retry of the same erase, decides nothing and goes.
         struct covering {
             segment_sequence seq;
             int64_t last_token;
-            bool operator<(const covering& o) const noexcept {
-                return seq < o.seq;
-            }
+            size_t index;
+            auto operator<=>(const covering&) const noexcept = default;
         };
         std::priority_queue<covering> started;
-        auto next = watermarks.begin();
+        auto next = indexes.begin();
         std::vector<step> steps;
         for (const auto from : bounds) {
-            for (; next != watermarks.end() && (*next)->first_token <= from; ++next) {
-                started.push(covering{.seq = (*next)->seq, .last_token = (*next)->last_token});
+            for (; next != indexes.end() && _watermarks[*next].first_token <= from; ++next) {
+                started.push(covering{.seq = _watermarks[*next].seq, .last_token = _watermarks[*next].last_token, .index = *next});
             }
             // A range that has ended is dropped only once it reaches the top, which is the only
             // place it would be read: below the top it decides nothing.
             while (!started.empty() && started.top().last_token < from) {
                 started.pop();
             }
-            const auto seq = started.empty() ? segment_sequence{0} : started.top().seq;
+            auto seq = segment_sequence{0};
+            if (!started.empty()) {
+                seq = started.top().seq;
+                decides[started.top().index] = true;
+            }
             if (steps.empty() || steps.back().seq != seq) {
                 steps.push_back(step{.from = from, .seq = seq});
             }
         }
         _steps.emplace(table, std::move(steps));
     }
+
+    std::vector<erase_watermark> kept;
+    for (size_t i = 0; i < _watermarks.size(); ++i) {
+        if (decides[i]) {
+            kept.push_back(_watermarks[i]);
+        }
+    }
+    _watermarks = std::move(kept);
 }
 
 bool erase_watermarks::erased(table_id table, dht::token token, segment_sequence seq) const noexcept {

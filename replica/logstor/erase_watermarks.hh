@@ -44,6 +44,9 @@ struct erase_watermark {
 // The file is rewritten whole on every erase, through a temporary file that replaces it. A missing
 // file means no watermarks: that is what a fresh store looks like. A corrupt one is an error.
 class erase_watermarks {
+    // Only the watermarks that decide a step below. One whose range later erases cover again, at
+    // sequences at least its own, changes no lookup and goes, so the set is bounded by the ranges
+    // that still show through and not by the number of erases.
     std::vector<erase_watermark> _watermarks;
     // The highest sequence of any watermark this set held, in memory or in its file. gc() does not
     // lower it, so the recovered sequence counter stays above every erase even after the
@@ -60,6 +63,7 @@ class erase_watermarks {
     };
     std::unordered_map<table_id, std::vector<step>> _steps;
 
+    // Rebuilds the steps and drops the watermarks that decide none of them.
     void rebuild_steps();
 
 public:
@@ -74,8 +78,9 @@ public:
     // Replaces the shard's file with the current set, atomically and durably.
     future<> save(const std::filesystem::path& base_dir) const;
 
-    // The set with `w` added. The set it is called on does not change, so that an erase can make
-    // the new set live and go back to the old one by swaps, which cannot fail.
+    // The set with `w` added and the watermarks it covers dropped. The set it is called on does not
+    // change, so that an erase can make the new set live and go back to the old one by swaps, which
+    // cannot fail.
     erase_watermarks with(erase_watermark w) const;
 
     const std::vector<erase_watermark>& all() const noexcept {
