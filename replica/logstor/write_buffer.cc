@@ -187,6 +187,24 @@ template raw_write_buffer::append_result raw_write_buffer::append<log_record_byt
 
 // write_buffer
 
+// A guess at the frame size of a record, which only sets the capacity that the per-record vectors of
+// a write buffer grow to first.
+static constexpr size_t expected_record_frame_size = 100;
+
+// Makes room for one more entry in a vector that holds an entry for each record of `raw`. The vector
+// grows to the expected record count of a chunk first, and doubles after that, but not past the most
+// records that a chunk can hold, so that a chunk of small records does not leave it at twice its need.
+template <typename T>
+static void reserve_record_entry(std::vector<T>& entries, const raw_write_buffer& raw) {
+    if (entries.size() < entries.capacity()) {
+        return;
+    }
+    static constexpr size_t min_frame_size = align_up(ondisk::record_frame_header_size + ondisk::record_header_fixed_size, ondisk::record_alignment);
+    const size_t max_count = (raw.buffer_size() - raw.chunk_headers_size()) / min_frame_size;
+    const size_t next = std::max(raw.buffer_size() / expected_record_frame_size, 2 * entries.capacity());
+    entries.reserve(std::max(entries.size() + 1, std::min(next, max_count)));
+}
+
 write_buffer::write_buffer(size_t buffer_size, segment_kind kind)
         : _raw(buffer_size, kind)
 {}
@@ -216,10 +234,9 @@ future<record_location_with_holder> write_buffer::write(Writer writer, write_tar
         if constexpr (!std::same_as<Writer, log_record_writer>) {
             on_internal_error(logstor_logger, "Record byte writes are not supported for mixed write buffers");
         }
-        if (_records_copy.size() == _records_copy.capacity()) {
-            _records_copy.reserve(std::max({size_t(1), _raw.buffer_size() / 100, 2 * _records_copy.capacity()}));
-        }
+        reserve_record_entry(_records_copy, _raw);
     }
+    reserve_record_entry(_waiters, _raw);
 
     // hold the write buffer until the write is complete, and pass the holder to the
     // caller for follow-up operations that should continue holding the buffer, such
