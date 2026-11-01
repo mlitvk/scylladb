@@ -1519,6 +1519,10 @@ future<> segment_manager_impl::request_segment_switch() {
 }
 
 future<> segment_manager_impl::switch_active_segment() {
+    utils::get_local_injector().inject("logstor_switch_fail", [] {
+        throw std::runtime_error("segment switch failed by injection");
+    });
+
     auto new_seg = co_await get_segment(write_source::normal_write);
 
     // Holds a switch whose new segment has its sequence but is not active yet. Checked first, so
@@ -1658,7 +1662,9 @@ void segment_manager_impl::free_segment(log_segment_id segment_id) noexcept {
 // 5. Erase the index range.
 // 6. Wait for the readers of the erased locations, then free the groups' segments left without
 //    a live record.
-// 7. Switch the active segment, so that the next write to the range lands above S.
+// 7. Switch the active segment, so that the next write to the range lands above S. This runs
+//    also when a step after 3 fails, because the fence comes down when the erase returns. If
+//    the switch fails, the erase drops the active segment, and the next write takes a new one.
 // This is steps 2-7: the caller fences writes to the range for the duration and has drained the
 // write path into the separator (logstor::erase() does the latter), unless the range is the
 // stopped group's own, whose closed gate says the same (compaction_group::stop()). The groups
@@ -1702,6 +1708,7 @@ future<> segment_manager_impl::erase(table_id table, primary_index& index, dht::
     // Step 4. Every sequence issued so far is below _next_segment_seq, and from here on nothing
     // issues one for a copy of a record in the range: writes are fenced, the copiers are stopped.
     const auto seq = segment_sequence(_next_segment_seq.value - 1);
+    std::exception_ptr failure;
     if (auto watermark = erase_watermarks::make(table, range, seq)) {
         // The new set is live while it is saved, and the old one comes back if the save fails.
         // Neither swap can fail, so the set in memory is always one of the two.
@@ -1709,31 +1716,47 @@ future<> segment_manager_impl::erase(table_id table, primary_index& index, dht::
         std::swap(_erase_watermarks, other);
         auto saved = co_await coroutine::as_future(_erase_watermarks.save(_cfg.base_dir));
         if (saved.failed()) {
-            // Not durable, so not an erase: the caller retries or reports it.
+            // Not durable, so not an erase: the caller retries or reports it. If only the directory
+            // sync after the rename failed, the file can still hold the watermark, until the next
+            // save writes it again without it. A restart before that applies the erase, so step 7
+            // runs anyway. The caller cannot tell a failed erase from one that took effect, as with
+            // a failed write. The same goes for a failure after this point: the watermark is
+            // durable, so an erase that failed in step 5 or 6 is completed by the next recovery,
+            // and a retry records a second watermark over the first. Both are accepted.
             std::swap(_erase_watermarks, other);
-            co_await coroutine::return_exception_ptr(saved.get_exception());
+            failure = saved.get_exception();
+        } else {
+            logstor_logger.info("Erased table {} range {} at {}", table, range, seq);
         }
-        logstor_logger.info("Erased table {} range {} at {}", table, range, seq);
     }
 
-    co_await utils::get_local_injector().inject("logstor_erase_wait_after_watermark", utils::wait_for_message(std::chrono::seconds{60}));
+    if (!failure) {
+        try {
+            co_await utils::get_local_injector().inject("logstor_erase_wait_after_watermark", utils::wait_for_message(std::chrono::seconds{60}));
+            utils::get_local_injector().inject("logstor_erase_fail_after_watermark", [] {
+                throw std::runtime_error("erase failed after the watermark by injection");
+            });
 
-    // Steps 5 and 6.
-    co_await index.erase(range);
-    if (!range.start() && !range.end() && !index.empty()) {
-        // Nothing of the table should be left after an erase of the whole ring: a key here
-        // came past the fence, or the counters drifted. A warning, not an error, because a
-        // migration streaming into the table does land records while the index is being
-        // erased, and those are meant to stay.
-        logstor_logger.warn("Erased the whole ring of table {}, {} keys left in its index", table, index.get_key_count());
+            // Steps 5 and 6.
+            co_await index.erase(range);
+            if (!range.start() && !range.end() && !index.empty()) {
+                // Nothing of the table should be left after an erase of the whole ring: a key here
+                // came past the fence, or the counters drifted. A warning, not an error, because a
+                // migration streaming into the table does land records while the index is being
+                // erased, and those are meant to stay.
+                logstor_logger.warn("Erased the whole ring of table {}, {} keys left in its index", table, index.get_key_count());
+            }
+            // A reader that took a location of the range before the erase can still be reading it:
+            // let the readers of the erased locations finish before their segments are freed, see
+            // free_segment().
+            co_await index.await_pending_reads();
+            co_await coroutine::parallel_for_each(groups, [this, stopped_group] (logstor_group* cg) {
+                return discard_group_segments(*cg, cg == stopped_group);
+            });
+        } catch (...) {
+            failure = std::current_exception();
+        }
     }
-    // A reader that took a location of the range before the erase can still be reading it:
-    // let the readers of the erased locations finish before their segments are freed, see
-    // free_segment().
-    co_await index.await_pending_reads();
-    co_await coroutine::parallel_for_each(groups, [this, stopped_group] (logstor_group* cg) {
-        return discard_group_segments(*cg, cg == stopped_group);
-    });
 
     // The copiers can go on: the range is out of the index, so they have nothing of it to copy, and
     // the switch below may wait for a segment that only their compaction frees.
@@ -1742,8 +1765,22 @@ future<> segment_manager_impl::erase(table_id table, primary_index& index, dht::
     // Step 7: the next write to the range lands in a segment above the watermark. A switch that was
     // already running can have taken its segment's sequence before step 4, so it is not enough to
     // join it: switch until the active segment is above the watermark.
-    while (!_active_segment || _active_segment->seq_num() <= seq) {
-        co_await request_segment_switch();
+    try {
+        while (!_active_segment || _active_segment->seq_num() <= seq) {
+            co_await request_segment_switch();
+        }
+    } catch (...) {
+        // The fence comes down when the erase returns, so the active segment cannot stay at or below
+        // the watermark. Without an active segment, the next write switches to a new one.
+        logstor_logger.warn("Failed to switch the active segment above erase watermark {}: {}", seq, std::current_exception());
+        if (_active_segment && _active_segment->seq_num() <= seq) {
+            auto old_seg = std::exchange(_active_segment, nullptr);
+            (void)old_seg->stop().finally([old_seg] {}).handle_exception([] (std::exception_ptr) {});
+        }
+    }
+
+    if (failure) {
+        co_await coroutine::return_exception_ptr(std::move(failure));
     }
 }
 
