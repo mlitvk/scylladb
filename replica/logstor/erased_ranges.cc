@@ -33,6 +33,7 @@
 #include "replica/logstor/segment_file.hh"
 #include "serializer.hh"
 #include "utils/crc.hh"
+#include "utils/error_injection.hh"
 
 namespace replica::logstor {
 
@@ -181,6 +182,9 @@ future<erased_ranges> erased_ranges::load(const std::filesystem::path& base_dir,
 }
 
 future<> erased_ranges::save(const std::filesystem::path& base_dir, unsigned shard) const {
+    utils::get_local_injector().inject("logstor_erased_ranges_save_fail", [] {
+        throw std::runtime_error("erased range save failed by injection");
+    });
     const auto name = file_name::erase(shard);
     const auto path = name.in(base_dir).string();
     const auto tmp_path = name.tmp().in(base_dir).string();

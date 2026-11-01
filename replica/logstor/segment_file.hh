@@ -180,6 +180,8 @@ public:
     // an internal error.
     future<seastar::file> get_file_for_new_segment(file_id_t);
 
+    unsigned shard() const noexcept { return _cfg.shard; }
+
     uint64_t allocated_file_count() const noexcept { return _allocated_file_count; }
 
     // The open file. The caller must ask for an allocated file, which is open.
