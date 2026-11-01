@@ -1654,7 +1654,8 @@ void segment_manager_impl::free_segment(log_segment_id segment_id) noexcept {
 // are the registered groups of the index that the range reaches into, whose segments and
 // separator buffers hold every record in it, found once the erase holds the shard's erase
 // semaphore, and `stopped_group`, if given: tablet cleanup erases a group it stopped, which is
-// no longer registered.
+// no longer registered. A referenced segment - one a migration is streaming out - is taken out
+// of its group and left to its last reference.
 future<> segment_manager_impl::erase(table_id table, primary_index& index, dht::token_range range, logstor_group* stopped_group) {
     auto holder = _async_gate.hold();
     auto units = co_await get_units(_erase_sem, 1);
@@ -1769,11 +1770,12 @@ future<> segment_manager_impl::erase(table_id table, primary_index& index, dht::
 
 // Takes every segment of the group that has no live record left out of the group and frees it,
 // after an erase removed the group's records from the index; compaction must be disabled. A
-// segment with live records stays in the group for compaction to reclaim: an erase of part of the
-// group's range leaves some, and a truncate racing a migration into the group finds the streamed
-// records it is meant to keep. A stopped group can have neither, its range was erased whole and
-// nothing streams into it, so there a live record is an error: it came past the fence, or the
-// accounting drifted.
+// segment something else still refers to - a migration streaming it out - is only taken out of
+// the group, and the last reference frees it. A segment with live records stays in the group for
+// compaction to reclaim: an erase of part of the group's range leaves some, and a truncate racing
+// a migration into the group finds the streamed records it is meant to keep. A stopped group can
+// have neither, its range was erased whole and nothing streams into it, so there a live record is
+// an error: it came past the fence, or the accounting drifted.
 future<> segment_manager_impl::discard_group_segments(logstor_group& cg, bool stopped) {
     auto& ss = cg.logstor_segments();
 
@@ -1783,6 +1785,7 @@ future<> segment_manager_impl::discard_group_segments(logstor_group& cg, bool st
     // `segment_count` segments stay valid.
     const auto segment_count = ss.segment_count();
     utils::chunked_vector<log_segment_id> segments;
+    utils::chunked_vector<log_segment_id> referenced;
     segments.reserve(segment_count);
     for (size_t i = 0; i < segment_count; ++i) {
         auto& desc = ss.segment_at(i);
@@ -1797,23 +1800,28 @@ future<> segment_manager_impl::discard_group_segments(logstor_group& cg, bool st
             continue;
         }
 
-        // Belonging to the group is the only reference the segment may have left.
-        if (desc.ref_count != 1) {
-            on_internal_error(logstor_logger, format("Discarding segment {} with non-zero reference count", seg_id));
+        // Belonging to the group is one reference.
+        if (desc.ref_count > 1) {
+            referenced.push_back(seg_id);
+        } else {
+            segments.push_back(seg_id);
         }
-
-        segments.push_back(seg_id);
         co_await coroutine::maybe_yield();
     }
 
     logstor_logger.debug("Discarding {} segments", segments.size());
 
     // Removing and freeing a segment cannot fail, so every segment taken out of the group is also
-    // freed. The segments keep their chunks on disk: the watermark covers their records, so the
-    // next recovery keeps none of them and finds the segments free.
+    // freed, here or by its last reference. The segments keep their chunks on disk: the watermark
+    // covers their records, so the next recovery keeps none of them and finds the segments free.
     for (auto seg_id : segments) {
         ss.remove_segment(get_segment_descriptor(seg_id));
         free_segment(seg_id);
+        co_await coroutine::maybe_yield();
+    }
+    for (auto seg_id : referenced) {
+        logstor_logger.debug("Leaving referenced segment {} to its references", seg_id);
+        ss.remove_segment(get_segment_descriptor(seg_id));
         co_await coroutine::maybe_yield();
     }
 }

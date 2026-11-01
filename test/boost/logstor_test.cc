@@ -4367,6 +4367,51 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_erase_covers_only_its_range) {
     BOOST_REQUIRE_EQUAL(recovery_divergence(ls, schema->id(), cg.logstor_index()), std::string());
 }
 
+// A segment a snapshot refers to - what a migration streaming it out holds - is not discarded with
+// the rest of the group: the watermark already covers its records, so it is left intact for the
+// reader and freed by the last reference.
+SEASTAR_THREAD_TEST_CASE(test_logstor_erase_leaves_a_referenced_segment_to_its_reference) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    test_recovery_catalog no_tables;
+    ls.do_recovery(no_tables).get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    auto& sm = ls.get_segment_manager();
+    test_logstor_group cg(schema, ls);
+    auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+
+    write_and_flush_segment(ls, cg, make_kv_mutation(schema, "pk0", "v0", api::timestamp_type(1)));
+    write_and_flush_segment(ls, cg, make_kv_mutation(schema, "pk1", "v0", api::timestamp_type(1)));
+    BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 2u);
+
+    auto snapshot = sm.make_snapshot(cg).get();
+    BOOST_REQUIRE_EQUAL(snapshot.size(), 2u);
+
+    ls.erase(schema->id(), cg.logstor_index(), dht::token_range()).get();
+    BOOST_REQUIRE(cg.logstor_index().empty());
+    BOOST_REQUIRE(cg.logstor_segments().empty());
+
+    // Still readable through the snapshot.
+    for (const auto& seg : snapshot) {
+        auto in = seg.source(seastar::file_input_stream_options{.buffer_size = 4096, .read_ahead = 0}).get();
+        auto close_in = seastar::defer([&in] noexcept { in.close().get(); });
+        auto info = read_chunk_info(in).get();
+        BOOST_REQUIRE(info);
+        BOOST_REQUIRE(info->kind == segment_kind::full);
+    }
+    BOOST_REQUIRE_EQUAL(recovery_divergence(ls, schema->id(), cg.logstor_index()), std::string());
+
+    // The last reference frees them, and the store goes on: the segments are reused below.
+    snapshot.clear();
+    write_and_flush_segment(ls, cg, make_kv_mutation(schema, "pk2", "v0", api::timestamp_type(1)));
+    BOOST_REQUIRE_EQUAL(recovery_divergence(ls, schema->id(), cg.logstor_index()), std::string());
+}
+
 // A switch of the active segment takes the new segment's sequence first and makes the segment
 // active later. An erase that chooses its watermark between the two must not end by joining that
 // switch: the next write would land at or below the watermark and the next recovery would drop it.
