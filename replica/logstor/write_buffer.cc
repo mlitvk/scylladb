@@ -189,12 +189,7 @@ template raw_write_buffer::append_result raw_write_buffer::append<log_record_byt
 
 write_buffer::write_buffer(size_t buffer_size, segment_kind kind)
         : _raw(buffer_size, kind)
-{
-    _waiters.reserve(_raw.buffer_size() / 100);
-    if (with_record_copy()) {
-        _records_copy.reserve(_raw.buffer_size() / 100);
-    }
-}
+{}
 
 void write_buffer::reset() {
     _raw.reset();
