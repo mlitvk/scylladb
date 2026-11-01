@@ -8,6 +8,7 @@
 #pragma once
 
 #include "types.hh"
+#include "dht/i_partitioner_fwd.hh"
 #include "schema/schema_fwd.hh"
 #include "utils/chunked_vector.hh"
 #include "write_buffer.hh"
@@ -495,6 +496,9 @@ public:
     virtual bool automatic_compaction_disabled() const noexcept {
         return false;
     }
+
+    // Returns the token range of the group.
+    virtual const dht::token_range& token_range() const noexcept = 0;
 
     virtual primary_index& logstor_index() noexcept = 0;
     virtual const primary_index& logstor_index() const noexcept = 0;

@@ -54,6 +54,9 @@ public:
     ::table_id table_id() const noexcept override {
         return {};
     }
+    const dht::token_range& token_range() const noexcept override {
+        std::abort();
+    }
     bool automatic_compaction_disabled() const noexcept override {
         return automatic_compaction_off;
     }
