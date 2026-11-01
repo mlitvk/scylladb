@@ -264,6 +264,8 @@ public:
     // finished the recovery, and must not ask for a file after the next one.
     bool check_file_ready_for_new_segment(file_id_t);
 
+    unsigned shard() const noexcept { return _cfg.shard; }
+
     uint64_t allocated_file_count() const noexcept { return _allocated_file_count; }
 
     // The open file. The caller must ask for an allocated file, which is open.
