@@ -43,6 +43,7 @@
 #include "replica/logstor/write_buffer.hh"
 #include <seastar/testing/thread_test_case.hh>
 
+#include "replica/logstor/segment_file.hh"
 #include "replica/logstor/segment_io.hh"
 #include "replica/database.hh"
 #include "schema/schema_builder.hh"
@@ -4217,6 +4218,84 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_erase_drains_every_group_of_the_table) {
     other.flush_separator().get();
 
     BOOST_REQUIRE_EQUAL(cg.logstor_index().get_usage().key_count, 0u);
+    require_recovery_matches(ls, schema->id(), cg.logstor_index());
+}
+
+// Returns the number of segments in the data files of `dir` whose first chunk is a full chunk of
+// `table`. A segment whose first block holds zeros holds no chunk.
+size_t count_full_segments_on_disk(const std::filesystem::path& dir, ::table_id table) {
+    const logstor_params params;
+    const uint64_t segments_per_file = params.file_size / params.segment_size;
+    size_t count = 0;
+    for (uint64_t file_id = 0;; ++file_id) {
+        const auto path = file_name::data(this_shard_id(), file_id).in(dir).native();
+        if (!seastar::file_exists(path).get()) {
+            return count;
+        }
+        auto f = seastar::open_file_dma(path, seastar::open_flags::ro).get();
+        auto close_f = seastar::defer([&f] noexcept { f.close().get(); });
+        const auto file_size = f.size().get();
+        for (uint64_t i = 0; i < segments_per_file && (i + 1) * params.segment_size <= file_size; ++i) {
+            auto block = f.dma_read_exactly<char>(i * params.segment_size, ondisk::block_alignment).get();
+            auto in = seastar::util::as_input_stream(std::move(block));
+            auto info = read_chunk_info(in, log_segment_id(file_id * segments_per_file + i)).get();
+            in.close().get();
+            if (info && info->kind() == segment_kind::full && std::get<segment_info::full>(info->v).table == table) {
+                ++count;
+            }
+        }
+    }
+}
+
+// An erase zeroes the first block of each segment that it frees, so that recovery skips the
+// segment.
+SEASTAR_THREAD_TEST_CASE(test_logstor_erase_zeroes_the_segments_that_it_frees) {
+    auto schema = make_kv_schema();
+    started_logstor store;
+    auto& ls = store.ls();
+
+    test_logstor_group cg(schema, ls);
+    auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+
+    write_and_flush_segment(ls, cg, make_kv_mutation(schema, "pk0", "v0"));
+    write_and_flush_segment(ls, cg, make_kv_mutation(schema, "pk1", "v0"));
+    BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 2u);
+    BOOST_REQUIRE_EQUAL(count_full_segments_on_disk(store.dir(), schema->id()), 2u);
+
+    ls.erase(schema->id(), cg.logstor_index(), dht::token_range()).get();
+    BOOST_REQUIRE(cg.logstor_segments().empty());
+    BOOST_REQUIRE_EQUAL(count_full_segments_on_disk(store.dir(), schema->id()), 0u);
+    require_recovery_matches(ls, schema->id(), cg.logstor_index());
+}
+
+// The erased range covers the records of the segments that an erase frees, so the zeroing of the
+// segments is not needed for correctness. An erase whose zeroing fails still frees the segments
+// and does not fail.
+SEASTAR_THREAD_TEST_CASE(test_logstor_erase_frees_the_segments_when_their_zeroing_fails) {
+    if constexpr (!std::is_same_v<utils::error_injection_type, utils::error_injection<true>>) {
+        return;
+    }
+    auto schema = make_kv_schema();
+    started_logstor store;
+    auto& ls = store.ls();
+
+    auto& sm = ls.get_segment_manager();
+    test_logstor_group cg(schema, ls);
+    auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+
+    write_and_flush_segment(ls, cg, make_kv_mutation(schema, "pk0", "v0"));
+    write_and_flush_segment(ls, cg, make_kv_mutation(schema, "pk1", "v0"));
+    BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 2u);
+
+    const auto in_use_before_erase = sm.get_usage().segment_bytes_in_use;
+    utils::get_local_injector().enable("logstor_erase_zero_fail");
+    auto disable_injection = seastar::defer([] noexcept { utils::get_local_injector().disable("logstor_erase_zero_fail"); });
+    ls.erase(schema->id(), cg.logstor_index(), dht::token_range()).get();
+    BOOST_REQUIRE(cg.logstor_segments().empty());
+    // The erase also drops the active segment, which is below the sequence of the erase, so the
+    // erase can free more than the two segments of the group.
+    BOOST_REQUIRE_GE(in_use_before_erase - sm.get_usage().segment_bytes_in_use, 2 * sm.get_segment_size());
+    BOOST_REQUIRE_EQUAL(count_full_segments_on_disk(store.dir(), schema->id()), 2u);
     require_recovery_matches(ls, schema->id(), cg.logstor_index());
 }
 
