@@ -1702,8 +1702,7 @@ future<> segment_manager_impl::switch_active_segment_above(segment_sequence seq)
 // Takes the segments of `group` out of the group after an erase removed the records of the group
 // from the index. Compaction of the group must be disabled. Each segment ends in one of these
 // states:
-// - A segment with no live record is taken out of the group, its first block is zeroed, and it is
-//   freed.
+// - A segment with no live record and no other reference is freed.
 // - A segment with no live record and another reference is an internal error.
 // - A segment with live records stays in the group for compaction. An erase of part of the range
 //   of the group leaves such segments.
@@ -1741,24 +1740,16 @@ future<> segment_manager_impl::free_erased_segments(logstor_group& group, group_
         co_await coroutine::maybe_yield();
     }
 
-    // Removing the segments cannot fail, so every segment taken out of the group below is also
-    // freed further down.
+    logstor_logger.debug("Freeing {} segments of table {} after an erase", segments.size(), group.table_id());
+
+    // Removing and freeing a segment cannot fail, so every segment taken out of the group is also
+    // freed. The segments keep their chunks on disk, but the erased range covers their records, so
+    // the next recovery keeps none of them and finds the segments free.
     for (auto seg_id : segments) {
         ss.remove_segment(get_segment_descriptor(seg_id));
+        free_segment(seg_id);
         co_await coroutine::maybe_yield();
     }
-
-    logstor_logger.debug("Discarding {} segments", segments.size());
-
-    // Invalidate the first header block so recovery treats the segment as empty. The erased range
-    // covers the records either way; this only makes the segment's space count as free at once.
-    co_await max_concurrent_for_each(segments, 32, [this] (log_segment_id seg_id) -> future<> {
-        logstor_logger.trace("Discard segment {}", seg_id);
-        auto [file_id, file_offset] = segment_id_to_file_location(seg_id);
-        // The segments being discarded were written, so their file is allocated.
-        co_await _file_mgr.zero_region(file_id, file_offset, block_alignment);
-        free_segment(seg_id);
-    });
 }
 
 future<std::optional<segment_info>> segment_manager_impl::read_segment_info(log_segment_id segment_id) {
@@ -2570,11 +2561,12 @@ future<segment_manager_impl::rebuild_index_result> segment_manager_impl::rebuild
         [this, &cmp_with_seq, &resolve, &erased, &segment_infos, &result, &on_segment_scanned] (uint64_t seg_idx) -> future<> {
             const log_segment_id seg_id(seg_idx);
             // The scan reads a whole segment in its first read, also when the first chunk is not
-            // valid. A segment that was never written, or that discard_segments() freed, starts
-            // with a block of zeros, and most segments of a new store are like this. So read only
-            // the headers of the first chunk first, and scan the segment only when they are valid.
-            // The scanner checks the headers of the first chunk in the same way, so it would find
-            // no chunk in the segments that this check skips.
+            // valid. A segment that was never written starts with a block of zeros, and most
+            // segments of a new store are like this. So read only the headers of the first chunk
+            // first, and scan the segment only when they are valid. The scanner checks the headers
+            // of the first chunk in the same way, so it would find no chunk in the segments that
+            // this check skips. A segment that an erase freed keeps its chunks, so the scan reads
+            // it whole, and the erased range leaves out its records.
             if (auto info = co_await read_segment_info(seg_id)) {
                 logstor_logger.trace("Recovering segment {} with sequence {}", seg_id, info->segment_seq);
                 const auto seq = info->segment_seq;
