@@ -1276,6 +1276,8 @@ public:
     ::table_id table_id() const noexcept override;
     bool automatic_compaction_disabled() const noexcept override;
 
+    const dht::token_range& token_range() const noexcept override;
+
     logstor::primary_index& logstor_index() noexcept override;
     const logstor::primary_index& logstor_index() const noexcept override;
 
@@ -1306,6 +1308,10 @@ compaction_group_logstor_state::compaction_group_logstor_state(compaction_group&
 
 ::table_id compaction_group_logstor_state::table_id() const noexcept {
     return _cg->schema()->id();
+}
+
+const dht::token_range& compaction_group_logstor_state::token_range() const noexcept {
+    return _cg->token_range();
 }
 
 logstor::primary_index& compaction_group_logstor_state::logstor_index() noexcept {
