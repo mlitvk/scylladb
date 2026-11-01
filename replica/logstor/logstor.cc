@@ -129,6 +129,18 @@ future<> logstor::flush_to_separator() {
     co_await _segment_manager.await_pending_writes();
 }
 
+future<> logstor::erase(table_id table, primary_index& index, dht::token_range range, logstor_group* stopped_group) {
+    auto gate_holder = _async_gate.hold();
+    // Every write accepted before the fence is in a separator buffer once this returns. A stopped
+    // group that covers the range needs none of it: its gate closed when every write to it, and
+    // the separator task carrying it, was done, see write_target::alive_holder. The flush seals a
+    // mixed buffer for the whole shard, which a tablet cleanup need not pay for.
+    if (!stopped_group || !stopped_group->token_range().contains(range, dht::token_comparator())) {
+        co_await flush_to_separator();
+    }
+    co_await _segment_manager.erase(table, index, std::move(range), stopped_group);
+}
+
 future<> logstor::write(const mutation& m, write_target target, db::timeout_clock::time_point timeout) noexcept {
     try {
         return do_write(*m.schema(), m.decorated_key(), record_timestamp(m), encode_record_value(m),
