@@ -7,6 +7,7 @@
  */
 #include "replica/logstor/logstor.hh"
 #include <seastar/core/coroutine.hh>
+#include <seastar/util/defer.hh>
 #include <seastar/util/log.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/metrics.hh>
@@ -69,7 +70,7 @@ logstor::logstor(logstor_config config, ::cache_tracker& shared_cache_tracker)
         sm::make_gauge("queued_write_count", [this] { return _write_buffer.queued_write_count(); },
                        sm::description("Number of writes currently queued in the write buffer.")),
         sm::make_counter("write_failures", [this] { return _stats.write_failures; },
-                       sm::description("Number of writes that failed to be persisted.")),
+                       sm::description("Counts the writes that failed.")),
     });
 }
 
@@ -151,6 +152,7 @@ future<> logstor::write(const mutation& m, write_target target, db::timeout_cloc
         return do_write(*m.schema(), m.decorated_key(), record_timestamp(m), encode_record_value(m),
                 std::move(target), timeout);
     } catch (...) {
+        _stats.write_failures++;
         return current_exception_as_future();
     }
 }
@@ -161,12 +163,17 @@ future<> logstor::write(const frozen_mutation& m, const schema& s, write_target 
         return do_write(s, m.decorated_key(s), record_timestamp(m), encode_record_value(m, s),
                 std::move(target), timeout);
     } catch (...) {
+        _stats.write_failures++;
         return current_exception_as_future();
     }
 }
 
 future<> logstor::do_write(const schema& s, dht::decorated_key dk, api::timestamp_type ts, record_value value,
         write_target target, db::timeout_clock::time_point timeout) {
+    // Every exit before the index insert is a failed write: a closed gate, a failure to buffer or
+    // persist the record, an allocation failure. The write() overloads count a failure that happens
+    // before this coroutine starts.
+    auto count_failure = defer([this] noexcept { _stats.write_failures++; });
     auto gate_holder = _async_gate.hold();
 
     auto& cg = *target.cg;
@@ -189,12 +196,10 @@ future<> logstor::do_write(const schema& s, dht::decorated_key dk, api::timestam
     // cost a coroutine frame per write to do nothing else.
     auto accepted_f = co_await coroutine::as_future(_write_buffer.write_to_buffer(std::move(writer), timeout, std::move(target)));
     if (accepted_f.failed()) {
-        _stats.write_failures++;
         co_await coroutine::return_exception_ptr(accepted_f.get_exception());
     }
     auto persisted_f = co_await coroutine::as_future(std::move(accepted_f.get().persisted));
     if (persisted_f.failed()) {
-        _stats.write_failures++;
         co_await coroutine::return_exception_ptr(persisted_f.get_exception());
     }
     auto [location, op] = persisted_f.get();
@@ -203,6 +208,7 @@ future<> logstor::do_write(const schema& s, dht::decorated_key dk, api::timestam
         .timestamp = ts,
     };
     index.insert(key, std::move(new_entry));
+    count_failure.cancel();
 }
 
 }
