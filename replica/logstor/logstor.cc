@@ -129,6 +129,23 @@ future<> logstor::flush_to_separator() {
     co_await _segment_manager.await_pending_writes();
 }
 
+future<> logstor::erase(table_id table, primary_index& index, dht::token_range range, logstor_group* stopped_group) {
+    auto gate_holder = _async_gate.hold();
+    if (!raw_token_bounds::of(range)) {
+        // The range holds no token, so the erase has nothing to do. The early return also skips the
+        // flush below, which seals the mixed buffer of the shard.
+        co_return;
+    }
+    // The flush puts every write that came before the fence into a separator buffer. The flush
+    // seals the mixed buffer of the whole shard, so the erase skips it when a stopped group covers
+    // the range, because the gate of a stopped group closed only after each write to the group and
+    // its separator task were done, see write_target::alive_holder.
+    if (!stopped_group || !stopped_group->token_range().contains(range, dht::token_comparator())) {
+        co_await flush_to_separator();
+    }
+    co_await _segment_manager.erase(table, index, std::move(range), stopped_group);
+}
+
 future<> logstor::write(const mutation& m, write_target target, db::timeout_clock::time_point timeout) noexcept {
     try {
         return do_write(*m.schema(), m.decorated_key(), record_timestamp(m), encode_record_value(m),

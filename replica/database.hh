@@ -1206,7 +1206,8 @@ public:
     bool needs_flush() const;
     future<> clear(); // discards memtable(s) without flushing them to disk.
     future<db::replay_position> discard_sstables(db_clock::time_point);
-    future<> discard_logstor_segments();
+    // Erases all logstor records of the table on this shard.
+    future<> truncate_logstor();
 
     bool can_flush() const;
 

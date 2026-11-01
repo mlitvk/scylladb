@@ -398,6 +398,10 @@ public:
     future<> submit_normal_compaction(logstor_group&, compaction_batch_limits limits) override;
     future<> submit_split_compaction(logstor_group&, mutation_writer::classify_by_token_group, split_target_group) override;
 
+    // Returns the registered groups of `index` whose token range overlaps `range`. The result stays
+    // valid while the caller holds the erase semaphore of the index, see remove().
+    std::vector<logstor_group*> groups_of(const primary_index& index, const dht::token_range& range) const;
+
 private:
     // compaction_driver::host
     future<compaction_driver::ranking> find_top_compaction_candidates(const compaction_batch_limits&, size_t max_candidates,
@@ -782,7 +786,7 @@ public:
         return sstring(_file_mgr.file_path(segment_id_to_file_location(segment_id).file_id).native());
     }
 
-    future<> discard_segments(logstor_group&);
+    future<> erase(table_id, primary_index&, dht::token_range, logstor_group* stopped_group);
 
     size_t get_memory_usage() const noexcept {
         return _segment_descs.capacity() * sizeof(segment_descriptor)
@@ -902,6 +906,9 @@ private:
     }
 
     void free_segment(log_segment_id) noexcept;
+
+    using group_stopped = bool_class<struct group_stopped_tag>;
+    future<> free_erased_segments(logstor_group&, group_stopped);
 
     segment_descriptor& get_segment_descriptor(log_segment_id segment_id) noexcept {
         return _segment_descs[segment_id.value];
@@ -1576,19 +1583,75 @@ void segment_manager_impl::free_segment(log_segment_id segment_id) noexcept {
     _stats.segments_freed++;
 }
 
-future<> segment_manager_impl::discard_segments(logstor_group& cg) {
-    auto compaction_disable_guard = co_await _compaction_mgr.disable_compaction(cg);
-
+// Erases the records of `table` in `range`. The caller fences the writes to the range until the
+// erase ends, and drains the write path into the separator first, see logstor::erase(). The caller
+// can skip the drain when `range` is inside `stopped_group`, because the gate of a stopped group
+// closed after each write to the group was done (compaction_group::stop()).
+//
+// The groups are the registered groups of `index` that overlap `range`, and `stopped_group` when
+// the caller gives one. A stopped group is no longer registered, so the erase cannot find it.
+future<> segment_manager_impl::erase(table_id table, primary_index& index, dht::token_range range, logstor_group* stopped_group) {
     auto holder = _async_gate.hold();
+    auto units = co_await get_units(index.erase_semaphore(), 1);
 
-    auto& ss = cg.logstor_segments();
+    // The erase finds the groups only after it holds the semaphore, because a group that the caller
+    // saw before can be gone, and a tablet split or a migration can add a group. While the erase
+    // holds the semaphore, no group of the list is removed, see compaction_manager_impl::remove().
+    //
+    // A group that joins after this point, for example a child of a split that is still running, is
+    // not in the list. The index erase covers its records like the others, but its segments stay in
+    // the group, with no live record, until compaction frees them.
+    auto groups = _compaction_mgr.groups_of(index, range);
+    if (stopped_group && !std::ranges::contains(groups, stopped_group)) {
+        groups.push_back(stopped_group);
+    }
 
-    // Collect and validate the segments to discard before removing any of them, so that this
-    // cannot fail with a segment already out of the group but not yet freed, which would leak it
-    // and leave its data on disk for recovery to find.
-    // Compaction is the only thing that removes segments from a group and it is disabled here, so
-    // the positions of the first `segment_count` segments stay valid. Segments appended while this runs
-    // are past `segment_count` and are left in the group.
+    // The caller drained the write path into the separator, and the erase flushes the separator
+    // buffers of the groups here, so that every record of the range is in a segment of a group. The
+    // flush comes before compaction is disabled, because a flush needs a free segment for each group
+    // and compaction frees segments.
+    co_await coroutine::parallel_for_each(groups, [] (logstor_group* group) {
+        return group->flush_separator();
+    });
+    std::vector<compaction_reenabler> compaction_disabled;
+    compaction_disabled.reserve(groups.size());
+    co_await coroutine::parallel_for_each(groups, [this, &compaction_disabled] (logstor_group* group) {
+        return _compaction_mgr.disable_compaction(*group).then([&compaction_disabled] (compaction_reenabler reenabler) {
+            compaction_disabled.push_back(std::move(reenabler));
+        });
+    });
+
+    co_await index.erase(range);
+    if (index.has_keys_in(range)) {
+        // A write that lands in the range during the erase leaves a key in the range, so this is a
+        // warning and not an error.
+        logstor_logger.warn("Erase of table {} range {} left keys in the range", table, range);
+    }
+    // A reader that took a location of the range before the index erase can still read it, so the
+    // readers must finish before the segments are freed, see free_segment().
+    co_await index.await_pending_reads();
+    co_await coroutine::parallel_for_each(groups, [this, stopped_group] (logstor_group* group) {
+        return free_erased_segments(*group, group_stopped(group == stopped_group));
+    });
+}
+
+// Takes the segments of `group` out of the group after an erase removed the records of the group
+// from the index. Compaction of the group must be disabled. Each segment ends in one of these
+// states:
+// - A segment with no live record is taken out of the group, its first block is zeroed, and it is
+//   freed.
+// - A segment with no live record and another reference is an internal error.
+// - A segment with live records stays in the group for compaction. An erase of part of the range
+//   of the group leaves such segments.
+// - A segment with live records in a stopped group is an internal error, because the erase removed
+//   the whole range of a stopped group and nothing streams into it.
+future<> segment_manager_impl::free_erased_segments(logstor_group& group, group_stopped stopped) {
+    auto& ss = group.logstor_segments();
+
+    // Collect the segments before removing any of them, so that this cannot fail with a segment
+    // already out of the group but not yet freed, which would leak it. Compaction is the only
+    // thing that removes segments from a group and it is disabled, so the positions of the first
+    // `segment_count` segments stay valid.
     const auto segment_count = ss.segment_count();
     utils::chunked_vector<log_segment_id> segments;
     segments.reserve(segment_count);
@@ -1596,14 +1659,18 @@ future<> segment_manager_impl::discard_segments(logstor_group& cg) {
         auto& desc = ss.segment_at(i);
         auto seg_id = desc_to_segment_id(desc);
 
+        if (desc.record_bytes(_cfg.segment_size) != 0) {
+            if (stopped) {
+                on_internal_error(logstor_logger, fmt::format("{} of the stopped group of table {} has {} bytes of live records after the erase of its range",
+                        seg_id, group.table_id(), desc.record_bytes(_cfg.segment_size)));
+            }
+            logstor_logger.trace("Leaving {} with live records in its group", seg_id);
+            continue;
+        }
+
         // Belonging to the group is the only reference the segment may have left.
         if (desc.ref_count != 1) {
             on_internal_error(logstor_logger, format("Discarding segment {} with non-zero reference count", seg_id));
-        }
-
-        // the index should be cleared before discarding segments, so no data should be reachable
-        if (desc.record_bytes(_cfg.segment_size) != 0) {
-            on_internal_error(logstor_logger, format("Discarding segment {} that has data", seg_id));
         }
 
         segments.push_back(seg_id);
@@ -1619,7 +1686,7 @@ future<> segment_manager_impl::discard_segments(logstor_group& cg) {
 
     logstor_logger.debug("Discarding {} segments", segments.size());
 
-    // Invalidate the first header block so recovery treats the slot as empty.
+    // Invalidate the first header block so recovery treats the segment as empty.
     co_await max_concurrent_for_each(segments, 32, [this] (log_segment_id seg_id) -> future<> {
         logstor_logger.trace("Discard segment {}", seg_id);
         auto [file_id, file_offset] = segment_id_to_file_location(seg_id);
@@ -1709,6 +1776,11 @@ future<> compaction_manager_impl::stop_ongoing_compactions(logstor_group& cg) {
 }
 
 future<> compaction_manager_impl::remove(logstor_group& cg) {
+    // A running erase of the group's index can have the group in its list. The removal waits for
+    // the erase semaphore of the index, so the group leaves the registry only between erases. Each
+    // path that destroys a group stops it first, and the stop calls remove(), so no erase uses a
+    // destroyed group.
+    auto erase_units = co_await get_units(cg.logstor_index().erase_semaphore(), 1);
     auto it = _groups.find(&cg);
     if (it == _groups.end()) {
         co_return;
@@ -1716,6 +1788,7 @@ future<> compaction_manager_impl::remove(logstor_group& cg) {
 
     auto state = std::move(it->second);
     _groups.erase(it);
+    erase_units.return_all();
 
     auto close_result = co_await coroutine::as_future(cg.close_separator());
     if (close_result.failed()) {
@@ -1728,6 +1801,16 @@ future<> compaction_manager_impl::remove(logstor_group& cg) {
     state->as.request_abort();
     auto f = co_await coroutine::as_future(state->completion.get_future());
     f.ignore_ready_future();
+}
+
+std::vector<logstor_group*> compaction_manager_impl::groups_of(const primary_index& index, const dht::token_range& range) const {
+    std::vector<logstor_group*> groups;
+    for (const auto& [cg, state] : _groups) {
+        if (&cg->logstor_index() == &index && cg->token_range().overlaps(range, dht::token_comparator())) {
+            groups.push_back(cg);
+        }
+    }
+    return groups;
 }
 
 future<compaction_reenabler> compaction_manager_impl::disable_compaction(logstor_group& cg) {
@@ -2652,8 +2735,8 @@ sstring segment_manager::get_segment_file_path(log_segment_id segment_id) const 
     return _impl->get_segment_file_path(segment_id);
 }
 
-future<> segment_manager::discard_segments(logstor_group& cg) {
-    return _impl->discard_segments(cg);
+future<> segment_manager::erase(table_id table, primary_index& index, dht::token_range range, logstor_group* stopped_group) {
+    return _impl->erase(table, index, std::move(range), stopped_group);
 }
 
 segment_manager_usage segment_manager::get_usage() const noexcept {

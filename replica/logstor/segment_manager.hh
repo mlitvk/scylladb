@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <vector>
 #include <seastar/core/shared_future.hh>
 #include <seastar/core/file.hh>
 #include <seastar/core/rwlock.hh>
@@ -19,6 +20,7 @@
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/util/bool_class.hh>
 #include "bytes_fwd.hh"
+#include "dht/i_partitioner_fwd.hh"
 #include "mutation_writer/token_group_based_splitting_writer.hh"
 #include "replica/logstor/segment_io.hh"
 #include "replica/logstor/write_buffer.hh"
@@ -188,10 +190,11 @@ public:
     // be called on the shard owning the segment.
     sstring get_segment_file_path(log_segment_id) const;
 
-    // Removes all the segments of the group and frees them. Waits for an ongoing compaction of
-    // the group and keeps compaction disabled while discarding, so the caller doesn't have to.
-    // The index must be cleared first, so that no record of the group is reachable.
-    future<> discard_segments(logstor_group&);
+    // Erases all the records of `table` in `range`, so that reads do not find them. The caller must
+    // fence the writes to the range until the erase ends, and must drain the write path first.
+    // `stopped_group` is a stopped group of the range, which is no longer registered, so the erase
+    // cannot find it.
+    future<> erase(table_id, primary_index&, dht::token_range, logstor_group* stopped_group = nullptr);
 
     segment_manager_usage get_usage() const noexcept;
 

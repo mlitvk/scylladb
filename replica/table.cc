@@ -1261,9 +1261,11 @@ future<> compaction_group::split(compaction::compaction_type_options::split opt,
     }
 }
 
-future<> compaction_group::discard_logstor_segments() {
-    auto& sm = get_logstor_segment_manager();
-    co_await sm.discard_segments(as_logstor_group());
+future<> compaction_group::erase_logstor() {
+    // The erase cannot find a stopped group in the registry, so the call gives the group when it is
+    // stopped. A live group is registered, so the erase finds it and drains its writes like the
+    // writes of other groups.
+    co_await _t._logstor->erase(_t.schema()->id(), _t.logstor_index(), token_range(), stopped() ? &as_logstor_group() : nullptr);
 }
 
 class compaction_group_logstor_state final : public logstor::logstor_group {
@@ -4981,16 +4983,13 @@ future<db::replay_position> table::discard_sstables(db_clock::time_point truncat
     co_return rp;
 }
 
-future<> table::discard_logstor_segments() {
+future<> table::truncate_logstor() {
     if (!uses_logstor()) {
         co_return;
     }
 
-    co_await _logstor_index->clear();
-
-    co_await parallel_foreach_compaction_group([] (compaction_group& cg) {
-        return cg.discard_logstor_segments();
-    });
+    // The erase finds the table's groups itself.
+    co_await _logstor->erase(_schema->id(), *_logstor_index, dht::token_range());
 }
 
 void table::mark_ready_for_writes(db::commitlog* cl) {
@@ -6074,8 +6073,7 @@ future<> compaction_group::cleanup() {
     _t.rebuild_statistics();
 
     if (_t.uses_logstor()) {
-        co_await _t.logstor_index().erase(token_range());
-        co_await discard_logstor_segments();
+        co_await erase_logstor();
     }
 
     if (!_sstables_compacted_but_not_deleted.empty()) {

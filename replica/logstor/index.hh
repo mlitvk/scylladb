@@ -10,6 +10,7 @@
 #include "dht/i_partitioner.hh"
 #include <functional>
 #include <limits>
+#include <seastar/core/semaphore.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 #include <optional>
 #include "dht/token.hh"
@@ -360,6 +361,10 @@ private:
 
     mutable utils::phased_barrier _reads_phaser{"logstor_primary_index"};
 
+    // Serializes the erases of the index with each other and with the removal of the index's groups
+    // from the compaction manager, see segment_manager::erase().
+    seastar::semaphore _erase_sem{1};
+
     // Non-owning pointer to the cache tracker; null when the cache is not set up.
     // Mutable so that logically-const methods can call non-const methods on the
     // tracker (touch, insert) for LRU accounting.
@@ -491,6 +496,15 @@ public:
 
     future<> await_pending_reads() {
         return _reads_phaser.advance_and_await();
+    }
+
+    seastar::semaphore& erase_semaphore() noexcept {
+        return _erase_sem;
+    }
+
+    // Returns whether the index holds a key in `tr`.
+    bool has_keys_in(const dht::token_range& tr) const {
+        return position_at_range_start(tr) != position_at_range_end(tr);
     }
 
     token_range_scan scan(const dht::token_range& tr = dht::token_range()) const {

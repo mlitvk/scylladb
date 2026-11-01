@@ -3315,7 +3315,6 @@ struct database::table_truncate_state {
     db_clock::time_point truncated_at;
     bool persist_truncation_record;
     std::vector<compaction::compaction_reenabler> cres;
-    std::vector<replica::logstor::compaction_reenabler> logstor_cres;
     bool did_flush;
 };
 
@@ -3364,7 +3363,6 @@ future<> database::truncate_table_on_all_shards(sharded<database>& sharded_db, s
                     st->cres.emplace_back(co_await cm.stop_and_disable_compaction("truncate", ts));
                 });
             });
-            // for logstor tables, we disable compaction only after the flush. see below.
 
             co_return make_foreign(std::move(st));
         });
@@ -3398,15 +3396,6 @@ future<> database::truncate_table_on_all_shards(sharded<database>& sharded_db, s
         co_await coroutine::parallel_for_each(views, [&] (lw_shared_ptr<replica::table> v) -> future<> {
             co_await flush_or_clear(*v);
         });
-        if (cf.uses_logstor()) {
-            // flush and only then disable the compaction. flush writes to new segments, and the compaction
-            // is what generates free segments for new writes.
-            co_await cf.flush_separator();
-            auto& logstor_cm = cf.get_logstor_compaction_manager();
-            co_await cf.parallel_foreach_logstor_compaction_group([&logstor_cm, &st] (replica::compaction_group& cg) -> future<> {
-                st.logstor_cres.emplace_back(co_await logstor_cm.disable_compaction(cg.as_logstor_group()));
-            });
-        }
         // Since writes could be appended to active memtable between getting low_mark above
         // and flush, the low_mark has to be adjusted to account for those writes, where
         // memtable was flushed with a higher replay position than the one obtained above.
@@ -3457,7 +3446,9 @@ future<> database::truncate(db::system_keyspace& sys_ks, column_family& cf, std:
     dblog.debug("Discarding sstable data for truncated CF + indexes");
     // TODO: notify truncation
 
-    co_await cf.discard_logstor_segments();
+    // The erase does all the logstor work of the truncate. It drains the write path and the
+    // separator buffers and disables compaction itself.
+    co_await cf.truncate_logstor();
 
     db::replay_position rp = co_await cf.discard_sstables(truncated_at);
     // TODO: indexes.

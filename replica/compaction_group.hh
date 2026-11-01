@@ -348,7 +348,8 @@ public:
         _repair_sstable_classifier = std::move(repair_sstable_classifier);
     }
 
-    future<> discard_logstor_segments();
+    // Erases the logstor records of the group.
+    future<> erase_logstor();
 
     future<> flush_separator(std::optional<logstor::segment_sequence> seq_num = std::nullopt);
 
