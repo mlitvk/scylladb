@@ -790,6 +790,7 @@ private:
 
     using group_stopped = bool_class<struct group_stopped_tag>;
     future<> free_erased_segments(logstor_group&, group_stopped);
+    future<> zero_first_blocks(const utils::chunked_vector<log_segment_id>&) noexcept;
 
     segment_descriptor& get_segment_descriptor(log_segment_id segment_id) noexcept {
         return _segment_descs[segment_id.value];
@@ -1689,7 +1690,7 @@ void segment_manager_impl::raise_active_segment_floor(segment_sequence seq) noex
 // from the index. Compaction of the group must be disabled. Each segment ends in one of these
 // states:
 // - A segment with no live record is taken out of the group, its first block is zeroed, and it is
-//   freed.
+//   freed. The zeroing is not needed for correctness, see zero_first_blocks().
 // - A segment with no live record and another reference is an internal error.
 // - A segment with live records stays in the group for compaction. An erase of part of the range
 //   of the group leaves such segments.
@@ -1727,24 +1728,43 @@ future<> segment_manager_impl::free_erased_segments(logstor_group& group, group_
         co_await coroutine::maybe_yield();
     }
 
-    // Removing the segments cannot fail, so every segment taken out of the group below is also
-    // freed further down.
+    logstor_logger.debug("Freeing {} segments of table {} after an erase", segments.size(), group.table_id());
+
+    // Removing a segment, zero_first_blocks() and freeing a segment cannot fail, so every segment
+    // taken out of the group is also freed.
     for (auto seg_id : segments) {
         ss.remove_segment(get_segment_descriptor(seg_id));
         co_await coroutine::maybe_yield();
     }
-
-    logstor_logger.debug("Discarding {} segments", segments.size());
-
-    // Invalidate the first header block so recovery treats the segment as empty. The erased range
-    // covers the records either way; this only makes the segment's space count as free at once.
-    co_await max_concurrent_for_each(segments, 32, [this] (log_segment_id seg_id) -> future<> {
-        logstor_logger.trace("Discard segment {}", seg_id);
-        auto [file_id, file_offset] = _geometry.position_of(seg_id);
-        // The segments being discarded were written, so their file is allocated.
-        co_await _file_mgr.zero_region(file_id, file_offset, block_alignment);
+    co_await zero_first_blocks(segments);
+    for (auto seg_id : segments) {
         free_segment(seg_id);
-    });
+        co_await coroutine::maybe_yield();
+    }
+}
+
+// Writes zeros over the first block of each of `segments`, so that recovery finds no chunk in them.
+// The erased range covers the records of the segments, so the zeros are not needed for correctness.
+// They make recovery skip the segments in place of reading them whole, and they let the erased
+// range become obsolete, because recovery finds no chunk at its sequence in these segments, see
+// erased_ranges::drop_obsolete(). So a failure only logs.
+//
+// The caller must free the segments only after the returned future resolves, because a freed
+// segment can take a new chunk, which the zeros would overwrite.
+future<> segment_manager_impl::zero_first_blocks(const utils::chunked_vector<log_segment_id>& segments) noexcept {
+    auto zeroed = co_await coroutine::as_future(futurize_invoke([this, &segments] {
+        return max_concurrent_for_each(segments, 32, [this] (log_segment_id seg_id) -> future<> {
+            utils::get_local_injector().inject("logstor_erase_zero_fail", [] {
+                throw std::runtime_error("zeroing of a segment failed by injection");
+            });
+            auto [file_id, file_offset] = _geometry.position_of(seg_id);
+            co_await _file_mgr.zero_region(file_id, file_offset, block_alignment);
+        });
+    }));
+    if (zeroed.failed()) {
+        logstor_logger.warn("Failed to zero the first block of a segment that an erase freed, so recovery reads the segment until it is written again: {}",
+                zeroed.get_exception());
+    }
 }
 
 future<std::optional<segment_info>> segment_manager_impl::read_segment_info(log_segment_id segment_id) {
@@ -2559,8 +2579,8 @@ future<segment_manager_impl::rebuild_index_result> segment_manager_impl::rebuild
         [this, &cmp_with_seq, &resolve, &erased, &segment_infos, &result, &on_segment_scanned] (uint64_t seg_idx) -> future<> {
             const log_segment_id seg_id(seg_idx);
             // The scan reads a whole segment in its first read, also when the first chunk is not
-            // valid. A segment that was never written, or that discard_segments() freed, starts
-            // with a block of zeros, and most segments of a new store are like this. So read only
+            // valid. A segment that was never written, or that an erase zeroed, starts with a block
+            // of zeros, and most segments of a new store are like this. So read only
             // the headers of the first chunk first, and scan the segment only when they are valid.
             // The scanner checks the headers of the first chunk in the same way, so it would find
             // no chunk in the segments that this check skips.
