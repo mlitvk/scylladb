@@ -4917,7 +4917,8 @@ future<> table::truncate_logstor() {
         co_return;
     }
 
-    // The erase finds the table's groups itself.
+    // Logstor writes do not go through the commitlog, so there is no replay position to cut here:
+    // the erase watermark is the whole cut. The erase finds the table's groups itself.
     co_await _logstor->erase(_schema->id(), *_logstor_index, dht::token_range());
 }
 

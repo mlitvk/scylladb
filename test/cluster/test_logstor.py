@@ -1171,7 +1171,9 @@ async def test_recovery_after_tablet_migration(manager: ScyllaClusterManager):
     After a tablet migrates to another shard, the source shard still holds the tablet's records on
     disk: the originals sit in the mixed segments they were written to, which the separator freed
     without erasing once it had moved them. Recovery must neither fail the node on them nor revive
-    them - they belong to no compaction group of that shard - and it counts what it dropped.
+    them. The erase watermark that cleanup left behind covers them, so recovery never offers them
+    to the index, and its tripwire - the warning about records that belong to no compaction group
+    of the shard - is not logged.
     """
     cmdline = ['--logger-log-level', 'logstor=trace', '--smp=2']
     cfg = {'experimental_features': ['logstor']}
@@ -1208,8 +1210,62 @@ async def test_recovery_after_tablet_migration(manager: ScyllaClusterManager):
             assert len(rows) == 1, f"Expected 1 row for key {i} after recovery, but got {len(rows)}"
             assert rows[0].v == f"{i}_{value}", f"Wrong value for key {i} after recovery"
 
-        matches = await server_log.grep(r"Recovery dropped (\d+) records", from_mark=log_mark)
-        assert sum(int(m.group(1)) for _, m in matches) >= nrows
+        assert not await server_log.grep(r"Recovery dropped \d+ records", from_mark=log_mark)
+        metrics = await manager.metrics.query(s1.ip_addr)
+        assert (metrics.get("scylla_logstor_sm_erase_watermarks") or 0) >= 1
+
+async def test_truncate_survives_restarts(manager: ScyllaClusterManager):
+    """
+    Truncate erases everything the table holds, and nothing on disk says so but the erase
+    watermark it persists: the records stay where they were written until their segments are
+    reused.
+    What the watermark must not touch are the writes made after the truncate, one of which carries
+    an older timestamp than the record it replaces, so it only wins if the erased record is never a
+    candidate. They are checked after two restarts: at the second, a recovered sequence counter
+    that ignored the watermark would already have handed the post-truncate writes a sequence the
+    watermark covers.
+    """
+    cmdline = ['--logger-log-level', 'logstor=trace', '--smp=1']
+    cfg = {'experimental_features': ['logstor']}
+    servers = await manager.servers_add(1, cmdline=cmdline, config=cfg)
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "WITH tablets={'initial': 2}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v text) WITH storage_engine = 'logstor'")
+
+        value = 'x' * (30 * 1024)
+        for i in range(10):
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, v) VALUES ({i}, 'before_{value}') USING TIMESTAMP 1000")
+        # Half of it in the tablets' own segments, the rest left in the shared mixed segments.
+        await manager.api.logstor_flush(servers[0].ip_addr)
+        for i in range(10, 15):
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, v) VALUES ({i}, 'before_{value}') USING TIMESTAMP 1000")
+
+        await cql.run_async(f"TRUNCATE TABLE {ks}.test")
+        assert len(await cql.run_async(f"SELECT pk FROM {ks}.test")) == 0
+
+        expected = {}
+        await cql.run_async(f"INSERT INTO {ks}.test (pk, v) VALUES (0, 'after_{value}') USING TIMESTAMP 5")
+        expected[0] = f'after_{value}'
+        for i in range(20, 25):
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, v) VALUES ({i}, 'after_{value}')")
+            expected[i] = f'after_{value}'
+
+        async def check(when: str):
+            rows = await cql.run_async(f"SELECT pk, v FROM {ks}.test")
+            assert {row.pk: row.v for row in rows} == expected, f"Wrong table content {when}"
+
+        await check("after the truncate")
+        server_log = await manager.server_open_log(servers[0].server_id)
+        for restart in range(1, 3):
+            log_mark = await server_log.mark()
+            await manager.server_stop_gracefully(servers[0].server_id)
+            await manager.server_start(servers[0].server_id)
+            cql, _ = await manager.get_ready_cql(servers)
+            await check(f"after restart {restart}")
+            assert not await server_log.grep(r"Recovery dropped \d+ records", from_mark=log_mark)
+            metrics = await manager.metrics.query(servers[0].ip_addr)
+            assert (metrics.get("scylla_logstor_sm_erase_watermarks") or 0) >= 1
 
 @pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
 async def test_tablet_migration_with_compaction(manager: ScyllaClusterManager):
