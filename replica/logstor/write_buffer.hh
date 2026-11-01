@@ -287,8 +287,9 @@ public:
     };
 
 private:
-    // Resolved with the full result, so a write needs no continuation that could fail to allocate
-    // after its record is already in the buffer.
+    // Resolved with the full result, so that write() chains no continuation that can fail to
+    // allocate after the append. A continuation that the caller chains can still fail there, and
+    // the record then has no index entry, the same as a write that fails after its flush.
     struct pending_write {
         promise<record_location_with_holder> done;
         seastar::gate::holder op;
