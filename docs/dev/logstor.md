@@ -180,7 +180,7 @@ what a run has to get right are in the comment at the top of
 Segments are stored in large pre-allocated files on disk. Each file holds a fixed number of segments determined by the `file_size / segment_size` ratio. File names follow the pattern:
 
 ```
-ls_{shard_id}-{file_id}-Data.db
+ls-{shard_id}-Data-{file_id}.db
 ```
 
 Files are pre-formatted (zero-filled) before use.
