@@ -128,6 +128,12 @@ public:
         return _table_id;
     }
 
+    // A test group holds the whole ring.
+    const dht::token_range& token_range() const noexcept override {
+        static const dht::token_range full_ring;
+        return full_ring;
+    }
+
     replica::logstor::primary_index& logstor_index() noexcept override {
         return _index;
     }
