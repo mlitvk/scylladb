@@ -359,8 +359,7 @@ private:
         return _raw.kind() == segment_kind::mixed;
     }
 
-    // Swaps in a recycled vector so the next chunk refills existing capacity instead of regrowing.
-    std::vector<record_in_buffer> take_separator_records(std::vector<record_in_buffer> spare) noexcept;
+    std::vector<record_in_buffer> take_separator_records();
 
     friend class buffered_writer;
     friend class segment_manager_impl;
