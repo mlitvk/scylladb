@@ -69,6 +69,11 @@ Only step 4 writes to the disk - all other steps only update in-memory metadata.
 4. It reads the segments, finding all live records, and writing them into a write buffer. When the buffer is full it is flushed into a new segment, and for each recording updating the index location to the new location.
 5. After all live records are rewritten the old segments are freed.
 
+**Erase:**
+1. Tablet cleanup and truncate remove records from the index without a newer record shadowing them on disk, so the erase is recorded in the shard's erase watermark file (see [On-Disk Format](#erase-watermarks)) before the index entries go: the table, the token range erased and the segment sequence `S` current at the time. Every record of the range written so far sits in a segment at a sequence of at most `S`, because the write path and the groups' separator buffers are drained first and compaction is stopped. The erase finds the table's groups in the range itself, once it holds the shard's erase semaphore, and a group leaves the compaction manager's registry only between erases, so none it works on goes away under it.
+2. The index range is erased, the groups' segments left without live records are freed, and the active segment is switched, so that the next write to the range lands at a sequence above `S`. Writes to the range wait meanwhile: for cleanup the group is stopped.
+The steps and why each is needed, and in that order, are written at `segment_manager::erase()`.
+
 ## Usage
 
 ### Enabling Logstor

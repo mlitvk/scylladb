@@ -290,4 +290,12 @@ inline void require_equal_indexes(const replica::logstor::primary_index& expecte
             describe(expected_entries, actual_entries, "expected"), describe(actual_entries, expected_entries, "actual")));
 }
 
+// Requires that the index of `table` that recovery rebuilds from disk holds the entries of the `live`
+// index. The same rules as for rebuild_index_from_disk() apply: nothing may write, separate or
+// compact while it runs.
+inline void require_recovery_matches(replica::logstor::logstor& ls, ::table_id table, const replica::logstor::primary_index& live) {
+    null_space_accounting accounting;
+    require_equal_indexes(live, *rebuild_index_from_disk(ls, table, accounting));
+}
+
 } // namespace tests::logstor
