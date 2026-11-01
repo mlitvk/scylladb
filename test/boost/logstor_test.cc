@@ -4428,6 +4428,57 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_erase_switches_above_its_watermark) {
     BOOST_REQUIRE_EQUAL(recovery_divergence(ls, schema->id(), cg.logstor_index()), std::string());
 }
 
+// An erase that fails after its watermark is durable still switches above it before the fence
+// comes down. Otherwise the next write lands in the active segment, at or below the watermark,
+// and the next recovery drops it.
+SEASTAR_THREAD_TEST_CASE(test_logstor_failed_erase_switches_above_its_watermark) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    test_recovery_catalog no_tables;
+    ls.do_recovery(no_tables).get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+    auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+
+    utils::get_local_injector().enable("logstor_erase_fail_after_watermark", true /* one shot */);
+    BOOST_REQUIRE_THROW(ls.erase(schema->id(), cg.logstor_index(), dht::token_range()).get(), std::runtime_error);
+
+    ls.write(make_kv_mutation(schema, "pk0", "v0"), write_target(&cg, {}), db::no_timeout).get();
+    ls.flush_to_separator().get();
+    BOOST_REQUIRE_EQUAL(cg.logstor_index().get_key_count(), 1u);
+    BOOST_REQUIRE_EQUAL(recovery_divergence(ls, schema->id(), cg.logstor_index()), std::string());
+}
+
+// An erase that cannot switch above its watermark drops the active segment, so the next write
+// takes a new one above the watermark. The erase itself took effect, so it does not fail.
+SEASTAR_THREAD_TEST_CASE(test_logstor_erase_drops_the_active_segment_when_the_switch_fails) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    test_recovery_catalog no_tables;
+    ls.do_recovery(no_tables).get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+    auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+
+    utils::get_local_injector().enable("logstor_switch_fail", true /* one shot */);
+    ls.erase(schema->id(), cg.logstor_index(), dht::token_range()).get();
+
+    ls.write(make_kv_mutation(schema, "pk0", "v0"), write_target(&cg, {}), db::no_timeout).get();
+    ls.flush_to_separator().get();
+    BOOST_REQUIRE_EQUAL(cg.logstor_index().get_key_count(), 1u);
+    BOOST_REQUIRE_EQUAL(recovery_divergence(ls, schema->id(), cg.logstor_index()), std::string());
+}
+
 // The erase finds the groups of the table in the range itself, so it drains the separator buffer
 // of every one of them. A record left in the buffer of a group the erase did not drain would be
 // written out later, in a segment above the watermark, and the next recovery would bring it back.
