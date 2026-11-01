@@ -8,6 +8,7 @@
 #pragma once
 
 #include "types.hh"
+#include "dht/i_partitioner_fwd.hh"
 #include "schema/schema_fwd.hh"
 #include "utils/chunked_vector.hh"
 #include "write_buffer.hh"
@@ -492,6 +493,9 @@ public:
     virtual ~logstor_group() = default;
 
     virtual table_id table_id() const noexcept = 0;
+
+    // The tokens whose records the group holds.
+    virtual const dht::token_range& token_range() const noexcept = 0;
 
     virtual primary_index& logstor_index() noexcept = 0;
     virtual const primary_index& logstor_index() const noexcept = 0;
