@@ -1747,7 +1747,9 @@ future<> segment_manager_impl::switch_active_segment_above(segment_sequence seq)
 // from the index. Compaction of the group must be disabled. Each segment ends in one of these
 // states:
 // - A segment with no live record and no other reference is freed.
-// - A segment with no live record and another reference is an internal error.
+// - A segment with no live record and another reference, for example from the snapshot of a
+//   stale stream of a tablet migration, is only taken out of the group, and its last reference
+//   frees it.
 // - A segment with live records stays in the group for compaction. An erase of part of the range
 //   of the group leaves such segments.
 // - A segment with live records in a stopped group is an internal error, because the erase removed
@@ -1775,11 +1777,6 @@ future<> segment_manager_impl::free_erased_segments(logstor_group& group, group_
             continue;
         }
 
-        // Belonging to the group is the only reference the segment may have left.
-        if (desc.ref_count != 1) {
-            on_internal_error(logstor_logger, format("Discarding segment {} with non-zero reference count", seg_id));
-        }
-
         segments.push_back(seg_id);
         co_await coroutine::maybe_yield();
     }
@@ -1787,11 +1784,21 @@ future<> segment_manager_impl::free_erased_segments(logstor_group& group, group_
     logstor_logger.debug("Freeing {} segments of table {} after an erase", segments.size(), group.table_id());
 
     // Removing and freeing a segment cannot fail, so every segment taken out of the group is also
-    // freed. The segments keep their chunks on disk, but the erased range covers their records, so
-    // the next recovery keeps none of them and finds the segments free.
+    // freed, here or by its last reference. The segments keep their chunks on disk, but the erased
+    // range covers their records, so the next recovery keeps none of them and finds the segments
+    // free.
+    //
+    // Belonging to the group is one reference. The loop reads the reference count after the
+    // removal, and not in the loop above, because another reference can be taken or released while
+    // the erase yields.
     for (auto seg_id : segments) {
-        ss.remove_segment(get_segment_descriptor(seg_id));
-        free_segment(seg_id);
+        auto& desc = get_segment_descriptor(seg_id);
+        ss.remove_segment(desc);
+        if (desc.ref_count == 0) {
+            free_segment(seg_id);
+        } else {
+            logstor_logger.debug("Leaving {} to its other references", seg_id);
+        }
         co_await coroutine::maybe_yield();
     }
 }

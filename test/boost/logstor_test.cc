@@ -4474,6 +4474,48 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_erase_of_an_empty_range_does_nothing) {
     require_recovery_matches(ls, schema->id(), cg.logstor_index());
 }
 
+// An erase does not free a segment that a snapshot refers to, as when a migration streams the
+// segment out. The erased range covers the records of the segment, so the erase only takes the
+// segment out of the group, the reader can still read it, and the last reference frees it.
+SEASTAR_THREAD_TEST_CASE(test_logstor_erase_leaves_a_referenced_segment_to_its_reference) {
+    auto schema = make_kv_schema();
+    started_logstor store;
+    auto& ls = store.ls();
+
+    auto& sm = ls.get_segment_manager();
+    test_logstor_group cg(schema, ls);
+    auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+
+    write_and_flush_segment(ls, cg, make_kv_mutation(schema, "pk0", "v0", api::timestamp_type(1)));
+    write_and_flush_segment(ls, cg, make_kv_mutation(schema, "pk1", "v0", api::timestamp_type(1)));
+    BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 2u);
+
+    auto snapshot = sm.make_snapshot(cg).get();
+    BOOST_REQUIRE_EQUAL(snapshot.size(), 2u);
+
+    ls.erase(schema->id(), cg.logstor_index(), dht::token_range()).get();
+    BOOST_REQUIRE(cg.logstor_index().empty());
+    BOOST_REQUIRE(cg.logstor_segments().empty());
+
+    // The snapshot can still read the segments.
+    for (const auto& seg : snapshot) {
+        auto in = seg.source(seastar::file_input_stream_options{.buffer_size = 4096, .read_ahead = 0}).get();
+        auto close_in = seastar::defer([&in] noexcept { in.close().get(); });
+        auto info = read_chunk_info(in, seg.segment_id).get();
+        BOOST_REQUIRE(info);
+        BOOST_REQUIRE(info->kind() == segment_kind::full);
+    }
+    require_recovery_matches(ls, schema->id(), cg.logstor_index());
+
+    // The release of the snapshot, which holds the last references, frees the segments, and the
+    // store goes on.
+    const auto in_use_before_release = sm.get_usage().segment_bytes_in_use;
+    snapshot.clear();
+    BOOST_REQUIRE_EQUAL(in_use_before_release - sm.get_usage().segment_bytes_in_use, 2 * sm.get_segment_size());
+    write_and_flush_segment(ls, cg, make_kv_mutation(schema, "pk2", "v0", api::timestamp_type(1)));
+    require_recovery_matches(ls, schema->id(), cg.logstor_index());
+}
+
 // A switch of the active segment takes the new segment's sequence first and makes the segment
 // active later. An erase that chooses its sequence between the two must not end by joining that
 // switch, because the next write would land at or below the sequence of the erase, and the next
