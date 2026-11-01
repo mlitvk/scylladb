@@ -304,6 +304,9 @@ private:
     seastar::gate _write_gate;
 
     std::vector<record_in_buffer> _records_copy;
+    // The first capacity of _records_copy when the last chunk had more records than a chunk of
+    // typical records.
+    size_t _records_copy_first_count = 0;
 
 public:
 

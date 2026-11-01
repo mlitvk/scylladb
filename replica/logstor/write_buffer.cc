@@ -187,22 +187,29 @@ template raw_write_buffer::append_result raw_write_buffer::append<log_record_byt
 
 // write_buffer
 
-// A guess at the frame size of a record, which only sets the capacity that the per-record vectors of
-// a write buffer grow to first.
-static constexpr size_t expected_record_frame_size = 100;
+// The frame size that sets the first capacity of the per-record vectors of a write buffer. It is a
+// typical frame, not the smallest one: a buffer of smaller records grows its vectors once and keeps
+// the capacity, while a smaller value reserves entries that no chunk uses. With the current record
+// format, a frame takes ~320 bytes for 1 column of 20 bytes, ~1.2 KB for 5 columns of 100 bytes and
+// ~3.7 KB for 30 columns of 20 bytes (perf_logstor --record-size-report).
+static constexpr size_t initial_record_frame_size = 512;
 
 // Makes room for one more entry in a vector that holds an entry for each record of `raw`. The vector
-// grows to the expected record count of a chunk first, and doubles after that, but not past the most
-// records that a chunk can hold, so that a chunk of small records does not leave it at twice its need.
+// grows to `first_count` entries first, and doubles after that, but not past the most records that a
+// chunk can hold.
 template <typename T>
-static void reserve_record_entry(std::vector<T>& entries, const raw_write_buffer& raw) {
+static void reserve_record_entry(std::vector<T>& entries, const raw_write_buffer& raw, size_t first_count) {
     if (entries.size() < entries.capacity()) {
         return;
     }
     static constexpr size_t min_frame_size = align_up(ondisk::record_frame_header_size + ondisk::record_header_fixed_size, ondisk::record_alignment);
     const size_t max_count = (raw.buffer_size() - raw.chunk_headers_size()) / min_frame_size;
-    const size_t next = std::max(raw.buffer_size() / expected_record_frame_size, 2 * entries.capacity());
+    const size_t next = std::max(first_count, 2 * entries.capacity());
     entries.reserve(std::max(entries.size() + 1, std::min(next, max_count)));
+}
+
+static size_t initial_record_count(const raw_write_buffer& raw) {
+    return raw.buffer_size() / initial_record_frame_size;
 }
 
 write_buffer::write_buffer(size_t buffer_size, segment_kind kind)
@@ -234,9 +241,9 @@ future<record_location_with_holder> write_buffer::write(Writer writer, write_tar
         if constexpr (!std::same_as<Writer, log_record_writer>) {
             on_internal_error(logstor_logger, "Record byte writes are not supported for mixed write buffers");
         }
-        reserve_record_entry(_records_copy, _raw);
+        reserve_record_entry(_records_copy, _raw, std::max(_records_copy_first_count, initial_record_count(_raw)));
     }
-    reserve_record_entry(_waiters, _raw);
+    reserve_record_entry(_waiters, _raw, initial_record_count(_raw));
 
     // hold the write buffer until the write is complete, and pass the holder to the
     // caller for follow-up operations that should continue holding the buffer, such
@@ -289,6 +296,10 @@ future<> write_buffer::abort_writes(std::exception_ptr ex) {
 }
 
 std::vector<write_buffer::record_in_buffer> write_buffer::take_separator_records() {
+    // The vector leaves with its capacity, so the next chunk allocates a new one. A chunk of records
+    // smaller than the typical one would grow it in each chunk, so size it from this chunk, and a
+    // quarter more, so that a chunk with a few more records does not grow it either.
+    _records_copy_first_count = _records_copy.size() + _records_copy.size() / 4;
     return std::move(_records_copy);
 }
 
