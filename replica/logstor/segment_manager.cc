@@ -7,6 +7,7 @@
  */
 #include "replica/logstor/segment_manager.hh"
 #include "replica/logstor/segment_file.hh"
+#include "replica/logstor/erase_watermarks.hh"
 #include "replica/logstor/ondisk.hh"
 #include "replica/logstor/segment_io.hh"
 #include "exceptions/exceptions.hh"
@@ -659,6 +660,9 @@ class segment_manager_impl {
     std::optional<shared_future<>> _switch_segment_fut;
     segment_sequence _next_segment_seq{1};
 
+    // The erases that recovery honours. Loaded before the segments are scanned.
+    erase_watermarks _erase_watermarks;
+
     seastar::gate _async_gate;
     future<> _reserve_replenisher{make_ready_future<>()};
 
@@ -792,18 +796,26 @@ public:
         // with no valid chunk has no segment info.
         utils::chunked_vector<std::optional<segment_info>> segment_infos;
         segment_sequence max_segment_seq{0};
+        // The lowest segment sequence found. It is empty when no segment holds a valid chunk.
+        std::optional<segment_sequence> min_segment_seq;
     };
 
     // Scans every segment below segment_count into the indexes the resolver names, the way
-    // recovery does.
-    future<rebuild_index_result> rebuild_index(uint64_t segment_count, const index_resolver&);
+    // recovery does, and leaves out the records that the watermarks erased.
+    future<rebuild_index_result> rebuild_index(uint64_t segment_count, const index_resolver&, const erase_watermarks&);
 
-    // Scans one segment into the resolver's indexes. `cmp` decides between two records of the same
-    // key.
-    future<> index_segment_records(log_segment_id, const primary_index::entry_cmp_fn& cmp, const index_resolver&);
+    // Scans one segment into the resolver's indexes, and leaves out the records that the watermarks
+    // erased. `seq` is the sequence of the segment, and `cmp` decides between two records of the
+    // same key.
+    future<> index_segment_records(log_segment_id, segment_sequence seq, const primary_index::entry_cmp_fn& cmp, const index_resolver&,
+            const erase_watermarks&);
 
+    // This is a coroutine, so that the resolver and the watermarks stay alive until the scan that
+    // uses them ends. The watermarks are read from the file, as recovery reads them, so that an
+    // erase counts only once it is durable.
     future<> rebuild_index_from_disk(index_resolver resolve) {
-        co_await rebuild_index(_file_mgr.allocated_file_count() * _segments_per_file, resolve);
+        const auto watermarks = co_await erase_watermarks::load(_cfg.base_dir);
+        co_await rebuild_index(_file_mgr.allocated_file_count() * _segments_per_file, resolve, watermarks);
     }
 
     compaction_manager& get_compaction_manager() noexcept {
@@ -1199,6 +1211,8 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
                        sm::description("Counts number of logstor segment references that failed to free the segment.")),
         sm::make_gauge("separator_task_queue_size", [this]() { return _separator_task_queue.size(); },
                        sm::description("Current number of pending tasks in the separator task queue.")),
+        sm::make_gauge("erase_watermarks", [this] { return _erase_watermarks.size(); },
+                       sm::description("Number of erase watermarks kept for the next recovery: one per tablet cleanup or truncate whose erased records may still be on disk.")),
     });
 }
 
@@ -2314,7 +2328,10 @@ class segment_manager_impl::recovery {
     file_manager::recovery _files;
     recovery_summary _summary;
     recovery_stats _stats;
+    // The highest and the lowest segment sequence on disk. The lowest is empty when no segment
+    // holds a valid chunk.
     segment_sequence _max_segment_seq{0};
+    std::optional<segment_sequence> _min_segment_seq;
     // The segment info of the first chunk of each found segment, by segment id, which the scan
     // returns. The placement of the used segments reads it, so it does not read the segments again.
     utils::chunked_vector<std::optional<segment_info>> _segment_infos;
@@ -2332,20 +2349,24 @@ public:
 
 private:
     future<> open_found_files();
+    future<> load_erase_watermarks();
     future<> index_found_segments();
     future<> place_found_segments();
     future<> retire_unused_files();
     void resume_segment_sequence();
+    future<> drop_spent_erase_watermarks();
 };
 
 future<recovery_summary> segment_manager_impl::recovery::run() {
     logstor_logger.info("Starting recovery for shard {} in directory {}", this_shard_id(), _sm._cfg.base_dir.string());
 
     co_await open_found_files();
+    co_await load_erase_watermarks();
     co_await index_found_segments();
     co_await place_found_segments();
     co_await retire_unused_files();
     resume_segment_sequence();
+    co_await drop_spent_erase_watermarks();
     co_await _files.finish();
 
     _summary.dropped_records = _stats.dropped_records;
@@ -2376,9 +2397,18 @@ future<> segment_manager_impl::recovery::open_found_files() {
     }
 }
 
-// Scans every found segment into the indexes of the catalog.
+// Loads the erases that the scan must honour.
+future<> segment_manager_impl::recovery::load_erase_watermarks() {
+    _sm._erase_watermarks = co_await erase_watermarks::load(_sm._cfg.base_dir);
+    if (!_sm._erase_watermarks.empty()) {
+        logstor_logger.info("Recovery: {} erase watermarks, sequence floor {}", _sm._erase_watermarks.size(), _sm._erase_watermarks.seq_floor());
+    }
+}
+
+// Scans every found segment into the indexes of the catalog, leaving out the records that an erase
+// watermark covers.
 future<> segment_manager_impl::recovery::index_found_segments() {
-    auto rebuilt = co_await _sm.rebuild_index(_summary.found_segments, _sm.make_index_resolver(_catalog, _stats));
+    auto rebuilt = co_await _sm.rebuild_index(_summary.found_segments, _sm.make_index_resolver(_catalog, _stats), _sm._erase_watermarks);
     _segment_infos = std::move(rebuilt.segment_infos);
     for (uint64_t seg_idx = 0; seg_idx < _summary.found_segments; ++seg_idx) {
         const auto& info = _segment_infos[seg_idx];
@@ -2386,6 +2416,7 @@ future<> segment_manager_impl::recovery::index_found_segments() {
         co_await coroutine::maybe_yield();
     }
     _max_segment_seq = rebuilt.max_segment_seq;
+    _min_segment_seq = rebuilt.min_segment_seq;
     logstor_logger.info("Recovery indexed {} live records", _sm._stats.live_record_count);
 }
 
@@ -2433,10 +2464,22 @@ future<> segment_manager_impl::recovery::retire_unused_files() {
     co_await _files.retire_unused_files(_used_file_count);
 }
 
-// New segments get sequences above every sequence on disk.
+// New segments get sequences above every sequence on disk and every sequence a watermark refers to,
+// or a write made after an erase could land at a sequence the erase covers and be dropped by the next
+// recovery. The floor is the highest sequence of every watermark the shard ever had, so the counter
+// does not go back when the watermarks below are dropped.
 void segment_manager_impl::recovery::resume_segment_sequence() {
-    _sm._next_segment_seq = _max_segment_seq + 1;
+    _sm._next_segment_seq = std::max(_max_segment_seq, _sm._erase_watermarks.seq_floor()) + 1;
     _summary.next_segment_seq = _sm._next_segment_seq;
+}
+
+// A watermark below every chunk on the shard has nothing left to erase, and neither has one of a
+// table that is gone, whose records recovery drops anyway.
+future<> segment_manager_impl::recovery::drop_spent_erase_watermarks() {
+    if (_sm._erase_watermarks.gc(_min_segment_seq, [this] (table_id table) { return _catalog.index(table) != nullptr; })) {
+        logstor_logger.info("Recovery: {} erase watermarks left after dropping the spent ones", _sm._erase_watermarks.size());
+        co_await _sm._erase_watermarks.save(_sm._cfg.base_dir);
+    }
 }
 
 future<recovery_summary> segment_manager_impl::do_recovery(recovery_catalog& catalog) {
@@ -2462,7 +2505,8 @@ segment_manager_impl::index_resolver segment_manager_impl::make_index_resolver(r
     };
 }
 
-future<segment_manager_impl::rebuild_index_result> segment_manager_impl::rebuild_index(uint64_t segment_count, const index_resolver& resolve) {
+future<segment_manager_impl::rebuild_index_result> segment_manager_impl::rebuild_index(uint64_t segment_count, const index_resolver& resolve,
+        const erase_watermarks& watermarks) {
     rebuild_index_result result;
     auto& segment_infos = result.segment_infos;
     segment_infos.resize(static_cast<size_t>(segment_count));
@@ -2499,7 +2543,7 @@ future<segment_manager_impl::rebuild_index_result> segment_manager_impl::rebuild
     };
 
     co_await max_concurrent_for_each(std::views::iota(uint64_t(0), segment_count), 32,
-        [this, &cmp_with_seq, &resolve, &segment_infos, &result, &on_segment_scanned] (uint64_t seg_idx) -> future<> {
+        [this, &cmp_with_seq, &resolve, &watermarks, &segment_infos, &result, &on_segment_scanned] (uint64_t seg_idx) -> future<> {
             const log_segment_id seg_id(seg_idx);
             // The scan reads a whole segment in its first read, also when the first chunk is not
             // valid. A segment that was never written, or that discard_segments() freed, starts
@@ -2509,9 +2553,11 @@ future<segment_manager_impl::rebuild_index_result> segment_manager_impl::rebuild
             // no chunk in the segments that this check skips.
             if (auto info = co_await read_segment_info(seg_id)) {
                 logstor_logger.trace("Recovering segment {} with sequence {}", seg_id, info->segment_seq);
-                result.max_segment_seq = std::max(result.max_segment_seq, info->segment_seq);
+                const auto seq = info->segment_seq;
+                result.max_segment_seq = std::max(result.max_segment_seq, seq);
+                result.min_segment_seq = result.min_segment_seq ? std::min(*result.min_segment_seq, seq) : seq;
                 segment_infos[seg_idx] = std::move(info);
-                co_await index_segment_records(seg_id, cmp_with_seq, resolve);
+                co_await index_segment_records(seg_id, seq, cmp_with_seq, resolve, watermarks);
             }
             on_segment_scanned();
         }
@@ -2520,11 +2566,17 @@ future<segment_manager_impl::rebuild_index_result> segment_manager_impl::rebuild
     co_return result;
 }
 
-future<> segment_manager_impl::index_segment_records(log_segment_id segment_id, const primary_index::entry_cmp_fn& cmp,
-        const index_resolver& resolve) {
+future<> segment_manager_impl::index_segment_records(log_segment_id segment_id, segment_sequence seq, const primary_index::entry_cmp_fn& cmp,
+        const index_resolver& resolve, const erase_watermarks& watermarks) {
     co_await for_each_record(segment_id, [&] (const chunk_record& record) {
         const auto& header = record.header;
         logstor_logger.trace("Recovery: read record at {} key {} ts {}", record.location, header.key, header.timestamp);
+        // Erased before it was written over, so it is not a candidate at all: a later record of
+        // the key with an older timestamp must win. The scan of a segment stops at a chunk of
+        // another sequence, so every record of the segment has the sequence `seq`.
+        if (watermarks.erased(header.table, header.key.token(), seq)) {
+            return make_ready_future<>();
+        }
         if (auto* index = resolve(header)) {
             index->insert(header.index_key(), index_entry{.location = record.location, .timestamp = header.timestamp}, cmp);
         }
@@ -2800,7 +2852,8 @@ future<> segment_manager_impl::adopt_streamed_segment(recovery_catalog& catalog,
         // The segment has no valid chunk, so it holds no record.
         co_return;
     }
-    co_await index_segment_records(seg_id, primary_index::default_entry_cmp{}, make_index_resolver(catalog, stats));
+    co_await index_segment_records(seg_id, info->segment_seq, primary_index::default_entry_cmp{}, make_index_resolver(catalog, stats),
+            _erase_watermarks);
     if (place_recovered_segment(catalog, seg_id, *info, stats) == needs_separation::yes) {
         co_await separate_segment_records(catalog, seg_id, stats);
     }
