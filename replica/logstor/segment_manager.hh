@@ -82,6 +82,8 @@ struct recovery_summary {
     uint64_t free_segments{0};
     // The records of a tablet that is not on this shard, which recovery drops.
     uint64_t dropped_records{0};
+    // The records that an erased range covers, which recovery leaves out.
+    uint64_t erased_records{0};
     // The full segments that fit no single compaction group of this shard. start() separates their
     // records one by one.
     uint64_t separated_segments{0};
