@@ -18,6 +18,7 @@
 #include <seastar/util/noncopyable_function.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 #include "mutation_writer/token_group_based_splitting_writer.hh"
+#include <boost/intrusive/list.hpp>
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -80,6 +81,15 @@ struct segment_descriptor : public log_heap_hook<segment_descriptor_hist_options
     // The sequence of the latest use of the segment, which each valid chunk of the segment also
     // has, except between get_segment() and the write of the first chunk. reset() keeps it.
     segment_sequence seq{0};
+    // A kept segment is not freed when its last reference goes, because the index still points at
+    // records in it that the separator did not move (see segment_ref). The segment manager links
+    // the kept segments into a list through `kept_hook`.
+    bool kept{false};
+    // The last reference of a kept segment went, so no buffer holds its records any more, and no
+    // write appends to it. Nothing reads the flag yet. A later change separates a released segment
+    // again while the store runs, and it takes only released segments.
+    bool kept_released{false};
+    boost::intrusive::list_member_hook<> kept_hook;
 
     void reset(size_t segment_size) noexcept {
         free_space = segment_size;
@@ -316,18 +326,19 @@ private:
     }
 };
 
+// segment_ref refers to a segment. The copies share one state, and the last copy that goes releases
+// the segment, which frees it unless the segment is kept. A copy keeps the segment with
+// set_flush_failure(), because records in the segment can still be needed, for example because
+// the index still points into the segment. The state calls `on_kept` once, at the first
+// set_flush_failure(), and `on_last_release` when the last copy goes, kept or not.
 class segment_ref {
     struct state {
         log_segment_id id;
         std::function<void()> on_last_release;
-        std::function<void()> on_failure;
-        bool flush_failure{false};
+        std::function<void()> on_kept;
+        bool kept{false};
         ~state() {
-            if (!flush_failure) {
-                if (on_last_release) on_last_release();
-            } else {
-                if (on_failure) on_failure();
-            }
+            if (on_last_release) on_last_release();
         }
     };
     lw_shared_ptr<state> _state;
@@ -343,12 +354,17 @@ public:
     log_segment_id id() const noexcept { return _state->id; }
     bool empty() const noexcept { return !_state; }
 
-    void set_flush_failure() noexcept { if (_state) _state->flush_failure = true; }
+    void set_flush_failure() noexcept {
+        if (_state && !_state->kept) {
+            _state->kept = true;
+            if (_state->on_kept) _state->on_kept();
+        }
+    }
 
 private:
     friend class segment_manager_impl;
-    explicit segment_ref(log_segment_id id, std::function<void()> on_last_release, std::function<void()> on_failure)
-        : _state(make_lw_shared<state>(id, std::move(on_last_release), std::move(on_failure)))
+    explicit segment_ref(log_segment_id id, std::function<void()> on_last_release, std::function<void()> on_kept)
+        : _state(make_lw_shared<state>(id, std::move(on_last_release), std::move(on_kept)))
     {}
 };
 

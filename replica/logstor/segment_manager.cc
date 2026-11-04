@@ -603,6 +603,14 @@ class segment_manager_impl {
     // them.
     seastar::circular_buffer<log_segment_id> _free_segments;
 
+    // The kept segments, in the order in which they were kept. The list is empty at start, and
+    // nothing takes a segment out of it until the node restarts, when recovery separates the kept
+    // segments again.
+    using kept_segment_list = boost::intrusive::list<segment_descriptor,
+            boost::intrusive::member_hook<segment_descriptor, boost::intrusive::list_member_hook<>, &segment_descriptor::kept_hook>,
+            boost::intrusive::constant_time_size<true>>;
+    kept_segment_list _kept_segments;
+
     seg_ptr _active_segment;
     segment_pool _segment_pool;
     std::optional<shared_future<>> _switch_segment_fut;
@@ -809,6 +817,10 @@ public:
         return _writes_phaser.advance_and_await();
     }
 
+    size_t kept_segment_count() const noexcept {
+        return _kept_segments.size();
+    }
+
     future<utils::chunked_vector<segment_snapshot>> make_snapshot(logstor_group&);
 
     future<seastar::input_stream<char>> create_segment_input_stream(log_segment_id segment_id, const seastar::file_input_stream_options& opts);
@@ -869,13 +881,22 @@ private:
         return segment_ref(seg_id,
             [this, seg_id] {
                 auto& desc = get_segment_descriptor(seg_id);
-                if (--desc.ref_count == 0) {
+                if (--desc.ref_count != 0) {
+                    return;
+                }
+                if (!desc.kept) {
                     return free_segment(seg_id);
                 }
+                desc.kept_released = true;
+                ++_stats.segment_free_failures;
+                logstor_logger.warn("Cannot free {}, it is kept because the index still points into it", seg_id);
             },
             [this, seg_id] {
-                ++_stats.segment_free_failures;
-                logstor_logger.warn("Segment {} can't be freed", seg_id);
+                auto& desc = get_segment_descriptor(seg_id);
+                if (!desc.kept) {
+                    desc.kept = true;
+                    _kept_segments.push_back(desc);
+                }
             }
         );
     }
@@ -1150,7 +1171,9 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
         sm::make_counter("separator_buffers_dropped", _separator_buffer_pool.get_stats().buffers_dropped,
                        sm::description("Counts number of separator write buffers permanently removed from the pool after they could not be reclaimed.")),
         sm::make_counter("segment_free_failures", _stats.segment_free_failures,
-                       sm::description("Counts number of logstor segment references that failed to free the segment.")),
+                       sm::description("Counts the kept segments whose last reference went without freeing the segment.")),
+        sm::make_gauge("kept_segments", [this] { return _kept_segments.size(); },
+                       sm::description("Number of kept segments. A kept segment holds records that the index points at and that no group owns, because the separator or the group add failed, and the segment is not freed until the node restarts.")),
         sm::make_gauge("separator_task_queue_size", [this]() { return _separator_task_queue.size(); },
                        sm::description("Current number of pending tasks in the separator task queue.")),
     });
@@ -2239,9 +2262,13 @@ future<recovery_summary> segment_manager_impl::recovery::run() {
 future<> segment_manager_impl::recovery::open_found_files() {
     const file_id_t found_file_count = co_await _files.open_found_files();
 
-    // Recovery reads every found segment, so each of them needs a descriptor.
+    // Recovery reads every found segment, so each of them needs a descriptor. The resize moves the
+    // descriptors, which the kept list links by address, so the list must still be empty here.
     const uint64_t found_segment_count = found_file_count * _sm._segments_per_file;
     _summary.found_segments = found_segment_count;
+    if (!_sm._kept_segments.empty()) {
+        on_internal_error(logstor_logger, "Recovery found kept segments before it read any segment");
+    }
     _sm._segment_descs.resize(std::max(_sm._segment_descs.size(), static_cast<size_t>(found_segment_count)));
 
     _sm._next_new_segment_id = found_segment_count;
@@ -2461,9 +2488,10 @@ future<> segment_manager_impl::separate_recovered_segments() {
     }
     logstor_logger.info("Separating the records of {} recovered segments", recovered.to_separate.size());
     // If a separation throws, start() fails and the segments that are not separated stay on disk
-    // with no owner. Nothing frees them: no group owns them and no reference holds them, and the
-    // segment that failed keeps its reference with the flush failure set. The index still points
-    // into them, so no record is lost, and the next recovery lists them again.
+    // with no owner. The reference of the segment that failed has the flush failure set, so that
+    // segment goes on the kept list, and its last release does not free it. Nothing frees the
+    // segments after it either, because no group owns them and no reference holds them. The index
+    // still points into all of them, so no record is lost, and the next recovery lists them again.
     recovery_stats stats;
     for (auto seg_id : recovered.to_separate) {
         co_await separate_segment_records(*recovered.catalog, seg_id, stats);
@@ -2613,6 +2641,10 @@ segment_manager_usage segment_manager::get_usage() const noexcept {
 
 future<> segment_manager::await_pending_writes() {
     return _impl->await_pending_writes();
+}
+
+size_t segment_manager::kept_segment_count() const noexcept {
+    return _impl->kept_segment_count();
 }
 
 class segment_data_sink_impl : public data_sink_impl {
