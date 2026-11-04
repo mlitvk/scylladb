@@ -15,6 +15,7 @@ from cassandra.protocol import ConfigurationException, ServerError
 import pytest
 import logging
 from test.pylib.tablets import get_tablet_count, get_tablet_replica
+from test.pylib.rest_client import HTTPError
 from test.pylib.util import wait_for
 
 logger = logging.getLogger(__name__)
@@ -1459,3 +1460,75 @@ async def test_cache(manager: ScyllaClusterManager):
             for i in range(num_keys):
                 rows = await cql.run_async(f"SELECT pk, v FROM {ks}.test_no_cache WHERE pk = {i}")
                 assert rows[0].v == i * 10, f"unexpected value for pk={i}"
+
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
+async def test_failed_separator_flush_fails_flush_and_migration(manager: ScyllaClusterManager):
+    """
+    A failed separator flush keeps the records in a mixed segment. The flush that the API requests
+    and the migration of the tablet then fail, also with nothing new to flush, until the node restarts
+    and recovery separates the kept segment. No row is lost.
+    """
+    cmdline = ['--logger-log-level', 'logstor=debug', '--smp=1']
+    cfg = {'experimental_features': ['logstor']}
+    s1 = await manager.server_add(cmdline=cmdline, config=cfg, property_file={"dc": "dc1", "rack": "rack1"})
+    servers = [s1]
+    cql, _ = await manager.get_ready_cql(servers)
+
+    await manager.disable_tablet_balancing()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets={'initial': 1}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v text) WITH storage_engine = 'logstor'")
+
+        nrows = 20
+        value = 'x' * 1024
+        for i in range(nrows):
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, v) VALUES ({i}, '{i}_{value}')")
+
+        async def check_rows():
+            for i in range(nrows):
+                rows = await cql.run_async(f"SELECT pk, v FROM {ks}.test WHERE pk = {i}")
+                assert len(rows) == 1, f"Expected 1 row for key {i}, but got {len(rows)}"
+                assert rows[0].v == f"{i}_{value}", f"Unexpected value for key {i}"
+
+        # The flush reports the failure of its own flush of the separator.
+        await manager.api.enable_injection(s1.ip_addr, "fail_flush_separator_buffer", one_shot=True)
+        with pytest.raises(HTTPError, match="failed by injection"):
+            await manager.api.keyspace_flush(s1.ip_addr, ks, "test")
+        await check_rows()
+
+        # The records stay in the kept segment, so a flush with nothing new to flush fails too, also
+        # the flush of all keyspaces, which takes the other API path.
+        with pytest.raises(HTTPError, match="not separated"):
+            await manager.api.keyspace_flush(s1.ip_addr, ks, "test")
+        with pytest.raises(HTTPError, match="not separated"):
+            await manager.api.flush_all_keyspaces(s1.ip_addr)
+
+        # The migration snapshot fails the same way, and the migration retries until the restart.
+        s2 = await manager.server_add(cmdline=cmdline, config=cfg, property_file={"dc": "dc1", "rack": "rack1"})
+        servers.append(s2)
+        cql, _ = await manager.get_ready_cql(servers)
+        h1 = await manager.get_host_id(s1.server_id)
+        h2 = await manager.get_host_id(s2.server_id)
+        # The destination pulls the segments and logs the failure of the source.
+        s2_log = await manager.server_open_log(s2.server_id)
+        log_mark = await s2_log.mark()
+        move = asyncio.create_task(manager.api.move_tablet(s1.ip_addr, ks, "test", h1, 0, h2, 0, 0))
+        await s2_log.wait_for("were not separated", from_mark=log_mark, timeout=60)
+
+        # Recovery separates the kept segment, the migration completes, and no row is lost. The move
+        # request was made to the restarted node, so only the tablet replica tells that it completed.
+        await manager.server_restart(s1.server_id)
+        try:
+            await move
+        except Exception as e:
+            logger.info(f"The move request ended with the restart: {e}")
+        cql, _ = await manager.get_ready_cql(servers)
+        # Recovery separated the kept segment, so the flush passes while the tablet is still here.
+        await manager.api.keyspace_flush(s1.ip_addr, ks, "test")
+
+        async def tablet_moved():
+            replica = await get_tablet_replica(manager, s2, ks, 'test', 0)
+            return replica[0] == h2 or None
+        await wait_for(tablet_moved, time.time() + 120)
+
+        await check_rows()
