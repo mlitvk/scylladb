@@ -153,6 +153,10 @@ public:
 
     future<> await_pending_writes();
 
+    // Returns the number of kept segments, which hold records that the separator did not move, and
+    // which are not freed until the node restarts.
+    size_t kept_segment_count() const noexcept;
+
     future<utils::chunked_vector<segment_snapshot>> make_snapshot(logstor_group& cg);
 
     // Create an output stream to write a segment (for receiving from remote node)
