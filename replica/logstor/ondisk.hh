@@ -49,24 +49,24 @@ namespace replica::logstor::ondisk {
 // The record value that follows the header also has a variable size, record_frame_header holds
 // that size too, and replica/logstor/record_value.cc defines the encoding of the value.
 
-static constexpr size_t block_alignment = 4096;
-static constexpr size_t record_alignment = 8;
+inline constexpr size_t block_alignment = 4096;
+inline constexpr size_t record_alignment = 8;
 // current_version is the format version that this code writes.
-static constexpr uint8_t current_version = 1;
+inline constexpr uint8_t current_version = 1;
 // min_read_version is the oldest format version that this code reads, and this code reads every
 // version from min_read_version to current_version. To remove the read path of an old version,
 // increase min_read_version.
-static constexpr uint8_t min_read_version = 1;
+inline constexpr uint8_t min_read_version = 1;
 // known_chunk_flags holds the chunk header flags that this code defines.
-static constexpr uint16_t known_chunk_flags = 0;
+inline constexpr uint16_t known_chunk_flags = 0;
 // known_record_flags holds the record frame header flags that this code defines.
-static constexpr uint16_t known_record_flags = 0;
-static constexpr uint32_t chunk_header_magic = 0x4c475342;
+inline constexpr uint16_t known_record_flags = 0;
+inline constexpr uint32_t chunk_header_magic = 0x4c475342;
 
 // max_key_size is the size of the largest partition key that a record can hold. CQL limits the
 // serialized key to this size (see validation::max_key_size), and the record frame header holds the
 // key size in 16 bits.
-static constexpr size_t max_key_size = std::numeric_limits<uint16_t>::max();
+inline constexpr size_t max_key_size = std::numeric_limits<uint16_t>::max();
 
 // segment_kind is the kind of the segment that holds a chunk, as the chunk header records it.
 enum class segment_kind : uint8_t {
@@ -211,13 +211,13 @@ struct record_header_fixed : fixed_layout {
 };
 
 // These constants are the on-disk sizes, which fixed_size calculates from the fields of each type.
-static constexpr size_t chunk_header_size = fixed_size<chunk_header>;
-static constexpr size_t segment_header_size = fixed_size<segment_header>;
-static constexpr size_t record_frame_header_size = fixed_size<record_frame_header>;
-static constexpr size_t record_header_fixed_size = fixed_size<record_header_fixed>;
+inline constexpr size_t chunk_header_size = fixed_size<chunk_header>;
+inline constexpr size_t segment_header_size = fixed_size<segment_header>;
+inline constexpr size_t record_frame_header_size = fixed_size<record_frame_header>;
+inline constexpr size_t record_header_fixed_size = fixed_size<record_header_fixed>;
 // min_record_frame_size is the size of the smallest record frame, which holds a
 // record_frame_header and a record header with an empty key.
-static constexpr size_t min_record_frame_size = record_frame_header_size + record_header_fixed_size;
+inline constexpr size_t min_record_frame_size = record_frame_header_size + record_header_fixed_size;
 
 static_assert(chunk_header_size % record_alignment == 0, "Chunk header size must be aligned by record_alignment");
 static_assert(segment_header_size % record_alignment == 0, "Segment header size must be aligned by record_alignment");
