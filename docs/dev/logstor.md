@@ -68,6 +68,7 @@ Only step 4 writes to the disk - all other steps only update in-memory metadata.
 3. Compaction picks segments for compaction from the segment set. It chooses segments with the lowest utilization such that compacting them results in net gain of free segments.
 4. It reads the segments, finding all live records, and writing them into a write buffer. When the buffer is full it is flushed into a new segment, and for each recording updating the index location to the new location.
 5. After all live records are rewritten the old segments are freed.
+6. A segment that the scan cannot read fully, because a chunk of it is corrupt, keeps the live records that compaction did not rewrite. Compaction then erases the index entries that still point into the segment, logs an error, counts the records in the `compaction_records_dropped` metric, and frees the segment. Recovery drops the same records at the next start, so a restart gives the same result, except that an older version of a dropped key can come back from a segment that still holds it. A repair restores the records from other replicas. A split compaction does the same.
 
 ## Usage
 

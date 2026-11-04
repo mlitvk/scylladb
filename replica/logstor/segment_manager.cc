@@ -37,6 +37,7 @@
 #include <seastar/core/on_internal_error.hh>
 #include <seastar/coroutine/parallel_for_each.hh>
 #include <seastar/coroutine/maybe_yield.hh>
+#include <seastar/coroutine/try_future.hh>
 #include <seastar/coroutine/exception.hh>
 #include <seastar/core/abort_source.hh>
 #include <seastar/core/circular_buffer.hh>
@@ -335,6 +336,7 @@ private:
         uint64_t segments_out{0};
         uint64_t records_skipped{0};
         uint64_t records_rewritten{0};
+        uint64_t records_dropped{0};
         uint64_t bytes_read{0};
         uint64_t failures{0};
         uint64_t separator_buffers_flushed{0};
@@ -461,6 +463,14 @@ private:
     future<> submit_group_compaction(logstor_group&, std::function<future<>(group_compaction_state&)>, scheduling_group);
     future<> do_compaction(logstor_group&, compaction_batch_limits, abort_source&);
     future<> do_split_compaction(logstor_group&, mutation_writer::classify_by_token_group, split_target_group, abort_source&);
+
+    // The records of a segment that compaction dropped because the scan could not read them.
+    struct dropped_records {
+        uint64_t count = 0;
+        uint64_t bytes = 0;
+    };
+    future<dropped_records> erase_unread_records(logstor_group&, log_segment_id, abort_source&);
+    future<> drop_unread_records(logstor_group&, const std::vector<log_segment_id>&, abort_source&);
 
     group_compaction_state& get_group_state(logstor_group&);
     group_compaction_state* find_group_state(logstor_group&) noexcept;
@@ -1101,6 +1111,8 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
                        sm::description("Counts number of records skipped during compaction.")),
         sm::make_counter("compaction_records_rewritten", _compaction_mgr.get_stats().records_rewritten,
                        sm::description("Counts number of records rewritten during compaction.")),
+        sm::make_counter("compaction_records_dropped", _compaction_mgr.get_stats().records_dropped,
+                       sm::description("Counts number of records that compaction dropped because it could not read them: a chunk of their segment is corrupt.")),
         sm::make_gauge("compaction_buffers_in_use", [this] { return _compaction_buffer_pool.used_buffer_count(); },
                        sm::description("Counts number of write buffers currently held by compaction. The pool size is the cap on concurrent compactions.")),
         sm::make_counter("compaction_buffer_allocation_waits", _compaction_buffer_pool.get_stats().allocation_waits,
@@ -1961,6 +1973,90 @@ struct split_buffer_pair {
     }
 };
 
+// Erases the index entries that still point into `segment_id` after compaction moved every record
+// that the scan gave it, and returns their count and bytes. The live bytes that the segment has at
+// that point belong to records that the scan could not read, because a chunk of the segment is
+// corrupt. Recovery would drop the same records at the next start, so compaction drops them now
+// and frees the segment, which it cannot empty in any other way.
+//
+// The scan of the index covers the token range of the segment header, or the whole index when the
+// headers do not read. The erase is conditional on the location, so a key that a concurrent write
+// moved keeps its entry. A batch of the scan is local to one iteration of the loop, so its
+// index_read_guard is released before await_pending_reads() runs after the drop. An abort fails
+// the compaction, and the segment stays in its group: the next compaction erases the rest.
+future<compaction_manager_impl::dropped_records> compaction_manager_impl::erase_unread_records(logstor_group& cg, log_segment_id segment_id, abort_source& as) {
+    auto& index = cg.logstor_index();
+    const auto segment_size = _sm.get_segment_size();
+
+    dht::token_range range;
+    if (auto info = co_await coroutine::try_future(_sm.read_segment_info(segment_id))) {
+        // A group owns full segments only.
+        if (!std::holds_alternative<segment_info::full>(info->v)) {
+            on_internal_error(logstor_logger, fmt::format("Segment {} of compaction group {} is not a full segment", segment_id, cg.table_id()));
+        }
+        const auto& full = std::get<segment_info::full>(info->v);
+        range = dht::token_range(dht::token_range::bound(full.first_token), dht::token_range::bound(full.last_token));
+    } else {
+        logstor_logger.warn("The headers of segment {} of table {} do not read, so compaction scans the whole index of the table for its records",
+                segment_id, cg.table_id());
+    }
+
+    dropped_records dropped;
+    std::vector<std::pair<primary_index_key, record_location>> unread;
+    auto scan = index.scan(range);
+    while (_sm.get_segment_descriptor(segment_id).record_bytes(segment_size) != 0) {
+        if (as.abort_requested()) {
+            co_await coroutine::return_exception(abort_requested_exception());
+        }
+        unread.clear();
+        if (auto batch = scan.next_batch(1024)) {
+            for (const primary_index_entry& e : batch->entries) {
+                if (e.entry().location.segment == segment_id) {
+                    unread.emplace_back(e.key(), e.entry().location);
+                }
+            }
+        } else {
+            break;
+        }
+        for (const auto& [key, location] : unread) {
+            if (index.erase(key, location)) {
+                dropped.count++;
+                dropped.bytes += location.size;
+            }
+        }
+        co_await coroutine::maybe_yield();
+    }
+    // The index entries of a full segment are in the token range of its header, so a scan that ends
+    // with live bytes left means that the accounting or the header is wrong. The compaction fails
+    // here with the context, instead of in free_segment() without it.
+    if (const auto left = _sm.get_segment_descriptor(segment_id).record_bytes(segment_size); left != 0) {
+        on_internal_error(logstor_logger, fmt::format("Segment {} of table {} has {} live bytes left after a scan of {} erased {} records ({} bytes)",
+                segment_id, cg.table_id(), left, range.is_full() ? "the whole index" : fmt::format("the token range {}", range), dropped.count, dropped.bytes));
+    }
+    co_return dropped;
+}
+
+// Drops the records of the segments of a batch that the scan could not read, see
+// erase_unread_records(). Compaction runs it after it rewrote the batch and before it frees the
+// segments, so that free_segment() finds no live bytes in them.
+future<> compaction_manager_impl::drop_unread_records(logstor_group& cg, const std::vector<log_segment_id>& segments, abort_source& as) {
+    for (auto seg_id : segments) {
+        if (_sm.get_segment_descriptor(seg_id).record_bytes(_sm.get_segment_size()) == 0) {
+            continue;
+        }
+        auto dropped = co_await coroutine::try_future(erase_unread_records(cg, seg_id, as));
+        // A write that moved the last key of the segment while the header was read leaves nothing
+        // to drop.
+        if (dropped.count == 0) {
+            continue;
+        }
+        logstor_logger.error("Compaction could not read {} records ({} bytes) of segment {} of table {}, because a chunk of the segment is corrupt. "
+                "Their index entries are erased, so this node lost the records; a repair can restore them from other replicas.",
+                dropped.count, dropped.bytes, seg_id, cg.table_id());
+        _stats.records_dropped += dropped.count;
+    }
+}
+
 future<> compaction_manager_impl::do_compaction(logstor_group& cg, compaction_batch_limits limits, abort_source& as) {
     auto candidate = select_segments_for_compaction(cg, limits);
     if (!candidate) {
@@ -1999,6 +2095,8 @@ future<> compaction_manager_impl::do_compaction(logstor_group& cg, compaction_ba
     const size_t compaction_segments_out = cb_stats.flush_count;
 
     logstor_logger.debug("Compaction complete: in {} out {}", compaction_segments_in, compaction_segments_out);
+
+    co_await drop_unread_records(cg, segments, as);
 
     // wait for read operations that use the old locations
     co_await index.await_pending_reads();
@@ -2049,7 +2147,15 @@ future<> compaction_manager_impl::do_split_compaction(logstor_group& src, mutati
         batch.reserve(candidates.size());
         for (auto cand_seg_id : candidates) {
             auto cand_info = co_await _sm.read_segment_info(cand_seg_id);
-            if (!cand_info || !std::holds_alternative<segment_info::full>(cand_info->v)) {
+            if (!cand_info) {
+                // The headers of the segment do not read, so the fast path cannot tell its side.
+                // The slow path gets no record from the scan of the segment, and drops the records
+                // that the index still holds in it.
+                logstor_logger.warn("The headers of segment {} of table {} do not read, so split compaction takes the segment through its slow path", cand_seg_id, src.table_id());
+                batch.push_back(cand_seg_id);
+                continue;
+            }
+            if (!std::holds_alternative<segment_info::full>(cand_info->v)) {
                 on_internal_error(logstor_logger, format("Invalid segment header for segment {} during split compaction", cand_seg_id));
             }
             auto& cand_seg_info = std::get<segment_info::full>(cand_info->v);
@@ -2108,6 +2214,8 @@ future<> compaction_manager_impl::do_split_compaction(logstor_group& src, mutati
                              batch_stats.flush_count, batch.size());
 
         _stats.bytes_read += nonempty_segments.size() * _sm.get_segment_size();
+
+        co_await drop_unread_records(src, batch, as);
 
         // All records are safely written to new segments in src.
         // Await pending reads before freeing the source segments.
