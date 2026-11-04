@@ -145,7 +145,7 @@ api::timestamp_type record_timestamp(const mutation& m) {
         return partition_tombstone.timestamp;
     }
 
-    throw std::runtime_error("logstor mutation has no row marker or partition tombstone timestamp");
+    throw std::runtime_error("logstor: mutation has no row marker or partition tombstone timestamp");
 }
 
 api::timestamp_type record_timestamp(const frozen_mutation& m) {
@@ -161,7 +161,7 @@ api::timestamp_type record_timestamp(const frozen_mutation& m) {
         return partition_tombstone.timestamp;
     }
 
-    throw std::runtime_error("logstor mutation has no row marker or partition tombstone timestamp");
+    throw std::runtime_error("logstor: mutation has no row marker or partition tombstone timestamp");
 }
 
 record_value encode_record_value(const mutation& m) {
@@ -178,7 +178,7 @@ record_value encode_record_value(const frozen_mutation& m, const schema& s) {
 
 single_row_partition decode_record_value(const record_value& v, const schema& s, const record_header& h) {
     if (s.id() != h.table) {
-        throw std::runtime_error(format("logstor: record of table {} decoded with the schema of table {} ({}.{})",
+        throw std::runtime_error(fmt::format("logstor: record of table {} decoded with the schema of table {} ({}.{})",
                 h.table, s.id(), s.ks_name(), s.cf_name()));
     }
 
