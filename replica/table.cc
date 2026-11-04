@@ -1835,6 +1835,9 @@ future<utils::chunked_vector<logstor::segment_snapshot>> table::take_logstor_sna
     utils::chunked_vector<logstor::segment_snapshot> snp;
     for (auto& sg : storage_groups_for_token_range(tr)) {
         co_await sg->flush_separator();
+        // A record that stays in a kept segment is not in the snapshot, and the cleanup of the source
+        // would erase it, so the snapshot fails instead.
+        co_await check_separated(sg->token_range());
 
         auto deletion_guard = co_await get_sstable_list_permit();
 
@@ -1842,6 +1845,16 @@ future<utils::chunked_vector<logstor::segment_snapshot>> table::take_logstor_sna
         snp.insert(snp.end(), std::make_move_iterator(sg_snp.begin()), std::make_move_iterator(sg_snp.end()));
     }
     co_return std::move(snp);
+}
+
+future<> table::check_separated(dht::token_range range) {
+    // The scan reads from disk, and a drop of the table must not destroy the index under it, so the
+    // check holds a pending flush, which the stop of the table waits for.
+    if (_pending_flushes_phaser.is_closed()) {
+        co_return;
+    }
+    auto op = _pending_flushes_phaser.start();
+    co_await _logstor->get_segment_manager().check_separated(schema()->id(), logstor_index(), std::move(range));
 }
 
 future<std::unique_ptr<logstor::segment_stream_sink>> table::create_logstor_segment_sink(replica::database& db) {

@@ -821,6 +821,8 @@ public:
         return _kept_segments.size();
     }
 
+    future<> check_separated(table_id, const primary_index&, dht::token_range);
+
     future<utils::chunked_vector<segment_snapshot>> make_snapshot(logstor_group&);
 
     future<seastar::input_stream<char>> create_segment_input_stream(log_segment_id segment_id, const seastar::file_input_stream_options& opts);
@@ -1646,6 +1648,54 @@ future<> segment_manager_impl::discard_segments(logstor_group& cg) {
         co_await _file_mgr.zero_region(file_id, file_offset, block_alignment);
         free_segment(seg_id);
     });
+}
+
+// `range` is taken by value, because the scan suspends and a caller can pass a temporary.
+future<> segment_manager_impl::check_separated(table_id table, const primary_index& index, dht::token_range range) {
+    auto holder = _async_gate.hold();
+
+    // The scan yields, and a flush that fails meanwhile adds to the list, so scan a copy.
+    std::vector<log_segment_id> kept_segments;
+    kept_segments.reserve(_kept_segments.size());
+    for (const auto& desc : _kept_segments) {
+        kept_segments.push_back(desc_to_segment_id(desc));
+    }
+    if (kept_segments.empty()) {
+        co_return;
+    }
+
+    // A failed flush keeps every segment that its records came from, which can be the active
+    // segment, and a scan reads a chunk write in flight as a torn chunk. So switch the active
+    // segment first, and then wait for the writes in flight, which the phaser covers until the
+    // separator takes them. A full store has no segment to switch to, and the check must not wait
+    // for one, so it fails at once with the segment it cannot scan.
+    if (_active_segment && get_segment_descriptor(_active_segment->id()).kept) {
+        if (available_segment_count(write_source::normal_write) == 0) {
+            co_await coroutine::return_exception(unseparated_records_error(fmt::format(
+                    "Records of table {} in the active {} were possibly not separated, and no free segment allows the switch that a scan needs",
+                    table, _active_segment->id())));
+        }
+        co_await request_segment_switch();
+    }
+    co_await _writes_phaser.advance_and_await();
+
+    std::optional<log_segment_id> found;
+    for (auto segment_id : kept_segments) {
+        co_await for_each_record(segment_id, [&] (const chunk_record& record) {
+            if (found || record.header.table != table) {
+                return make_ready_future<>();
+            }
+            const auto key = record.header.index_key();
+            if (range.contains(key.token(), dht::token_comparator()) && index.is_record_alive(key, record.location)) {
+                found = record.location.segment;
+            }
+            return make_ready_future<>();
+        });
+        if (found) {
+            co_await coroutine::return_exception(unseparated_records_error(fmt::format(
+                    "Records of table {} in {} were not separated, the segment is kept until the node restarts", table, *found)));
+        }
+    }
 }
 
 future<std::optional<segment_info>> segment_manager_impl::read_segment_info(log_segment_id segment_id) {
@@ -2651,6 +2701,10 @@ future<> segment_manager::await_pending_writes() {
 
 size_t segment_manager::kept_segment_count() const noexcept {
     return _impl->kept_segment_count();
+}
+
+future<> segment_manager::check_separated(table_id table, const primary_index& index, dht::token_range range) {
+    return _impl->check_separated(table, index, std::move(range));
 }
 
 class segment_data_sink_impl : public data_sink_impl {
