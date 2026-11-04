@@ -1351,7 +1351,13 @@ future<> storage_group::split(compaction::compaction_type_options::split opt, ta
         }
         auto holder = cg->async_gate().hold();
         co_await cg->flush();
-        co_await cg->flush_separator();
+        // A record that the separator did not move is placed by its token when the separator moves
+        // it later, so the split goes on.
+        auto separator_flush = co_await coroutine::as_future(cg->flush_separator());
+        if (separator_flush.failed()) {
+            tlogger.warn("Cannot flush the logstor separator of {}.{} before a split, its records stay in kept segments: {}",
+                    cg->schema()->ks_name(), cg->schema()->cf_name(), separator_flush.get_exception());
+        }
         co_await cg->split(opt, tablet_split_task_info);
     }
 }
@@ -3645,11 +3651,15 @@ future<> compaction_group::stop(sstring reason) noexcept {
         co_await _t._compaction_manager.remove(*view, reason);
     }
 
+    if (separator_flush_future.failed()) {
+        // The stop does not need the records in group segments. They stay readable in their kept
+        // segments, and a cleanup or a truncate makes them dead, or recovery separates them again
+        // after a restart.
+        tlogger.warn("Cannot flush the logstor separator of {}.{} at stop, its records stay in kept segments: {}",
+                _t.schema()->ks_name(), _t.schema()->cf_name(), separator_flush_future.get_exception());
+    }
     if (flush_future.failed()) {
         co_await seastar::coroutine::return_exception_ptr(flush_future.get_exception());
-    }
-    if (separator_flush_future.failed()) {
-        co_await seastar::coroutine::return_exception_ptr(separator_flush_future.get_exception());
     }
 }
 
@@ -4778,8 +4788,22 @@ future<> storage_group::flush() noexcept {
 }
 
 future<> storage_group::flush_separator() noexcept {
+    // Flush every group before the first failure is reported, so that a failure in one group does
+    // not leave the records of the other groups in their buffers.
+    std::exception_ptr first_failure;
     for (auto& cg : compaction_groups_immediate()) {
-        co_await cg->flush_separator();
+        auto f = co_await coroutine::as_future(cg->flush_separator());
+        if (!f.failed()) {
+            continue;
+        }
+        if (!first_failure) {
+            first_failure = f.get_exception();
+        } else {
+            f.ignore_ready_future();
+        }
+    }
+    if (first_failure) {
+        co_await coroutine::return_exception_ptr(std::move(first_failure));
     }
 }
 
