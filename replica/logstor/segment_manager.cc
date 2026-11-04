@@ -496,7 +496,7 @@ future<> compaction_manager_impl::stop() {
 }
 
 enum class write_source {
-    normal_write,
+    normal,
     compaction,
     separator,
     streaming,
@@ -506,7 +506,7 @@ static constexpr size_t write_source_count = 4;
 
 static sstring write_source_to_string(write_source src) {
     switch (src) {
-        case write_source::normal_write: return "normal_write";
+        case write_source::normal: return "normal";
         case write_source::compaction: return "compaction";
         case write_source::separator: return "separator";
         case write_source::streaming: return "streaming";
@@ -578,7 +578,7 @@ public:
     // with abort_requested_exception.
     future<seg_ptr> take(write_source src, abort_source* as = nullptr) {
         const size_t reserved = src == write_source::compaction ? 0 : _reserved_for_compaction;
-        if (_segments.size() <= reserved && src == write_source::normal_write) {
+        if (_segments.size() <= reserved && src == write_source::normal) {
             _stats.normal_segments_wait++;
         }
         seastar::optimized_optional<abort_source::subscription> abort_subscription;
@@ -609,7 +609,7 @@ public:
         switch (src) {
             case write_source::compaction:
                 return _segments.size();
-            case write_source::normal_write:
+            case write_source::normal:
             case write_source::separator:
             case write_source::streaming:
                 return _segments.size() > _reserved_for_compaction ? _segments.size() - _reserved_for_compaction : 0;
@@ -964,7 +964,7 @@ private:
 };
 
 float compaction_manager_impl::compaction_pressure() const noexcept {
-    return compaction_shares_pressure(_sm.available_segment_count(write_source::normal_write), get_free_segment_watermarks());
+    return compaction_shares_pressure(_sm.available_segment_count(write_source::normal), get_free_segment_watermarks());
 }
 
 void compaction_manager_impl::refresh_free_segment_watermarks() noexcept {
@@ -1107,7 +1107,7 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
                        sm::description("Counts number of segments in the segment pool.")),
         sm::make_counter("segment_pool_segments_put", _segment_pool.get_stats().segments_put,
                        sm::description("Counts number of segments returned to the segment pool.")),
-        sm::make_counter("segment_pool_normal_segments_get", _segment_pool.get_stats().segments_taken[static_cast<size_t>(write_source::normal_write)],
+        sm::make_counter("segment_pool_normal_segments_get", _segment_pool.get_stats().segments_taken[static_cast<size_t>(write_source::normal)],
                        sm::description("Counts number of segments taken from the segment pool for normal writes.")),
         sm::make_counter("segment_pool_compaction_segments_get", _segment_pool.get_stats().segments_taken[static_cast<size_t>(write_source::compaction)],
                        sm::description("Counts number of segments taken from the segment pool for compaction.")),
@@ -1115,9 +1115,9 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
                        sm::description("Counts number of segments taken from the segment pool for separator writes.")),
         sm::make_counter("segment_pool_normal_segments_wait", _segment_pool.get_stats().normal_segments_wait,
                        sm::description("Counts number of times normal writes had to wait for a segment to become available in the segment pool.")),
-        sm::make_counter("bytes_written", _stats.bytes_written[static_cast<size_t>(write_source::normal_write)],
+        sm::make_counter("bytes_written", _stats.bytes_written[static_cast<size_t>(write_source::normal)],
                        sm::description("Counts number of bytes written to the disk.")),
-        sm::make_counter("data_bytes_written", _stats.data_bytes_written[static_cast<size_t>(write_source::normal_write)],
+        sm::make_counter("data_bytes_written", _stats.data_bytes_written[static_cast<size_t>(write_source::normal)],
                        sm::description("Counts number of data bytes written to the disk.")),
         sm::make_counter("write_failures", _stats.write_failures,
                        sm::description("Counts number of write failures when appending to a logstor segment.")),
@@ -1277,7 +1277,7 @@ future<> segment_manager_impl::run_separator_fiber() {
 }
 
 future<> segment_manager_impl::write(write_buffer& wb) {
-    write_source source = write_source::normal_write;
+    write_source source = write_source::normal;
     auto holder = _async_gate.hold();
     auto write_op = _writes_phaser.start();
     const auto chunk_size = wb.chunk_size(block_alignment);
@@ -1462,7 +1462,7 @@ future<> segment_manager_impl::request_segment_switch() {
 }
 
 future<> segment_manager_impl::switch_active_segment() {
-    auto new_seg = co_await take_segment(write_source::normal_write);
+    auto new_seg = co_await take_segment(write_source::normal);
 
     auto old_seg = std::exchange(_active_segment, std::move(new_seg));
 
@@ -1855,7 +1855,7 @@ bool compaction_manager_impl::should_run_auto_compaction() noexcept {
         return false;
     }
 
-    const auto available_segments = _sm.available_segment_count(write_source::normal_write);
+    const auto available_segments = _sm.available_segment_count(write_source::normal);
     const auto watermarks = get_free_segment_watermarks();
 
     if (!auto_compaction_wanted(running, available_segments, watermarks)) {
