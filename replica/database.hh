@@ -1570,6 +1570,10 @@ public:
     future<utils::chunked_vector<sstables::shared_sstable>> take_sstable_set_snapshot();
 
     future<utils::chunked_vector<logstor::segment_snapshot>> take_logstor_snapshot(dht::token_range tr);
+    // Fails with logstor::unseparated_records_error when a kept segment holds a live record of the
+    // table in the range, which the separator did not move to a group segment. The table must use
+    // logstor, and the caller flushes the separator first.
+    future<> check_separated(dht::token_range);
     future<std::unique_ptr<logstor::segment_stream_sink>> create_logstor_segment_sink(replica::database&);
 
     // Clones storage of a given tablet. Memtable is flushed first to guarantee that the
@@ -2253,6 +2257,12 @@ public:
     static future<> flush_tables_on_all_shards(sharded<database>& sharded_db, std::vector<table_info> tables);
     // flush all tables in a keyspace on all shards.
     static future<> flush_keyspace_on_all_shards(sharded<database>& sharded_db, std::string_view ks_name);
+    // Checks, after a flush that the API requests, that the separator moved every record of the
+    // logstor tables to their group segments, because the API promises that the records are in the
+    // storage of the table. The flushes that the server runs for itself do not check, because the
+    // records stay readable in any case.
+    static future<> check_logstor_separated_on_all_shards(sharded<database>& sharded_db, table_id id);
+    static future<> check_logstor_separated_on_all_shards(sharded<database>& sharded_db);
     // flush all tables on this shard.
     // Note: force_new_active_segment in the commitlog, so that
     // flushing all tables will allow reclaiming of all commitlog segments

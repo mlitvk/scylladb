@@ -1353,6 +1353,7 @@ void set_column_family(http_context& ctx, routes& r, sharded<replica::database>&
         co_await db.invoke_on_all([] (replica::database& db) {
             return db.flush_all_tables();
         });
+        co_await replica::database::check_logstor_separated_on_all_shards(db);
         co_return json_void();
     });
 

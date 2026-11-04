@@ -61,6 +61,7 @@ Only step 4 writes to the disk - all other steps only update in-memory metadata.
 1. When a record is written to the active segment, it is also written to its compaction group's separator buffer. The separator buffer holds a reference to the original segment.
 2. The separator buffer is flushed when it's full, or requested to flush for other reason. It is written into a new segment in the compaction group, and it updates the location of the records from the original mixed segments to the new segments in the compaction group.
 3. After the separator buffer is flushed and all records from the original segment are moved, it releases the reference of the segment. When there are no more reference to the segment it is freed.
+4. A flush that fails keeps the mixed segments that its records came from: the records stay readable where the index points, and the segments are not freed until the node restarts, when recovery separates them again. The segment manager lists the kept segments. A table flush that the API requests, and the snapshot of a tablet migration, fail with `unseparated_records_error` while a kept segment holds a live record of the table in their range, because the records would not be in the segments that the flush promises or the migration streams.
 
 **Compaction:**
 1. The amount of live data is tracked for each segment in its (in-memory) segment_descriptor. The segment descriptors are stored in a histogram by live data. This histogram is called a `segment_set` and each compaction group owns one.

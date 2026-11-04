@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <stdexcept>
 #include <seastar/core/shared_future.hh>
 #include <seastar/core/file.hh>
 #include <seastar/core/rwlock.hh>
@@ -131,6 +132,13 @@ public:
 class segment_manager_impl;
 class log_index;
 
+// A kept segment holds a live record that the separator did not move to a group segment, so a
+// flush or a snapshot that needs the records of the table in group segments cannot give them.
+class unseparated_records_error : public std::runtime_error {
+public:
+    explicit unseparated_records_error(std::string message) : std::runtime_error(std::move(message)) {}
+};
+
 class segment_manager : public space_accounting_subscriber {
     std::unique_ptr<segment_manager_impl> _impl;
 private:
@@ -198,6 +206,12 @@ public:
     // Returns the number of kept segments, which hold records that the separator did not move, and
     // which are not freed until the node restarts.
     size_t kept_segment_count() const noexcept;
+
+    // Fails with unseparated_records_error when a kept segment holds a live record of the table in
+    // the token range, which the separator did not move to a group segment, and which a later flush
+    // does not move either. The caller flushes the separator of the table first, else the records
+    // that the flush moves count as well. `index` is the index of the table.
+    future<> check_separated(table_id, const primary_index& index, dht::token_range);
 
     future<utils::chunked_vector<segment_snapshot>> make_snapshot(logstor_group& cg);
 
