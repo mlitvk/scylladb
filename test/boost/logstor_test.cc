@@ -18,6 +18,7 @@
 #include <span>
 #include <vector>
 #include <fmt/format.h>
+#include <seastar/core/file.hh>
 #include <seastar/core/memory.hh>
 #include <seastar/core/metrics_api.hh>
 #include <seastar/core/seastar.hh>
@@ -3898,6 +3899,278 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_split_compaction_flushes_a_full_buffer) {
 
     for (const auto& expected : written) {
         auto actual = read_mutation(ls, schema, src.logstor_index(), expected.decorated_key(), schema->full_slice()).get();
+        BOOST_REQUIRE(actual);
+        assert_that(*actual).is_equal_to(expected);
+    }
+}
+
+// Writes `block`, the first block of a segment, back to its place on disk.
+void write_segment_first_block_on_disk(logstor& ls, log_segment_id segment_id, const temporary_buffer<char>& block) {
+    const logstor_params params;
+    const uint64_t offset = segment_id.value % (params.file_size / params.segment_size) * params.segment_size;
+    auto f = open_file_dma(ls.get_segment_manager().get_segment_file_path(segment_id), open_flags::rw).get();
+    auto close_file = defer([&f] noexcept { f.close().get(); });
+    BOOST_REQUIRE_EQUAL(f.dma_write(offset, block.get(), block.size()).get(), block.size());
+}
+
+// Reads the first block of a segment from disk.
+temporary_buffer<char> read_segment_first_block_on_disk(logstor& ls, log_segment_id segment_id) {
+    const logstor_params params;
+    const uint64_t offset = segment_id.value % (params.file_size / params.segment_size) * params.segment_size;
+    auto f = open_file_dma(ls.get_segment_manager().get_segment_file_path(segment_id), open_flags::ro).get();
+    auto close_file = defer([&f] noexcept { f.close().get(); });
+    auto block = temporary_buffer<char>::aligned(f.memory_dma_alignment(), ondisk::block_alignment);
+    BOOST_REQUIRE_EQUAL(f.dma_read(offset, block.get_write(), block.size()).get(), block.size());
+    return block;
+}
+
+// Changes the body CRC of a full segment on disk and recomputes the header CRC. The headers stay
+// valid and every record stays readable at its location, but a scan of the segment fails the body
+// check and gives no records.
+void corrupt_body_crc_on_disk(logstor& ls, log_segment_id segment_id) {
+    auto block = read_segment_first_block_on_disk(ls, segment_id);
+    auto ch = read_chunk_header(block);
+    BOOST_REQUIRE(ch.kind == segment_kind::full);
+    ch.body_crc ^= 1;
+    ch.crc = ch.calculate_crc(read_segment_header(block));
+    seastar::simple_memory_output_stream out(block.get_write(), ondisk::chunk_header_size);
+    ser::serialize<ondisk::chunk_header>(out, ch);
+    write_segment_first_block_on_disk(ls, segment_id, block);
+}
+
+// Flips a byte of the segment header of a full segment on disk. The header CRC covers the segment
+// header, so the headers of the segment do not read any more: a scan gives no chunk, and the
+// segment info, with the token range of the segment, is not available.
+void corrupt_segment_header_on_disk(logstor& ls, log_segment_id segment_id) {
+    auto block = read_segment_first_block_on_disk(ls, segment_id);
+    BOOST_REQUIRE(read_chunk_header(block).kind == segment_kind::full);
+    flip_byte(block, ondisk::chunk_header_size + ondisk::segment_header_size - 1);
+    write_segment_first_block_on_disk(ls, segment_id, block);
+}
+
+// Runs the compaction of a group that holds pk0_v0, pk1_v0 and pk0_v1 in three segments, after
+// `corrupt` damaged the segment of pk1 on disk, and checks that compaction dropped pk1: the scan
+// cannot read the segment, so the index entry of pk1 is erased, the segment is freed, and the
+// output segment holds pk0_v1 alone.
+void check_compaction_drops_records_it_cannot_read(std::function<void(logstor&, log_segment_id)> corrupt) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    test_recovery_catalog no_tables;
+    ls.do_recovery(no_tables).get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+    auto setup_guard = std::make_optional(ls.get_compaction_manager().disable_compaction(cg).get());
+
+    auto pk0_v0 = make_kv_mutation(schema, "pk0", "v0", api::timestamp_type(1));
+    auto pk1_v0 = make_kv_mutation(schema, "pk1", "v1", api::timestamp_type(2));
+    auto pk0_v1 = make_kv_mutation(schema, "pk0", "v0-new", api::timestamp_type(3));
+
+    write_and_flush_segment(ls, cg, pk0_v0);
+    write_and_flush_segment(ls, cg, pk1_v0);
+    write_and_flush_segment(ls, cg, pk0_v1);
+
+    BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 3u);
+
+    const auto pk0 = make_index_key(*schema, pk0_v1.decorated_key());
+    const auto pk1 = make_index_key(*schema, pk1_v0.decorated_key());
+    const auto pk0_before = cg.logstor_index().get(pk0)->location;
+    const auto pk1_before = cg.logstor_index().get(pk1)->location;
+
+    corrupt(ls, pk1_before.segment);
+
+    setup_guard.reset();
+    ls.get_compaction_manager().submit(cg);
+    auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+
+    // The three segments are freed, and the one segment left is the output, with pk0_v1 in it.
+    BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 1u);
+    BOOST_REQUIRE(cg.logstor_index().get(pk0)->location != pk0_before);
+    BOOST_REQUIRE(!cg.logstor_index().get(pk1));
+
+    auto actual_pk0 = read_mutation(ls, schema, cg.logstor_index(), pk0_v1.decorated_key(), schema->full_slice()).get();
+    BOOST_REQUIRE(actual_pk0);
+    assert_that(*actual_pk0).is_equal_to(pk0_v1);
+    BOOST_REQUIRE(!read_mutation(ls, schema, cg.logstor_index(), pk1_v0.decorated_key(), schema->full_slice()).get());
+}
+
+// Checks that compaction drops the records of a segment whose body does not match its CRC, instead
+// of freeing the segment while the index still points into it, which stops the node. The segment
+// header reads, so the index entries are found through the token range of the segment.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_drops_records_it_cannot_read) {
+    check_compaction_drops_records_it_cannot_read(corrupt_body_crc_on_disk);
+}
+
+// The same for a segment whose headers do not read: the token range of the segment is not known,
+// so the index entries are found by a scan of the whole index.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_drops_records_of_a_segment_whose_header_does_not_read) {
+    check_compaction_drops_records_it_cannot_read(corrupt_segment_header_on_disk);
+}
+
+// Checks that compaction drops the records that it cannot read in the free step after a flush,
+// not only at the end. The first segment in the order of the scan is corrupt, and the live records
+// of the other segments need two new segments, so the free step after the first flush frees the
+// corrupt segment.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_drops_records_it_cannot_read_before_its_last_flush) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    test_recovery_catalog no_tables;
+    ls.do_recovery(no_tables).get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+    auto setup_guard = std::make_optional(ls.get_compaction_manager().disable_compaction(cg).get());
+
+    constexpr size_t input_count = 4;
+    constexpr size_t overwrites_per_segment = tenth_of_segment_records / 2;
+
+    auto make_version = [&] (size_t segment, size_t record, unsigned version) {
+        return make_kv_mutation(schema, seastar::format("s{}r{}", segment, record),
+                sstring(tenth_of_segment_value_size, char('a' + version)), api::timestamp_type(1 + version));
+    };
+    auto segment_ids = [&] {
+        return snapshot_segment_ids(ls.get_segment_manager().make_snapshot(cg).get());
+    };
+
+    for (size_t s = 0; s < input_count; ++s) {
+        std::vector<mutation> ms;
+        for (size_t r = 0; r < tenth_of_segment_records; ++r) {
+            ms.push_back(make_version(s, r, 0));
+        }
+        write_and_flush_segment(ls, cg, ms);
+    }
+    const auto input_ids = segment_ids();
+    BOOST_REQUIRE_EQUAL(input_ids.size(), input_count);
+
+    // Overwrite half of the records of each segment. The overwrites fill their own segments, so
+    // the compaction takes the inputs only.
+    std::vector<mutation> ms;
+    for (size_t s = 0; s < input_count; ++s) {
+        for (size_t r = 0; r < overwrites_per_segment; ++r) {
+            ms.push_back(make_version(s, r, 1));
+        }
+        if (ms.size() == tenth_of_segment_records) {
+            write_and_flush_segment(ls, cg, ms);
+            ms.clear();
+        }
+    }
+    BOOST_REQUIRE(ms.empty());
+    const auto segment_count_before = cg.logstor_segments().segment_count();
+
+    // The compaction scans the inputs in the order of their ids, so the first id is the first
+    // segment of the scan.
+    const auto corrupt_segment = *input_ids.begin();
+    auto in_corrupt_segment = [&] (size_t s) {
+        const auto key = make_index_key(*schema, make_version(s, tenth_of_segment_records - 1, 0).decorated_key());
+        return cg.logstor_index().get(key)->location.segment == corrupt_segment;
+    };
+    const auto corrupt_input = *std::ranges::find_if(std::views::iota(size_t(0), input_count), in_corrupt_segment);
+    corrupt_body_crc_on_disk(ls, corrupt_segment);
+
+    // The live records of the other three inputs need two new segments, and the record that
+    // triggers the first flush is in the last input.
+    setup_guard.reset();
+    ls.get_compaction_manager().submit(cg);
+    setup_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+
+    const auto ids_after = segment_ids();
+    for (auto id : input_ids) {
+        BOOST_REQUIRE(!ids_after.contains(id));
+    }
+    BOOST_REQUIRE_EQUAL(ids_after.size(), segment_count_before - input_count + 2);
+
+    // The records of the corrupt input that were not overwritten are gone, and all other records
+    // read back their latest version.
+    for (size_t s = 0; s < input_count; ++s) {
+        for (size_t r = 0; r < tenth_of_segment_records; ++r) {
+            const auto expected = make_version(s, r, r < overwrites_per_segment ? 1 : 0);
+            auto actual = read_mutation(ls, schema, cg.logstor_index(), expected.decorated_key(), schema->full_slice()).get();
+            if (s == corrupt_input && r >= overwrites_per_segment) {
+                BOOST_REQUIRE(!cg.logstor_index().get(make_index_key(*schema, expected.decorated_key())));
+                BOOST_REQUIRE(!actual);
+            } else {
+                BOOST_REQUIRE(actual);
+                assert_that(*actual).is_equal_to(expected);
+            }
+        }
+    }
+}
+
+// Checks that a split compaction ends when it cannot read a segment of the group that it splits,
+// and drops the records that it could not read: the body of the straddling segment does not match
+// its CRC, and the headers of a single-sided segment do not read, so the fast path cannot place it.
+SEASTAR_THREAD_TEST_CASE(test_logstor_split_compaction_drops_records_it_cannot_read) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    test_recovery_catalog no_tables;
+    ls.do_recovery(no_tables).get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group src(schema, ls);
+    test_logstor_group left(schema, ls, src.logstor_index());
+    test_logstor_group right(schema, ls, src.logstor_index());
+    auto& index = src.logstor_index();
+    auto setup_guard = std::make_optional(ls.get_compaction_manager().disable_compaction(src).get());
+
+    const auto keys = make_token_ordered_keys(schema, 6);
+    const auto boundary = dht::decorate_key(*schema, partition_key::from_single_value(*schema, serialized(keys[2]))).token();
+    auto classify = [boundary] (dht::token t) -> mutation_writer::token_group_id {
+        return t <= boundary ? 0 : 1;
+    };
+
+    auto k0 = make_kv_mutation(schema, keys[0], "v0", api::timestamp_type(1));
+    auto k1 = make_kv_mutation(schema, keys[1], "v1", api::timestamp_type(2));
+    auto k2_v0 = make_kv_mutation(schema, keys[2], "v2", api::timestamp_type(3));
+    auto k3 = make_kv_mutation(schema, keys[3], "v3", api::timestamp_type(4));
+    auto k4 = make_kv_mutation(schema, keys[4], "v4", api::timestamp_type(5));
+    auto k5 = make_kv_mutation(schema, keys[5], "v5", api::timestamp_type(6));
+    auto k2_v1 = make_kv_mutation(schema, keys[2], "v2-new", api::timestamp_type(7));
+
+    write_and_flush_segment(ls, src, k0);
+    const std::array right_only = {k4, k5};
+    write_and_flush_segment(ls, src, right_only);
+    const std::array straddling = {k1, k2_v0, k3};
+    write_and_flush_segment(ls, src, straddling);
+    write_and_flush_segment(ls, src, k2_v1);
+    BOOST_REQUIRE_EQUAL(src.logstor_segments().segment_count(), 4u);
+
+    const auto k0_segment = index.get(make_index_key(*schema, k0.decorated_key()))->location.segment;
+    const auto straddling_segment = index.get(make_index_key(*schema, k1.decorated_key()))->location.segment;
+    corrupt_segment_header_on_disk(ls, k0_segment);
+    corrupt_body_crc_on_disk(ls, straddling_segment);
+
+    setup_guard.reset();
+    ls.get_compaction_manager().submit_split_compaction(src, classify,
+            [&] (log_segment_id, dht::token first_token, dht::token last_token) -> logstor_group& {
+                BOOST_REQUIRE_EQUAL(classify(first_token), classify(last_token));
+                return classify(first_token) == 0 ? static_cast<logstor_group&>(left) : right;
+            }).get();
+
+    // The split took every segment out of the group, and the two it could not read are freed: the
+    // target groups hold only the single-sided segments that read.
+    BOOST_REQUIRE_EQUAL(src.logstor_segments().segment_count(), 0u);
+    BOOST_REQUIRE_EQUAL(left.logstor_segments().segment_count(), 1u);
+    BOOST_REQUIRE_EQUAL(right.logstor_segments().segment_count(), 1u);
+
+    // The records of the two segments are gone, and the others are readable.
+    for (const auto& lost : {k0, k1, k3}) {
+        BOOST_REQUIRE(!index.get(make_index_key(*schema, lost.decorated_key())));
+        BOOST_REQUIRE(!read_mutation(ls, schema, index, lost.decorated_key(), schema->full_slice()).get());
+    }
+    for (const auto& expected : {k2_v1, k4, k5}) {
+        auto actual = read_mutation(ls, schema, index, expected.decorated_key(), schema->full_slice()).get();
         BOOST_REQUIRE(actual);
         assert_that(*actual).is_equal_to(expected);
     }
