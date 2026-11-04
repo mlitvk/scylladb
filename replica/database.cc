@@ -3075,7 +3075,27 @@ future<> database::flush_tables_on_all_shards(sharded<database>& sharded_db, std
         return force_new_commitlog_segments(db._commitlog, db._schema_commitlog);
     }).then([&, tables = std::move(tables)] {
         return parallel_for_each(tables, [&] (const auto& ti) {
-            return flush_table_on_all_shards(sharded_db, ti.id);
+            return flush_table_on_all_shards(sharded_db, ti.id).then([&sharded_db, id = ti.id] {
+                return check_logstor_separated_on_all_shards(sharded_db, id);
+            });
+        });
+    });
+}
+
+future<> database::check_logstor_separated_on_all_shards(sharded<database>& sharded_db, table_id id) {
+    return sharded_db.invoke_on_all([id] (replica::database& db) {
+        if (!db.column_family_exists(id)) {
+            return make_ready_future<>();
+        }
+        auto& t = db.find_column_family(id);
+        return t.uses_logstor() ? t.check_separated(dht::token_range::make_open_ended_both_sides()) : make_ready_future<>();
+    });
+}
+
+future<> database::check_logstor_separated_on_all_shards(sharded<database>& sharded_db) {
+    return sharded_db.invoke_on_all([] (replica::database& db) {
+        return db.get_tables_metadata().parallel_for_each_table([] (table_id, lw_shared_ptr<table> t) {
+            return t->uses_logstor() ? t->check_separated(dht::token_range::make_open_ended_both_sides()) : make_ready_future<>();
         });
     });
 }
