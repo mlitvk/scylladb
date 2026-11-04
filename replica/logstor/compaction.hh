@@ -78,7 +78,7 @@ struct segment_descriptor : public log_heap_hook<segment_descriptor_hist_options
     static constexpr uint32_t no_index = std::numeric_limits<uint32_t>::max();
     uint32_t index_in_set{no_index};
     // The sequence of the latest use of the segment, which each valid chunk of the segment also
-    // has, except between get_segment() and the write of the first chunk. reset() keeps it.
+    // has, except between take_segment() and the write of the first chunk. reset() keeps it.
     segment_sequence seq{0};
 
     void reset(size_t segment_size) noexcept {
