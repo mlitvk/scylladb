@@ -26,6 +26,7 @@
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/shard_id.hh>
 #include <seastar/core/shared_future.hh>
+#include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/util/log.hh>
 
@@ -387,5 +388,7 @@ private:
         return _size - _append_offset;
     }
 };
+
+using seg_ptr = lw_shared_ptr<segment>;
 
 }
