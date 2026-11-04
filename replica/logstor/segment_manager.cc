@@ -474,7 +474,7 @@ public:
 
     struct stats {
         uint64_t segments_put{0};
-        std::array<uint64_t, write_source_count> segments_get{0};
+        std::array<uint64_t, write_source_count> segments_taken{0};
         uint64_t normal_segments_wait{0};
     } _stats;
 
@@ -519,7 +519,7 @@ public:
 
     // Takes a segment for `src`, or waits for one. If `as` is given and aborted, the wait fails
     // with abort_requested_exception.
-    future<seg_ptr> get_segment(write_source src, abort_source* as = nullptr) {
+    future<seg_ptr> take(write_source src, abort_source* as = nullptr) {
         const size_t reserved = src == write_source::compaction ? 0 : _reserved_for_compaction;
         if (_segments.size() <= reserved && src == write_source::normal_write) {
             _stats.normal_segments_wait++;
@@ -542,7 +542,7 @@ public:
                 co_await coroutine::return_exception_ptr(_replenish_error);
             }
         }
-        _stats.segments_get[static_cast<size_t>(src)]++;
+        _stats.segments_taken[static_cast<size_t>(src)]++;
         auto seg = std::move(_segments.front());
         _segments.pop_front();
         co_return seg;
@@ -919,8 +919,8 @@ private:
         );
     }
 
-    future<seg_ptr> get_segment(write_source src, abort_source* as = nullptr) {
-        seg_ptr seg = co_await _segment_pool.get_segment(src, as);
+    future<seg_ptr> take_segment(write_source src, abort_source* as = nullptr) {
+        seg_ptr seg = co_await _segment_pool.take(src, as);
         _replenisher_wakeup.signal();
         auto& desc = get_segment_descriptor(seg->id());
         desc.seq = allocate_segment_seq();
@@ -1110,11 +1110,11 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
                        sm::description("Counts number of segments in the segment pool.")),
         sm::make_counter("segment_pool_segments_put", _segment_pool.get_stats().segments_put,
                        sm::description("Counts number of segments returned to the segment pool.")),
-        sm::make_counter("segment_pool_normal_segments_get", _segment_pool.get_stats().segments_get[static_cast<size_t>(write_source::normal_write)],
+        sm::make_counter("segment_pool_normal_segments_get", _segment_pool.get_stats().segments_taken[static_cast<size_t>(write_source::normal_write)],
                        sm::description("Counts number of segments taken from the segment pool for normal writes.")),
-        sm::make_counter("segment_pool_compaction_segments_get", _segment_pool.get_stats().segments_get[static_cast<size_t>(write_source::compaction)],
+        sm::make_counter("segment_pool_compaction_segments_get", _segment_pool.get_stats().segments_taken[static_cast<size_t>(write_source::compaction)],
                        sm::description("Counts number of segments taken from the segment pool for compaction.")),
-        sm::make_counter("segment_pool_separator_segments_get", _segment_pool.get_stats().segments_get[static_cast<size_t>(write_source::separator)],
+        sm::make_counter("segment_pool_separator_segments_get", _segment_pool.get_stats().segments_taken[static_cast<size_t>(write_source::separator)],
                        sm::description("Counts number of segments taken from the segment pool for separator writes.")),
         sm::make_counter("segment_pool_normal_segments_wait", _segment_pool.get_stats().normal_segments_wait,
                        sm::description("Counts number of times normal writes had to wait for a segment to become available in the segment pool.")),
@@ -1388,7 +1388,7 @@ future<> segment_manager_impl::write_full_segment(write_buffer& wb, logstor_grou
         throw std::runtime_error(fmt::format("Chunk size {} exceeds segment size {}", chunk_size, _cfg.segment_size));
     }
 
-    auto seg = co_await get_segment(source, as);
+    auto seg = co_await take_segment(source, as);
     logstor_logger.trace("Write full segment {} seq {} from {}", seg->id(), seg->seq_num(), write_source_to_string(source));
 
     wb.seal(seg->seq_num(), cg.table_id(), block_alignment);
@@ -1494,7 +1494,7 @@ future<> segment_manager_impl::request_segment_switch() {
 }
 
 future<> segment_manager_impl::switch_active_segment() {
-    auto new_seg = co_await get_segment(write_source::normal_write);
+    auto new_seg = co_await take_segment(write_source::normal_write);
 
     auto old_seg = std::exchange(_active_segment, std::move(new_seg));
 
@@ -2761,7 +2761,7 @@ future<> segment_manager_impl::adopt_streamed_segment(recovery_catalog& catalog,
 }
 
 future<std::unique_ptr<segment_stream_sink>> segment_manager_impl::create_segment_output_stream(recovery_catalog& catalog) {
-    auto seg = co_await get_segment(write_source::streaming);
+    auto seg = co_await take_segment(write_source::streaming);
     co_return std::make_unique<segment_stream_sink_impl>(*this, catalog, std::move(seg));
 }
 
