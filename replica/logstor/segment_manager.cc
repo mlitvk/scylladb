@@ -50,6 +50,7 @@
 #include <seastar/coroutine/as_future.hh>
 #include "replica/logstor/write_buffer.hh"
 #include "utils/disk-error-handler.hh"
+#include "utils/exceptions.hh"
 #include "utils/dynamic_bitset.hh"
 #include "utils/serialized_action.hh"
 #include "replica/database.hh"
@@ -600,6 +601,12 @@ struct separator_task {
 // The largest read buffer of a segment scan. It is the largest segment size today
 // (segment_descriptor_hist_options), so a scan reads a segment in one buffer.
 static constexpr size_t max_scan_buffer_size = 128 * 1024;
+
+// A separator failure keeps a segment until the node restarts, so each failure is worth a warning.
+// A lasting cause, for example a full store, fails every flush, so the warnings are rate limited,
+// with one limit per site, so that one site does not hide the other.
+static thread_local logger::rate_limit separator_task_failure_rate_limit{std::chrono::seconds(10)};
+static thread_local logger::rate_limit separator_flush_failure_rate_limit{std::chrono::seconds(10)};
 
 class segment_manager_impl {
 
@@ -1212,6 +1219,7 @@ future<> segment_manager_impl::run_separator_fiber() {
             co_return;
         }
 
+        const auto segment_id = task.seg_ref.id();
         auto write_to_separator_failed = defer([seg_ref = task.seg_ref] mutable noexcept {
             seg_ref.set_flush_failure();
         });
@@ -1219,9 +1227,14 @@ future<> segment_manager_impl::run_separator_fiber() {
         try {
             co_await write_to_separator(task.records, task.chunk_position, std::move(task.seg_ref), task.seq_num);
             write_to_separator_failed.cancel();
+        } catch (const seastar::abort_requested_exception&) {
+            ++_stats.separator_task_failures;
+            logstor_logger.debug("Separator task of {} stopped: {}", segment_id, std::current_exception());
         } catch (...) {
             ++_stats.separator_task_failures;
-            logstor_logger.debug("logstor separator task failure in separator fiber: {:t}", std::current_exception());
+            logstor_logger.log(log_level::warn, separator_task_failure_rate_limit,
+                    "Cannot write the records of {} to the separator, the segment is kept until the node restarts: {}",
+                    segment_id, std::current_exception());
         }
     }
 }
@@ -2201,7 +2214,13 @@ future<> compaction_manager_impl::flush_separator_buffer(separator_buffer& buf, 
     if (flush_result.failed()) {
         auto ep = flush_result.get_exception();
         ++_stats.separator_flush_failures;
-        logstor_logger.debug("logstor separator flush failure: {}", ep);
+        if (try_catch<seastar::abort_requested_exception>(ep)) {
+            logstor_logger.debug("Separator flush of table {} stopped: {}", cg.table_id(), ep);
+        } else {
+            logstor_logger.log(log_level::warn, separator_flush_failure_rate_limit,
+                    "Cannot flush the separator buffer of table {}, its {} segments are kept until the node restarts: {}",
+                    cg.table_id(), buf.held_segments.size(), ep);
+        }
 
         auto abort_result = co_await coroutine::as_future(buf.abort(ep));
         if (abort_result.failed()) {
