@@ -68,6 +68,13 @@ schema_ptr make_kv_schema() {
             .build();
 }
 
+schema_ptr make_kv_schema(std::string_view cf_name) {
+    return schema_builder(1, "ks", cf_name)
+            .with_column("pk", utf8_type, column_kind::partition_key)
+            .with_column("v", utf8_type)
+            .build();
+}
+
 primary_index_key make_index_key(const schema&, const dht::decorated_key& dk) {
     return primary_index_key{dk};
 }
@@ -370,6 +377,14 @@ void write_and_flush_segment(logstor& ls, test_logstor_group& cg, std::span<cons
 
 void write_and_flush_segment(logstor& ls, test_logstor_group& cg, const mutation& m) {
     write_and_flush_segment(ls, cg, std::span(&m, 1));
+}
+
+const dht::token_range all_tokens = dht::token_range::make_open_ended_both_sides();
+
+// Writes the mutation and hands it to the separator buffer of the group, without a flush.
+void write_to_separator_buffer(logstor& ls, test_logstor_group& cg, const mutation& m) {
+    ls.write(m, write_target(&cg, {}), db::no_timeout).get();
+    ls.flush_to_separator().get();
 }
 
 // Which side of a split a key falls on is decided by its token, so a split test needs its keys in
@@ -2672,6 +2687,138 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_and_separator_flush) {
     auto actual = read_mutation(ls, schema, cg.logstor_index(), key, schema->full_slice()).get();
     BOOST_REQUIRE(actual);
     assert_that(*actual).is_equal_to(expected);
+}
+
+// A failed separator flush is reported to the flush that waits for it, and the records that it did
+// not move keep their mixed segment, which the check finds until the records are dead.
+SEASTAR_THREAD_TEST_CASE(test_logstor_failed_separator_flush_is_reported_and_keeps_the_segment) {
+    if constexpr (!std::is_same_v<utils::error_injection_type, utils::error_injection<true>>) {
+        return;
+    }
+
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    test_recovery_catalog no_tables;
+    ls.do_recovery(no_tables).get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+    auto& sm = ls.get_segment_manager();
+
+    test_logstor_group cg(schema, ls);
+
+    auto m = make_kv_mutation(schema, "pk0", "value0", api::timestamp_type(100));
+    write_to_separator_buffer(ls, cg, m);
+    const auto key = make_index_key(*schema, m.decorated_key());
+    const auto location_before = cg.logstor_index().get(key)->location;
+
+    utils::get_local_injector().enable("fail_flush_separator_buffer", true /* one shot */);
+    auto disable = seastar::defer([] noexcept { utils::get_local_injector().disable("fail_flush_separator_buffer"); });
+    BOOST_REQUIRE_THROW(cg.flush_separator().get(), std::runtime_error);
+
+    // The record stays where the index pointed, in a segment that is kept, and it is readable.
+    BOOST_REQUIRE_EQUAL(sm.kept_segment_count(), 1u);
+    BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 0u);
+    BOOST_REQUIRE(cg.logstor_index().get(key)->location == location_before);
+    auto read = read_mutation(ls, schema, cg.logstor_index(), m.decorated_key(), schema->full_slice()).get();
+    BOOST_REQUIRE(read);
+    assert_that(*read).is_equal_to(m);
+
+    // A flush with nothing to flush passes, because the failure belongs to the earlier flush. The
+    // check still fails, because the record is live in the kept segment, which is the active one:
+    // the check switches it before the scan.
+    cg.flush_separator().get();
+    BOOST_REQUIRE_THROW(sm.check_separated(schema->id(), cg.logstor_index(), all_tokens).get(), unseparated_records_error);
+
+    // The check sees only the records of the table in its range.
+    BOOST_REQUIRE_THROW(sm.check_separated(schema->id(), cg.logstor_index(), dht::token_range::make_singular(key.token())).get(),
+            unseparated_records_error);
+    const auto other_token = dht::token::from_int64(key.token().raw() + 1);
+    sm.check_separated(schema->id(), cg.logstor_index(), dht::token_range::make_singular(other_token)).get();
+    sm.check_separated(make_kv_schema("other")->id(), cg.logstor_index(), all_tokens).get();
+
+    // An overwrite that the separator moves makes the kept record dead, and the check passes.
+    auto m2 = make_kv_mutation(schema, "pk0", "value1", api::timestamp_type(101));
+    write_and_flush_segment(ls, cg, m2);
+    BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 1u);
+    sm.check_separated(schema->id(), cg.logstor_index(), all_tokens).get();
+    BOOST_REQUIRE_EQUAL(sm.kept_segment_count(), 1u);
+}
+
+// A mixed segment is held by the buffers of every group that has a record in it. When the flush of
+// one group fails, the check of that group's table fails at once, while the other group still holds
+// the segment, and the other group's flush and check are not affected.
+SEASTAR_THREAD_TEST_CASE(test_logstor_failed_separator_flush_of_one_group_is_found_while_another_holds_the_segment) {
+    if constexpr (!std::is_same_v<utils::error_injection_type, utils::error_injection<true>>) {
+        return;
+    }
+
+    auto schema_a = make_kv_schema("a");
+    auto schema_b = make_kv_schema("b");
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    test_recovery_catalog no_tables;
+    ls.do_recovery(no_tables).get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+    auto& sm = ls.get_segment_manager();
+
+    test_logstor_group cg_a(schema_a, ls);
+    test_logstor_group cg_b(schema_b, ls);
+
+    write_to_separator_buffer(ls, cg_a, make_kv_mutation(schema_a, "pk0", "value-a"));
+    write_to_separator_buffer(ls, cg_b, make_kv_mutation(schema_b, "pk0", "value-b"));
+    BOOST_REQUIRE_EQUAL(cg_a.separator_held_segment_count(), 1u);
+    BOOST_REQUIRE_EQUAL(cg_b.separator_held_segment_count(), 1u);
+
+    utils::get_local_injector().enable("fail_flush_separator_buffer", true /* one shot */);
+    auto disable = seastar::defer([] noexcept { utils::get_local_injector().disable("fail_flush_separator_buffer"); });
+    BOOST_REQUIRE_THROW(cg_a.flush_separator().get(), std::runtime_error);
+
+    BOOST_REQUIRE_EQUAL(sm.kept_segment_count(), 1u);
+    BOOST_REQUIRE_EQUAL(cg_b.separator_held_segment_count(), 1u);
+    BOOST_REQUIRE_THROW(sm.check_separated(schema_a->id(), cg_a.logstor_index(), all_tokens).get(), unseparated_records_error);
+
+    cg_b.flush_separator().get();
+    BOOST_REQUIRE_EQUAL(cg_b.logstor_segments().segment_count(), 1u);
+    sm.check_separated(schema_b->id(), cg_b.logstor_index(), all_tokens).get();
+    BOOST_REQUIRE_THROW(sm.check_separated(schema_a->id(), cg_a.logstor_index(), all_tokens).get(), unseparated_records_error);
+}
+
+// The final flush of the stop can fail too. The stop goes on, and the segment stays allocated for
+// recovery to separate it again.
+SEASTAR_THREAD_TEST_CASE(test_logstor_stops_after_a_failed_final_separator_flush) {
+    if constexpr (!std::is_same_v<utils::error_injection_type, utils::error_injection<true>>) {
+        return;
+    }
+
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    test_recovery_catalog no_tables;
+    ls.do_recovery(no_tables).get();
+    ls.start().get();
+    bool stopped = false;
+    auto stop_store = seastar::defer([&] noexcept { if (!stopped) { ls.stop().get(); } });
+    auto& sm = ls.get_segment_manager();
+
+    // The group outlives the stop of the store, so that the final flush of the stop finds its buffer.
+    std::optional<test_logstor_group> cg;
+    cg.emplace(schema, ls);
+    write_to_separator_buffer(ls, *cg, make_kv_mutation(schema, "pk0", "value0"));
+
+    utils::get_local_injector().enable("fail_flush_separator_buffer");
+    auto disable = seastar::defer([] noexcept { utils::get_local_injector().disable("fail_flush_separator_buffer"); });
+    ls.stop().get();
+    stopped = true;
+    BOOST_REQUIRE_EQUAL(sm.kept_segment_count(), 1u);
+    cg.reset();
 }
 
 // Checks that a group discarded while the separator still holds unflushed records for it gives up
