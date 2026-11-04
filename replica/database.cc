@@ -3388,8 +3388,13 @@ future<> database::truncate_table_on_all_shards(sharded<database>& sharded_db, s
         });
         if (cf.uses_logstor()) {
             // flush and only then disable the compaction. flush writes to new segments, and the compaction
-            // is what generates free segments for new writes.
-            co_await cf.flush_separator();
+            // is what generates free segments for new writes. The truncate clears the index, which
+            // makes every record that the separator did not move dead, so it goes on after a failure.
+            auto separator_flush = co_await coroutine::as_future(cf.flush_separator());
+            if (separator_flush.failed()) {
+                dblog.warn("Cannot flush the logstor separator of {}.{} before a truncate: {}",
+                        cf.schema()->ks_name(), cf.schema()->cf_name(), separator_flush.get_exception());
+            }
             auto& logstor_cm = cf.get_logstor_compaction_manager();
             co_await cf.parallel_foreach_logstor_compaction_group([&logstor_cm, &st] (replica::compaction_group& cg) -> future<> {
                 st.logstor_cres.emplace_back(co_await logstor_cm.disable_compaction(cg.as_logstor_group()));

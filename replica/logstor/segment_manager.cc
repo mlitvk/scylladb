@@ -1237,7 +1237,12 @@ future<> segment_manager_impl::stop() {
     _separator_buffer_abort.request_abort();
     co_await std::move(_separator_fiber).handle_exception([] (std::exception_ptr) {});
 
-    co_await _compaction_mgr.flush_all_separator_buffers(std::nullopt);
+    // The stop goes on after a failed flush: the records stay readable in their kept segments, and
+    // recovery separates them at the next start.
+    auto final_flush = co_await coroutine::as_future(_compaction_mgr.flush_all_separator_buffers(std::nullopt));
+    if (final_flush.failed()) {
+        logstor_logger.warn("Cannot flush the separator buffers at stop, their records stay in kept segments: {}", final_flush.get_exception());
+    }
 
     if (_active_segment) {
         co_await _active_segment->stop();
@@ -1487,7 +1492,8 @@ future<> segment_manager_impl::switch_active_segment() {
         (void)old_seg->stop().finally([old_seg] {}).handle_exception([] (std::exception_ptr) {});
     }
 
-    // trigger separator flush for separator buffers that hold old segments
+    // trigger separator flush for separator buffers that hold old segments. A failure is logged by
+    // the flush, and the next flush of the group tries again with its new records.
     auto u = std::max<size_t>(1, _configured_max_segments / 100);
     if (_next_segment_seq.value % u == 0 && _next_segment_seq.value > 5*u) {
         (void)_compaction_mgr.flush_all_separator_buffers(segment_sequence(_next_segment_seq.value - 5*u)).handle_exception([] (std::exception_ptr) {});
@@ -2816,6 +2822,8 @@ future<> logstor_group::write_to_separator(Writer writer, segment_ref seg_ref, s
         }
 
         if (!_separator_flush.available()) {
+            // The failure of the flush that this write waits for belongs to the records of that
+            // flush, not to this record. Those records stay in their kept segments.
             auto f = co_await coroutine::as_future(_separator_flush.get_future());
             f.ignore_ready_future();
             continue;
@@ -2846,16 +2854,33 @@ future<> logstor_group::flush_separator(std::optional<segment_sequence> seq_num)
 
     auto target_generation = _separator_generation;
     if (!should_flush(_active_buffer)) {
+        // A flush that completed before this call is not reported here, whether it failed or not,
+        // because a stored failure would fail every later call until new writes switch the buffer.
+        // The records that a failed flush left behind are found through their kept segments instead.
         if (_separator_flush.available()) {
             co_return;
         }
         target_generation--;
     }
 
+    // Flush everything first and report the first failure at the end, so that a failure of an older
+    // flush does not leave the buffer of this call unflushed.
+    std::exception_ptr first_failure;
+    auto wait_for_flush = [this, &first_failure] () -> future<> {
+        auto f = co_await coroutine::as_future(_separator_flush.get_future());
+        if (!f.failed()) {
+            co_return;
+        }
+        if (!first_failure) {
+            first_failure = f.get_exception();
+        } else {
+            f.ignore_ready_future();
+        }
+    };
+
     while (target_generation >= _separator_generation) {
         if (!_separator_flush.available()) {
-            auto f = co_await coroutine::as_future(_separator_flush.get_future());
-            f.ignore_ready_future();
+            co_await wait_for_flush();
             continue;
         }
 
@@ -2863,8 +2888,11 @@ future<> logstor_group::flush_separator(std::optional<segment_sequence> seq_num)
     }
 
     if (target_generation == _separator_generation - 1 && !_separator_flush.available()) {
-        auto f = co_await coroutine::as_future(_separator_flush.get_future());
-        f.ignore_ready_future();
+        co_await wait_for_flush();
+    }
+
+    if (first_failure) {
+        co_await coroutine::return_exception_ptr(std::move(first_failure));
     }
 }
 
@@ -2875,7 +2903,8 @@ future<> logstor_group::close_separator() {
     _separator_enabled = false;
 
     // A flush in progress owns the buffer it is writing out, and releases it when it is done, so let
-    // it finish rather than pulling the buffer out from under it.
+    // it finish rather than pulling the buffer out from under it. Its failure was logged, and the
+    // segments it kept are what this teardown leaves behind in any case.
     if (!_separator_flush.available()) {
         auto f = co_await coroutine::as_future(_separator_flush.get_future());
         f.ignore_ready_future();
