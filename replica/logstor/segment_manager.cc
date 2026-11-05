@@ -2269,7 +2269,7 @@ future<> segment_manager_impl::do_recovery(replica::database& db) {
         if (!tp->uses_logstor()) {
             co_return;
         }
-        logstor_logger.info("Table {}.{} has {} entries in logstor index", tp->schema()->ks_name(), tp->schema()->cf_name(), tp->logstor_index().get_key_count());
+        logstor_logger.info("Table {}.{} has {} entries in logstor index", tp->schema()->ks_name(), tp->schema()->cf_name(), tp->logstor_index().get_usage().key_count);
         auto scan = tp->logstor_index().scan();
         while (auto batch = scan.next_batch(1024)) {
             for (const auto& entry : batch->entries) {
