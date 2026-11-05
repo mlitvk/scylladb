@@ -71,10 +71,20 @@ mutation make_mutation(schema_ptr schema, sstring pk, sstring value) {
     return m;
 }
 
+// Returns the location of the record of a key, or nullopt when the index does not have the key. It
+// looks the key up the way a read that bypasses the cache does.
+std::optional<record_location> lookup_location(const primary_index& index, const primary_index_key& key, const schema& s) {
+    auto result = index.lookup_for_read(key, s, use_cache::no);
+    if (!result) {
+        return std::nullopt;
+    }
+    return std::get<primary_index::guarded_location>(*result).location;
+}
+
 void populate(primary_index& index, const primary_index_key& key, const mutation& m) {
-    auto entry = index.get(key);
-    BOOST_REQUIRE(entry);
-    BOOST_REQUIRE(index.populate_cache(key, entry->location, m.schema(), m.key(), to_single_row_partition(mutation(m))));
+    auto location = lookup_location(index, key, *m.schema());
+    BOOST_REQUIRE(location);
+    BOOST_REQUIRE(index.populate_cache(key, *location, m.schema(), m.key(), to_single_row_partition(mutation(m))));
 }
 
 mutation lookup_mutation(primary_index& index, const primary_index_key& key, schema_ptr schema) {
@@ -376,11 +386,11 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_range_erase_and_clear_space_
     BOOST_REQUIRE_EQUAL(accounting.add_calls, 5u);
     BOOST_REQUIRE_EQUAL(accounting.free_calls, 3u);
     check_live_bytes(ssize_t(entries[0].loc.size + entries[4].loc.size));
-    BOOST_REQUIRE(index.get(entries[0].key).has_value());
-    BOOST_REQUIRE(!index.get(entries[1].key).has_value());
-    BOOST_REQUIRE(!index.get(entries[2].key).has_value());
-    BOOST_REQUIRE(!index.get(entries[3].key).has_value());
-    BOOST_REQUIRE(index.get(entries[4].key).has_value());
+    BOOST_REQUIRE(lookup_location(index, entries[0].key, *schema).has_value());
+    BOOST_REQUIRE(!lookup_location(index, entries[1].key, *schema).has_value());
+    BOOST_REQUIRE(!lookup_location(index, entries[2].key, *schema).has_value());
+    BOOST_REQUIRE(!lookup_location(index, entries[3].key, *schema).has_value());
+    BOOST_REQUIRE(lookup_location(index, entries[4].key, *schema).has_value());
     BOOST_REQUIRE_EQUAL(std::count(accounting.freed_locations.begin(), accounting.freed_locations.end(), entries[1].loc), 1);
     BOOST_REQUIRE_EQUAL(std::count(accounting.freed_locations.begin(), accounting.freed_locations.end(), entries[2].loc), 1);
     BOOST_REQUIRE_EQUAL(std::count(accounting.freed_locations.begin(), accounting.freed_locations.end(), entries[3].loc), 1);
@@ -493,7 +503,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_cache_invalidation_and_evict
 
     BOOST_REQUIRE(index.erase(key1, make_index_entry(1, 10, 10, 1).location) == false);
     BOOST_REQUIRE(index.erase(key1, make_index_entry(2, 10, 12, 2).location));
-    BOOST_REQUIRE(!index.get(key1));
+    BOOST_REQUIRE(!lookup_location(index, key1, *schema));
 
     populate(index, key2, mut2);
     populate(index, key3, mut3);
@@ -511,7 +521,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_cache_invalidation_and_evict
     BOOST_REQUIRE_EQUAL(cache.shared_tracker.get_stats().partition_evictions, evictions_before + 1);
 
     auto cached_after_eviction = int(lookup_exists(index, key0, schema))
-        + int(index.get(key2) && lookup_exists(index, key2, schema))
+        + int(lookup_location(index, key2, *schema) && lookup_exists(index, key2, schema))
         + int(lookup_exists(index, key3, schema));
     BOOST_REQUIRE_EQUAL(cached_after_eviction, 2);
 
@@ -520,10 +530,10 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_cache_invalidation_and_evict
     assert_that(schema, lookup(index, key0, schema)).is_equal_to(mut0.partition());
 
     BOOST_REQUIRE(index.erase(key2, make_index_entry(2, 20, 12, 2).location));
-    BOOST_REQUIRE(!index.get(key2));
+    BOOST_REQUIRE(!lookup_location(index, key2, *schema));
 
-    BOOST_REQUIRE(index.get(key0));
-    BOOST_REQUIRE(index.get(key3));
+    BOOST_REQUIRE(lookup_location(index, key0, *schema));
+    BOOST_REQUIRE(lookup_location(index, key3, *schema));
 
     index.clear().get();
     BOOST_REQUIRE(index.empty());
@@ -550,8 +560,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_drain_cache_preserves_index_
 
     index.drain_cache().get();
 
-    BOOST_REQUIRE(index.get(key0));
-    BOOST_REQUIRE(index.get(key1));
+    BOOST_REQUIRE(lookup_location(index, key0, *schema));
+    BOOST_REQUIRE(lookup_location(index, key1, *schema));
     BOOST_REQUIRE(!lookup_exists(index, key0, schema));
     BOOST_REQUIRE(!lookup_exists(index, key1, schema));
 }
@@ -608,12 +618,11 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_cache_survives_index_rebalan
     BOOST_REQUIRE_EQUAL(cache.shared_tracker.get_stats().partition_insertions, insertions_before_repopulate + hot_keys.size());
 
     for (size_t i = 0; i < hot_keys.size(); ++i) {
-        auto entry = index.get(hot_keys[i]);
-        BOOST_REQUIRE(entry);
+        BOOST_REQUIRE(lookup_location(index, hot_keys[i], *schema));
         assert_that(schema, lookup(index, hot_keys[i], schema)).is_equal_to(hot_mutations[i].partition());
     }
 
-    BOOST_REQUIRE(index.get(grown_keys.back()));
+    BOOST_REQUIRE(lookup_location(index, grown_keys.back(), *schema));
     index.drain_cache().get();
 }
 
