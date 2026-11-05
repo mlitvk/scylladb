@@ -106,6 +106,9 @@ public:
     virtual ~space_accounting_subscriber() = default;
     virtual void on_add_record(record_location location) noexcept = 0;
     virtual void on_free_record(record_location location) noexcept = 0;
+    // Called when compaction or the separator writes a live record to a new location, so the data
+    // at `from` is dead and the same data is live at `to`. A move frees no data.
+    virtual void on_move_record(record_location from, record_location to) noexcept = 0;
 };
 
 }
