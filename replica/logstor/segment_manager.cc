@@ -2271,10 +2271,9 @@ future<> segment_manager_impl::do_recovery(replica::database& db) {
         }
         logstor_logger.info("Table {}.{} has {} entries in logstor index", tp->schema()->ks_name(), tp->schema()->cf_name(), tp->logstor_index().get_usage().key_count);
         auto scan = tp->logstor_index().scan();
-        while (auto batch = scan.next_batch(1024)) {
-            for (const auto& entry : batch->entries) {
-                used_segments.set(entry.get().entry().location.segment.value);
-            }
+        while (scan.next_batch(1024, [&] (const primary_index::scanned_entry& entry) {
+            used_segments.set(entry.entry().location.segment.value);
+        })) {
             co_await coroutine::maybe_yield();
         }
     });
