@@ -186,10 +186,17 @@ public:
         bool inserted() const noexcept { return result == insert_result::inserted; }
     };
 
-private:
-    using iterator = typename tree_type::iterator;
+    // Which of two entries of the same key is the newer one. Every write of an existing key asks
+    // this, so the default is a stateless functor and the comparator a template parameter: the
+    // compare is then inlined, rather than a std::function built per insert to call it through.
+    // Only recovery has a comparator of its own, and it captures state, which entry_cmp_fn is for.
+    struct default_entry_cmp {
+        std::strong_ordering operator()(const index_entry& a, const index_entry& b) const noexcept {
+            return a.timestamp <=> b.timestamp;
+        }
+    };
 
-public:
+    using entry_cmp_fn = std::function<std::strong_ordering(const index_entry&, const index_entry&)>;
 
     // The number of entries in one batch of a scan whose caller has no reason to choose another
     // number, and in one page of a range erase. A batch or a page runs without a yield, so this
@@ -336,70 +343,6 @@ public:
         }
     };
 
-private:
-    counting_allocation_strategy _tree_allocator{standard_allocator(), logstor_logger};
-    tree_type _entries;
-    size_t _key_count = 0;
-    // Bytes of the records this index points at.
-    uint64_t _live_record_bytes = 0;
-
-    mutable utils::phased_barrier _reads_phaser{"logstor_primary_index"};
-
-    // Non-owning pointer to the cache tracker, which is null when the cache is not set up.
-    cache_tracker* _cache_tracker = nullptr;
-
-    // Currently we support a single subscriber for space accounting which is the segment manager.
-    space_accounting_subscriber& _space_accounting;
-
-    void space_accounting_on_record_added(record_location location) noexcept {
-        _space_accounting.on_add_record(location);
-        _live_record_bytes += location.size;
-    }
-
-    void space_accounting_on_record_freed(record_location location) noexcept {
-        if (location.size > _live_record_bytes) {
-            on_fatal_internal_error(logstor_logger, format("freeing a record of {} bytes from an index holding {} live record bytes",
-                    location.size, _live_record_bytes));
-        }
-        _space_accounting.on_free_record(location);
-        _live_record_bytes -= location.size;
-    }
-
-    auto make_entry_disposer() noexcept {
-        return [this] (primary_index_entry* e) noexcept {
-            if (_cache_tracker) {
-                _cache_tracker->evict(*e);
-            }
-            space_accounting_on_record_freed(e->_e.location);
-            --_key_count;
-        };
-    }
-
-    auto find_key(this auto& self, const primary_index_key& key) {
-        return self._entries.find(key, primary_index_key_cmp{});
-    }
-
-    auto position_at_range_start(this auto& self, const dht::token_range& tr) -> decltype(self._entries.begin()) {
-        return tr.start()
-                ? (tr.start()->is_inclusive()
-                    ? self._entries.lower_bound(tr.start()->value().raw(), primary_index_key_cmp{})
-                    : self._entries.upper_bound(tr.start()->value().raw(), primary_index_key_cmp{}))
-                : self._entries.begin();
-    }
-
-    auto position_at_range_end(this auto& self, const dht::token_range& tr) -> decltype(self._entries.end()) {
-        return tr.end()
-                ? (tr.end()->is_inclusive()
-                    ? self._entries.upper_bound(tr.end()->value().raw(), primary_index_key_cmp{})
-                    : self._entries.lower_bound(tr.end()->value().raw(), primary_index_key_cmp{}))
-                : self._entries.end();
-    }
-
-    index_read_guard start_read() const {
-        return index_read_guard(_reads_phaser.start());
-    }
-
-public:
     explicit primary_index(space_accounting_subscriber& space_accounting, cache_tracker* ct)
         : _entries(dht::raw_token_less_comparator{})
         , _cache_tracker(ct)
@@ -423,106 +366,9 @@ public:
         return _reads_phaser.advance_and_await();
     }
 
-    token_range_scan scan(const dht::token_range& tr = dht::token_range()) const {
-        return token_range_scan(*this, tr);
+    future<> clear() {
+        return erase(dht::token_range());
     }
-
-    // Looks up a key for MUTATION_FRAGMENTS(): returns its index entry and, when the key
-    // is cached, a snapshot of the cached mutation. Unlike the read path this neither
-    // touches the cache's LRU nor counts a cache hit or miss, so that inspecting a table
-    // does not perturb its cache.
-    std::optional<dump_lookup_result> lookup_for_dump(const primary_index_key& key, schema_ptr target_schema) const {
-        auto it = find_key(key);
-        if (it == _entries.end()) {
-            return std::nullopt;
-        }
-
-        dump_lookup_result result{.entry = it->entry()};
-        if (_cache_tracker) {
-            result.cached_mutation = _cache_tracker->peek(*it, std::move(target_schema));
-        }
-        return result;
-    }
-
-    // Returns the cached partition, with its key, of an entry that a scan visits. Returns nullopt
-    // when the entry holds nothing, when the cache is not enabled or when the read does not use the
-    // cache. Counts a hit or a miss and touches the LRU, like a point read does. The entry must
-    // belong to this index, and the caller must be inside the visit of a scan.
-    std::optional<keyed_single_row_partition> lookup_cached(const scanned_entry& e, const schema& target_schema, use_cache uses_cache) const {
-        if (!_cache_tracker || !uses_cache) {
-            return std::nullopt;
-        }
-        return _cache_tracker->read_partition(e._e, target_schema);
-    }
-
-    // Finds a key for a point read. Returns nullopt if the index does not have the key. If the
-    // read uses the cache and the cache has the key, returns the cached partition with its key. If
-    // not, returns the location of the record with a guard. The entry has only the hash of the key,
-    // so the caller compares the key of a cached partition with its own.
-    std::optional<read_lookup_result> lookup_for_read(const primary_index_key& key, const schema& target_schema, use_cache uses_cache) const {
-        auto it = find_key(key);
-        if (it == _entries.end()) {
-            return std::nullopt;
-        }
-
-        if (_cache_tracker && uses_cache) {
-            if (auto cached = _cache_tracker->read_partition(*it, target_schema)) {
-                return std::move(*cached);
-            }
-        }
-        return guarded_location{.location = it->entry().location, .guard = start_read()};
-    }
-
-    bool populate_cache(const primary_index_key& key, record_location read_location, const schema_ptr& schema, const partition_key& pk,
-            const single_row_partition& partition) const {
-        if (!_cache_tracker) {
-            return false;
-        }
-
-        auto it = find_key(key);
-        if (it == _entries.end() || it->entry().location != read_location) {
-            return false;
-        }
-
-        _cache_tracker->populate(*it, schema, pk, partition);
-        return true;
-    }
-
-    bool is_record_alive(const primary_index_key& key, record_location location) const {
-        auto it = find_key(key);
-        if (it != _entries.end()) {
-            return it->_e.location == location;
-        } else {
-            return false;
-        }
-    }
-
-    bool update_record_location(const primary_index_key& key, record_location old_location, record_location new_location) {
-        auto it = find_key(key);
-        if (it != _entries.end()) {
-            if (it->_e.location == old_location) {
-                it->_e.location = new_location;
-                space_accounting_on_record_freed(old_location);
-                space_accounting_on_record_added(new_location);
-                // The cached partition is still valid (same data, new location on
-                // disk after compaction moved it) — do not evict the cache here.
-                return true;
-            }
-        }
-        return false;
-    }
-
-    // Which of two entries of the same key is the newer one. Every write of an existing key asks
-    // this, so the default is a stateless functor and the comparator a template parameter: the
-    // compare is then inlined, rather than a std::function built per insert to call it through.
-    // Only recovery has a comparator of its own, and it captures state, which entry_cmp_fn is for.
-    struct default_entry_cmp {
-        std::strong_ordering operator()(const index_entry& a, const index_entry& b) const noexcept {
-            return a.timestamp <=> b.timestamp;
-        }
-    };
-
-    using entry_cmp_fn = std::function<std::strong_ordering(const index_entry&, const index_entry&)>;
 
     template <typename EntryCmp = default_entry_cmp>
     insert_outcome insert(const primary_index_key& key, index_entry new_entry, const EntryCmp& cmp = {}) {
@@ -556,7 +402,7 @@ public:
         auto it = find_key(key);
         if (it != _entries.end() && it->_e.location == loc) {
             with_allocator(_tree_allocator, [&] {
-                it.erase_and_dispose(dht::raw_token_less_comparator{}, make_entry_disposer());
+                it.erase_and_dispose(dht::raw_token_less_comparator{}, [this] (primary_index_entry* e) noexcept { dispose_entry(e); });
             });
             return true;
         }
@@ -567,7 +413,7 @@ public:
     // page seeks both of its ends, so that no iterator lives from one page to the next.
     future<> erase(dht::token_range tr) {
         static constexpr size_t page_size = default_scan_batch_size;
-        auto dispose = make_entry_disposer();
+        auto dispose = [this] (primary_index_entry* e) noexcept { dispose_entry(e); };
         std::optional<primary_index_key> next_key;
         while (true) {
             const bool done = with_allocator(_tree_allocator, [&] {
@@ -590,8 +436,93 @@ public:
         }
     }
 
-    future<> clear() {
-        return erase(dht::token_range());
+    bool is_record_alive(const primary_index_key& key, record_location location) const {
+        auto it = find_key(key);
+        if (it != _entries.end()) {
+            return it->_e.location == location;
+        } else {
+            return false;
+        }
+    }
+
+    bool update_record_location(const primary_index_key& key, record_location old_location, record_location new_location) {
+        auto it = find_key(key);
+        if (it != _entries.end()) {
+            if (it->_e.location == old_location) {
+                it->_e.location = new_location;
+                space_accounting_on_record_freed(old_location);
+                space_accounting_on_record_added(new_location);
+                // The cached partition is still valid (same data, new location on
+                // disk after compaction moved it) — do not evict the cache here.
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Finds a key for a point read. Returns nullopt if the index does not have the key. If the
+    // read uses the cache and the cache has the key, returns the cached partition with its key. If
+    // not, returns the location of the record with a guard. The entry has only the hash of the key,
+    // so the caller compares the key of a cached partition with its own.
+    std::optional<read_lookup_result> lookup_for_read(const primary_index_key& key, const schema& target_schema, use_cache uses_cache) const {
+        auto it = find_key(key);
+        if (it == _entries.end()) {
+            return std::nullopt;
+        }
+
+        if (_cache_tracker && uses_cache) {
+            if (auto cached = _cache_tracker->read_partition(*it, target_schema)) {
+                return std::move(*cached);
+            }
+        }
+        return guarded_location{.location = it->entry().location, .guard = start_read()};
+    }
+
+    token_range_scan scan(const dht::token_range& tr = dht::token_range()) const {
+        return token_range_scan(*this, tr);
+    }
+
+    // Returns the cached partition, with its key, of an entry that a scan visits. Returns nullopt
+    // when the entry holds nothing, when the cache is not enabled or when the read does not use the
+    // cache. Counts a hit or a miss and touches the LRU, like a point read does. The entry must
+    // belong to this index, and the caller must be inside the visit of a scan.
+    std::optional<keyed_single_row_partition> lookup_cached(const scanned_entry& e, const schema& target_schema, use_cache uses_cache) const {
+        if (!_cache_tracker || !uses_cache) {
+            return std::nullopt;
+        }
+        return _cache_tracker->read_partition(e._e, target_schema);
+    }
+
+    bool populate_cache(const primary_index_key& key, record_location read_location, const schema_ptr& schema, const partition_key& pk,
+            const single_row_partition& partition) const {
+        if (!_cache_tracker) {
+            return false;
+        }
+
+        auto it = find_key(key);
+        if (it == _entries.end() || it->entry().location != read_location) {
+            return false;
+        }
+
+        _cache_tracker->populate(*it, schema, pk, partition);
+        return true;
+    }
+
+    // Looks up a key for MUTATION_FRAGMENTS(): returns its index entry and, when the key
+    // is cached, a snapshot of the cached mutation. Unlike the read path this neither
+    // touches the cache's LRU nor counts a cache hit or miss, so that inspecting a table
+    // does not perturb its cache.
+    std::optional<dump_lookup_result> lookup_for_dump(const primary_index_key& key, schema_ptr target_schema) const {
+        auto it = find_key(key);
+        if (it == _entries.end()) {
+            return std::nullopt;
+        }
+
+        dump_lookup_result result{.entry = it->entry()};
+        if (_cache_tracker) {
+            result.cached_mutation = _cache_tracker->peek(*it, std::move(target_schema));
+        }
+        return result;
     }
 
     // Returns what the index holds now.
@@ -604,6 +535,70 @@ public:
         };
     }
 
+private:
+    using iterator = typename tree_type::iterator;
+
+    counting_allocation_strategy _tree_allocator{standard_allocator(), logstor_logger};
+    tree_type _entries;
+    size_t _key_count = 0;
+    // Bytes of the records this index points at.
+    uint64_t _live_record_bytes = 0;
+
+    mutable utils::phased_barrier _reads_phaser{"logstor_primary_index"};
+
+    // Non-owning pointer to the cache tracker, which is null when the cache is not set up.
+    cache_tracker* _cache_tracker = nullptr;
+
+    // Currently we support a single subscriber for space accounting which is the segment manager.
+    space_accounting_subscriber& _space_accounting;
+
+    void space_accounting_on_record_added(record_location location) noexcept {
+        _space_accounting.on_add_record(location);
+        _live_record_bytes += location.size;
+    }
+
+    void space_accounting_on_record_freed(record_location location) noexcept {
+        if (location.size > _live_record_bytes) {
+            on_fatal_internal_error(logstor_logger, format("freeing a record of {} bytes from an index holding {} live record bytes",
+                    location.size, _live_record_bytes));
+        }
+        _space_accounting.on_free_record(location);
+        _live_record_bytes -= location.size;
+    }
+
+    // Evicts the cached partition of an entry that the tree erases, and frees its record in the
+    // accounting.
+    void dispose_entry(primary_index_entry* e) noexcept {
+        if (_cache_tracker) {
+            _cache_tracker->evict(*e);
+        }
+        space_accounting_on_record_freed(e->_e.location);
+        --_key_count;
+    }
+
+    auto find_key(this auto& self, const primary_index_key& key) -> decltype(self._entries.find(key, primary_index_key_cmp{})) {
+        return self._entries.find(key, primary_index_key_cmp{});
+    }
+
+    auto position_at_range_start(this auto& self, const dht::token_range& tr) -> decltype(self._entries.begin()) {
+        return tr.start()
+                ? (tr.start()->is_inclusive()
+                    ? self._entries.lower_bound(tr.start()->value().raw(), primary_index_key_cmp{})
+                    : self._entries.upper_bound(tr.start()->value().raw(), primary_index_key_cmp{}))
+                : self._entries.begin();
+    }
+
+    auto position_at_range_end(this auto& self, const dht::token_range& tr) -> decltype(self._entries.end()) {
+        return tr.end()
+                ? (tr.end()->is_inclusive()
+                    ? self._entries.upper_bound(tr.end()->value().raw(), primary_index_key_cmp{})
+                    : self._entries.lower_bound(tr.end()->value().raw(), primary_index_key_cmp{}))
+                : self._entries.end();
+    }
+
+    index_read_guard start_read() const {
+        return index_read_guard(_reads_phaser.start());
+    }
 };
 
 }
