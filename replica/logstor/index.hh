@@ -322,10 +322,8 @@ private:
 
     mutable utils::phased_barrier _reads_phaser{"logstor_primary_index"};
 
-    // Non-owning pointer to the cache tracker; null when the cache is not set up.
-    // Mutable so that logically-const methods can call non-const methods on the
-    // tracker (touch, insert) for LRU accounting.
-    mutable cache_tracker* _cache_tracker = nullptr;
+    // Non-owning pointer to the cache tracker, which is null when the cache is not set up.
+    cache_tracker* _cache_tracker = nullptr;
 
     // Currently we support a single subscriber for space accounting which is the segment manager.
     space_accounting_subscriber& _space_accounting;
