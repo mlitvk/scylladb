@@ -99,6 +99,29 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_top_compaction_candidates) {
     BOOST_REQUIRE(ids(std::move(top).take_sorted()) == (std::vector<int>{3, 2, 1}));
 }
 
+// Checks that the segment estimate charges the schema table of every output segment.
+SEASTAR_THREAD_TEST_CASE(test_logstor_estimate_required_segments_charges_the_schema_table) {
+    constexpr uint64_t segment_size = 128 * 1024;
+    constexpr size_t record_size = 1024;
+    constexpr size_t record_count = 4 * segment_size / record_size;
+    constexpr size_t record_bytes = record_count * record_size;
+
+    const auto without = estimate_required_segments(record_bytes, record_count, segment_size, 0);
+    BOOST_REQUIRE_GT(without, 0u);
+
+    // A table small against the segment does not change the count, and never lowers it.
+    const auto with_small = estimate_required_segments(record_bytes, record_count, segment_size, 256);
+    BOOST_REQUIRE_GE(with_small, without);
+
+    // One large enough against the segment does: it leaves half of each for records, so it takes
+    // about twice as many of them.
+    const auto with_large = estimate_required_segments(record_bytes, record_count, segment_size, segment_size / 2);
+    BOOST_REQUIRE_GT(with_large, without);
+
+    // A table that leaves no room at all still answers, rather than dividing by zero.
+    BOOST_REQUIRE_GE(estimate_required_segments(record_bytes, record_count, segment_size, segment_size), 1u);
+}
+
 // Checks that the schema table estimate starts at the first sample of a table, moves part of the
 // way toward each new sample, and is kept per table.
 SEASTAR_THREAD_TEST_CASE(test_logstor_schema_table_size_estimator) {

@@ -40,6 +40,32 @@ inline record_location locate_record(segment_position chunk_position, frame_exte
     };
 }
 
+// The sizes that the layout of a chunk gives.
+namespace chunk_layout {
+
+// The size of the schema table of a chunk whose records are all of the version of `mapping`.
+inline size_t single_version_schema_table_size(const schema_mapping& mapping) noexcept {
+    return ondisk::schema_table_header_size + ondisk::schema_table_entry_size(mapping.serialized.size());
+}
+
+// Returns the largest record, header and value, of the schema version of `mapping` that fits an
+// empty chunk of `buffer_size` bytes and of `kind`.
+inline size_t max_record_size(size_t buffer_size, segment_kind kind, const schema_mapping& mapping) noexcept {
+    const size_t overhead = ondisk::chunk_headers_size(kind) + ondisk::record_frame_header_size
+            + align_up(single_version_schema_table_size(mapping), ondisk::record_alignment);
+    return buffer_size > overhead ? buffer_size - overhead : 0;
+}
+
+// Returns the largest record of the schema version of `mapping` that fits an empty chunk of
+// `buffer_size` bytes of either kind. The separator rewrites the records of a mixed segment into
+// full segments, so a record that logstor accepts has to fit both kinds.
+inline size_t max_record_size_any_kind(size_t buffer_size, const schema_mapping& mapping) noexcept {
+    return std::min(max_record_size(buffer_size, segment_kind::mixed, mapping),
+                    max_record_size(buffer_size, segment_kind::full, mapping));
+}
+
+}
+
 // The schema table of a chunk that a buffer builds: the registry entry of each schema version of
 // the chunk's records, once, in the order the versions were first added, and the size the table
 // takes on disk.
@@ -153,33 +179,8 @@ public:
 
     bool has_data() const noexcept;
 
-    // The size of the schema table of a chunk whose records are all of the version of `mapping`.
-    static size_t schema_table_size(const schema_mapping& mapping) noexcept {
-        return ondisk::schema_table_header_size + ondisk::schema_table_entry_size(mapping.serialized.size());
-    }
-
-    // The largest record - record header and value, the frame header aside - of the schema
-    // version of `mapping` that fits an empty buffer of this size and kind. The kinds differ in
-    // what they carry ahead of their records, so a record can fit a buffer of one kind and not of
-    // the other.
-    static size_t max_record_size(size_t buffer_size, segment_kind kind, const schema_mapping& mapping) noexcept {
-        const size_t overhead = chunk_headers_size(kind) + ondisk::record_frame_header_size
-                + align_up(schema_table_size(mapping), ondisk::record_alignment);
-        return buffer_size > overhead ? buffer_size - overhead : 0;
-    }
-
-    // The largest record of the schema version of `mapping` that fits an empty buffer of this
-    // size whatever its kind. A record is written to a segment of one kind and can be rewritten
-    // into a segment of the other - the separator rewrites the records of a mixed segment into
-    // full segments of their compaction group - so a record that logstor accepts at all has to
-    // fit both.
-    static size_t max_record_size_any_kind(size_t buffer_size, const schema_mapping& mapping) noexcept {
-        return std::min(max_record_size(buffer_size, segment_kind::mixed, mapping),
-                        max_record_size(buffer_size, segment_kind::full, mapping));
-    }
-
     size_t max_record_size(const schema_mapping& mapping) const noexcept {
-        return max_record_size(_buffer_size, _segment_kind, mapping);
+        return chunk_layout::max_record_size(_buffer_size, _segment_kind, mapping);
     }
 
     size_t record_bytes() const noexcept { return _record_bytes; }
@@ -189,23 +190,8 @@ public:
     template <log_record_writer_concept Writer>
     frame_extent append(const Writer& writer);
 
-    // How many segments of this kind `record_count` records of `record_bytes` bytes take.
-    // `schema_table_size` is the estimated size of the schema table of one segment.
-    static size_t estimate_required_segments(size_t record_bytes, size_t record_count, size_t segment_size,
-            segment_kind, size_t schema_table_size);
-
-    // What a chunk of this kind carries ahead of its records: the chunk header, and the
-    // segment header too for a full segment.
-    static constexpr size_t chunk_headers_size(segment_kind kind) noexcept {
-        size_t s = ondisk::chunk_header_size;
-        if (kind == segment_kind::full) {
-            s += ondisk::segment_header_size;
-        }
-        return s;
-    }
-
     size_t chunk_headers_size() const noexcept {
-        return chunk_headers_size(_segment_kind);
+        return ondisk::chunk_headers_size(_segment_kind);
     }
 
     // Ends the appends: writes the schema table, pads the chunk to block_alignment and computes

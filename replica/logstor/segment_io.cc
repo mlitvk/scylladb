@@ -344,11 +344,7 @@ void streamed_segment_rewriter::maybe_parse_initial_header() {
         throw std::runtime_error("Invalid streamed logstor chunk header");
     }
 
-    size_t header_size = ondisk::chunk_header_size;
-    if (ch.kind == segment_kind::full) {
-        header_size += ondisk::segment_header_size;
-    }
-    _initial_header_size = header_size;
+    _initial_header_size = ondisk::chunk_headers_size(ch.kind);
 }
 
 void streamed_segment_rewriter::rewrite_chunk_header() {
