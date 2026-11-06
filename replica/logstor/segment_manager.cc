@@ -2273,6 +2273,9 @@ future<> compaction_manager_impl::flush_separator_buffer(separator_buffer& buf, 
         utils::get_local_injector().inject("fail_flush_separator_buffer", []() {
             throw std::runtime_error("flush_separator_buffer failed by injection");
         });
+        // A message releases only one flush, so that a test can also hold the flush that starts next.
+        co_await utils::get_local_injector().inject("logstor_separator_flush_wait",
+                utils::wait_for_message(std::chrono::seconds{60}), false /* share_messages */);
 
         if (!buf.empty()) {
             co_await with_scheduling_group(_cfg.separator_sg, [&] {
@@ -2864,6 +2867,17 @@ future<> logstor_group::flush_separator(std::optional<segment_sequence> seq_num)
             continue;
         }
 
+        if (!_separator_enabled) {
+            // close_separator() discards both buffers, and it can wait in the middle of the discard. A
+            // switch here starts a flush of a buffer that the close gives back to the pool. The records
+            // of the active buffer stay in their kept segments, so report that they were not flushed.
+            if (!first_failure) {
+                first_failure = std::make_exception_ptr(std::runtime_error(fmt::format(
+                        "logstor separator flush of a closed compaction group of table {}", table_id())));
+            }
+            break;
+        }
+
         switch_active_separator_buffer();
     }
 
@@ -2884,8 +2898,9 @@ future<> logstor_group::close_separator() {
 
     // A flush in progress owns the buffer it is writing out, and releases it when it is done, so let
     // it finish rather than pulling the buffer out from under it. Its failure was logged, and the
-    // segments it kept are what this teardown leaves behind in any case.
-    if (!_separator_flush.available()) {
+    // segments it kept are what this teardown leaves behind in any case. No flush starts after the
+    // flag is cleared, but the loop keeps the discard below safe also if a flush starts while this waits.
+    while (!_separator_flush.available()) {
         auto f = co_await coroutine::as_future(_separator_flush.get_future());
         f.ignore_ready_future();
     }
