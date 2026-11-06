@@ -121,15 +121,68 @@ public:
 // This type only serializes a chunk. Tests and write_buffer use it directly.
 class chunk_builder {
 public:
+    chunk_builder(size_t buffer_size, segment_kind kind);
 
-    using ostream = seastar::simple_memory_output_stream;
+    chunk_builder(const chunk_builder&) = delete;
+    chunk_builder& operator=(const chunk_builder&) = delete;
+
+    chunk_builder(chunk_builder&&) noexcept = default;
+    chunk_builder& operator=(chunk_builder&&) noexcept = default;
+
+    // Empties the buffer, to build a new chunk in it.
+    void reset();
+
+    // Appends the record frame of the writer's record. Throws std::runtime_error when the record
+    // does not fit, see can_fit(). An append that throws leaves the builder unchanged.
+    template <log_record_writer_concept Writer>
+    frame_extent append(const Writer& writer);
+
+    // Ends the appends: writes the schema table, pads the chunk to block_alignment and computes
+    // the body CRC. Returns the size of the chunk, which does not change after this, so a caller
+    // can reserve room for the chunk in a segment before it seals the buffer.
+    size_t finish();
+
+    // Completes the chunk: finishes the buffer if finish() was not called, and writes the
+    // headers. Returns the chunk, which is what is written to a segment. The first form is for
+    // segment_kind::mixed, and the second for segment_kind::full, whose segment header holds
+    // `table`.
+    bytes_view seal(segment_sequence segment_seq);
+    bytes_view seal(segment_sequence segment_seq, table_id table);
+
+    // Whether the writer's record fits, along with the schema table entry it adds if its schema
+    // version is not in the buffer yet.
+    template <log_record_writer_concept Writer>
+    bool can_fit(const Writer& writer) const noexcept {
+        return fits(writer.record_size(), _schema_table.growth(writer.mapping()));
+    }
+
+    bool has_data() const noexcept;
+
+    // The bytes written to the buffer so far, which after finish() is the whole chunk.
+    size_t serialized_size() const noexcept { return _buffer_size - _stream.size(); }
+
+    size_t buffer_size() const noexcept { return _buffer_size; }
+
+    size_t chunk_headers_size() const noexcept {
+        return ondisk::chunk_headers_size(_segment_kind);
+    }
+
+    size_t record_bytes() const noexcept { return _record_bytes; }
+    size_t record_count() const noexcept { return _record_count; }
+
+    // The size of the schema table of the versions appended so far.
+    size_t schema_table_size() const noexcept { return _schema_table.size(); }
+
+    // The bytes of an appended record frame, its padding excluded.
+    bytes_view frame_bytes(frame_extent frame) const noexcept {
+        return bytes_view(reinterpret_cast<const int8_t*>(_buffer.get() + frame.offset), frame.size);
+    }
 
 private:
-
-    using aligned_buffer_type = std::unique_ptr<char[], free_deleter>;
+    using ostream = seastar::simple_memory_output_stream;
 
     size_t _buffer_size;
-    aligned_buffer_type _buffer;
+    std::unique_ptr<char[], free_deleter> _buffer;
     segment_kind _segment_kind;
     ostream _stream;
 
@@ -151,73 +204,11 @@ private:
     std::optional<finished_body> _finished_body;
     bool _sealed{false};
 
-public:
-
-    chunk_builder(size_t buffer_size, segment_kind kind);
-
-    void reset();
-
-    chunk_builder(const chunk_builder&) = delete;
-    chunk_builder& operator=(const chunk_builder&) = delete;
-
-    chunk_builder(chunk_builder&&) noexcept = default;
-    chunk_builder& operator=(chunk_builder&&) noexcept = default;
-
-    const char* data() const noexcept { return _buffer.get(); }
-
-    // The bytes written to the buffer so far, which after finish() is the whole chunk.
-    size_t serialized_size() const noexcept { return _buffer_size - _stream.size(); }
-
-    size_t buffer_size() const noexcept { return _buffer_size; }
-
-    // Whether the writer's record fits, along with the schema table entry it adds if its schema
-    // version is not in the buffer yet.
-    template <log_record_writer_concept Writer>
-    bool can_fit(const Writer& writer) const noexcept {
-        return can_fit(writer.record_size(), _schema_table.growth(writer.mapping()));
-    }
-
-    bool has_data() const noexcept;
-
-    size_t max_record_size(const schema_mapping& mapping) const noexcept {
-        return chunk_layout::max_record_size(_buffer_size, _segment_kind, mapping);
-    }
-
-    size_t record_bytes() const noexcept { return _record_bytes; }
-    size_t record_count() const noexcept { return _record_count; }
-    segment_kind kind() const noexcept { return _segment_kind; }
-
-    template <log_record_writer_concept Writer>
-    frame_extent append(const Writer& writer);
-
-    size_t chunk_headers_size() const noexcept {
-        return ondisk::chunk_headers_size(_segment_kind);
-    }
-
-    // Ends the appends: writes the schema table, pads the chunk to block_alignment and computes
-    // the body CRC. Returns the size of the chunk, which does not change after this, so a caller
-    // can reserve room for the chunk in a segment before it seals the buffer.
-    size_t finish();
-
-    // Completes the chunk: finishes the buffer if finish() was not called, and writes the
-    // headers. Returns the chunk, which is what is written to a segment. The first form is for
-    // segment_kind::mixed, and the second for segment_kind::full, whose segment header holds
-    // `table`.
-    bytes_view seal(segment_sequence segment_seq);
-    bytes_view seal(segment_sequence segment_seq, table_id table);
-
-    // The size of the schema table of the versions appended so far.
-    size_t schema_table_size() const noexcept { return _schema_table.size(); }
-
-private:
-
-    bytes_view do_seal(segment_sequence segment_seq, std::optional<table_id> table);
-
-    bool can_fit(size_t record_size, size_t schema_table_growth) const noexcept;
+    bool fits(size_t record_size, size_t schema_table_growth) const noexcept;
 
     void pad_to_alignment(size_t alignment);
 
-    friend class write_buffer;
+    bytes_view do_seal(segment_sequence segment_seq, std::optional<table_id> table);
 };
 
 extern template frame_extent chunk_builder::append<log_record_writer>(const log_record_writer&);
