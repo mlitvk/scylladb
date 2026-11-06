@@ -187,9 +187,9 @@ future<> logstor::do_write(const schema& s, dht::decorated_key dk, api::timestam
         _stats.write_failures++;
         co_await coroutine::return_exception_ptr(persisted_f.get_exception());
     }
-    auto [location, op] = persisted_f.get();
+    auto written = persisted_f.get();
     index_entry new_entry {
-        .location = location,
+        .location = written.location,
         .timestamp = ts,
     };
     index.insert(key, std::move(new_entry));

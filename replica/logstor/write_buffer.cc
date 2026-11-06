@@ -102,7 +102,7 @@ bool chunk_builder::has_data() const noexcept {
 }
 
 template <log_record_writer_concept Writer>
-chunk_builder::append_result chunk_builder::append(const Writer& writer) {
+frame_extent chunk_builder::append(const Writer& writer) {
     const auto& header = writer.header();
     const size_t header_size = writer.header_size();
     const size_t value_size = writer.value_size();
@@ -151,9 +151,9 @@ chunk_builder::append_result chunk_builder::append(const Writer& writer) {
     _min_token = _min_token ? std::min(*_min_token, header.key.token()) : header.key.token();
     _max_token = _max_token ? std::max(*_max_token, header.key.token()) : header.key.token();
 
-    return append_result {
-        .frame_offset = frame_offset,
-        .frame_size = frame_size,
+    return frame_extent {
+        .offset = static_cast<uint32_t>(frame_offset),
+        .size = static_cast<uint32_t>(frame_size),
     };
 }
 
@@ -247,23 +247,23 @@ size_t chunk_builder::estimate_required_segments(size_t record_bytes, size_t rec
     return (record_count + records_per_segment - 1) / records_per_segment;
 }
 
-template chunk_builder::append_result chunk_builder::append<log_record_writer>(const log_record_writer&);
-template chunk_builder::append_result chunk_builder::append<log_record_bytes_writer>(const log_record_bytes_writer&);
+template frame_extent chunk_builder::append<log_record_writer>(const log_record_writer&);
+template frame_extent chunk_builder::append<log_record_bytes_writer>(const log_record_bytes_writer&);
 
 // write_buffer
 
 write_buffer::write_buffer(size_t buffer_size, segment_kind kind)
         : _builder(buffer_size, kind)
 {
-    if (with_record_copy()) {
-        _records_copy.reserve(_builder.buffer_size() / 100);
+    if (keeps_separator_records()) {
+        _separator_records.reserve(_builder.buffer_size() / 100);
     }
 }
 
 void write_buffer::reset() {
     _builder.reset();
-    _written = {};
-    _records_copy.clear();
+    _chunk_position = {};
+    _separator_records.clear();
     _write_gate = {};
 }
 
@@ -278,15 +278,14 @@ bool write_buffer::is_closed() const noexcept {
 }
 
 template <log_record_writer_concept Writer>
-future<record_location_with_holder> write_buffer::write(Writer writer, write_target target) {
-    auto append_result = _builder.append(writer);
+future<written_record> write_buffer::write(Writer writer, write_target target) {
+    const auto frame = _builder.append(writer);
 
-    if (with_record_copy()) {
+    if (keeps_separator_records()) {
         if constexpr (std::same_as<Writer, log_record_writer>) {
-            _records_copy.push_back(record_in_buffer {
+            _separator_records.push_back(separator_record {
                 .writer = std::move(writer),
-                .frame_offset = append_result.frame_offset,
-                .frame_size = append_result.frame_size,
+                .frame = frame,
                 .target = std::move(target)
             });
         } else {
@@ -297,38 +296,37 @@ future<record_location_with_holder> write_buffer::write(Writer writer, write_tar
     // hold the write buffer until the write is complete, and pass the holder to the
     // caller for follow-up operations that should continue holding the buffer, such
     // as index updates.
-    auto op = _write_gate.hold();
+    auto buffer_holder = _write_gate.hold();
 
-    return _written.get_shared_future().then(
-            [frame_offset = append_result.frame_offset, frame_size = append_result.frame_size, op = std::move(op)]
-            (segment_position chunk_position) mutable {
-        return std::make_tuple(locate_record(chunk_position, frame_offset, frame_size), std::move(op));
+    return _chunk_position.get_shared_future().then(
+            [frame, buffer_holder = std::move(buffer_holder)] (segment_position chunk_position) mutable {
+        return written_record{locate_record(chunk_position, frame), std::move(buffer_holder)};
     });
 }
 
 future<> write_buffer::complete_writes(segment_position chunk_position) {
-    _written.set_value(chunk_position);
+    _chunk_position.set_value(chunk_position);
     co_await close();
 }
 
 future<> write_buffer::abort_writes(std::exception_ptr ex) {
-    if (!_written.available()) {
-        _written.set_exception(std::move(ex));
+    if (!_chunk_position.available()) {
+        _chunk_position.set_exception(std::move(ex));
     }
 
     // Mixed buffers keep copies of their records for separator rewriting. A failed flush has no
     // separator pass to consume them, and they were never written anywhere, so drop them.
-    _records_copy.clear();
+    _separator_records.clear();
 
     co_await close();
 }
 
-std::vector<write_buffer::record_in_buffer> write_buffer::take_separator_records() {
-    return std::move(_records_copy);
+std::vector<separator_record> write_buffer::take_separator_records() {
+    return std::move(_separator_records);
 }
 
-template future<record_location_with_holder> write_buffer::write<log_record_writer>(log_record_writer, write_target);
-template future<record_location_with_holder> write_buffer::write<log_record_bytes_writer>(log_record_bytes_writer, write_target);
+template future<written_record> write_buffer::write<log_record_writer>(log_record_writer, write_target);
+template future<written_record> write_buffer::write<log_record_bytes_writer>(log_record_bytes_writer, write_target);
 
 // write_buffer_pool
 
@@ -552,7 +550,7 @@ bool buffered_writer::maybe_advance_head() noexcept {
 // The target is taken by reference and moved from only once the record is in a buffer: a caller
 // whose append does not happen goes on to queue the record, and the write target it queues has to
 // be the one it came with, holders and all.
-std::optional<future<record_location_with_holder>> buffered_writer::append_to_head_buffer(log_record_writer& writer, write_target& target) {
+std::optional<future<written_record>> buffered_writer::append_to_head_buffer(log_record_writer& writer, write_target& target) {
     if (!head_buf().can_fit(writer) && !maybe_advance_head()) {
         return std::nullopt;
     }
