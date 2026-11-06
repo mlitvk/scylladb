@@ -51,10 +51,10 @@ class buffered_writer {
     size_t _buffer_size;
     size_t _ring_size;
     std::chrono::milliseconds _sync_period;
-    seastar::noncopyable_function<future<>(write_buffer&)> _flush_func;
+    seastar::noncopyable_function<future<>(mixed_write_buffer&)> _flush_func;
 
     // The ring of buffers, indexed modulo _ring_size.
-    std::vector<write_buffer> _ring;
+    std::vector<mixed_write_buffer> _ring;
 
     // Monotonically increasing indices; the actual slot is idx % _ring_size.
     // _head: next slot writers append to.
@@ -200,7 +200,7 @@ class buffered_writer {
 
 public:
     explicit buffered_writer(buffered_writer_config cfg,
-            seastar::noncopyable_function<future<>(write_buffer&)> flush_func);
+            seastar::noncopyable_function<future<>(mixed_write_buffer&)> flush_func);
 
     buffered_writer(const buffered_writer&) = delete;
     buffered_writer& operator=(const buffered_writer&) = delete;

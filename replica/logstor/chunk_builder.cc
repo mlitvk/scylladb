@@ -169,16 +169,30 @@ size_t chunk_builder::finish() {
     return serialized_size();
 }
 
-bytes_view chunk_builder::seal(segment_sequence segment_seq, std::optional<table_id> table) {
+bytes_view chunk_builder::seal(segment_sequence segment_seq) {
+    if (_segment_kind != segment_kind::mixed) {
+        on_internal_error(logstor_logger, "Cannot seal a chunk of a full segment without a table");
+    }
+    return do_seal(segment_seq, std::nullopt);
+}
+
+bytes_view chunk_builder::seal(segment_sequence segment_seq, table_id table) {
+    if (_segment_kind != segment_kind::full) {
+        on_internal_error(logstor_logger, "Cannot seal a chunk of a mixed segment with a table");
+    }
+    return do_seal(segment_seq, table);
+}
+
+bytes_view chunk_builder::do_seal(segment_sequence segment_seq, std::optional<table_id> table) {
     if (_sealed) {
         throw std::runtime_error("Cannot seal write buffer more than once");
     }
     finish();
 
     std::optional<ondisk::segment_header> seg_hdr;
-    if (with_segment_header()) {
+    if (table) {
         seg_hdr = ondisk::segment_header {
-            .table = table.value(),
+            .table = *table,
             .first_token = _min_token.value_or(dht::minimum_token()),
             .last_token = _max_token.value_or(dht::minimum_token()),
         };

@@ -52,81 +52,105 @@ struct separator_record {
     }
 };
 
-// Tracks asynchronous write completion on top of chunk_builder.
+// A chunk builder that tracks the writes of its records: write() appends a record and returns a
+// future that resolves to where the record ends up, once the chunk is written to a segment and
+// complete_writes() is called. The buffer_holder of the written_record keeps the buffer open, for
+// follow-up work such as index updates.
 //
-// This is the buffer type used by the segment manager, buffered_writer,
-// compaction, and separator flows. write() appends a record to the underlying
-// chunk builder and returns a future that resolves to the final record_location once
-// the buffer is flushed. The returned gate holder keeps the buffer alive for
-// follow-up work such as index updates. For mixed buffers it also keeps copies
-// of appended records so separator rewriting can replay them after the flush.
+// mixed_write_buffer and full_write_buffer take different records and seal different headers, and
+// this class holds what they share.
 class write_buffer {
-private:
     chunk_builder _builder;
     shared_promise<segment_position> _chunk_position;
     seastar::gate _write_gate;
 
-    std::vector<separator_record> _separator_records;
-
 public:
-
-    write_buffer(size_t buffer_size, segment_kind kind);
-
-    void reset();
-
     write_buffer(const write_buffer&) = delete;
     write_buffer& operator=(const write_buffer&) = delete;
 
-    write_buffer(write_buffer&&) noexcept = default;
-    write_buffer& operator=(write_buffer&&) noexcept = default;
+    // Ends the appends, see chunk_builder::finish().
+    size_t finish() { return _builder.finish(); }
 
+    // Completes the tracked writes once the chunk of the buffer is written at `chunk_position`, and
+    // waits for the holders of the written records.
+    future<> complete_writes(segment_position chunk_position);
+
+    // Waits for the holders of the written records. A buffer is reset only once it is closed.
     future<> close();
     bool is_closed() const noexcept;
-
-    size_t serialized_size() const noexcept { return _builder.serialized_size(); }
-
-    size_t buffer_size() const noexcept { return _builder.buffer_size(); }
 
     template <log_record_writer_concept Writer>
     bool can_fit(const Writer& writer) const noexcept { return _builder.can_fit(writer); }
     bool has_data() const noexcept { return _builder.has_data(); }
 
+    size_t serialized_size() const noexcept { return _builder.serialized_size(); }
+    size_t buffer_size() const noexcept { return _builder.buffer_size(); }
     size_t record_bytes() const noexcept { return _builder.record_bytes(); }
     size_t record_count() const noexcept { return _builder.record_count(); }
 
-    size_t finish() { return _builder.finish(); }
+protected:
+    write_buffer(size_t buffer_size, segment_kind kind);
+    ~write_buffer() = default;
 
-    bytes_view seal(segment_sequence segment_seq, std::optional<table_id> table) {
-        return _builder.seal(segment_seq, table);
-    }
+    write_buffer(write_buffer&&) noexcept = default;
+    write_buffer& operator=(write_buffer&&) noexcept = default;
 
-    size_t schema_table_size() const noexcept { return _builder.schema_table_size(); }
+    // Returns the future of where the record whose frame is at `frame` ends up. It holds the write
+    // gate until the record's write completes, and passes the holder to the caller.
+    future<written_record> track(frame_extent frame);
 
-    // Write a record to the buffer.
-    // Returns a future that will be resolved with the record location once flushed and a gate holder
-    // that keeps the write buffer open. The gate should be held for index updates after the write
-    // is done.
-    template <log_record_writer_concept Writer>
-    future<written_record> write(Writer writer, write_target target = {});
+    // Fails the tracked writes with `ex`, for a chunk that is not written, and closes the buffer.
+    future<> abort_writes(std::exception_ptr ex);
 
-    // Complete all tracked writes with their locations once the buffer's chunk is written at chunk_position
-    future<> complete_writes(segment_position chunk_position);
-    future<> abort_writes(std::exception_ptr);
+    void reset();
 
-private:
-    bool keeps_separator_records() const noexcept {
-        return _builder.kind() == segment_kind::mixed;
-    }
-
-    std::vector<separator_record> take_separator_records();
-
-    friend class buffered_writer;
-    friend class segment_manager_impl;
-    friend struct separator_buffer;
+    chunk_builder& builder() noexcept { return _builder; }
+    const chunk_builder& builder() const noexcept { return _builder; }
 };
 
-extern template future<written_record> write_buffer::write<log_record_writer>(log_record_writer, write_target);
-extern template future<written_record> write_buffer::write<log_record_bytes_writer>(log_record_bytes_writer, write_target);
+// The write buffer of a mixed segment, which takes the user writes. It keeps the records it took
+// until its chunk is written, for the separator to rewrite them into full segments.
+class mixed_write_buffer final : public write_buffer {
+    std::vector<separator_record> _separator_records;
+
+public:
+    explicit mixed_write_buffer(size_t buffer_size);
+
+    future<written_record> write(log_record_writer writer, write_target target);
+
+    bytes_view seal(segment_sequence segment_seq) {
+        return builder().seal(segment_seq);
+    }
+
+    // The records of the buffer, once its chunk is written, for the separator.
+    std::vector<separator_record> take_separator_records();
+
+    future<> abort_writes(std::exception_ptr ex);
+
+    void reset();
+};
+
+// The write buffer of a full segment, which compaction and the separator write.
+class full_write_buffer final : public write_buffer {
+public:
+    explicit full_write_buffer(size_t buffer_size)
+        : write_buffer(buffer_size, segment_kind::full)
+    {}
+
+    template <log_record_writer_concept Writer>
+    future<written_record> write(const Writer& writer) {
+        return track(builder().append(writer));
+    }
+
+    bytes_view seal(segment_sequence segment_seq, table_id table) {
+        return builder().seal(segment_seq, table);
+    }
+
+    using write_buffer::abort_writes;
+    using write_buffer::reset;
+
+    size_t schema_table_size() const noexcept { return builder().schema_table_size(); }
+};
 
 }
 }

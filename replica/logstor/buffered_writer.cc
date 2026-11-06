@@ -19,7 +19,7 @@
 
 namespace replica::logstor {
 
-buffered_writer::buffered_writer(buffered_writer_config cfg, seastar::noncopyable_function<future<>(write_buffer&)> flush_func)
+buffered_writer::buffered_writer(buffered_writer_config cfg, seastar::noncopyable_function<future<>(mixed_write_buffer&)> flush_func)
         : _flush_sg(cfg.flush_sg)
         , _buffer_size(cfg.buffer_size)
         , _ring_size(cfg.ring_size)
@@ -41,7 +41,7 @@ buffered_writer::buffered_writer(buffered_writer_config cfg, seastar::noncopyabl
 
     _ring.reserve(_ring_size);
     for (size_t i = 0; i < _ring_size; ++i) {
-        _ring.emplace_back(_buffer_size, segment_kind::mixed);
+        _ring.emplace_back(_buffer_size);
     }
 }
 

@@ -200,18 +200,18 @@ public:
     size_t finish();
 
     // Completes the chunk: finishes the buffer if finish() was not called, and writes the
-    // headers. Returns the chunk, which is what is written to a segment. `table` is set for
-    // segment_kind::full.
-    bytes_view seal(segment_sequence segment_seq, std::optional<table_id> table);
+    // headers. Returns the chunk, which is what is written to a segment. The first form is for
+    // segment_kind::mixed, and the second for segment_kind::full, whose segment header holds
+    // `table`.
+    bytes_view seal(segment_sequence segment_seq);
+    bytes_view seal(segment_sequence segment_seq, table_id table);
 
     // The size of the schema table of the versions appended so far.
     size_t schema_table_size() const noexcept { return _schema_table.size(); }
 
 private:
 
-    bool with_segment_header() const noexcept {
-        return _segment_kind == segment_kind::full;
-    }
+    bytes_view do_seal(segment_sequence segment_seq, std::optional<table_id> table);
 
     bool can_fit(size_t record_size, size_t schema_table_growth) const noexcept;
 
