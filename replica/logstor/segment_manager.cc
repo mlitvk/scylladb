@@ -1328,11 +1328,7 @@ future<> segment_manager_impl::write(user_write_buffer& wb) {
         _stats.bytes_written[static_cast<size_t>(source)] += chunk.size();
         _stats.data_bytes_written[static_cast<size_t>(source)] += wb.record_bytes();
 
-        // Insert the records into the index before the separator gets them, so that the separator
-        // finds each record at the location that it moves it from.
-        co_await wb.complete_writes(pos);
-
-        auto records = wb.take_separator_records();
+        auto records = co_await wb.complete_writes(pos);
         if (!records.empty()) {
             co_await with_semaphore(_separator_enqueue_sem, 1, [&] {
                 return _separator_task_queue.push_eventually(separator_task{
