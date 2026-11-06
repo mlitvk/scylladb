@@ -13,13 +13,12 @@
 
 namespace replica::logstor {
 
-void write_buffer_returner::operator()(write_buffer* wb) noexcept {
+void write_buffer_returner::operator()(full_write_buffer* wb) noexcept {
     _pool->return_buffer(wb, std::move(_units));
 }
 
 write_buffer_pool::write_buffer_pool(config cfg)
     : _buffer_size(cfg.buffer_size)
-    , _kind(cfg.kind)
     , _max_cached(cfg.max_cached)
     , _capacity(cfg.capacity)
     , _available_sem(cfg.capacity)
@@ -31,7 +30,7 @@ write_buffer_pool::write_buffer_pool(config cfg)
     }
     _free.reserve(_max_cached);
     for (size_t i = 0; i < cfg.preallocate; ++i) {
-        _free.push_back(std::make_unique<write_buffer>(_buffer_size, _kind));
+        _free.push_back(std::make_unique<full_write_buffer>(_buffer_size));
         ++_stats.buffers_created;
     }
 }
@@ -53,14 +52,14 @@ future<std::vector<owned_write_buffer>> write_buffer_pool::allocate_many(size_t 
 
     // Take the cached buffers and build the ones that are missing before handing any of them out,
     // so that failing to build one leaves the pool as it was and signals the units back.
-    std::vector<std::unique_ptr<write_buffer>> bufs;
+    std::vector<std::unique_ptr<full_write_buffer>> bufs;
     bufs.reserve(count);
     while (bufs.size() < count) {
         if (!_free.empty()) {
             bufs.push_back(std::move(_free.back()));
             _free.pop_back();
         } else {
-            bufs.push_back(std::make_unique<write_buffer>(_buffer_size, _kind));
+            bufs.push_back(std::make_unique<full_write_buffer>(_buffer_size));
             ++_stats.buffers_created;
         }
     }
@@ -74,9 +73,9 @@ future<std::vector<owned_write_buffer>> write_buffer_pool::allocate_many(size_t 
     co_return buffers;
 }
 
-void write_buffer_pool::return_buffer(write_buffer* wb, seastar::semaphore_units<> pool_units) noexcept {
+void write_buffer_pool::return_buffer(full_write_buffer* wb, seastar::semaphore_units<> pool_units) noexcept {
     // Take the buffer back, so that it is destroyed when this returns unless it is kept for reuse.
-    auto buf = std::unique_ptr<write_buffer>(wb);
+    auto buf = std::unique_ptr<full_write_buffer>(wb);
     --_in_use;
 
     if (!buf->is_closed()) {
@@ -103,7 +102,7 @@ void write_buffer_pool::return_buffer(write_buffer* wb, seastar::semaphore_units
     }
 }
 
-void write_buffer_pool::drop_buffer(std::unique_ptr<write_buffer> wb, seastar::semaphore_units<>& pool_units) noexcept {
+void write_buffer_pool::drop_buffer(std::unique_ptr<full_write_buffer> wb, seastar::semaphore_units<>& pool_units) noexcept {
     ++_stats.buffers_dropped;
     (void)pool_units.release();
     // Leaked deliberately - see drop_buffer()'s declaration for why the buffer must not be destroyed.

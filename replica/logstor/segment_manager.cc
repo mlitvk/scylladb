@@ -704,8 +704,8 @@ public:
     future<> start();
     future<> stop();
 
-    future<> write(write_buffer&);
-    future<> write_full_segment(write_buffer&, logstor_group&, write_source);
+    future<> write(mixed_write_buffer&);
+    future<> write_full_segment(full_write_buffer&, logstor_group&, write_source);
 
     future<log_record> read(record_location);
 
@@ -1059,7 +1059,6 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
     , _compaction_buffer_pool(write_buffer_pool::config{
             .capacity = max_compaction_parallelism,
             .buffer_size = config.segment_size,
-            .kind = segment_kind::full,
             .preallocate = max_compaction_parallelism,
             .max_cached = max_compaction_parallelism,
       })
@@ -1069,7 +1068,6 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
     , _separator_buffer_pool(write_buffer_pool::config{
             .capacity = separator_flush_reserve,
             .buffer_size = config.segment_size,
-            .kind = segment_kind::full,
             .preallocate = 0,
             .max_cached = separator_flush_reserve,
       })
@@ -1279,7 +1277,7 @@ future<> segment_manager_impl::run_separator_fiber() {
     }
 }
 
-future<> segment_manager_impl::write(write_buffer& wb) {
+future<> segment_manager_impl::write(mixed_write_buffer& wb) {
     write_source source = write_source::normal_write;
     auto holder = _async_gate.hold();
     auto write_op = _writes_phaser.start();
@@ -1309,7 +1307,7 @@ future<> segment_manager_impl::write(write_buffer& wb) {
 
         auto seq_num = seg->seq_num();
 
-        const auto chunk = wb.seal(seq_num, std::nullopt);
+        const auto chunk = wb.seal(seq_num);
 
         // if we wrote a record to the segment but failed to write it to the separator, the segment should not be freed.
         auto write_to_separator_failed = defer([seg_ref] mutable noexcept {
@@ -1351,7 +1349,7 @@ future<> segment_manager_impl::write(write_buffer& wb) {
     }
 }
 
-future<> segment_manager_impl::write_full_segment(write_buffer& wb, logstor_group& cg, write_source source) {
+future<> segment_manager_impl::write_full_segment(full_write_buffer& wb, logstor_group& cg, write_source source) {
     const auto chunk_size = wb.finish();
 
     if (chunk_size > _cfg.segment_size) {
@@ -2579,7 +2577,7 @@ future<> segment_manager::stop() {
     return _impl->stop();
 }
 
-future<> segment_manager::write(write_buffer& wb) {
+future<> segment_manager::write(mixed_write_buffer& wb) {
     return _impl->write(wb);
 }
 
