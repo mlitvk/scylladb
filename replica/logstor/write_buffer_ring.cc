@@ -218,16 +218,6 @@ future<> write_buffer_ring::stop() {
     co_await std::move(close_fut);
     co_await std::move(_consumer);
 
-    for (auto& state : _in_flight) {
-        if (state.completion) {
-            auto f = co_await coroutine::as_future(std::move(*state.completion));
-            state.completion.reset();
-            if (f.failed()) {
-                logstor_logger.warn("A buffer flush failed during stop: {}. Ignoring.", f.get_exception());
-            }
-        }
-    }
-
     logstor_logger.info("Write buffer ring stopped");
 }
 
