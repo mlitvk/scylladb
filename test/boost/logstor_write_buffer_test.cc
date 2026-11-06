@@ -1155,6 +1155,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_rejects_when_max_queued_
     auto rejected = make_write_buffer_ring_record(schema, 4, large_value, api::timestamp_type(404));
     auto rejected_write = ring_write(ring, index, rejected);
     BOOST_REQUIRE_THROW(rejected_write.get(), replica::rate_limit_exception);
+    BOOST_REQUIRE_EQUAL(ring.failed_write_count(), 1u);
 
     flush_ctl.release_one_flush();
     wait_for_persisted(persisted0);
@@ -1206,6 +1207,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_queued_write_times_out) 
     BOOST_REQUIRE_EQUAL(ring.queued_write_count(), 1u);
     BOOST_REQUIRE_THROW(queued.get(), seastar::timed_out_error);
     BOOST_REQUIRE_EQUAL(ring.queued_write_count(), 0u);
+    BOOST_REQUIRE_EQUAL(ring.failed_write_count(), 1u);
     BOOST_REQUIRE_EQUAL(seastar::engine().abandoned_failed_futures(), abandoned_before);
 
     flush_ctl.release_all_flushes();
@@ -1338,6 +1340,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_stop_drains_queued_write
     auto late = make_write_buffer_ring_record(schema, 3, "value", api::timestamp_type(803));
     auto late_write = ring_write(ring, index, late);
     BOOST_REQUIRE_THROW(late_write.get(), seastar::gate_closed_exception);
+    BOOST_REQUIRE_EQUAL(ring.failed_write_count(), 1u);
 }
 
 // Checks that a flush failure is propagated to every write that was already accepted into that buffer,
@@ -1372,6 +1375,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_flush_failure_fails_all_
 
     BOOST_REQUIRE_THROW(persisted0.get(), std::runtime_error);
     BOOST_REQUIRE_THROW(persisted1.get(), std::runtime_error);
+    BOOST_REQUIRE_EQUAL(ring.failed_write_count(), 2u);
 
     flush.get();
 
@@ -1390,5 +1394,6 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_flush_failure_fails_all_
     }
 
     BOOST_REQUIRE_EQUAL(flush_ctl.started_count, 4u);
+    BOOST_REQUIRE_EQUAL(ring.failed_write_count(), 2u);
     assert_records_in_order(schema, flush_ctl.all_records(), expected);
 }

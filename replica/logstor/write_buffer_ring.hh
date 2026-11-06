@@ -144,6 +144,7 @@ class write_buffer_ring {
 
     seastar::expiring_fifo<queued_write, on_queued_write_expiry, db::timeout_clock> _queued_writes;
     size_t _queued_write_bytes{0};
+    uint64_t _failed_writes{0};
     size_t _max_queued_write_bytes{0};
 
     seastar::timer<db::timeout_clock> _sync_timer;
@@ -187,6 +188,7 @@ class write_buffer_ring {
     future<bool> drain_queued_writes();
 
     void on_queued_write_removed(const queued_write&) noexcept;
+    void fail_write(index_insert&, std::exception_ptr) noexcept;
     void fail_queued_write(queued_write&, std::exception_ptr) noexcept;
     void on_queued_writes_changed() noexcept;
 
@@ -211,6 +213,10 @@ public:
     void write(log_record_writer, index_insert completion, db::timeout_clock::time_point timeout, write_target target = {}) noexcept;
 
     size_t queued_write_count() const noexcept { return _queued_writes.size(); }
+
+    // Returns how many writes the ring failed: refused, timed out on the queue, or in a buffer whose
+    // flush failed.
+    uint64_t failed_write_count() const noexcept { return _failed_writes; }
 
     size_t memory_usage() const noexcept { return _ring_size * _buffer_size + _queued_write_bytes; }
 
