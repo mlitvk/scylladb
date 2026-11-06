@@ -82,9 +82,11 @@ void write_buffer_ring::on_queued_write_removed(const queued_write& w) noexcept 
     _queued_write_bytes -= w.write_size;
 }
 
+// Fails only the accepted promise. The future of the persisted promise is taken only when the write
+// is accepted, so a failed write never has one, and a promise that holds an exception and has no
+// future reports the exception as ignored when it is destroyed.
 void write_buffer_ring::fail_queued_write(queued_write& request, std::exception_ptr ep) noexcept {
-    request.accepted_pr.set_exception(ep);
-    request.persisted_pr.set_exception(std::move(ep));
+    request.accepted_pr.set_exception(std::move(ep));
 }
 
 bool write_buffer_ring::maybe_advance_head() noexcept {
