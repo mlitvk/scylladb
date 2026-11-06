@@ -546,7 +546,7 @@ public:
 };
 
 struct separator_task {
-    std::vector<write_buffer::record_in_buffer> records;
+    std::vector<separator_record> records;
     // Where the chunk holding the records was written, which is what the records' own locations are
     // relative to.
     segment_position chunk_position{};
@@ -903,7 +903,7 @@ private:
     }
     future<> run_separator_fiber();
 
-    future<> write_to_separator(std::vector<write_buffer::record_in_buffer>&, segment_position chunk_position, segment_ref, segment_sequence);
+    future<> write_to_separator(std::vector<separator_record>&, segment_position chunk_position, segment_ref, segment_sequence);
 
     // The segment info of the first chunk of the segment, or nothing if its headers are not valid.
     future<std::optional<segment_info>> read_segment_info(log_segment_id);
@@ -1924,13 +1924,12 @@ struct compaction_buffer {
             co_await flush();
         }
 
-        auto write_and_update_index = buf->write(std::move(writer)).then_unpack(
-                [this, index_ptr, key = std::move(key), read_location]
-                (record_location new_location, seastar::gate::holder op) {
+        auto write_and_update_index = buf->write(std::move(writer)).then(
+                [this, index_ptr, key = std::move(key), read_location] (written_record written) {
             utils::get_local_injector().inject("logstor_compaction_fail_index_update", [] {
                 throw std::runtime_error("compaction index update failed by injection");
             });
-            if (index_ptr->update_record_location(key, read_location, new_location)) {
+            if (index_ptr->update_record_location(key, read_location, written.location)) {
                 stats.records_rewritten++;
             } else {
                 // another write updated this key
@@ -2140,17 +2139,17 @@ future<> compaction_manager_impl::flush_all_separator_buffers(std::optional<segm
     });
 }
 
-void separator_index_update::operator()(record_location new_location, seastar::gate::holder) const {
-    index->update_record_location(key, prev_location, new_location);
+void separator_index_update::operator()(written_record written) const {
+    index->update_record_location(key, prev_location, written.location);
 }
 
-future<> segment_manager_impl::write_to_separator(std::vector<write_buffer::record_in_buffer>& records, segment_position chunk_position,
+future<> segment_manager_impl::write_to_separator(std::vector<separator_record>& records, segment_position chunk_position,
         segment_ref seg_ref, segment_sequence segment_seq_num) {
     static constexpr size_t separator_group_write_concurrency = 4;
 
     struct separator_group_records {
         logstor_group* cg;
-        std::vector<write_buffer::record_in_buffer*> records;
+        std::vector<separator_record*> records;
     };
 
     std::vector<separator_group_records> groups;

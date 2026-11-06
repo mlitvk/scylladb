@@ -52,7 +52,7 @@ struct separator_index_update {
     primary_index_key key;
     record_location prev_location;
 
-    void operator()(record_location new_location, seastar::gate::holder) const;
+    void operator()(written_record) const;
 };
 
 using split_target_group = std::function<logstor_group&(log_segment_id, dht::token first_token, dht::token last_token)>;
@@ -400,7 +400,7 @@ struct separator_buffer {
         }
 
         pending_updates.push_back(
-            buf->write(std::move(writer)).then_unpack(std::move(after_written))
+            buf->write(std::move(writer)).then(std::move(after_written))
         );
     }
 

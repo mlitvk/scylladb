@@ -359,9 +359,10 @@ log_record make_buffered_writer_record(schema_ptr schema, size_t idx, const sstr
     return make_log_record(schema, sstring(fmt::format("pk{:04}", idx)), value, ts);
 }
 
-record_location wait_for_persisted(future<record_location_with_holder>& fut) {
-    auto [loc, op] = fut.get();
-    return loc;
+record_location wait_for_persisted(future<written_record>& fut) {
+    // get() returns a reference into the future, so move the record out to release its holder.
+    auto written = fut.get();
+    return written.location;
 }
 
 struct test_flush_controller {
@@ -2761,7 +2762,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_buffered_writer_basic_flushes_records) {
     });
 
     std::vector<log_record> expected;
-    std::vector<future<record_location_with_holder>> persisted;
+    std::vector<future<written_record>> persisted;
     for (size_t i = 0; i < 3; ++i) {
         auto record = make_buffered_writer_record(schema, i, sstring(fmt::format("value{}", i)), api::timestamp_type(100 + i));
         expected.push_back(record);
@@ -2801,7 +2802,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_buffered_writer_flushes_partial_buffer_wit
     });
 
     std::vector<log_record> expected;
-    std::vector<future<record_location_with_holder>> persisted;
+    std::vector<future<written_record>> persisted;
     for (size_t i = 0; i < 3; ++i) {
         auto record = make_buffered_writer_record(schema, i, sstring(fmt::format("value{}", i)), api::timestamp_type(150 + i));
         expected.push_back(record);

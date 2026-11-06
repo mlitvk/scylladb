@@ -1006,8 +1006,8 @@ private:
         _record_writer.emplace(*_record, column_mappings().add(*_schema));
         _serialization_buffer->reset();
         auto appended = _serialization_buffer->append(*_record_writer);
-        _serialized_record = temporary_buffer<char>(_serialization_buffer->data() + appended.frame_offset,
-                appended.frame_size);
+        _serialized_record = temporary_buffer<char>(_serialization_buffer->data() + appended.offset,
+                appended.size);
     }
 };
 
