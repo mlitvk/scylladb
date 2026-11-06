@@ -117,8 +117,6 @@ public:
 // the chunk, and the size it returns does not change after this. seal() then writes
 // the headers, which hold the sequence number of the segment that receives the chunk. So a
 // caller can reserve room for the chunk in a segment before it knows that number.
-//
-// This type only serializes a chunk. Tests and write_buffer use it directly.
 class chunk_builder {
 public:
     chunk_builder(size_t buffer_size, segment_kind kind);
