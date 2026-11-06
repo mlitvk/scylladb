@@ -7,6 +7,10 @@
  */
 #include "replica/logstor/write_buffer.hh"
 
+#include <seastar/core/on_internal_error.hh>
+
+#include "replica/logstor/logstor.hh"
+
 namespace replica::logstor {
 
 write_buffer::write_buffer(size_t buffer_size, segment_kind kind)
@@ -45,6 +49,9 @@ future<> write_buffer::abort_writes(std::exception_ptr ex) {
 }
 
 void write_buffer::reset() {
+    if (!is_closed()) {
+        on_internal_error(logstor_logger, "Cannot reset a write buffer that is not closed");
+    }
     _builder.reset();
     _chunk_position = {};
     _write_gate = {};
