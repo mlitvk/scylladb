@@ -13,7 +13,7 @@
 
 namespace replica::logstor {
 
-void write_buffer_returner::operator()(full_write_buffer* wb) noexcept {
+void write_buffer_returner::operator()(rewrite_buffer* wb) noexcept {
     _pool->return_buffer(wb, std::move(_units));
 }
 
@@ -30,7 +30,7 @@ write_buffer_pool::write_buffer_pool(config cfg)
     }
     _free.reserve(_max_cached);
     for (size_t i = 0; i < cfg.preallocate; ++i) {
-        _free.push_back(std::make_unique<full_write_buffer>(_buffer_size));
+        _free.push_back(std::make_unique<rewrite_buffer>(_buffer_size));
         ++_stats.buffers_created;
     }
 }
@@ -52,14 +52,14 @@ future<std::vector<owned_write_buffer>> write_buffer_pool::allocate_many(size_t 
 
     // Take the cached buffers and build the ones that are missing before handing any of them out,
     // so that failing to build one leaves the pool as it was and signals the units back.
-    std::vector<std::unique_ptr<full_write_buffer>> bufs;
+    std::vector<std::unique_ptr<rewrite_buffer>> bufs;
     bufs.reserve(count);
     while (bufs.size() < count) {
         if (!_free.empty()) {
             bufs.push_back(std::move(_free.back()));
             _free.pop_back();
         } else {
-            bufs.push_back(std::make_unique<full_write_buffer>(_buffer_size));
+            bufs.push_back(std::make_unique<rewrite_buffer>(_buffer_size));
             ++_stats.buffers_created;
         }
     }
@@ -73,19 +73,10 @@ future<std::vector<owned_write_buffer>> write_buffer_pool::allocate_many(size_t 
     co_return buffers;
 }
 
-void write_buffer_pool::return_buffer(full_write_buffer* wb, seastar::semaphore_units<> pool_units) noexcept {
+void write_buffer_pool::return_buffer(rewrite_buffer* wb, seastar::semaphore_units<> pool_units) noexcept {
     // Take the buffer back, so that it is destroyed when this returns unless it is kept for reuse.
-    auto buf = std::unique_ptr<full_write_buffer>(wb);
+    auto buf = std::unique_ptr<rewrite_buffer>(wb);
     --_in_use;
-
-    if (!buf->is_closed()) {
-        // reset() below reinstalls the buffer's write gate, which is only valid once the gate was
-        // closed and all the writes it held completed. Closing is asynchronous and there is nothing
-        // left here that can wait for it, so drop the buffer instead.
-        on_internal_error_noexcept(logstor_logger, "Returning a logstor write buffer that was not closed");
-        drop_buffer(std::move(buf), pool_units);
-        return;
-    }
 
     // Hold on to the buffer only as long as the pool is meant to keep one - the units are signalled
     // back either way, so a buffer that is let go here is simply built again when it is needed.
@@ -97,16 +88,11 @@ void write_buffer_pool::return_buffer(full_write_buffer* wb, seastar::semaphore_
         buf->reset();
         _free.push_back(std::move(buf));
     } catch (...) {
+        // The buffer is destroyed when this returns, and the units go back with it, so the pool
+        // builds a new buffer when it needs one.
+        ++_stats.buffers_dropped;
         logstor_logger.error("Failed to return a write buffer, dropping it from the pool: {:t}", std::current_exception());
-        drop_buffer(std::move(buf), pool_units);
     }
-}
-
-void write_buffer_pool::drop_buffer(std::unique_ptr<full_write_buffer> wb, seastar::semaphore_units<>& pool_units) noexcept {
-    ++_stats.buffers_dropped;
-    (void)pool_units.release();
-    // Leaked deliberately - see drop_buffer()'s declaration for why the buffer must not be destroyed.
-    [[maybe_unused]] auto* leaked = wb.release();
 }
 
 void write_buffer_pool::set_capacity(size_t capacity) {
@@ -137,10 +123,7 @@ future<> write_buffer_pool::stop() {
     // Fail pending and future allocations, so that nothing can start using a buffer of a pool that
     // is being stopped.
     _available_sem.broken();
-    // Buffers are expected to be back by now - the callers stop everything that allocates from the
-    // pool before stopping it, and a compaction closes and returns its buffer before it completes.
-    // A buffer that is still out is one an owner never gave back at all; one that came back but
-    // could not be taken in was already accounted for and reported by drop_buffer().
+    // A buffer that is still out here is one that its owner never gave back.
     if (used_buffer_count() != 0) {
         on_internal_error_noexcept(logstor_logger, fmt::format(
                 "Stopping logstor write buffer pool with {} of {} buffers still in use",

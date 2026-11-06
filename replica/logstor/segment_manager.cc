@@ -704,8 +704,8 @@ public:
     future<> start();
     future<> stop();
 
-    future<> write(mixed_write_buffer&);
-    future<> write_full_segment(full_write_buffer&, logstor_group&, write_source);
+    future<> write(user_write_buffer&);
+    future<> write_full_segment(rewrite_buffer&, logstor_group&, write_source);
 
     future<log_record> read(record_location);
 
@@ -1157,7 +1157,7 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
         sm::make_counter("compaction_buffer_allocation_waits", _compaction_buffer_pool.get_stats().allocation_waits,
                        sm::description("Counts number of times a compaction had to wait for a write buffer to become available.")),
         sm::make_counter("compaction_buffers_dropped", _compaction_buffer_pool.get_stats().buffers_dropped,
-                       sm::description("Counts number of write buffers permanently removed from the pool after they could not be reclaimed.")),
+                       sm::description("Counts number of compaction write buffers that the pool could not reset for reuse, and destroyed.")),
         sm::make_counter("compaction_bytes_read", _compaction_mgr.get_stats().bytes_read,
                         sm::description("Counts number of bytes read by compaction.")),
         sm::make_counter("compaction_failures", _compaction_mgr.get_stats().failures,
@@ -1183,7 +1183,7 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
         sm::make_counter("separator_buffer_allocation_waits", _separator_buffer_pool.get_stats().allocation_waits,
                        sm::description("Counts number of times the separator had to wait for a write buffer to become available.")),
         sm::make_counter("separator_buffers_dropped", _separator_buffer_pool.get_stats().buffers_dropped,
-                       sm::description("Counts number of separator write buffers permanently removed from the pool after they could not be reclaimed.")),
+                       sm::description("Counts number of separator write buffers that the pool could not reset for reuse, and destroyed.")),
         sm::make_counter("segment_free_failures", _stats.segment_free_failures,
                        sm::description("Counts number of logstor segment references that failed to free the segment.")),
         sm::make_gauge("separator_task_queue_size", [this]() { return _separator_task_queue.size(); },
@@ -1277,7 +1277,7 @@ future<> segment_manager_impl::run_separator_fiber() {
     }
 }
 
-future<> segment_manager_impl::write(mixed_write_buffer& wb) {
+future<> segment_manager_impl::write(user_write_buffer& wb) {
     write_source source = write_source::normal_write;
     auto holder = _async_gate.hold();
     auto write_op = _writes_phaser.start();
@@ -1320,7 +1320,7 @@ future<> segment_manager_impl::write(mixed_write_buffer& wb) {
         if (append_result.failed()) {
             auto ex = append_result.get_exception();
             ++_stats.write_failures;
-            co_await wb.abort_writes(ex);
+            wb.abort_writes(ex);
             co_await coroutine::return_exception_ptr(std::move(ex));
         }
         auto pos = append_result.get();
@@ -1328,8 +1328,8 @@ future<> segment_manager_impl::write(mixed_write_buffer& wb) {
         _stats.bytes_written[static_cast<size_t>(source)] += chunk.size();
         _stats.data_bytes_written[static_cast<size_t>(source)] += wb.record_bytes();
 
-        // complete all buffered writes with their individual locations and wait
-        // for them to be updated in the index.
+        // Insert the records into the index before the separator gets them, so that the separator
+        // finds each record at the location that it moves it from.
         co_await wb.complete_writes(pos);
 
         auto records = wb.take_separator_records();
@@ -1349,7 +1349,7 @@ future<> segment_manager_impl::write(mixed_write_buffer& wb) {
     }
 }
 
-future<> segment_manager_impl::write_full_segment(full_write_buffer& wb, logstor_group& cg, write_source source) {
+future<> segment_manager_impl::write_full_segment(rewrite_buffer& wb, logstor_group& cg, write_source source) {
     const auto chunk_size = wb.finish();
 
     if (chunk_size > _cfg.segment_size) {
@@ -1365,7 +1365,7 @@ future<> segment_manager_impl::write_full_segment(full_write_buffer& wb, logstor
     if (append_result.failed()) {
         auto ex = append_result.get_exception();
         ++_stats.write_failures;
-        co_await wb.abort_writes(ex);
+        wb.abort_writes(ex);
         co_await coroutine::return_exception_ptr(std::move(ex));
     }
     auto pos = append_result.get();
@@ -1891,10 +1891,6 @@ future<> compaction_manager_impl::run_auto_compaction() {
     co_await get_units(_auto_compaction_sem, parallelism);
 }
 
-// A single buffer used by compaction for rewriting records into new segments in a single compaction group.
-// `rewrite_record` append a record to the buffer and given it's current location, and
-// when the buffer is flushed it updates the index with the new location.
-// the buffer is flushed when the next record doesn't fit and on close().
 struct compaction_buffer_stats {
     size_t flush_count{0};
     size_t records_rewritten{0};
@@ -1914,11 +1910,14 @@ struct compaction_buffer_stats {
     }
 };
 
+// The buffer into which compaction rewrites the live records of one compaction group. rewrite_record()
+// appends a record with its old location, and flush() writes the buffer to a new full segment and
+// points the index at the new locations. The buffer is flushed when the next record does not fit,
+// and at the end of the compaction.
 struct compaction_buffer {
     segment_manager_impl& sm;
     owned_write_buffer buf;
     logstor_group& cg;
-    std::vector<future<>> pending_updates;
 
     compaction_buffer_stats stats;
 
@@ -1928,68 +1927,49 @@ struct compaction_buffer {
         , cg(cg)
     {}
 
-    compaction_buffer(compaction_buffer&& o) noexcept
-        : sm(o.sm), buf(std::move(o.buf)), cg(o.cg)
-        , pending_updates(std::move(o.pending_updates)), stats(o.stats) {}
-
-    ~compaction_buffer() {
-        // A compaction that ends without a final flush - because it failed or was aborted - leaves
-        // index updates waiting for a flush that will never happen. close() fails them, so consume
-        // them here to keep them from being reported as ignored.
-        for (auto& update : pending_updates) {
-            (void)std::move(update).handle_exception([] (std::exception_ptr) {});
-        }
-    }
-
     future<> flush() {
         if (buf->has_data()) {
+            const auto record_count = buf->record_count();
+            const auto rewritten_before = stats.records_rewritten;
             co_await sm.write_full_segment(*buf, cg, write_source::compaction);
             stats.flush_count++;
+            stats.records_skipped += record_count - (stats.records_rewritten - rewritten_before);
             logstor_logger.trace("Compaction buffer flushed with {} bytes", buf->record_bytes());
         }
-        auto updates = std::move(pending_updates);
-        pending_updates.clear();
-        co_await when_all_succeed(updates.begin(), updates.end());
-        co_await buf->close();
         buf->reset();
     }
 
-    // Closes the buffer and hands it back to the pool. Run from with_closeable(), so it also runs
-    // for a compaction that failed or was aborted, where the buffer can still hold records that
-    // were never flushed.
+    // Hands the buffer back to the pool. Run from with_closeable(), so it also runs for a
+    // compaction that failed or was aborted, where the buffer can still hold records that were
+    // never flushed.
     future<> close() noexcept {
-        co_await buf->abort_writes(std::make_exception_ptr(
-                std::runtime_error("logstor compaction buffer was closed before its records were flushed")));
+        std::exception_ptr ex;
+        try {
+            ex = std::make_exception_ptr(std::runtime_error("logstor compaction buffer was closed before its records were flushed"));
+        } catch (...) {
+            ex = std::current_exception();
+        }
+        buf->abort_writes(std::move(ex));
         buf.reset();
+        return make_ready_future<>();
     }
 
-    // Rewrite a single live record into this buffer, updating the index atomically.
-    // Returns immediately after queuing the write; caller must co_await close()/flush()
-    // to ensure all pending updates complete.
-    future<> rewrite_record(primary_index& index, record_location read_location, const record_header& header, log_record_bytes_view record_view) {
-        auto* index_ptr = &index;
-        auto key = header.index_key();
-
-        auto writer = log_record_bytes_writer(header, record_view, sm.mapping_for_rewrite(header, read_location));
+    // Rewrites a single live record into this buffer. The flush of the buffer points the index at
+    // the new location, unless another write updated the key first, and counts the moved entries in
+    // `stats`, so the buffer must not move after its first write.
+    future<> rewrite_record(primary_index& index, record_location old_location, const record_header& header, log_record_bytes_view record_view) {
+        auto writer = log_record_bytes_writer(header, record_view, sm.mapping_for_rewrite(header, old_location));
 
         if (!buf->can_fit(writer)) {
             co_await flush();
         }
 
-        auto write_and_update_index = buf->write(std::move(writer)).then(
-                [this, index_ptr, key = std::move(key), read_location] (written_record written) {
-            utils::get_local_injector().inject("logstor_compaction_fail_index_update", [] {
-                throw std::runtime_error("compaction index update failed by injection");
-            });
-            if (index_ptr->update_record_location(key, read_location, written.location)) {
-                stats.records_rewritten++;
-            } else {
-                // another write updated this key
-                stats.records_skipped++;
-            }
+        buf->write(writer, index_relocation {
+            .index = &index,
+            .key = header.index_key(),
+            .old_location = old_location,
+            .relocated = &stats.records_rewritten,
         });
-
-        pending_updates.push_back(std::move(write_and_update_index));
 
         utils::get_local_injector().inject("logstor_compaction_fail_after_rewrite", [] {
             throw std::runtime_error("compaction failed after rewriting a record by injection");
@@ -2181,10 +2161,6 @@ future<> compaction_manager_impl::flush_all_separator_buffers(std::optional<segm
     });
 }
 
-void separator_index_update::operator()(written_record written) const {
-    index->update_record_location(key, prev_location, written.location);
-}
-
 future<> segment_manager_impl::write_to_separator(std::vector<separator_record>& records, segment_position chunk_position,
         segment_ref seg_ref, segment_sequence segment_seq_num) {
     static constexpr size_t separator_group_write_concurrency = 4;
@@ -2213,13 +2189,13 @@ future<> segment_manager_impl::write_to_separator(std::vector<separator_record>&
     co_await seastar::max_concurrent_for_each(groups, separator_group_write_concurrency,
             [chunk_position, seg_ref, segment_seq_num] (separator_group_records& group) -> future<> {
         for (auto* record : group.records) {
-            separator_index_update update {
+            index_relocation relocation {
                 .index = &group.cg->logstor_index(),
                 .key = record->writer.record().header.index_key(),
-                .prev_location = record->location(chunk_position),
+                .old_location = record->location(chunk_position),
             };
 
-            co_await group.cg->write_to_separator(std::move(record->writer), seg_ref, segment_seq_num, std::move(update));
+            co_await group.cg->write_to_separator(std::move(record->writer), seg_ref, segment_seq_num, std::move(relocation));
         }
     });
 }
@@ -2239,11 +2215,6 @@ future<> compaction_manager_impl::flush_separator_buffer(separator_buffer& buf, 
             _stats.separator_buffers_flushed++;
         }
 
-        auto updates = std::move(buf.pending_updates);
-        buf.pending_updates.clear();
-        co_await when_all_succeed(updates.begin(), updates.end());
-        co_await buf.close();
-
         // wait for read operations that use the old locations before freeing the old segments
         co_await cg.logstor_index().await_pending_reads();
     }());
@@ -2253,18 +2224,14 @@ future<> compaction_manager_impl::flush_separator_buffer(separator_buffer& buf, 
         ++_stats.separator_flush_failures;
         logstor_logger.debug("logstor separator flush failure: {}", ep);
 
-        auto abort_result = co_await coroutine::as_future(buf.abort(ep));
-        if (abort_result.failed()) {
-            logstor_logger.warn("logstor separator buffer abort failed after flush failure: {}", abort_result.get_exception());
-        }
-
-        co_await buf.release();
+        buf.abort(ep);
+        buf.release();
 
         co_await coroutine::return_exception_ptr(std::move(ep));
     }
 
     // give the buffer back to the pool and release all held segments
-    co_await buf.release();
+    buf.release();
 }
 
 future<> segment_manager_impl::do_recovery(replica::database& db) {
@@ -2505,10 +2472,10 @@ future<> segment_manager_impl::add_segment_to_compaction_group(replica::database
                 auto writer = log_record_bytes_writer(header, record.bytes, mapping_for_rewrite(header, record.location));
 
                 return cg.write_to_separator(std::move(writer), seg_ref, std::nullopt,
-                    separator_index_update {
+                    index_relocation {
                         .index = &cg.logstor_index(),
                         .key = key,
-                        .prev_location = record.location,
+                        .old_location = record.location,
                     }
                 );
             } catch (const replica::no_such_column_family&) {
@@ -2577,7 +2544,7 @@ future<> segment_manager::stop() {
     return _impl->stop();
 }
 
-future<> segment_manager::write(mixed_write_buffer& wb) {
+future<> segment_manager::write(user_write_buffer& wb) {
     return _impl->write(wb);
 }
 
@@ -2721,33 +2688,17 @@ separator_buffer::~separator_buffer() {
     }
 }
 
-future<> separator_buffer::abort(std::exception_ptr ep) {
+void separator_buffer::abort(std::exception_ptr ex) noexcept {
     for (auto& seg_ref : held_segments) {
         seg_ref.set_flush_failure();
     }
-    if (!empty()) {
-        co_await buf->abort_writes(std::move(ep));
+    if (buf) {
+        buf->abort_writes(std::move(ex));
     }
 }
 
-future<> separator_buffer::release() {
-    if (buf && !buf->is_closed()) {
-        // The pool takes back only closed buffers, and closing waits for the writes the buffer
-        // holds, which only a flush or an abort resolves. A buffer that reaches this without either
-        // is one whose flush failed before it had anything to abort, so there is nothing to lose by
-        // failing its writes here - and a record that was never flushed is still on disk at the
-        // location the index points to.
-        co_await buf->abort_writes(std::make_exception_ptr(
-                std::runtime_error("logstor separator buffer was released before its records were flushed")));
-    }
+void separator_buffer::release() noexcept {
     buf.reset();
-    // A flush hands the updates to when_all_succeed() and leaves nothing here, so the ones still
-    // held are the ones a flush never waited for: writes that were just failed by abort(), or by the
-    // fallback above. Consume them rather than leaving them to be reported as ignored.
-    for (auto& update : pending_updates) {
-        (void)std::move(update).handle_exception([] (std::exception_ptr) {});
-    }
-    pending_updates.clear();
     held_segments.clear();
     min_seq_num.reset();
 }
@@ -2773,7 +2724,7 @@ future<> logstor_group::allocate_active_separator_buffer() {
 }
 
 template <log_record_writer_concept Writer>
-future<> logstor_group::write_to_separator(Writer writer, segment_ref seg_ref, std::optional<segment_sequence> segment_seq_num, separator_index_update after_written) {
+future<> logstor_group::write_to_separator(Writer writer, segment_ref seg_ref, std::optional<segment_sequence> segment_seq_num, index_relocation relocation) {
     while (!_active_buffer.can_fit(writer)) {
         if (!_separator_enabled) {
             break;
@@ -2811,11 +2762,11 @@ future<> logstor_group::write_to_separator(Writer writer, segment_ref seg_ref, s
                 "logstor separator write to a closed compaction group of table {}", table_id()));
     }
 
-    _active_buffer.write(std::move(seg_ref), segment_seq_num, std::move(writer), std::move(after_written));
+    _active_buffer.write(std::move(seg_ref), segment_seq_num, writer, std::move(relocation));
 }
 
-template future<> logstor_group::write_to_separator(log_record_writer, segment_ref, std::optional<segment_sequence>, separator_index_update);
-template future<> logstor_group::write_to_separator(log_record_bytes_writer, segment_ref, std::optional<segment_sequence>, separator_index_update);
+template future<> logstor_group::write_to_separator(log_record_writer, segment_ref, std::optional<segment_sequence>, index_relocation);
+template future<> logstor_group::write_to_separator(log_record_bytes_writer, segment_ref, std::optional<segment_sequence>, index_relocation);
 
 future<> logstor_group::flush_separator(std::optional<segment_sequence> seq_num) {
     auto should_flush = [seq_num] (separator_buffer& buf) {
@@ -2859,24 +2810,22 @@ future<> logstor_group::close_separator() {
         f.ignore_ready_future();
     }
 
-    auto discard = [this] (separator_buffer& buf) -> future<> {
+    auto discard = [this] (separator_buffer& buf) {
         if (!buf.allocated()) {
-            co_return;
+            return;
         }
         if (!buf.empty()) {
             logstor_logger.warn("Discarding a logstor separator buffer of table {} with {} bytes from {} segments,"
                     " the segments will not be reclaimed", table_id(), buf.serialized_size(), buf.held_segments.size());
         }
-        // The same teardown a failed flush takes: abort() fails the writes the buffer holds, which
-        // is what lets it be closed, and marks the segments those writes came from. Failing partway
-        // leaves the rest to the group's destruction, which is why remove() only logs what comes out
-        // of here.
-        co_await buf.abort(std::make_exception_ptr(
+        // The same teardown a failed flush takes: abort() drops the relocations of the buffer and
+        // marks the segments that its records came from.
+        buf.abort(std::make_exception_ptr(
                 std::runtime_error("logstor separator buffer was discarded with its compaction group")));
-        co_await buf.release();
+        buf.release();
     };
-    co_await discard(_active_buffer);
-    co_await discard(_flushing_buffer);
+    discard(_active_buffer);
+    discard(_flushing_buffer);
 }
 
 }

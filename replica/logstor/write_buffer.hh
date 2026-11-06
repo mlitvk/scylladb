@@ -7,11 +7,16 @@
  */
 #pragma once
 
+#include <concepts>
+#include <exception>
+#include <type_traits>
 #include <vector>
 
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
-#include <seastar/core/shared_future.hh>
+#include <seastar/core/on_internal_error.hh>
+#include <seastar/coroutine/maybe_yield.hh>
+#include <seastar/util/log.hh>
 
 #include "replica/logstor/chunk_builder.hh"
 #include "replica/logstor/record_writer.hh"
@@ -19,6 +24,8 @@
 namespace replica {
 
 namespace logstor {
+
+extern seastar::logger logstor_logger;
 
 class logstor_group;
 
@@ -34,13 +41,6 @@ struct write_target {
     seastar::gate::holder alive_holder;
 };
 
-// A record that a write buffer wrote, once its chunk is in a segment. `buffer_holder` keeps the
-// buffer open, for follow-up work such as the index update.
-struct written_record {
-    record_location location;
-    seastar::gate::holder buffer_holder;
-};
-
 // A record of a mixed buffer that the separator rewrites once the buffer is written.
 struct separator_record {
     log_record_writer writer;
@@ -52,17 +52,36 @@ struct separator_record {
     }
 };
 
-// A chunk builder that tracks the writes of its records: write() appends a record and returns a
-// future that resolves to where the record ends up, once the chunk is written to a segment and
-// complete_writes() is called. The buffer_holder of the written_record keeps the buffer open, for
-// follow-up work such as index updates.
+// The work for one record of a write buffer. The buffer calls on_written() with the location of the
+// record once the chunk of the record is written to a segment, or on_failed() when the chunk is not
+// written. It calls one of them once for each record, in the order of the records.
+template <typename Completion>
+concept write_completion = std::is_nothrow_move_constructible_v<Completion>
+        && std::is_nothrow_move_assignable_v<Completion>
+        && requires (Completion& c, record_location location, std::exception_ptr ex) {
+    { c.on_written(location) } noexcept;
+    { c.on_failed(ex) } noexcept;
+};
+
+// A chunk builder that keeps a completion for each record that it takes, and completes them once
+// its chunk is written to a segment, or fails them when the chunk is not written.
 //
 // mixed_write_buffer and full_write_buffer take different records and seal different headers, and
 // this class holds what they share.
+template <write_completion Completion>
 class write_buffer {
+    struct entry {
+        Completion completion;
+        frame_extent frame{};
+
+        explicit entry(Completion&& c) noexcept
+            : completion(std::move(c))
+        {}
+    };
+
     chunk_builder _builder;
-    shared_promise<segment_position> _chunk_position;
-    seastar::gate _write_gate;
+    // The buffer clears the vector and does not free it, so that a reused buffer allocates nothing.
+    std::vector<entry> _entries;
 
 public:
     write_buffer(const write_buffer&) = delete;
@@ -70,14 +89,6 @@ public:
 
     // Ends the appends, see chunk_builder::finish().
     size_t finish() { return _builder.finish(); }
-
-    // Completes the tracked writes once the chunk of the buffer is written at `chunk_position`, and
-    // waits for the holders of the written records.
-    future<> complete_writes(segment_position chunk_position);
-
-    // Waits for the holders of the written records. A buffer is reset only once it is closed.
-    future<> close();
-    bool is_closed() const noexcept;
 
     template <log_record_writer_concept Writer>
     bool can_fit(const Writer& writer) const noexcept { return _builder.can_fit(writer); }
@@ -89,20 +100,63 @@ public:
     size_t record_count() const noexcept { return _builder.record_count(); }
 
 protected:
-    write_buffer(size_t buffer_size, segment_kind kind);
-    ~write_buffer() = default;
+    write_buffer(size_t buffer_size, segment_kind kind)
+        : _builder(buffer_size, kind)
+    {}
+
+    // A completion that is destroyed and not called leaves its write without an outcome.
+    ~write_buffer() {
+        if (!_entries.empty()) {
+            on_internal_error_noexcept(logstor_logger, fmt::format("Destroying a write buffer with {} writes that are not complete", _entries.size()));
+        }
+    }
 
     write_buffer(write_buffer&&) noexcept = default;
     write_buffer& operator=(write_buffer&&) noexcept = default;
 
-    // Returns the future of where the record whose frame is at `frame` ends up. It holds the write
-    // gate until the record's write completes, and passes the holder to the caller.
-    future<written_record> track(frame_extent frame);
+    // Appends the record, and keeps `completion` for complete_writes(). The completion goes into
+    // the buffer before the record, so that nothing can fail once the record is in the chunk. When
+    // the append throws, `completion` is left to the caller.
+    template <log_record_writer_concept Writer>
+    frame_extent append(const Writer& writer, Completion&& completion) {
+        // emplace_back() allocates before it moves `completion`, so a failed allocation also leaves
+        // `completion` to the caller.
+        auto& e = _entries.emplace_back(std::move(completion));
+        try {
+            e.frame = _builder.append(writer);
+        } catch (...) {
+            completion = std::move(e.completion);
+            _entries.pop_back();
+            throw;
+        }
+        return e.frame;
+    }
 
-    // Fails the tracked writes with `ex`, for a chunk that is not written, and closes the buffer.
-    future<> abort_writes(std::exception_ptr ex);
+    // Calls on_written() of each completion, once the chunk of the buffer is written at
+    // `chunk_position`.
+    future<> complete_writes(segment_position chunk_position) {
+        for (auto& e : _entries) {
+            e.completion.on_written(locate_record(chunk_position, e.frame));
+            co_await coroutine::maybe_yield();
+        }
+        _entries.clear();
+    }
 
-    void reset();
+    // Calls on_failed() of each completion with `ex`, for a chunk that is not written.
+    void abort_writes(std::exception_ptr ex) noexcept {
+        for (auto& e : _entries) {
+            e.completion.on_failed(ex);
+        }
+        _entries.clear();
+    }
+
+    // Empties the buffer for a new chunk. The writes of the last chunk must be complete or aborted.
+    void reset() {
+        if (!_entries.empty()) {
+            on_internal_error(logstor_logger, fmt::format("Cannot reset a write buffer with {} writes that are not complete", _entries.size()));
+        }
+        _builder.reset();
+    }
 
     chunk_builder& builder() noexcept { return _builder; }
     const chunk_builder& builder() const noexcept { return _builder; }
@@ -110,46 +164,79 @@ protected:
 
 // The write buffer of a mixed segment, which takes the user writes. It keeps the records it took
 // until its chunk is written, for the separator to rewrite them into full segments.
-class mixed_write_buffer final : public write_buffer {
+template <write_completion Completion>
+class mixed_write_buffer final : public write_buffer<Completion> {
+    using base = write_buffer<Completion>;
+
     std::vector<separator_record> _separator_records;
 
 public:
-    explicit mixed_write_buffer(size_t buffer_size);
+    explicit mixed_write_buffer(size_t buffer_size)
+        : base(buffer_size, segment_kind::mixed)
+    {}
 
-    future<written_record> write(log_record_writer writer, write_target target);
+    // Appends the record, see write_buffer::append().
+    void write(log_record_writer writer, write_target target, Completion&& completion) {
+        auto& record = _separator_records.emplace_back(separator_record{
+            .writer = std::move(writer),
+            .target = std::move(target),
+        });
+        try {
+            record.frame = base::append(record.writer, std::move(completion));
+        } catch (...) {
+            _separator_records.pop_back();
+            throw;
+        }
+    }
 
     bytes_view seal(segment_sequence segment_seq) {
-        return builder().seal(segment_seq);
+        return base::builder().seal(segment_seq);
     }
 
     // The records of the buffer, once its chunk is written, for the separator.
-    std::vector<separator_record> take_separator_records();
+    std::vector<separator_record> take_separator_records() {
+        return std::move(_separator_records);
+    }
 
-    future<> abort_writes(std::exception_ptr ex);
+    using base::complete_writes;
 
-    void reset();
+    void abort_writes(std::exception_ptr ex) noexcept {
+        // The separator never gets these records, so drop them and the holders of their targets.
+        _separator_records.clear();
+        base::abort_writes(std::move(ex));
+    }
+
+    void reset() {
+        base::reset();
+        _separator_records.clear();
+    }
 };
 
 // The write buffer of a full segment, which compaction and the separator write.
-class full_write_buffer final : public write_buffer {
+template <write_completion Completion>
+class full_write_buffer final : public write_buffer<Completion> {
+    using base = write_buffer<Completion>;
+
 public:
     explicit full_write_buffer(size_t buffer_size)
-        : write_buffer(buffer_size, segment_kind::full)
+        : base(buffer_size, segment_kind::full)
     {}
 
+    // Appends the record, see write_buffer::append().
     template <log_record_writer_concept Writer>
-    future<written_record> write(const Writer& writer) {
-        return track(builder().append(writer));
+    void write(const Writer& writer, Completion&& completion) {
+        base::append(writer, std::move(completion));
     }
 
     bytes_view seal(segment_sequence segment_seq, table_id table) {
-        return builder().seal(segment_seq, table);
+        return base::builder().seal(segment_seq, table);
     }
 
-    using write_buffer::abort_writes;
-    using write_buffer::reset;
+    using base::complete_writes;
+    using base::abort_writes;
+    using base::reset;
 
-    size_t schema_table_size() const noexcept { return builder().schema_table_size(); }
+    size_t schema_table_size() const noexcept { return base::builder().schema_table_size(); }
 };
 
 }
