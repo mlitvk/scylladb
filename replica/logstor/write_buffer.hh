@@ -99,6 +99,9 @@ public:
     size_t record_bytes() const noexcept { return _builder.record_bytes(); }
     size_t record_count() const noexcept { return _builder.record_count(); }
 
+    // Returns how many writes are neither complete nor aborted.
+    size_t pending_write_count() const noexcept { return _entries.size(); }
+
 protected:
     write_buffer(size_t buffer_size, segment_kind kind)
         : _builder(buffer_size, kind)

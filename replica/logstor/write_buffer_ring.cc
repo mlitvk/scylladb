@@ -82,8 +82,13 @@ void write_buffer_ring::on_queued_write_removed(const queued_write& w) noexcept 
     _queued_write_bytes -= w.write_size;
 }
 
+void write_buffer_ring::fail_write(index_insert& completion, std::exception_ptr ep) noexcept {
+    ++_failed_writes;
+    completion.on_failed(std::move(ep));
+}
+
 void write_buffer_ring::fail_queued_write(queued_write& request, std::exception_ptr ep) noexcept {
-    request.completion.on_failed(std::move(ep));
+    fail_write(request.completion, std::move(ep));
 }
 
 bool write_buffer_ring::maybe_advance_head() noexcept {
@@ -151,6 +156,7 @@ future<bool> write_buffer_ring::reclaim_completed_tails() {
         auto f = co_await coroutine::as_future(std::move(completion));
 
         if (f.failed()) {
+            _failed_writes += tail_buf().pending_write_count();
             tail_buf().abort_writes(f.get_exception());
         }
 
@@ -281,7 +287,7 @@ void write_buffer_ring::write(log_record_writer writer, index_insert completion,
         // separator could put it.
         const size_t max_size = chunk_layout::max_record_size_any_kind(head_buf().buffer_size(), writer.mapping());
         if (writer.record_size() > max_size) [[unlikely]] {
-            completion.on_failed(std::make_exception_ptr(std::runtime_error(fmt::format(
+            fail_write(completion, std::make_exception_ptr(std::runtime_error(fmt::format(
                     "Write size {} exceeds the maximum record size {} of a {} byte buffer, whose schema table takes {} bytes for schema version {}",
                     writer.record_size(), max_size, head_buf().buffer_size(),
                     chunk_layout::single_version_schema_table_size(writer.mapping()), writer.header().schema_version))));
@@ -289,7 +295,7 @@ void write_buffer_ring::write(log_record_writer writer, index_insert completion,
         }
         const size_t key_size = writer.header_size() - ondisk::record_header_fixed_size;
         if (key_size > ondisk::max_key_size) [[unlikely]] {
-            completion.on_failed(std::make_exception_ptr(std::runtime_error(
+            fail_write(completion, std::make_exception_ptr(std::runtime_error(
                     fmt::format("Partition key size {} exceeds the maximum {}", key_size, ondisk::max_key_size))));
             return;
         }
@@ -303,14 +309,14 @@ void write_buffer_ring::write(log_record_writer writer, index_insert completion,
         // either there are queued writes or there is no space in the head buffer and ring is full - queue the write.
         queue_write(std::move(writer), std::move(completion), timeout, std::move(target), std::move(holder));
     } catch (...) {
-        completion.on_failed(std::current_exception());
+        fail_write(completion, std::current_exception());
     }
 }
 
 void write_buffer_ring::queue_write(log_record_writer writer, index_insert completion, db::timeout_clock::time_point timeout,
         write_target target, seastar::gate::holder holder) noexcept {
     if (_max_queued_write_bytes != 0 && _queued_write_bytes + writer.record_size() > _max_queued_write_bytes) {
-        completion.on_failed(std::make_exception_ptr(replica::rate_limit_exception()));
+        fail_write(completion, std::make_exception_ptr(replica::rate_limit_exception()));
         return;
     }
 
@@ -322,7 +328,7 @@ void write_buffer_ring::queue_write(log_record_writer writer, index_insert compl
         // still holds its completion.
         _queued_writes.push_back(std::move(request), timeout);
     } catch (...) {
-        request.completion.on_failed(std::current_exception());
+        fail_write(request.completion, std::current_exception());
         return;
     }
     _queued_write_bytes += write_size;
