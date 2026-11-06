@@ -220,6 +220,13 @@ public:
     // location comes from.
     future<accepted_write> write_to_buffer(log_record_writer, db::timeout_clock::time_point timeout, write_target target = {}) noexcept;
 
+    // Resolves once the record is in a segment. Not a coroutine, so it adds no frame per write.
+    future<written_record> write(log_record_writer writer, db::timeout_clock::time_point timeout, write_target target = {}) noexcept {
+        return write_to_buffer(std::move(writer), timeout, std::move(target)).then([] (accepted_write a) {
+            return std::move(a.persisted);
+        });
+    }
+
     size_t queued_write_count() const noexcept { return _queued_writes.size(); }
 
     size_t memory_usage() const noexcept { return _ring_size * _buffer_size + _queued_write_bytes; }
