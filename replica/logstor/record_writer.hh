@@ -24,8 +24,6 @@ namespace logstor {
 // The writer also holds the registry entry of the record's schema version, for the schema table of
 // the chunk that the buffer builds. The registry never erases an entry that a writer holds.
 class log_record_writer {
-    using ostream = seastar::simple_memory_output_stream;
-
     log_record _record;
     const schema_mapping* _mapping;
 
@@ -45,16 +43,14 @@ public:
     size_t record_size() const { return header_size() + value_size(); }
 
     // Write the record's frame - frame header, record header, value - to an output stream.
-    void write_frame(ostream& out) const {
+    void write_frame(seastar::simple_memory_output_stream& out) const {
         ondisk::write_record_frame(out, _record.header, _record.value);
     }
 };
 
-// Writer for log records that stores pre-serialized bytes.
-// Used in compaction and separator rewriting to avoid deserialization.
+// Writer for a record whose header and value are already serialized. It writes the bytes as they
+// are, so that a rewrite of a record does not decode it.
 class log_record_bytes_writer {
-    using ostream = seastar::simple_memory_output_stream;
-
     record_header _header;
     bytes_view _header_bytes;
     bytes_view _value_bytes;
@@ -75,7 +71,7 @@ public:
     size_t value_size() const { return _value_bytes.size(); }
     size_t record_size() const { return header_size() + value_size(); }
 
-    void write_frame(ostream& out) const {
+    void write_frame(seastar::simple_memory_output_stream& out) const {
         ondisk::write_record_frame(out, log_record_bytes_view{_header_bytes, _value_bytes});
     }
 };
