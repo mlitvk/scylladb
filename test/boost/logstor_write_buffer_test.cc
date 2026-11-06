@@ -370,6 +370,91 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_chunk_builder_finish_returns_the_final_chu
     BOOST_REQUIRE_THROW(wb.seal(segment_sequence{3}), std::runtime_error);
 }
 
+// Checks that a builder that is reset after a chunk of one table seals a chunk of another table with
+// nothing left from the first: the table, the token range, the schema table and the records.
+SEASTAR_THREAD_TEST_CASE(test_logstor_chunk_builder_reused_for_another_table_seals_only_its_own_chunk) {
+    auto first_schema = make_kv_schema();
+    auto second_schema = make_kv_schema();
+    BOOST_REQUIRE(first_schema->id() != second_schema->id());
+
+    // Keys whose tokens are in order, so that the first chunk can take the lowest and the highest
+    // token and leave the ones between them to the second: a token range the reset does not clear
+    // then shows in the segment header of the second chunk.
+    std::vector<sstring> keys;
+    for (size_t i = 0; i < 7; ++i) {
+        keys.push_back(fmt::format("pk{}", i));
+    }
+    auto token_of = [&] (const sstring& key) {
+        return dht::decorate_key(*second_schema, partition_key::from_single_value(*second_schema, serialized(key))).token();
+    };
+    std::ranges::sort(keys, std::less{}, token_of);
+
+    chunk_builder wb(32 * 1024, segment_kind::full);
+    wb.append(make_writer(make_log_record(first_schema, keys.front(), "v", api::timestamp_type(1))));
+    wb.append(make_writer(make_log_record(first_schema, keys.back(), "v", api::timestamp_type(2))));
+    wb.seal(segment_sequence{1}, first_schema->id());
+    wb.reset();
+
+    // Appended so that neither the first nor the last record holds the lowest or the highest token.
+    std::vector<log_record> by_token;
+    for (size_t i = 1; i < keys.size() - 1; ++i) {
+        by_token.push_back(make_log_record(second_schema, keys[i], "v", api::timestamp_type(10 + i)));
+    }
+    std::vector<log_record> expected;
+    for (size_t i : {2, 0, 4, 1, 3}) {
+        expected.push_back(by_token[i]);
+    }
+
+    size_t expected_records_size = 0;
+    for (const auto& record : expected) {
+        auto writer = make_writer(record);
+        expected_records_size += align_up(ondisk::record_frame_header_size + writer.record_size(), ondisk::record_alignment);
+        wb.append(writer);
+    }
+
+    const auto chunk = wb.seal(segment_sequence{2}, second_schema->id());
+    seastar::simple_memory_input_stream in(reinterpret_cast<const char*>(chunk.data()), chunk.size());
+    auto ch = ser::deserialize(in, std::type_identity<ondisk::chunk_header>{});
+    auto sh = ser::deserialize(in, std::type_identity<ondisk::segment_header>{});
+    BOOST_REQUIRE(ondisk::validate_chunk_headers(ch, sh));
+    BOOST_REQUIRE_EQUAL(ch.segment_seq.value, 2u);
+    BOOST_REQUIRE_EQUAL(ch.records_size, expected_records_size);
+    BOOST_REQUIRE_EQUAL(sh.table, second_schema->id());
+    BOOST_REQUIRE_EQUAL(sh.first_token, by_token.front().header.key.token());
+    BOOST_REQUIRE_EQUAL(sh.last_token, by_token.back().header.key.token());
+
+    auto entries = read_schema_table(chunk, ch);
+    BOOST_REQUIRE_EQUAL(entries.size(), 1u);
+    BOOST_REQUIRE_EQUAL(entries[0].table, second_schema->id());
+    BOOST_REQUIRE_EQUAL(entries[0].schema_version, second_schema->version());
+
+    assert_records_in_order(second_schema, scan_buffer_records(copy_chunk(chunk), log_segment_id{1}), expected);
+}
+
+// Checks that a record that compaction or the separator rewrites from the bytes of its frame gets the
+// same frame as the record it was read from.
+SEASTAR_THREAD_TEST_CASE(test_logstor_chunk_builder_bytes_writer_writes_the_same_frame) {
+    auto schema = make_kv_schema();
+    auto writer = make_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(5)));
+
+    chunk_builder original(32 * 1024, segment_kind::mixed);
+    const auto original_frame = original.append(writer);
+    const auto original_bytes = original.frame_bytes(original_frame);
+
+    seastar::simple_memory_input_stream in(reinterpret_cast<const char*>(original_bytes.data()), original_bytes.size());
+    auto parsed = ondisk::try_read_record_frame(in);
+    BOOST_REQUIRE(parsed);
+    BOOST_REQUIRE_EQUAL(in.size(), 0u);
+
+    chunk_builder rewritten(32 * 1024, segment_kind::full);
+    const auto bytes_writer = log_record_bytes_writer(parsed->header, parsed->bytes, writer.mapping());
+    BOOST_REQUIRE_EQUAL(bytes_writer.record_size(), writer.record_size());
+    const auto rewritten_frame = rewritten.append(bytes_writer);
+
+    BOOST_REQUIRE_EQUAL(rewritten_frame.size, original_frame.size);
+    BOOST_REQUIRE(rewritten.frame_bytes(rewritten_frame) == original_bytes);
+}
+
 // Checks that a buffer holding records that were never flushed can still be closed and reused
 // after aborting its writes. A pending write is resolved only by the flush and holds the buffer's
 // write gate until then, so close() alone never completes. The compaction buffer pool relies on
@@ -393,6 +478,77 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_abort_writes_reclaims_unflush
     wb.reset();
     BOOST_REQUIRE(!wb.is_closed());
     BOOST_REQUIRE(!wb.has_data());
+}
+
+// Checks that complete_writes() waits for the holders of the written records: a record's index update
+// runs under its holder, so the buffer must not be reused before every update is done.
+SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_complete_writes_waits_for_record_holders) {
+    auto schema = make_kv_schema();
+
+    full_write_buffer wb(32 * 1024);
+    auto write = wb.write(make_writer(make_log_record(schema, "pk0", "v0", api::timestamp_type(1))));
+    wb.seal(segment_sequence{1}, schema->id());
+
+    const auto chunk_position = segment_position{.segment = log_segment_id{5}, .offset = 0};
+    auto completed = wb.complete_writes(chunk_position);
+    {
+        auto written = write.get();
+        BOOST_REQUIRE(written.location.segment == log_segment_id{5});
+        seastar::thread::yield();
+        BOOST_REQUIRE(!completed.available());
+    }
+    completed.get();
+    BOOST_REQUIRE(wb.is_closed());
+}
+
+// Checks that a mixed buffer gives the separator each record with its write target and its location,
+// also for a chunk at an offset other than 0, and that an aborted buffer drops its records and the
+// holders of their targets.
+SEASTAR_THREAD_TEST_CASE(test_logstor_mixed_write_buffer_keeps_its_records_for_the_separator) {
+    auto schema = make_kv_schema();
+    // Outlives the buffers, whose records hold it.
+    seastar::gate target_gate;
+
+    mixed_write_buffer wb(32 * 1024);
+    std::vector<future<written_record>> writes;
+    for (size_t i = 0; i < 3; ++i) {
+        auto record = make_log_record(schema, fmt::format("pk{}", i), "v", api::timestamp_type(1 + i));
+        writes.push_back(wb.write(make_writer(std::move(record)), write_target{.non_empty_holder = target_gate.hold()}));
+    }
+    BOOST_REQUIRE_EQUAL(target_gate.get_count(), 3u);
+
+    wb.seal(segment_sequence{1});
+    const auto chunk_position = segment_position{.segment = log_segment_id{7}, .offset = 3 * ondisk::block_alignment};
+    auto completed = wb.complete_writes(chunk_position);
+    std::vector<record_location> locations;
+    for (auto& write : writes) {
+        locations.push_back(wait_for_persisted(write));
+    }
+    completed.get();
+
+    auto records = wb.take_separator_records();
+    BOOST_REQUIRE_EQUAL(records.size(), 3u);
+    BOOST_REQUIRE(wb.take_separator_records().empty());
+    for (size_t i = 0; i < records.size(); ++i) {
+        BOOST_REQUIRE(records[i].location(chunk_position) == locations[i]);
+        BOOST_REQUIRE_GE(locations[i].offset, chunk_position.offset + ondisk::chunk_header_size);
+        BOOST_REQUIRE_EQUAL(records[i].writer.record().header.timestamp, api::timestamp_type(1 + i));
+    }
+    // The write targets stay with the records until the separator is done with them.
+    BOOST_REQUIRE_EQUAL(target_gate.get_count(), 3u);
+    records.clear();
+    BOOST_REQUIRE_EQUAL(target_gate.get_count(), 0u);
+
+    mixed_write_buffer aborted(32 * 1024);
+    auto write = aborted.write(make_writer(make_log_record(schema, "pk3", "v", api::timestamp_type(4))),
+            write_target{.non_empty_holder = target_gate.hold()});
+    BOOST_REQUIRE_EQUAL(target_gate.get_count(), 1u);
+    aborted.abort_writes(std::make_exception_ptr(std::runtime_error("chunk was not written"))).get();
+    BOOST_REQUIRE_THROW(write.get(), std::runtime_error);
+    BOOST_REQUIRE_EQUAL(target_gate.get_count(), 0u);
+    BOOST_REQUIRE(aborted.take_separator_records().empty());
+
+    target_gate.close().get();
 }
 
 // Checks that a pool builds its buffers at the point of use and keeps only max_cached of them once
@@ -934,7 +1090,56 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_stop_drains_blocked_in_f
     assert_log_record_matches(schema, actual.front().record, record);
 }
 
-// Checks that a flush failure is propagated to every write that was already accepted into that buffer.
+// Checks that stop() flushes the writes that wait for room in the ring before it completes, and that
+// a write that comes after stop() fails.
+SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_stop_drains_queued_writes) {
+    auto schema = make_kv_schema();
+    constexpr size_t buffer_size = 4 * 1024;
+    const auto large_value = make_single_buffer_value(schema, buffer_size);
+
+    test_flush_controller flush_ctl{.pause_flushes = true};
+    write_buffer_ring ring(make_write_buffer_ring_config(buffer_size, 2), [&flush_ctl] (mixed_write_buffer& wb) {
+        return flush_ctl(wb);
+    });
+
+    ring.start().get();
+
+    std::vector<log_record> expected;
+    for (size_t i = 0; i < 3; ++i) {
+        expected.push_back(make_write_buffer_ring_record(schema, i, large_value, api::timestamp_type(800 + i)));
+    }
+
+    auto accepted0 = ring.write_to_buffer(make_writer(expected[0]), test_timeout()).get();
+    auto persisted0 = std::move(accepted0.persisted);
+    flush_ctl.wait_for_flush_starts(1);
+    auto accepted1 = ring.write_to_buffer(make_writer(expected[1]), test_timeout()).get();
+    auto persisted1 = std::move(accepted1.persisted);
+    auto queued = ring.write_to_buffer(make_writer(expected[2]), test_timeout());
+    BOOST_REQUIRE_EQUAL(ring.queued_write_count(), 1u);
+
+    auto stop_fut = ring.stop();
+
+    flush_ctl.release_one_flush();
+    wait_for_persisted(persisted0);
+    flush_ctl.wait_for_flush_starts(2);
+    auto accepted2 = queued.get();
+    auto persisted2 = std::move(accepted2.persisted);
+
+    flush_ctl.release_one_flush();
+    wait_for_persisted(persisted1);
+    flush_ctl.wait_for_flush_starts(3);
+    flush_ctl.release_one_flush();
+    wait_for_persisted(persisted2);
+    stop_fut.get();
+
+    assert_records_in_order(schema, flush_ctl.all_records(), expected);
+
+    auto late = make_write_buffer_ring_record(schema, 3, "value", api::timestamp_type(803));
+    BOOST_REQUIRE_THROW(ring.write_to_buffer(make_writer(late), test_timeout()).get(), seastar::gate_closed_exception);
+}
+
+// Checks that a flush failure is propagated to every write that was already accepted into that buffer,
+// and that the ring goes on taking and flushing writes after it.
 SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_flush_failure_fails_all_writes_in_buffer) {
     auto schema = make_kv_schema();
     constexpr size_t buffer_size = 4 * 1024;
@@ -969,4 +1174,20 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_flush_failure_fails_all_
 
     BOOST_REQUIRE_EQUAL(flush_ctl.started_count, 1u);
     BOOST_REQUIRE(flush_ctl.flushed_buffers.empty());
+
+    // The ring takes writes again after the failure, and its buffers are reused, including the one
+    // whose flush failed: one write and one flush per buffer of the ring.
+    std::vector<log_record> expected;
+    for (size_t i = 0; i < 3; ++i) {
+        expected.push_back(make_write_buffer_ring_record(schema, 2 + i, fmt::format("value{}", 2 + i), api::timestamp_type(702 + i)));
+        auto accepted = ring.write_to_buffer(make_writer(expected.back()), test_timeout()).get();
+        auto persisted = std::move(accepted.persisted);
+        // The flush completes only once the record's holder is released.
+        auto flushed = ring.flush();
+        wait_for_persisted(persisted);
+        flushed.get();
+    }
+
+    BOOST_REQUIRE_EQUAL(flush_ctl.started_count, 4u);
+    assert_records_in_order(schema, flush_ctl.all_records(), expected);
 }
