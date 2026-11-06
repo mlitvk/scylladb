@@ -2883,6 +2883,71 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_discarded_group_does_not_free_its_unflushe
     assert_that(*actual).is_equal_to(expected);
 }
 
+// A group flush and the close of the group both wait for the same flush in progress. The close
+// resumes first and waits in the discard of the buffers, and then the group flush resumes. The group
+// flush must not switch the buffers then, because the close gives the buffer of a new flush back to
+// the pool while the new flush writes it.
+SEASTAR_THREAD_TEST_CASE(test_logstor_separator_flush_starts_no_flush_while_the_group_closes) {
+    if constexpr (!std::is_same_v<utils::error_injection_type, utils::error_injection<true>>) {
+        return;
+    }
+
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    test_recovery_catalog no_tables;
+    ls.do_recovery(no_tables).get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+    auto& sm = ls.get_segment_manager();
+
+    test_logstor_group cg(schema, ls);
+
+    constexpr std::string_view flush_wait = "logstor_separator_flush_wait";
+    auto& injector = utils::get_local_injector();
+    injector.enable(flush_wait);
+    auto disable = seastar::defer([&injector, flush_wait] noexcept { injector.disable(flush_wait); });
+
+    // The first flush takes the first record, and it waits at the injection.
+    auto m0 = make_kv_mutation(schema, "pk0", "value0");
+    write_to_separator_buffer(ls, cg, m0);
+    auto first_flush = cg.flush_separator();
+    BOOST_REQUIRE_EQUAL(injector.waiters(flush_wait), 1u);
+
+    // The second record goes into the other buffer, so the second flush waits for the first flush.
+    // The close waits for the first flush too, after the second flush.
+    auto m1 = make_kv_mutation(schema, "pk1", "value1");
+    write_to_separator_buffer(ls, cg, m1);
+    auto second_flush = cg.flush_separator();
+    auto remove = ls.get_compaction_manager().remove(cg);
+    BOOST_REQUIRE(!second_flush.available());
+    BOOST_REQUIRE(!remove.available());
+
+    injector.receive_message(flush_wait);
+    first_flush.get();
+    remove.get();
+
+    // Only the first flush started. A second flush would wait at the injection with a buffer that the
+    // close gave back to the pool, and the disable below releases it.
+    BOOST_CHECK_EQUAL(injector.enter_count(flush_wait), 1u);
+    injector.disable(flush_wait);
+    BOOST_CHECK_THROW(second_flush.get(), std::runtime_error);
+
+    // The close discarded the second record, so the segment that holds it is kept, and the index
+    // still points at the record there.
+    BOOST_REQUIRE(!cg.separator_has_data());
+    BOOST_REQUIRE_EQUAL(cg.separator_held_segment_count(), 0u);
+    BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 1u);
+    BOOST_REQUIRE_EQUAL(sm.kept_segment_count(), 1u);
+    for (const auto& m : {m0, m1}) {
+        auto read = read_mutation(ls, schema, cg.logstor_index(), m.decorated_key(), schema->full_slice()).get();
+        BOOST_REQUIRE(read);
+        assert_that(*read).is_equal_to(m);
+    }
+}
+
 // Checks that a group whose separator was closed takes no separator writes at all. Nothing can flush
 // what such a group buffers, so a record handed to it afterwards - which is what a write that was
 // already in flight when the group was closed amounts to - has to be refused rather than buffered.
