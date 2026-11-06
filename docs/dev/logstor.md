@@ -173,7 +173,7 @@ the exact layout, the field types and the encodings:
 - [replica/logstor/ondisk.hh](../../replica/logstor/ondisk.hh) for the headers, the record frame
   and the schema table.
 - the `chunk_builder` comment in
-  [replica/logstor/write_buffer.hh](../../replica/logstor/write_buffer.hh) for the layout of a
+  [replica/logstor/chunk_builder.hh](../../replica/logstor/chunk_builder.hh) for the layout of a
   chunk.
 
 ### Files

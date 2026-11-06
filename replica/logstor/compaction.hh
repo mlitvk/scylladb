@@ -10,7 +10,7 @@
 #include "types.hh"
 #include "schema/schema_fwd.hh"
 #include "utils/chunked_vector.hh"
-#include "write_buffer.hh"
+#include "write_buffer_pool.hh"
 #include "utils/log_heap.hh"
 #include "segment_stats.hh"
 #include <seastar/core/format.hh>

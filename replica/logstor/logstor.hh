@@ -19,7 +19,7 @@
 #include "types.hh"
 #include "index.hh"
 #include "segment_manager.hh"
-#include "write_buffer.hh"
+#include "buffered_writer.hh"
 #include "cache.hh"
 #include "mutation/mutation.hh"
 #include "dht/decorated_key.hh"

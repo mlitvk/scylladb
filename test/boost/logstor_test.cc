@@ -40,7 +40,9 @@
 #include "replica/logstor/ondisk.hh"
 #include "replica/logstor/record_value.hh"
 #include "replica/logstor/single_row_partition.hh"
-#include "replica/logstor/write_buffer.hh"
+#include "replica/logstor/buffered_writer.hh"
+#include "replica/logstor/chunk_builder.hh"
+#include "replica/logstor/write_buffer_pool.hh"
 #include <seastar/testing/thread_test_case.hh>
 
 #include "replica/logstor/segment_io.hh"

@@ -50,7 +50,7 @@
 #include <seastar/util/closeable.hh>
 #include <seastar/core/condition-variable.hh>
 #include <seastar/coroutine/as_future.hh>
-#include "replica/logstor/write_buffer.hh"
+#include "replica/logstor/write_buffer_pool.hh"
 #include "utils/disk-error-handler.hh"
 #include "utils/dynamic_bitset.hh"
 #include "utils/serialized_action.hh"
