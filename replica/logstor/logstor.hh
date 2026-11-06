@@ -19,7 +19,7 @@
 #include "types.hh"
 #include "index.hh"
 #include "segment_manager.hh"
-#include "buffered_writer.hh"
+#include "write_buffer_ring.hh"
 #include "cache.hh"
 #include "mutation/mutation.hh"
 #include "dht/decorated_key.hh"
@@ -46,7 +46,7 @@ class logstor {
     };
 
     segment_manager _segment_manager;
-    buffered_writer _write_buffer;
+    write_buffer_ring _write_buffer_ring;
     cache_tracker _cache_tracker;
     seastar::metrics::metric_groups _metrics;
     stats _stats;
