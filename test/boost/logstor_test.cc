@@ -987,7 +987,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_charges_the_schema_table_entr
 
     // The same record fits an empty buffer, whose max_record_size() accounts for its entry.
     chunk_builder empty(ondisk::block_alignment, segment_kind::mixed);
-    BOOST_REQUIRE_LE(other_version.record_size(), empty.max_record_size(other_version.mapping()));
+    BOOST_REQUIRE_LE(other_version.record_size(),
+            chunk_layout::max_record_size(ondisk::block_alignment, segment_kind::mixed, other_version.mapping()));
     BOOST_REQUIRE(empty.can_fit(other_version));
 }
 
@@ -1227,7 +1228,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_accepts_record_at_max_record_
     sstring value;
     auto record = make_log_record(schema, "pk", "", api::timestamp_type(27));
     auto writer = make_writer(record);
-    auto max_size = wb.max_record_size(writer.mapping());
+    auto max_size = chunk_layout::max_record_size(ondisk::block_alignment, segment_kind::mixed, writer.mapping());
 
     while (writer.record_size() < max_size) {
         value += "x";

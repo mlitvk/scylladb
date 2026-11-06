@@ -53,7 +53,9 @@ void write_buffer::reset() {
 mixed_write_buffer::mixed_write_buffer(size_t buffer_size)
         : write_buffer(buffer_size, segment_kind::mixed)
 {
-    _separator_records.reserve(buffer_size / 100);
+    // About the record count of a full buffer of small records, so that the vector rarely grows.
+    static constexpr size_t expected_bytes_per_record = 100;
+    _separator_records.reserve(buffer_size / expected_bytes_per_record);
 }
 
 future<written_record> mixed_write_buffer::write(log_record_writer writer, write_target target) {

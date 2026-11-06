@@ -53,7 +53,7 @@ void chunk_schema_table::write(seastar::simple_memory_output_stream& out) const 
 
 chunk_builder::chunk_builder(size_t buffer_size, segment_kind kind)
         : _buffer_size(buffer_size)
-        , _buffer(seastar::allocate_aligned_buffer<char>(buffer_size, 4096))
+        , _buffer(seastar::allocate_aligned_buffer<char>(buffer_size, ondisk::block_alignment))
         , _segment_kind(kind)
 {
     reset();
@@ -71,17 +71,6 @@ void chunk_builder::reset() {
     _sealed = false;
 }
 
-bool chunk_builder::can_fit(size_t record_size, size_t schema_table_growth) const noexcept {
-    // The padded record frame, and the padded schema table that follows the last record.
-    const auto padded_frame_size = align_up(ondisk::record_frame_header_size + record_size, ondisk::record_alignment);
-    const auto table_size = align_up(_schema_table.size() + schema_table_growth, ondisk::record_alignment);
-    return padded_frame_size + table_size <= _stream.size();
-}
-
-bool chunk_builder::has_data() const noexcept {
-    return serialized_size() > chunk_headers_size();
-}
-
 template <log_record_writer_concept Writer>
 frame_extent chunk_builder::append(const Writer& writer) {
     const auto& header = writer.header();
@@ -96,7 +85,7 @@ frame_extent chunk_builder::append(const Writer& writer) {
     }
 
     if (_finished_body) {
-        on_internal_error(logstor_logger, "Cannot append a record to a finished write buffer");
+        on_internal_error(logstor_logger, "Cannot append a record to a finished chunk");
     }
 
     const auto& mapping = writer.mapping();
@@ -107,7 +96,7 @@ frame_extent chunk_builder::append(const Writer& writer) {
 
     const auto record_size = header_size + value_size;
     const auto schema_table_growth = _schema_table.growth(mapping);
-    if (!can_fit(record_size, schema_table_growth)) {
+    if (!fits(record_size, schema_table_growth)) {
         throw std::runtime_error(fmt::format("Record of size {} does not fit the {} bytes left in the buffer, of which the schema table takes {} ({} for schema version {})",
                 record_size, _stream.size(), _schema_table.size() + schema_table_growth, schema_table_growth, header.schema_version));
     }
@@ -138,21 +127,12 @@ frame_extent chunk_builder::append(const Writer& writer) {
     };
 }
 
-void chunk_builder::pad_to_alignment(size_t alignment) {
-    auto current_pos = serialized_size();
-    auto next_pos = align_up(current_pos, alignment);
-    auto padding = next_pos - current_pos;
-    if (padding > 0) {
-        _stream.fill('\0', padding);
-    }
-}
-
 size_t chunk_builder::finish() {
     if (_finished_body) {
         return serialized_size();
     }
     const size_t records_size = serialized_size() - chunk_headers_size();
-    // The room for the table was reserved by can_fit() as the records were appended.
+    // The room for the table was reserved by fits() as the records were appended.
     auto table_out = _stream.write_substream(_schema_table.size());
     _schema_table.write(table_out);
     if (table_out.size() != 0) {
@@ -183,9 +163,29 @@ bytes_view chunk_builder::seal(segment_sequence segment_seq, table_id table) {
     return do_seal(segment_seq, table);
 }
 
+bool chunk_builder::has_data() const noexcept {
+    return serialized_size() > chunk_headers_size();
+}
+
+bool chunk_builder::fits(size_t record_size, size_t schema_table_growth) const noexcept {
+    // The padded record frame, and the padded schema table that follows the last record.
+    const auto padded_frame_size = align_up(ondisk::record_frame_header_size + record_size, ondisk::record_alignment);
+    const auto table_size = align_up(_schema_table.size() + schema_table_growth, ondisk::record_alignment);
+    return padded_frame_size + table_size <= _stream.size();
+}
+
+void chunk_builder::pad_to_alignment(size_t alignment) {
+    auto current_pos = serialized_size();
+    auto next_pos = align_up(current_pos, alignment);
+    auto padding = next_pos - current_pos;
+    if (padding > 0) {
+        _stream.fill('\0', padding);
+    }
+}
+
 bytes_view chunk_builder::do_seal(segment_sequence segment_seq, std::optional<table_id> table) {
     if (_sealed) {
-        throw std::runtime_error("Cannot seal write buffer more than once");
+        throw std::runtime_error("Cannot seal a chunk more than once");
     }
     finish();
 
