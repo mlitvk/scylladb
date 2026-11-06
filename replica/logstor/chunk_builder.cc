@@ -101,18 +101,20 @@ frame_extent chunk_builder::append(const Writer& writer) {
                 record_size, _stream.size(), _schema_table.size() + schema_table_growth, schema_table_growth, header.schema_version));
     }
 
-    // The version goes into the table before the frame is written. If add() throws, the buffer is
-    // unchanged, and no frame is left whose version the table does not list.
-    _schema_table.add(mapping, schema_table_growth);
-
     const size_t frame_offset = serialized_size();
     const size_t frame_size = ondisk::record_frame_size(header_size, value_size);
 
-    auto frame_out = _stream.write_substream(frame_size);
+    // Write the frame through a copy of the stream, and keep the copy only when the frame is
+    // complete and its version is in the table, so that an append that throws leaves the chunk as
+    // it was.
+    auto out = _stream;
+    auto frame_out = out.write_substream(frame_size);
     writer.write_frame(frame_out);
     if (frame_out.size() != 0) {
         on_internal_error(logstor_logger, fmt::format("Record frame of {} bytes left {} unwritten", frame_size, frame_out.size()));
     }
+    _schema_table.add(mapping, schema_table_growth);
+    _stream = out;
 
     pad_to_alignment(ondisk::record_alignment);
 
