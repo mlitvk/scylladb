@@ -216,7 +216,7 @@ void reseal_chunk_crcs(temporary_buffer<char>& buf) {
     if (ch.kind == segment_kind::full) {
         sh = read_segment_header(buf);
     }
-    ch.body_crc = ondisk::calculate_body_crc(std::span(buf.get() + chunk_builder::chunk_headers_size(ch.kind),
+    ch.body_crc = ondisk::calculate_body_crc(std::span(buf.get() + ondisk::chunk_headers_size(ch.kind),
             size_t(ch.records_size) + ch.schema_table_size));
     ch.crc = ch.calculate_crc(sh);
     seastar::simple_memory_output_stream out(buf.get_write(), ondisk::chunk_header_size);
@@ -230,7 +230,7 @@ struct schema_table_entry_copy {
 };
 
 std::vector<schema_table_entry_copy> read_schema_table(bytes_view chunk, const ondisk::chunk_header& ch) {
-    const auto* table = chunk.data() + chunk_builder::chunk_headers_size(ch.kind) + ch.records_size;
+    const auto* table = chunk.data() + ondisk::chunk_headers_size(ch.kind) + ch.records_size;
     std::vector<schema_table_entry_copy> entries;
     ondisk::for_each_schema_table_entry(bytes_view(table, ch.schema_table_size), [&entries] (const ondisk::schema_table_entry& e) {
         entries.push_back(schema_table_entry_copy{
@@ -255,7 +255,7 @@ void make_schema_table_unparsable_on_disk(logstor& ls, log_segment_id segment_id
     BOOST_REQUIRE_EQUAL(f.dma_read(offset, buf.get_write(), buf.size()).get(), buf.size());
     const auto ch = read_chunk_header(buf);
     BOOST_REQUIRE(ch.kind == segment_kind::full);
-    auto pos = chunk_builder::chunk_headers_size(ch.kind) + ch.records_size + ondisk::schema_table_header_size;
+    auto pos = ondisk::chunk_headers_size(ch.kind) + ch.records_size + ondisk::schema_table_header_size;
     for (const auto& e : read_schema_table(bytes_view(reinterpret_cast<const int8_t*>(buf.get()), buf.size()), ch)) {
         pos += ondisk::schema_table_entry_fixed_size;
         std::fill_n(buf.get_write() + pos, e.mapping.size(), char(0xff));
@@ -874,7 +874,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_record_and_header_serializati
 
     // The schema table follows the records and lists the one version the record was written under.
     const auto& mapping = *test_registry().find(schema->version());
-    BOOST_REQUIRE_EQUAL(ch.schema_table_size, chunk_builder::schema_table_size(mapping));
+    BOOST_REQUIRE_EQUAL(ch.schema_table_size, chunk_layout::single_version_schema_table_size(mapping));
     auto entries = read_schema_table(chunk, ch);
     BOOST_REQUIRE_EQUAL(entries.size(), 1u);
     BOOST_REQUIRE_EQUAL(entries[0].table, schema->id());
@@ -886,7 +886,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_record_and_header_serializati
 // of a block, also close enough to its end for the table to push the chunk into the next block.
 SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_finish_counts_the_schema_table) {
     auto schema = make_kv_schema();
-    const auto table_size = chunk_builder::schema_table_size(test_registry().add(*schema));
+    const auto table_size = chunk_layout::single_version_schema_table_size(test_registry().add(*schema));
     BOOST_REQUIRE_LT(table_size, ondisk::block_alignment);
 
     for (size_t value_size = 1; value_size <= ondisk::block_alignment; value_size += ondisk::record_alignment) {
@@ -957,7 +957,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_lists_a_schema_version_once_a
     const auto chunk = wb.seal(segment_sequence{7}, std::nullopt);
 
     auto ch = read_chunk_header(copy_chunk(chunk));
-    BOOST_REQUIRE_EQUAL(ch.schema_table_size, chunk_builder::schema_table_size(from_first));
+    BOOST_REQUIRE_EQUAL(ch.schema_table_size, chunk_layout::single_version_schema_table_size(from_first));
     auto entries = read_schema_table(chunk, ch);
     BOOST_REQUIRE_EQUAL(entries.size(), 1u);
     BOOST_REQUIRE_EQUAL(entries[0].schema_version, schema->version());
@@ -1309,7 +1309,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_largest_accepted_record_can_be_separated) 
     test_logstor_group cg(schema, ls);
 
     const auto segment_size = ls.get_segment_manager().get_segment_size();
-    const auto max_size = chunk_builder::max_record_size_any_kind(segment_size, test_registry().add(*schema));
+    const auto max_size = chunk_layout::max_record_size_any_kind(segment_size, test_registry().add(*schema));
 
     auto expected = make_kv_mutation_of_record_size(schema, "pk0", max_size);
     auto key = expected.decorated_key();
@@ -1358,7 +1358,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_rejects_record_that_does_not_fit_a_segment
     test_logstor_group cg(schema, ls);
 
     const auto segment_size = ls.get_segment_manager().get_segment_size();
-    const auto max_size = chunk_builder::max_record_size_any_kind(segment_size, test_registry().add(*schema));
+    const auto max_size = chunk_layout::max_record_size_any_kind(segment_size, test_registry().add(*schema));
 
     auto too_big = make_kv_mutation_of_record_size(schema, "pk0", max_size + 1);
     BOOST_REQUIRE_THROW(ls.write(too_big, write_target(&cg, {}), db::no_timeout).get(), std::runtime_error);
@@ -3630,20 +3630,20 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_estimate_required_segments_charges_the_sch
     constexpr size_t record_count = 4 * segment_size / record_size;
     constexpr size_t record_bytes = record_count * record_size;
 
-    const auto without = chunk_builder::estimate_required_segments(record_bytes, record_count, segment_size, segment_kind::full, 0);
+    const auto without = estimate_required_segments(record_bytes, record_count, segment_size, 0);
     BOOST_REQUIRE_GT(without, 0u);
 
     // A table small against the segment does not change the count, and never lowers it.
-    const auto with_small = chunk_builder::estimate_required_segments(record_bytes, record_count, segment_size, segment_kind::full, 256);
+    const auto with_small = estimate_required_segments(record_bytes, record_count, segment_size, 256);
     BOOST_REQUIRE_GE(with_small, without);
 
     // One large enough against the segment does: it leaves half of each for records, so it takes
     // about twice as many of them.
-    const auto with_large = chunk_builder::estimate_required_segments(record_bytes, record_count, segment_size, segment_kind::full, segment_size / 2);
+    const auto with_large = estimate_required_segments(record_bytes, record_count, segment_size, segment_size / 2);
     BOOST_REQUIRE_GT(with_large, without);
 
     // A table that leaves no room at all still answers, rather than dividing by zero.
-    BOOST_REQUIRE_GE(chunk_builder::estimate_required_segments(record_bytes, record_count, segment_size, segment_kind::full, segment_size), 1u);
+    BOOST_REQUIRE_GE(estimate_required_segments(record_bytes, record_count, segment_size, segment_size), 1u);
 }
 
 // Checks that the schema table estimate starts at the first sample of a table, moves part of the
@@ -3685,7 +3685,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_select_compaction_batch) {
     constexpr size_t dense_records = records_per_segment * 98 / 100;
     constexpr size_t sparse_count = 3;
     // Small against a 128 KiB segment, so it does not change which batch is worth taking.
-    const size_t schema_table_size = chunk_builder::schema_table_size(test_registry().add(*make_kv_schema()));
+    const size_t schema_table_size = chunk_layout::single_version_schema_table_size(test_registry().add(*make_kv_schema()));
 
     // Descriptors are intrusively linked into the sets, so they must keep their addresses, and every
     // set must be destroyed before them.

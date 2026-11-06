@@ -148,6 +148,10 @@ struct compaction_batch_limits {
     double extension_tolerance = compaction_batch_extension_tolerance;
 };
 
+// How many full segments `record_count` records of `record_bytes` bytes take. `schema_table_size` is
+// the estimated size of the schema table of one segment.
+size_t estimate_required_segments(size_t record_bytes, size_t record_count, size_t segment_size, size_t schema_table_size);
+
 // Picks the segments one compaction job should read, out of the ones a group owns.
 //
 // The set's free-space histogram is already ordered by ascending utilization, which is near-optimal

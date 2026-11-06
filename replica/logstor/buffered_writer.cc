@@ -301,12 +301,12 @@ future<buffered_write_result> buffered_writer::write_to_buffer(log_record_writer
     // later rewrites it into, so it is bounded by whichever of the two takes less: one that only
     // fits the buffer it is written to first would be accepted here and then never fit anywhere the
     // separator could put it.
-    const size_t max_size = chunk_builder::max_record_size_any_kind(head_buf().buffer_size(), writer.mapping());
+    const size_t max_size = chunk_layout::max_record_size_any_kind(head_buf().buffer_size(), writer.mapping());
     if (writer.record_size() > max_size) [[unlikely]] {
         return make_exception_future<buffered_write_result>(std::runtime_error(fmt::format(
                 "Write size {} exceeds the maximum record size {} of a {} byte buffer, whose schema table takes {} bytes for schema version {}",
                 writer.record_size(), max_size, head_buf().buffer_size(),
-                chunk_builder::schema_table_size(writer.mapping()), writer.header().schema_version)));
+                chunk_layout::single_version_schema_table_size(writer.mapping()), writer.header().schema_version)));
     }
     const size_t key_size = writer.header_size() - ondisk::record_header_fixed_size;
     if (key_size > ondisk::max_key_size) [[unlikely]] {

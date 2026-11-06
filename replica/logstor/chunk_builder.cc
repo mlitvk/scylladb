@@ -209,26 +209,6 @@ bytes_view chunk_builder::seal(segment_sequence segment_seq, std::optional<table
     return bytes_view(reinterpret_cast<const int8_t*>(_buffer.get()), serialized_size());
 }
 
-size_t chunk_builder::estimate_required_segments(size_t record_bytes, size_t record_count, size_t segment_size,
-        segment_kind kind, size_t schema_table_size) {
-    if (record_count == 0 || record_bytes == 0) {
-        return 0;
-    }
-
-    const size_t fixed_overhead = chunk_headers_size(kind) + align_up(schema_table_size, ondisk::record_alignment);
-
-    if (segment_size <= fixed_overhead) {
-        return 1;
-    }
-
-    const auto usable_bytes = segment_size - fixed_overhead;
-    auto records_per_segment = (usable_bytes * record_count) / record_bytes;
-    if (records_per_segment == 0) {
-        records_per_segment = 1;
-    }
-    return (record_count + records_per_segment - 1) / records_per_segment;
-}
-
 template frame_extent chunk_builder::append<log_record_writer>(const log_record_writer&);
 template frame_extent chunk_builder::append<log_record_bytes_writer>(const log_record_bytes_writer&);
 

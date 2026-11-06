@@ -240,6 +240,16 @@ inline constexpr size_t schema_table_entry_fixed_size = fixed_size<schema_table_
 static_assert(chunk_header_size % record_alignment == 0, "Chunk header size must be aligned by record_alignment");
 static_assert(segment_header_size % record_alignment == 0, "Segment header size must be aligned by record_alignment");
 
+// What a chunk of this kind carries ahead of its records: the chunk header, and the segment header
+// too for a full segment.
+constexpr size_t chunk_headers_size(segment_kind kind) noexcept {
+    size_t s = chunk_header_size;
+    if (kind == segment_kind::full) {
+        s += segment_header_size;
+    }
+    return s;
+}
+
 // Returns true if this code reads chunks of format version `v`.
 constexpr bool can_read_version(uint8_t v) noexcept {
     return v >= min_read_version && v <= current_version;
