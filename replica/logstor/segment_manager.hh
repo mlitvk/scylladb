@@ -22,7 +22,7 @@
 #include "mutation_writer/token_group_based_splitting_writer.hh"
 #include "replica/logstor/column_mapping_registry.hh"
 #include "replica/logstor/segment_io.hh"
-#include "replica/logstor/write_buffer.hh"
+#include "replica/logstor/write_buffer_pool.hh"
 #include "replica/logstor/compaction.hh"
 #include "replica/logstor/segment_stats.hh"
 #include "types.hh"

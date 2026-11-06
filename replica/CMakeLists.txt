@@ -20,7 +20,10 @@ target_sources(replica
     logstor/segment_manager.cc
     logstor/logstor.cc
     logstor/readers.cc
+    logstor/chunk_builder.cc
     logstor/write_buffer.cc
+    logstor/write_buffer_pool.cc
+    logstor/buffered_writer.cc
     logstor/record_value.cc
     logstor/column_mapping_registry.cc
     multishard_query.cc

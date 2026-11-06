@@ -306,7 +306,7 @@
 #include "replica/logstor/segment_io.hh"
 #include "replica/logstor/segment_manager.hh"
 #include "replica/logstor/single_row_partition.hh"
-#include "replica/logstor/write_buffer.hh"
+#include "replica/logstor/chunk_builder.hh"
 #include "schema/schema_builder.hh"
 #include "test/lib/logstor_test_utils.hh"
 #include "test/lib/random_utils.hh"

@@ -10,11 +10,12 @@
 #include "types.hh"
 #include "schema/schema_fwd.hh"
 #include "utils/chunked_vector.hh"
-#include "write_buffer.hh"
+#include "write_buffer_pool.hh"
 #include "utils/log_heap.hh"
 #include "segment_stats.hh"
 #include <seastar/core/format.hh>
 #include <seastar/core/semaphore.hh>
+#include <seastar/core/shared_future.hh>
 #include <seastar/util/noncopyable_function.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 #include "mutation_writer/token_group_based_splitting_writer.hh"
