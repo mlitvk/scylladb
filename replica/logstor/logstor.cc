@@ -7,6 +7,8 @@
  */
 #include "replica/logstor/logstor.hh"
 #include <seastar/core/coroutine.hh>
+#include <seastar/coroutine/try_future.hh>
+#include <seastar/util/defer.hh>
 #include <seastar/util/log.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/metrics.hh>
@@ -155,15 +157,12 @@ future<> logstor::write(const frozen_mutation& m, const schema& s, write_target 
 
 future<> logstor::do_write(const schema& s, dht::decorated_key dk, api::timestamp_type ts, record_value value,
         write_target target, db::timeout_clock::time_point timeout) {
+    auto count_failure = defer([this] noexcept { ++_stats.write_failures; });
     auto gate_holder = _async_gate.hold();
 
     auto& cg = *target.cg;
     primary_index_key key(dk);
-    auto& index = cg.logstor_index();
-
-    const auto& mapping = _segment_manager.column_mappings().add(s);
-
-    log_record record {
+    auto writer = log_record_writer(log_record{
         .header = {
             .key = std::move(dk),
             .timestamp = ts,
@@ -171,29 +170,14 @@ future<> logstor::do_write(const schema& s, dht::decorated_key dk, api::timestam
             .schema_version = s.version(),
         },
         .value = std::move(value),
-    };
+    }, _segment_manager.column_mappings().add(s));
 
-    auto writer = log_record_writer(std::move(record), mapping);
-
-    // Two waits, not one: first for the record to be taken into a buffer, then for that buffer to
-    // reach a segment. They are awaited here rather than behind a call of their own, which would
-    // cost a coroutine frame per write to do nothing else.
-    auto accepted_f = co_await coroutine::as_future(_write_buffer_ring.write_to_buffer(std::move(writer), timeout, std::move(target)));
-    if (accepted_f.failed()) {
-        _stats.write_failures++;
-        co_await coroutine::return_exception_ptr(accepted_f.get_exception());
-    }
-    auto persisted_f = co_await coroutine::as_future(std::move(accepted_f.get().persisted));
-    if (persisted_f.failed()) {
-        _stats.write_failures++;
-        co_await coroutine::return_exception_ptr(persisted_f.get_exception());
-    }
-    auto written = persisted_f.get();
-    index_entry new_entry {
+    auto written = co_await coroutine::try_future(_write_buffer_ring.write(std::move(writer), timeout, std::move(target)));
+    cg.logstor_index().insert(key, index_entry{
         .location = written.location,
         .timestamp = ts,
-    };
-    index.insert(key, std::move(new_entry));
+    });
+    count_failure.cancel();
 }
 
 }
