@@ -199,13 +199,13 @@ public:
         return base::builder().seal(segment_seq);
     }
 
-    // The records of the buffer, once its chunk is written, for the separator.
-    std::vector<separator_record> take_separator_records() {
+    // Completes the writes, and only then returns the records of the chunk for the separator, so
+    // that the separator finds each record in the index at the location that it moves it from.
+    future<std::vector<separator_record>> complete_writes(segment_position chunk_position) {
+        co_await base::complete_writes(chunk_position);
         _last_record_count = _separator_records.size();
-        return std::move(_separator_records);
+        co_return std::move(_separator_records);
     }
-
-    using base::complete_writes;
 
     void abort_writes(std::exception_ptr ex) noexcept {
         // The separator never gets these records, so drop them and the holders of their targets.

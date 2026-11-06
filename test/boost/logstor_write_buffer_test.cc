@@ -584,9 +584,9 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_write_that_throws_leaves_the_
         BOOST_REQUIRE_EQUAL(wb.record_count(), 1u);
 
         wb.seal(segment_sequence{1});
-        wb.complete_writes(chunk_position).get();
+        const auto records = wb.complete_writes(chunk_position).get();
         BOOST_REQUIRE(written.get().segment == log_segment_id{5});
-        BOOST_REQUIRE_EQUAL(wb.take_separator_records().size(), 1u);
+        BOOST_REQUIRE_EQUAL(records.size(), 1u);
     }
 
     {
@@ -665,13 +665,15 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_index_insert_inserts_before_it_resolves) {
     });
     wb.write(make_writer(record), write_target{}, std::move(completion));
     wb.seal(segment_sequence{1});
-    wb.complete_writes(segment_position{.segment = log_segment_id{5}, .offset = 0}).get();
+    const auto records = wb.complete_writes(segment_position{.segment = log_segment_id{5}, .offset = 0}).get();
+    // The record is in the index by the time that the buffer gives it to the separator.
+    BOOST_REQUIRE(index.get(key));
     const auto entry = done.get();
     BOOST_REQUIRE(entry);
     BOOST_REQUIRE(entry->location.segment == log_segment_id{5});
     BOOST_REQUIRE_EQUAL(entry->timestamp, api::timestamp_type(7));
+    BOOST_REQUIRE_EQUAL(records.size(), 1u);
 
-    wb.take_separator_records();
     wb.reset();
     auto other = make_log_record(schema, "pk1", "v1", api::timestamp_type(8));
     index_insert failed{.index = &index, .key = other.header.index_key(), .timestamp = 8};
@@ -700,15 +702,13 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_mixed_write_buffer_keeps_its_records_for_t
 
     wb.seal(segment_sequence{1});
     const auto chunk_position = segment_position{.segment = log_segment_id{7}, .offset = 3 * ondisk::block_alignment};
-    wb.complete_writes(chunk_position).get();
+    auto records = wb.complete_writes(chunk_position).get();
     std::vector<record_location> locations;
     for (auto& write : writes) {
         locations.push_back(wait_for_persisted(write));
     }
 
-    auto records = wb.take_separator_records();
     BOOST_REQUIRE_EQUAL(records.size(), 3u);
-    BOOST_REQUIRE(wb.take_separator_records().empty());
     for (size_t i = 0; i < records.size(); ++i) {
         BOOST_REQUIRE(records[i].location(chunk_position) == locations[i]);
         BOOST_REQUIRE_GE(locations[i].offset, chunk_position.offset + ondisk::chunk_header_size);
@@ -726,7 +726,6 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_mixed_write_buffer_keeps_its_records_for_t
     aborted.abort_writes(std::make_exception_ptr(std::runtime_error("chunk was not written")));
     BOOST_REQUIRE_THROW(write.get(), std::runtime_error);
     BOOST_REQUIRE_EQUAL(target_gate.get_count(), 0u);
-    BOOST_REQUIRE(aborted.take_separator_records().empty());
 
     target_gate.close().get();
 }
