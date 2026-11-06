@@ -122,12 +122,6 @@ class write_buffer_ring {
             , id(id)
             , write_size(write_size) {
         }
-
-        void fail_timeout() noexcept {
-            auto ep = std::make_exception_ptr(seastar::timed_out_error{});
-            accepted_pr.set_exception(ep);
-            persisted_pr.set_exception(ep);
-        }
     };
 
     struct on_queued_write_expiry {
@@ -135,7 +129,7 @@ class write_buffer_ring {
 
         void operator()(queued_write& w) noexcept {
             owner->on_queued_write_removed(w);
-            w.fail_timeout();
+            owner->fail_queued_write(w, std::make_exception_ptr(seastar::timed_out_error{}));
             owner->on_queued_writes_changed();
         }
     };

@@ -14,6 +14,7 @@
 #include <vector>
 #include <fmt/format.h>
 #include <seastar/core/abort_source.hh>
+#include <seastar/core/reactor.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/simple-stream.hh>
 #include <seastar/core/temporary_buffer.hh>
@@ -136,6 +137,13 @@ struct test_flush_controller {
 
     void release_one_flush() {
         flush_release.signal(1);
+    }
+
+    // Lets every flush, paused or to come, go on, so that stop() does not wait for a flush that a
+    // failed check left paused.
+    void release_all_flushes() {
+        pause_flushes = false;
+        flush_release.signal(started_count);
     }
 
     const temporary_buffer<char>& buffer_for_segment(log_segment_id segment_id) const {
@@ -1008,6 +1016,44 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_rejects_when_max_queued_
     wait_for_persisted(persisted3);
 
     assert_records_in_order(schema, flush_ctl.all_records(), expected);
+}
+
+// Checks that a queued write that times out fails with timed_out_error, leaves the queue, and leaves
+// no failed future that nothing waits for.
+SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_queued_write_times_out) {
+    auto schema = make_kv_schema();
+    constexpr size_t buffer_size = 4 * 1024;
+    const auto large_value = make_single_buffer_value(schema, buffer_size);
+
+    test_flush_controller flush_ctl{.pause_flushes = true};
+    write_buffer_ring ring(make_write_buffer_ring_config(buffer_size, 2), [&flush_ctl] (mixed_write_buffer& wb) {
+        return flush_ctl(wb);
+    });
+
+    ring.start().get();
+    auto stop = defer([&ring, &flush_ctl] noexcept {
+        flush_ctl.release_all_flushes();
+        ring.stop().get();
+    });
+
+    auto accepted0 = ring.write_to_buffer(make_writer(make_write_buffer_ring_record(schema, 0, large_value, api::timestamp_type(500))), test_timeout()).get();
+    auto persisted0 = std::move(accepted0.persisted);
+    flush_ctl.wait_for_flush_starts(1);
+
+    auto accepted1 = ring.write_to_buffer(make_writer(make_write_buffer_ring_record(schema, 1, large_value, api::timestamp_type(501))), test_timeout()).get();
+    auto persisted1 = std::move(accepted1.persisted);
+
+    const auto abandoned_before = seastar::engine().abandoned_failed_futures();
+    auto queued = ring.write_to_buffer(make_writer(make_write_buffer_ring_record(schema, 2, large_value, api::timestamp_type(502))),
+            db::timeout_clock::now() + std::chrono::milliseconds(10));
+    BOOST_REQUIRE_EQUAL(ring.queued_write_count(), 1u);
+    BOOST_REQUIRE_THROW(queued.get(), seastar::timed_out_error);
+    BOOST_REQUIRE_EQUAL(ring.queued_write_count(), 0u);
+    BOOST_REQUIRE_EQUAL(seastar::engine().abandoned_failed_futures(), abandoned_before);
+
+    flush_ctl.release_all_flushes();
+    wait_for_persisted(persisted0);
+    wait_for_persisted(persisted1);
 }
 
 // Checks that write_to_buffer() stays pending while a request is queued and only persistence remains pending once it is accepted.
