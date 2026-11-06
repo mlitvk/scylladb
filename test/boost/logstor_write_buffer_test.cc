@@ -182,7 +182,7 @@ void close_and_return(owned_write_buffer buf) {
 }
 
 // Checks that sealing a full chunk builder writes the expected header fields.
-SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_record_and_header_serialization) {
+SEASTAR_THREAD_TEST_CASE(test_logstor_chunk_builder_record_and_header_serialization) {
     auto schema = make_kv_schema();
     auto expected = make_log_record(schema, "pk0", "v0", api::timestamp_type(7));
 
@@ -219,7 +219,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_record_and_header_serializati
 
 // Checks that the size finish() returns covers the schema table. The records end at every offset
 // of a block, also close enough to its end for the table to push the chunk into the next block.
-SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_finish_counts_the_schema_table) {
+SEASTAR_THREAD_TEST_CASE(test_logstor_chunk_builder_finish_counts_the_schema_table) {
     auto schema = make_kv_schema();
     const auto table_size = chunk_layout::single_version_schema_table_size(test_registry().add(*schema));
     BOOST_REQUIRE_LT(table_size, ondisk::block_alignment);
@@ -236,7 +236,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_finish_counts_the_schema_tabl
 
 // Checks that a buffer lists each schema version its records were written under once, in the
 // order they were first appended, and that a registry built from the table decodes the records.
-SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_lists_each_schema_version_once) {
+SEASTAR_THREAD_TEST_CASE(test_logstor_chunk_builder_lists_each_schema_version_once) {
     auto schema = make_kv_schema();
     auto altered = schema_builder(schema).with_column("w", int32_type).build();
     BOOST_REQUIRE(altered->version() != schema->version());
@@ -276,7 +276,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_lists_each_schema_version_onc
 
 // Checks that a buffer lists a schema version once when its records come with the entries of two
 // registries.
-SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_lists_a_schema_version_once_across_registries) {
+SEASTAR_THREAD_TEST_CASE(test_logstor_chunk_builder_lists_a_schema_version_once_across_registries) {
     auto schema = make_kv_schema();
 
     column_mapping_registry first;
@@ -301,7 +301,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_lists_a_schema_version_once_a
 // Checks that the room a record's schema table entry takes is charged to the record that brings
 // the version into the buffer: a record that fits as one more of a version the buffer already
 // lists does not fit as the first of another version.
-SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_charges_the_schema_table_entry_to_the_first_record_of_a_version) {
+SEASTAR_THREAD_TEST_CASE(test_logstor_chunk_builder_charges_the_schema_table_entry_to_the_first_record_of_a_version) {
     auto schema = make_kv_schema();
     auto altered = schema_builder(schema).with_column("w", int32_type).build();
 
@@ -329,7 +329,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_charges_the_schema_table_entr
 }
 
 // Checks that a chunk builder can hold and seal a record whose serialized size is exactly max_record_size().
-SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_accepts_record_at_max_record_size) {
+SEASTAR_THREAD_TEST_CASE(test_logstor_chunk_builder_accepts_record_at_max_record_size) {
     auto schema = make_kv_schema();
 
     chunk_builder wb(ondisk::block_alignment, segment_kind::mixed);
@@ -355,7 +355,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_accepts_record_at_max_record_
 
 // Checks that the size finish() returns is the size of the chunk seal() returns, and that the
 // chunk carries the sequence number seal() got.
-SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_finish_returns_the_final_chunk_size) {
+SEASTAR_THREAD_TEST_CASE(test_logstor_chunk_builder_finish_returns_the_final_chunk_size) {
     auto schema = make_kv_schema();
 
     chunk_builder wb(4 * ondisk::block_alignment, segment_kind::mixed);
