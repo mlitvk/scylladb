@@ -13,6 +13,7 @@
 #include <boost/test/unit_test.hpp>
 #include <seastar/core/simple-stream.hh>
 #include <seastar/core/temporary_buffer.hh>
+#include <seastar/util/memory-data-source.hh>
 
 #include "dht/i_partitioner.hh"
 #include "mutation/mutation.hh"
@@ -20,6 +21,7 @@
 #include "replica/logstor/ondisk.hh"
 #include "replica/logstor/record_value.hh"
 #include "replica/logstor/record_writer.hh"
+#include "replica/logstor/segment_io.hh"
 #include "replica/logstor/single_row_partition.hh"
 #include "schema/schema_builder.hh"
 
@@ -123,6 +125,37 @@ inline std::vector<schema_table_entry_copy> read_schema_table(bytes_view chunk, 
         });
     });
     return entries;
+}
+
+// A record that a scan gave, and where it is in the segment.
+struct scanned_record {
+    replica::logstor::record_location location;
+    replica::logstor::log_record record;
+};
+
+// The records that a scan of `buf`, a segment, gives. If `registry` is set, it takes the entries of
+// the schema table of each chunk first, as a scan of the segment manager does.
+inline std::vector<scanned_record> scan_buffer_records(const temporary_buffer<char>& buf, replica::logstor::log_segment_id segment_id,
+        replica::logstor::column_mapping_registry* registry = nullptr) {
+    temporary_buffer<char> copy(buf.size());
+    std::copy_n(buf.get(), buf.size(), copy.get_write());
+    auto in = seastar::util::as_input_stream(std::move(copy));
+    std::vector<scanned_record> records;
+
+    replica::logstor::segment_scanner scanner(in, segment_id, buf.size());
+    while (auto* chunk = scanner.next_chunk().get()) {
+        if (registry) {
+            for (const auto& e : chunk->schema_table()) {
+                registry->add(e.table, e.schema_version, e.mapping);
+            }
+        }
+        for (const auto& record : chunk->records()) {
+            records.push_back(scanned_record{.location = record.location, .record = record.to_log_record()});
+        }
+    }
+    in.close().get();
+
+    return records;
 }
 
 } // namespace tests::logstor
