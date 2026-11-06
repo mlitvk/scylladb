@@ -9,6 +9,7 @@
 
 #include <seastar/core/future.hh>
 #include <seastar/core/temporary_buffer.hh>
+#include <chrono>
 #include <map>
 #include <seastar/core/scheduling.hh>
 #include "db/cache_tracker.hh"
@@ -32,11 +33,24 @@ namespace logstor {
 
 extern seastar::logger logstor_logger;
 
+// The number of buffers in the write buffer ring, so at most `ring_size - 1` flushes are in flight.
+// With a sync period of 0, records collect in a buffer only while all flushes are in flight, so a
+// larger ring writes more and smaller chunks, each padded to a block, and adds no throughput. 4
+// flushes in flight are sufficient to overlap the disk write with the index and separator work.
+inline constexpr size_t default_write_buffer_ring_size = 5;
+
+// How long the write buffer ring waits after the first record of a buffer that is not full before
+// it seals the buffer. A longer period writes fewer and larger chunks at low load, but each write
+// then waits up to the period. With 0, records still collect in a buffer while all flushes are in
+// flight, so the chunks are not small under load.
+inline constexpr std::chrono::milliseconds default_write_buffer_sync_period{0};
+
 struct logstor_config {
     segment_manager_config segment_manager_cfg;
     seastar::scheduling_group flush_sg;
     size_t max_queued_write_bytes{0};
-    size_t write_buffer_ring_size{5};
+    size_t write_buffer_ring_size{default_write_buffer_ring_size};
+    std::chrono::milliseconds write_buffer_sync_period{default_write_buffer_sync_period};
 };
 
 class logstor {
