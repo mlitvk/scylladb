@@ -21,7 +21,7 @@ target_sources(replica
     logstor/logstor.cc
     logstor/readers.cc
     logstor/chunk_builder.cc
-    logstor/write_buffer.cc
+    logstor/index_update.cc
     logstor/write_buffer_pool.cc
     logstor/write_buffer_ring.cc
     logstor/record_value.cc

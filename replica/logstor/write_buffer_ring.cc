@@ -19,7 +19,7 @@
 
 namespace replica::logstor {
 
-write_buffer_ring::write_buffer_ring(write_buffer_ring_config cfg, seastar::noncopyable_function<future<>(mixed_write_buffer&)> flush_func)
+write_buffer_ring::write_buffer_ring(write_buffer_ring_config cfg, seastar::noncopyable_function<future<>(user_write_buffer&)> flush_func)
         : _flush_sg(cfg.flush_sg)
         , _buffer_size(cfg.buffer_size)
         , _ring_size(cfg.ring_size)
@@ -82,11 +82,8 @@ void write_buffer_ring::on_queued_write_removed(const queued_write& w) noexcept 
     _queued_write_bytes -= w.write_size;
 }
 
-// Fails only the accepted promise. The future of the persisted promise is taken only when the write
-// is accepted, so a failed write never has one, and a promise that holds an exception and has no
-// future reports the exception as ignored when it is destroyed.
 void write_buffer_ring::fail_queued_write(queued_write& request, std::exception_ptr ep) noexcept {
-    request.accepted_pr.set_exception(std::move(ep));
+    request.completion.on_failed(std::move(ep));
 }
 
 bool write_buffer_ring::maybe_advance_head() noexcept {
@@ -99,21 +96,20 @@ bool write_buffer_ring::maybe_advance_head() noexcept {
     return true;
 }
 
-// The target is taken by reference and moved from only once the record is in a buffer: a caller
-// whose append does not happen goes on to queue the record, and the write target it queues has to
-// be the one it came with, holders and all.
-std::optional<future<written_record>> write_buffer_ring::append_to_head_buffer(log_record_writer& writer, write_target& target) {
+// A caller whose append does not happen queues the record with the write target that it came with,
+// holders and all, so the arguments are moved from only when the record goes into a buffer.
+bool write_buffer_ring::append_to_head_buffer(log_record_writer& writer, write_target& target, index_insert& completion) {
     if (!head_buf().can_fit(writer) && !maybe_advance_head()) {
-        return std::nullopt;
+        return false;
     }
 
     bool was_empty = !head_buf().has_data();
-    auto persisted = head_buf().write(std::move(writer), std::move(target));
+    head_buf().write(std::move(writer), std::move(target), std::move(completion));
     if (was_empty) {
         arm_sync_timer();
         _consumer_progress_cv.signal();
     }
-    return persisted;
+    return true;
 }
 
 bool write_buffer_ring::try_dispatch_next_buffer() {
@@ -155,11 +151,7 @@ future<bool> write_buffer_ring::reclaim_completed_tails() {
         auto f = co_await coroutine::as_future(std::move(completion));
 
         if (f.failed()) {
-            auto ex = f.get_exception();
-            auto abort_f = co_await coroutine::as_future(tail_buf().abort_writes(std::move(ex)));
-            if (abort_f.failed()) {
-                logstor_logger.warn("Failed to abort the writes of a buffer whose flush failed: {}. Ignoring.", abort_f.get_exception());
-            }
+            tail_buf().abort_writes(f.get_exception());
         }
 
         tail_buf().reset();
@@ -188,9 +180,9 @@ future<bool> write_buffer_ring::drain_queued_writes() {
         on_queued_write_removed(request);
         removed_queued_writes = true;
         try {
-            auto persisted = append_to_head_buffer(request.writer, request.target).value();
-            request.accepted_pr.set_value(accepted_write{request.persisted_pr.get_future()});
-            std::move(persisted).forward_to(std::move(request.persisted_pr));
+            if (!append_to_head_buffer(request.writer, request.target, request.completion)) {
+                on_internal_error(logstor_logger, "A queued write found no room in a head buffer that fits it");
+            }
         } catch (...) {
             fail_queued_write(request, std::current_exception());
         }
@@ -287,10 +279,9 @@ future<> write_buffer_ring::flush() {
     });
 }
 
-// Not a coroutine, because a record that goes straight into the head buffer waits for nothing, and
-// a coroutine would allocate a frame per write for no use. So the function gives each failure as a
-// failed future, and the try costs nothing on the path that does not throw.
-future<accepted_write> write_buffer_ring::write_to_buffer(log_record_writer writer, db::timeout_clock::time_point timeout, write_target target) noexcept {
+// This function is not a coroutine, so that a write that goes straight into the head buffer
+// allocates no coroutine frame.
+void write_buffer_ring::write(log_record_writer writer, index_insert completion, db::timeout_clock::time_point timeout, write_target target) noexcept {
     try {
         auto holder = _async_gate.hold();
 
@@ -300,48 +291,54 @@ future<accepted_write> write_buffer_ring::write_to_buffer(log_record_writer writ
         // separator could put it.
         const size_t max_size = chunk_layout::max_record_size_any_kind(head_buf().buffer_size(), writer.mapping());
         if (writer.record_size() > max_size) [[unlikely]] {
-            return make_exception_future<accepted_write>(std::runtime_error(fmt::format(
+            completion.on_failed(std::make_exception_ptr(std::runtime_error(fmt::format(
                     "Write size {} exceeds the maximum record size {} of a {} byte buffer, whose schema table takes {} bytes for schema version {}",
                     writer.record_size(), max_size, head_buf().buffer_size(),
-                    chunk_layout::single_version_schema_table_size(writer.mapping()), writer.header().schema_version)));
+                    chunk_layout::single_version_schema_table_size(writer.mapping()), writer.header().schema_version))));
+            return;
         }
         const size_t key_size = writer.header_size() - ondisk::record_header_fixed_size;
         if (key_size > ondisk::max_key_size) [[unlikely]] {
-            return make_exception_future<accepted_write>(std::runtime_error(
-                    fmt::format("Partition key size {} exceeds the maximum {}", key_size, ondisk::max_key_size)));
+            completion.on_failed(std::make_exception_ptr(std::runtime_error(
+                    fmt::format("Partition key size {} exceeds the maximum {}", key_size, ondisk::max_key_size))));
+            return;
         }
 
         // fast path - if there are no queued writes and there is space in the current head buffer or the next, advance the
         // head buffer if needed and write to it.
-        if (_queued_writes.empty()) {
-            if (auto persisted = append_to_head_buffer(writer, target)) {
-                return make_ready_future<accepted_write>(accepted_write{std::move(*persisted)});
-            }
+        if (_queued_writes.empty() && append_to_head_buffer(writer, target, completion)) {
+            return;
         }
 
         // either there are queued writes or there is no space in the head buffer and ring is full - queue the write.
-        return queue_write(std::move(writer), timeout, std::move(target), std::move(holder));
+        queue_write(std::move(writer), std::move(completion), timeout, std::move(target), std::move(holder));
     } catch (...) {
-        return current_exception_as_future<accepted_write>();
+        completion.on_failed(std::current_exception());
     }
 }
 
-future<accepted_write> write_buffer_ring::queue_write(log_record_writer writer, db::timeout_clock::time_point timeout,
-        write_target target, seastar::gate::holder holder) {
+void write_buffer_ring::queue_write(log_record_writer writer, index_insert completion, db::timeout_clock::time_point timeout,
+        write_target target, seastar::gate::holder holder) noexcept {
     if (_max_queued_write_bytes != 0 && _queued_write_bytes + writer.record_size() > _max_queued_write_bytes) {
-        return make_exception_future<accepted_write>(replica::rate_limit_exception());
+        completion.on_failed(std::make_exception_ptr(replica::rate_limit_exception()));
+        return;
     }
 
     const bool queue_was_empty = _queued_writes.empty();
     const auto write_size = writer.record_size();
-    queued_write request(std::move(writer), std::move(target), std::move(holder), timeout, _next_queued_write_id++, write_size);
-    auto accepted = request.accepted_pr.get_future();
+    queued_write request(std::move(writer), std::move(target), std::move(completion), std::move(holder), timeout, _next_queued_write_id++, write_size);
+    try {
+        // push_back() allocates before it moves the request, so a request that it does not take
+        // still holds its completion.
+        _queued_writes.push_back(std::move(request), timeout);
+    } catch (...) {
+        request.completion.on_failed(std::current_exception());
+        return;
+    }
     _queued_write_bytes += write_size;
-    _queued_writes.push_back(std::move(request), timeout);
     if (queue_was_empty) {
         _consumer_progress_cv.signal();
     }
-    return accepted;
 }
 
 // Each pass reclaims the flushed buffers at the tail, moves queued writes into the free buffers,

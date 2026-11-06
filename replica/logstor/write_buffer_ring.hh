@@ -20,17 +20,12 @@
 #include <seastar/core/timer.hh>
 #include <seastar/util/noncopyable_function.hh>
 
-#include "replica/logstor/write_buffer.hh"
+#include "replica/logstor/index_update.hh"
 #include "timeout_config.hh"
 
 namespace replica {
 
 namespace logstor {
-
-// A record that the ring took into a buffer. `persisted` resolves once the buffer is in a segment.
-struct accepted_write {
-    future<written_record> persisted;
-};
 
 struct write_buffer_ring_config {
     size_t buffer_size;
@@ -46,7 +41,8 @@ struct write_buffer_ring_config {
     std::chrono::milliseconds sync_period{0};
 };
 
-// A ring of mixed write buffers, which takes the user writes.
+// A ring of mixed write buffers, which takes the user writes. The ring reports the outcome of each
+// write through its index_insert, also when it refuses the write or the queue time of the write ends.
 //
 // A write goes into the head buffer. The head advances when the next record does not fit, when the
 // sync period ends after the first record, and when flush() or stop() asks for it. A write that
@@ -59,10 +55,10 @@ class write_buffer_ring {
     size_t _buffer_size;
     size_t _ring_size;
     std::chrono::milliseconds _sync_period;
-    seastar::noncopyable_function<future<>(mixed_write_buffer&)> _flush_func;
+    seastar::noncopyable_function<future<>(user_write_buffer&)> _flush_func;
 
     // The ring of buffers, indexed modulo _ring_size.
-    std::vector<mixed_write_buffer> _ring;
+    std::vector<user_write_buffer> _ring;
 
     // Monotonically increasing indices; the actual slot is idx % _ring_size.
     // _head: next slot writers append to.
@@ -102,10 +98,9 @@ class write_buffer_ring {
     std::vector<in_flight_write> _in_flight;
 
     struct queued_write {
-        seastar::promise<accepted_write> accepted_pr; // written to buffer
-        seastar::promise<written_record> persisted_pr; // written to a segment
         log_record_writer writer;
         write_target target;
+        index_insert completion;
         // Keeps the ring from finishing its stop() while the record is on the queue. The request
         // holds it, so that queueing a write needs no coroutine.
         seastar::gate::holder ring_holder;
@@ -113,10 +108,11 @@ class write_buffer_ring {
         uint64_t id;
         size_t write_size;
 
-        queued_write(log_record_writer writer, write_target target, seastar::gate::holder ring_holder,
+        queued_write(log_record_writer writer, write_target target, index_insert completion, seastar::gate::holder ring_holder,
                 db::timeout_clock::time_point timeout, uint64_t id, size_t write_size)
             : writer(std::move(writer))
             , target(std::move(target))
+            , completion(std::move(completion))
             , ring_holder(std::move(ring_holder))
             , timeout(timeout)
             , id(id)
@@ -175,12 +171,14 @@ class write_buffer_ring {
     bool should_advance_head() const noexcept;
     bool maybe_advance_head() noexcept;
 
-    std::optional<future<written_record>> append_to_head_buffer(log_record_writer&, write_target&);
+    // Appends the record to the head buffer, and advances the head first when the record does not
+    // fit there. Returns false, with the arguments left as they are, when the ring is full.
+    bool append_to_head_buffer(log_record_writer&, write_target&, index_insert&);
 
-    // Puts a record that found no room in the ring on the queue of writes. Returns a future that
-    // resolves once the consumer moves the record into a buffer.
-    future<accepted_write> queue_write(log_record_writer, db::timeout_clock::time_point timeout, write_target,
-            seastar::gate::holder);
+    // Puts a record that found no room in the ring on the queue of writes, where the consumer moves
+    // it into a buffer.
+    void queue_write(log_record_writer, index_insert, db::timeout_clock::time_point timeout, write_target,
+            seastar::gate::holder) noexcept;
 
     bool try_dispatch_next_buffer();
     future<> run_dispatched_write(size_t idx);
@@ -200,7 +198,7 @@ class write_buffer_ring {
 
 public:
     explicit write_buffer_ring(write_buffer_ring_config cfg,
-            seastar::noncopyable_function<future<>(mixed_write_buffer&)> flush_func);
+            seastar::noncopyable_function<future<>(user_write_buffer&)> flush_func);
 
     write_buffer_ring(const write_buffer_ring&) = delete;
     write_buffer_ring& operator=(const write_buffer_ring&) = delete;
@@ -209,17 +207,8 @@ public:
     future<> stop();
     future<> flush();
 
-    // Takes a record. The future it returns resolves once the record is in a buffer, and carries a
-    // second future that resolves once that buffer is in a segment, which is where the record's
-    // location comes from.
-    future<accepted_write> write_to_buffer(log_record_writer, db::timeout_clock::time_point timeout, write_target target = {}) noexcept;
-
-    // Resolves once the record is in a segment. Not a coroutine, so it adds no frame per write.
-    future<written_record> write(log_record_writer writer, db::timeout_clock::time_point timeout, write_target target = {}) noexcept {
-        return write_to_buffer(std::move(writer), timeout, std::move(target)).then([] (accepted_write a) {
-            return std::move(a.persisted);
-        });
-    }
+    // Takes a record, and reports the outcome of the write through `completion`.
+    void write(log_record_writer, index_insert completion, db::timeout_clock::time_point timeout, write_target target = {}) noexcept;
 
     size_t queued_write_count() const noexcept { return _queued_writes.size(); }
 

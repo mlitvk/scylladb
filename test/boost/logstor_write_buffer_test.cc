@@ -26,6 +26,7 @@
 #include "replica/exceptions.hh"
 #include "replica/logstor/chunk_builder.hh"
 #include "replica/logstor/column_mapping_registry.hh"
+#include "replica/logstor/index.hh"
 #include "replica/logstor/ondisk.hh"
 #include "replica/logstor/segment_io.hh"
 #include "replica/logstor/write_buffer.hh"
@@ -33,6 +34,7 @@
 #include "replica/logstor/write_buffer_ring.hh"
 #include "schema/schema_builder.hh"
 #include "test/lib/logstor_record_utils.hh"
+#include "test/lib/logstor_test_utils.hh"
 #include "test/lib/mutation_assertions.hh"
 
 using namespace replica::logstor;
@@ -83,10 +85,59 @@ log_record make_write_buffer_ring_record(schema_ptr schema, size_t idx, const ss
     return make_log_record(schema, sstring(fmt::format("pk{:04}", idx)), value, ts);
 }
 
-record_location wait_for_persisted(future<written_record>& fut) {
-    // get() returns a reference into the future, so move the record out to release its holder.
-    auto written = fut.get();
-    return written.location;
+record_location wait_for_persisted(future<record_location>& fut) {
+    return fut.get();
+}
+
+// A completion that resolves `done` with the location of its record, for the tests of the buffers.
+struct location_completion {
+    promise<record_location> done;
+
+    void on_written(record_location location) noexcept {
+        done.set_value(location);
+    }
+    void on_failed(std::exception_ptr ex) noexcept {
+        done.set_exception(std::move(ex));
+    }
+};
+
+using test_mixed_buffer = mixed_write_buffer<location_completion>;
+
+// Writes `record` to a test mixed buffer. The future resolves to the location of the record.
+future<record_location> buffer_write(test_mixed_buffer& wb, log_record record, write_target target = {}) {
+    location_completion completion;
+    auto done = completion.done.get_future();
+    wb.write(make_writer(std::move(record)), std::move(target), std::move(completion));
+    return done;
+}
+
+// Writes `record` to the ring with an index_insert into `index`. The future resolves to the location
+// that the index then holds for the record, so the records of a test have keys of their own.
+future<record_location> ring_write(write_buffer_ring& ring, primary_index& index, log_record record,
+        db::timeout_clock::time_point timeout = test_timeout(), write_target target = {}) {
+    const auto key = record.header.index_key();
+    index_insert completion{
+        .index = &index,
+        .key = key,
+        .timestamp = record.header.timestamp,
+    };
+    auto done = completion.done.get_future();
+    ring.write(make_writer(std::move(record)), std::move(completion), timeout, std::move(target));
+    return done.then([&index, key] {
+        return index.get(key)->location;
+    });
+}
+
+// Waits until the ring holds at most `count` queued writes, and fails the test when that takes
+// longer than test_timeout(), so that a write that is never taken fails the test, not hangs it.
+void wait_for_queued_writes(write_buffer_ring& ring, size_t count) {
+    const auto deadline = test_timeout();
+    while (ring.queued_write_count() > count) {
+        if (db::timeout_clock::now() > deadline) {
+            BOOST_FAIL(fmt::format("The ring still holds {} queued writes, more than {}", ring.queued_write_count(), count));
+        }
+        seastar::thread::yield();
+    }
 }
 
 struct test_flush_controller {
@@ -105,7 +156,7 @@ struct test_flush_controller {
     uint32_t next_segment_id{100};
     uint64_t next_sequence{1};
 
-    future<> operator()(mixed_write_buffer& wb) {
+    future<> operator()(user_write_buffer& wb) {
         const auto flush_idx = started_count++;
         flush_started.signal(1);
 
@@ -181,10 +232,8 @@ write_buffer_pool::config make_test_write_buffer_pool_config(size_t capacity, si
     };
 }
 
-// A pooled buffer has to be closed before it can go back to the pool, which happens when the
-// handle is destroyed - here, when this returns.
-void close_and_return(owned_write_buffer buf) {
-    buf->close().get();
+// A pooled buffer goes back to the pool when its handle is destroyed - here, when this returns.
+void return_to_pool(owned_write_buffer buf) {
 }
 
 }
@@ -463,50 +512,174 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_chunk_builder_bytes_writer_writes_the_same
     BOOST_REQUIRE(rewritten.frame_bytes(rewritten_frame) == original_bytes);
 }
 
-// Checks that a buffer holding records that were never flushed can still be closed and reused
-// after aborting its writes. A pending write is resolved only by the flush and holds the buffer's
-// write gate until then, so close() alone never completes. The compaction buffer pool relies on
-// abort_writes() to reclaim a buffer left behind by a compaction that failed before flushing.
-SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_abort_writes_reclaims_unflushed_buffer) {
+// Checks that abort_writes() fails the writes of a buffer whose chunk is not written, and that the
+// buffer can then be reset and reused.
+SEASTAR_THREAD_TEST_CASE(test_logstor_mixed_write_buffer_abort_writes_fails_its_writes) {
     auto schema = make_kv_schema();
 
-    full_write_buffer wb(32 * 1024);
-    auto written = wb.write(make_writer(make_log_record(schema, "pk0", "v0", api::timestamp_type(1))));
+    test_mixed_buffer wb(32 * 1024);
+    auto written = buffer_write(wb, make_log_record(schema, "pk0", "v0", api::timestamp_type(1)));
     BOOST_REQUIRE(!written.available());
 
-    auto closed = wb.close();
-    seastar::thread::yield();
-    BOOST_REQUIRE(!closed.available());
-
-    wb.abort_writes(std::make_exception_ptr(std::runtime_error("buffer was not flushed"))).get();
+    wb.abort_writes(std::make_exception_ptr(std::runtime_error("buffer was not flushed")));
     BOOST_REQUIRE_THROW(written.get(), std::runtime_error);
-    closed.get();
-    BOOST_REQUIRE(wb.is_closed());
 
     wb.reset();
-    BOOST_REQUIRE(!wb.is_closed());
+    BOOST_REQUIRE(!wb.has_data());
+    auto reused = buffer_write(wb, make_log_record(schema, "pk1", "v1", api::timestamp_type(2)));
+    wb.seal(segment_sequence{1});
+    wb.complete_writes(segment_position{.segment = log_segment_id{5}, .offset = 0}).get();
+    BOOST_REQUIRE(reused.get().segment == log_segment_id{5});
+}
+
+// A completion that records the order in which the buffer completes the writes.
+struct order_completion {
+    std::vector<size_t>* order;
+    size_t index;
+
+    void on_written(record_location) noexcept {
+        order->push_back(index);
+    }
+    void on_failed(std::exception_ptr) noexcept {}
+};
+
+// Checks that complete_writes() completes the writes in the order of the records.
+SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_completes_its_writes_in_record_order) {
+    auto schema = make_kv_schema();
+    std::vector<size_t> order;
+    order.reserve(10);
+
+    full_write_buffer<order_completion> wb(32 * 1024);
+    for (size_t i = 0; i < 10; ++i) {
+        wb.write(make_writer(make_log_record(schema, fmt::format("pk{}", i), "v", api::timestamp_type(1))),
+                order_completion{.order = &order, .index = i});
+    }
+    wb.seal(segment_sequence{1}, schema->id());
+    wb.complete_writes(segment_position{.segment = log_segment_id{5}, .offset = 0}).get();
+
+    BOOST_REQUIRE_EQUAL(order.size(), 10u);
+    for (size_t i = 0; i < order.size(); ++i) {
+        BOOST_REQUIRE_EQUAL(order[i], i);
+    }
+}
+
+// Checks that a write that throws, here because the record does not fit, leaves each kind of
+// buffer as it was.
+SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_write_that_throws_leaves_the_buffer_unchanged) {
+    auto schema = make_kv_schema();
+    constexpr size_t buffer_size = 4 * 1024;
+    auto small = make_log_record(schema, "pk0", "v0", api::timestamp_type(1));
+    auto large = make_log_record(schema, "pk1", sstring(2 * buffer_size, 'x'), api::timestamp_type(1));
+    const auto chunk_position = segment_position{.segment = log_segment_id{5}, .offset = 0};
+
+    {
+        test_mixed_buffer wb(buffer_size);
+        auto written = buffer_write(wb, small);
+        location_completion completion;
+        auto failed = completion.done.get_future();
+        BOOST_REQUIRE_THROW(wb.write(make_writer(large), write_target{}, std::move(completion)), std::runtime_error);
+        // The completion of the failed write is left to the caller.
+        completion.on_failed(std::make_exception_ptr(std::runtime_error("write failed")));
+        BOOST_REQUIRE_THROW(failed.get(), std::runtime_error);
+        BOOST_REQUIRE_EQUAL(wb.record_count(), 1u);
+
+        wb.seal(segment_sequence{1});
+        wb.complete_writes(chunk_position).get();
+        BOOST_REQUIRE(written.get().segment == log_segment_id{5});
+        BOOST_REQUIRE_EQUAL(wb.take_separator_records().size(), 1u);
+    }
+
+    {
+        primary_index index(noop_space_accounting, nullptr, false);
+        const auto old_location = record_location{.segment = log_segment_id{1}, .offset = 0, .size = 64};
+        index.insert(small.header.index_key(), index_entry{.location = old_location, .timestamp = 1});
+        index.insert(large.header.index_key(), index_entry{.location = old_location, .timestamp = 1});
+        size_t relocated = 0;
+
+        rewrite_buffer wb(buffer_size);
+        wb.write(make_writer(small), index_relocation{.index = &index, .key = small.header.index_key(), .old_location = old_location, .relocated = &relocated});
+        BOOST_REQUIRE_THROW(wb.write(make_writer(large), index_relocation{.index = &index, .key = large.header.index_key(), .old_location = old_location, .relocated = &relocated}),
+                std::runtime_error);
+        BOOST_REQUIRE_EQUAL(wb.record_count(), 1u);
+
+        wb.seal(segment_sequence{1}, schema->id());
+        wb.complete_writes(chunk_position).get();
+        BOOST_REQUIRE_EQUAL(relocated, 1u);
+        BOOST_REQUIRE(index.get(large.header.index_key())->location == old_location);
+    }
+}
+
+// Checks that an index_relocation points the index at the new location of its record, except for a
+// key that a newer write replaced, and that an aborted relocation leaves the index unchanged.
+SEASTAR_THREAD_TEST_CASE(test_logstor_index_relocation_moves_the_index_entry) {
+    auto schema = make_kv_schema();
+    primary_index index(noop_space_accounting, nullptr, false);
+    size_t relocated = 0;
+
+    auto record0 = make_log_record(schema, "pk0", "v0", api::timestamp_type(1));
+    auto record1 = make_log_record(schema, "pk1", "v1", api::timestamp_type(1));
+    const auto key0 = record0.header.index_key();
+    const auto key1 = record1.header.index_key();
+    const auto old_location0 = record_location{.segment = log_segment_id{1}, .offset = 0, .size = 64};
+    const auto old_location1 = record_location{.segment = log_segment_id{1}, .offset = 64, .size = 64};
+    index.insert(key0, index_entry{.location = old_location0, .timestamp = 1});
+    index.insert(key1, index_entry{.location = old_location1, .timestamp = 1});
+
+    rewrite_buffer wb(32 * 1024);
+    wb.write(make_writer(record0), index_relocation{.index = &index, .key = key0, .old_location = old_location0, .relocated = &relocated});
+    wb.write(make_writer(record1), index_relocation{.index = &index, .key = key1, .old_location = old_location1, .relocated = &relocated});
+    wb.seal(segment_sequence{1}, schema->id());
+
+    // A newer write of pk1 replaces the entry before the chunk is written.
+    const auto newer_location1 = record_location{.segment = log_segment_id{2}, .offset = 0, .size = 64};
+    index.insert(key1, index_entry{.location = newer_location1, .timestamp = 2});
+
+    wb.complete_writes(segment_position{.segment = log_segment_id{5}, .offset = 0}).get();
+    BOOST_REQUIRE_EQUAL(relocated, 1u);
+    BOOST_REQUIRE(index.get(key0)->location.segment == log_segment_id{5});
+    BOOST_REQUIRE(index.get(key1)->location == newer_location1);
+
+    wb.reset();
+    const auto location0 = index.get(key0)->location;
+    wb.write(make_writer(record0), index_relocation{.index = &index, .key = key0, .old_location = location0, .relocated = &relocated});
+    wb.abort_writes(std::make_exception_ptr(std::runtime_error("chunk was not written")));
+    BOOST_REQUIRE_EQUAL(relocated, 1u);
+    BOOST_REQUIRE(index.get(key0)->location == location0);
+
+    wb.reset();
     BOOST_REQUIRE(!wb.has_data());
 }
 
-// Checks that complete_writes() waits for the holders of the written records: a record's index update
-// runs under its holder, so the buffer must not be reused before every update is done.
-SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_complete_writes_waits_for_record_holders) {
+// Checks that an index_insert inserts its record into the index before it resolves its future, and
+// that a failed write fails the future and leaves the index as it was.
+SEASTAR_THREAD_TEST_CASE(test_logstor_index_insert_inserts_before_it_resolves) {
     auto schema = make_kv_schema();
+    primary_index index(noop_space_accounting, nullptr, false);
+    auto record = make_log_record(schema, "pk0", "v0", api::timestamp_type(7));
+    const auto key = record.header.index_key();
 
-    full_write_buffer wb(32 * 1024);
-    auto write = wb.write(make_writer(make_log_record(schema, "pk0", "v0", api::timestamp_type(1))));
-    wb.seal(segment_sequence{1}, schema->id());
+    user_write_buffer wb(32 * 1024);
+    index_insert completion{.index = &index, .key = key, .timestamp = 7};
+    auto done = completion.done.get_future().then([&index, key] {
+        return index.get(key);
+    });
+    wb.write(make_writer(record), write_target{}, std::move(completion));
+    wb.seal(segment_sequence{1});
+    wb.complete_writes(segment_position{.segment = log_segment_id{5}, .offset = 0}).get();
+    const auto entry = done.get();
+    BOOST_REQUIRE(entry);
+    BOOST_REQUIRE(entry->location.segment == log_segment_id{5});
+    BOOST_REQUIRE_EQUAL(entry->timestamp, api::timestamp_type(7));
 
-    const auto chunk_position = segment_position{.segment = log_segment_id{5}, .offset = 0};
-    auto completed = wb.complete_writes(chunk_position);
-    {
-        auto written = write.get();
-        BOOST_REQUIRE(written.location.segment == log_segment_id{5});
-        seastar::thread::yield();
-        BOOST_REQUIRE(!completed.available());
-    }
-    completed.get();
-    BOOST_REQUIRE(wb.is_closed());
+    wb.take_separator_records();
+    wb.reset();
+    auto other = make_log_record(schema, "pk1", "v1", api::timestamp_type(8));
+    index_insert failed{.index = &index, .key = other.header.index_key(), .timestamp = 8};
+    auto failed_done = failed.done.get_future();
+    wb.write(make_writer(other), write_target{}, std::move(failed));
+    wb.abort_writes(std::make_exception_ptr(std::runtime_error("chunk was not written")));
+    BOOST_REQUIRE_THROW(failed_done.get(), std::runtime_error);
+    BOOST_REQUIRE(!index.get(other.header.index_key()));
 }
 
 // Checks that a mixed buffer gives the separator each record with its write target and its location,
@@ -517,22 +690,21 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_mixed_write_buffer_keeps_its_records_for_t
     // Outlives the buffers, whose records hold it.
     seastar::gate target_gate;
 
-    mixed_write_buffer wb(32 * 1024);
-    std::vector<future<written_record>> writes;
+    test_mixed_buffer wb(32 * 1024);
+    std::vector<future<record_location>> writes;
     for (size_t i = 0; i < 3; ++i) {
         auto record = make_log_record(schema, fmt::format("pk{}", i), "v", api::timestamp_type(1 + i));
-        writes.push_back(wb.write(make_writer(std::move(record)), write_target{.non_empty_holder = target_gate.hold()}));
+        writes.push_back(buffer_write(wb, std::move(record), write_target{.non_empty_holder = target_gate.hold()}));
     }
     BOOST_REQUIRE_EQUAL(target_gate.get_count(), 3u);
 
     wb.seal(segment_sequence{1});
     const auto chunk_position = segment_position{.segment = log_segment_id{7}, .offset = 3 * ondisk::block_alignment};
-    auto completed = wb.complete_writes(chunk_position);
+    wb.complete_writes(chunk_position).get();
     std::vector<record_location> locations;
     for (auto& write : writes) {
         locations.push_back(wait_for_persisted(write));
     }
-    completed.get();
 
     auto records = wb.take_separator_records();
     BOOST_REQUIRE_EQUAL(records.size(), 3u);
@@ -547,11 +719,11 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_mixed_write_buffer_keeps_its_records_for_t
     records.clear();
     BOOST_REQUIRE_EQUAL(target_gate.get_count(), 0u);
 
-    mixed_write_buffer aborted(32 * 1024);
-    auto write = aborted.write(make_writer(make_log_record(schema, "pk3", "v", api::timestamp_type(4))),
+    test_mixed_buffer aborted(32 * 1024);
+    auto write = buffer_write(aborted, make_log_record(schema, "pk3", "v", api::timestamp_type(4)),
             write_target{.non_empty_holder = target_gate.hold()});
     BOOST_REQUIRE_EQUAL(target_gate.get_count(), 1u);
-    aborted.abort_writes(std::make_exception_ptr(std::runtime_error("chunk was not written"))).get();
+    aborted.abort_writes(std::make_exception_ptr(std::runtime_error("chunk was not written")));
     BOOST_REQUIRE_THROW(write.get(), std::runtime_error);
     BOOST_REQUIRE_EQUAL(target_gate.get_count(), 0u);
     BOOST_REQUIRE(aborted.take_separator_records().empty());
@@ -575,8 +747,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_pool_builds_buffers_on_demand
     BOOST_REQUIRE_EQUAL(pool.get_stats().buffers_created, 2u);
     BOOST_REQUIRE_EQUAL(b0->buffer_size(), 4u * 1024);
 
-    close_and_return(std::move(b0));
-    close_and_return(std::move(b1));
+    return_to_pool(std::move(b0));
+    return_to_pool(std::move(b1));
     BOOST_REQUIRE_EQUAL(pool.used_buffer_count(), 0u);
     BOOST_REQUIRE_EQUAL(pool.allocated_buffer_count(), 1u);
 
@@ -586,8 +758,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_pool_builds_buffers_on_demand
     auto b3 = pool.allocate(as).get();
     BOOST_REQUIRE_EQUAL(pool.get_stats().buffers_created, 3u);
 
-    close_and_return(std::move(b2));
-    close_and_return(std::move(b3));
+    return_to_pool(std::move(b2));
+    return_to_pool(std::move(b3));
 }
 
 // Checks that a pool configured to build its buffers up front never builds one at the point of use,
@@ -607,7 +779,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_pool_preallocates_its_buffers
     BOOST_REQUIRE_EQUAL(pool.get_stats().buffers_created, 2u);
 
     for (auto& buf : bufs) {
-        close_and_return(std::move(buf));
+        return_to_pool(std::move(buf));
     }
     BOOST_REQUIRE_EQUAL(pool.used_buffer_count(), 0u);
     BOOST_REQUIRE_EQUAL(pool.allocated_buffer_count(), 2u);
@@ -632,8 +804,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_pool_capacity_bounds_allocati
     auto b1 = waiting.get();
     BOOST_REQUIRE_EQUAL(pool.used_buffer_count(), 2u);
 
-    close_and_return(std::move(b0));
-    close_and_return(std::move(b1));
+    return_to_pool(std::move(b0));
+    return_to_pool(std::move(b1));
 }
 
 // Checks that lowering the capacity while buffers are out takes effect as they come back: the first
@@ -649,28 +821,29 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_pool_capacity_shrinks_while_b
     pool.set_capacity(1);
     BOOST_REQUIRE_EQUAL(pool.capacity(), 1u);
 
-    close_and_return(std::move(b0));
+    return_to_pool(std::move(b0));
     BOOST_REQUIRE_EQUAL(pool.allocated_buffer_count(), 1u);
 
     auto waiting = pool.allocate(as);
     seastar::thread::yield();
     BOOST_REQUIRE(!waiting.available());
 
-    close_and_return(std::move(b1));
+    return_to_pool(std::move(b1));
     auto b2 = waiting.get();
     BOOST_REQUIRE_EQUAL(pool.used_buffer_count(), 1u);
     BOOST_REQUIRE_EQUAL(pool.allocated_buffer_count(), 1u);
 
-    close_and_return(std::move(b2));
+    return_to_pool(std::move(b2));
 }
 
 // Checks that write_buffer_ring forwards records to the flush callback and resolves returned locations.
 SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_basic_flushes_records) {
     auto schema = make_kv_schema();
+    primary_index index(noop_space_accounting, nullptr, false);
     constexpr size_t buffer_size = 4 * 1024;
 
     test_flush_controller flush_ctl;
-    write_buffer_ring ring(make_write_buffer_ring_config(buffer_size, 3), [&flush_ctl] (mixed_write_buffer& wb) {
+    write_buffer_ring ring(make_write_buffer_ring_config(buffer_size, 3), [&flush_ctl] (user_write_buffer& wb) {
         return flush_ctl(wb);
     });
 
@@ -680,12 +853,11 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_basic_flushes_records) {
     });
 
     std::vector<log_record> expected;
-    std::vector<future<written_record>> persisted;
+    std::vector<future<record_location>> persisted;
     for (size_t i = 0; i < 3; ++i) {
         auto record = make_write_buffer_ring_record(schema, i, sstring(fmt::format("value{}", i)), api::timestamp_type(100 + i));
         expected.push_back(record);
-        auto accepted = ring.write_to_buffer(make_writer(record), test_timeout()).get();
-        persisted.push_back(std::move(accepted.persisted));
+        persisted.push_back(ring_write(ring, index, record));
     }
 
     std::vector<record_location> locations;
@@ -706,11 +878,12 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_basic_flushes_records) {
 // Checks that flush() seals and writes a partially filled head buffer even when the sync timer has not expired.
 SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_flushes_partial_buffer_with_large_sync_period) {
     auto schema = make_kv_schema();
+    primary_index index(noop_space_accounting, nullptr, false);
     constexpr size_t buffer_size = 4 * 1024;
     constexpr auto sync_period = std::chrono::hours(1);
 
     test_flush_controller flush_ctl;
-    write_buffer_ring ring(make_write_buffer_ring_config(buffer_size, 3, 0, sync_period), [&flush_ctl] (mixed_write_buffer& wb) {
+    write_buffer_ring ring(make_write_buffer_ring_config(buffer_size, 3, 0, sync_period), [&flush_ctl] (user_write_buffer& wb) {
         return flush_ctl(wb);
     });
 
@@ -720,12 +893,11 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_flushes_partial_buffer_w
     });
 
     std::vector<log_record> expected;
-    std::vector<future<written_record>> persisted;
+    std::vector<future<record_location>> persisted;
     for (size_t i = 0; i < 3; ++i) {
         auto record = make_write_buffer_ring_record(schema, i, sstring(fmt::format("value{}", i)), api::timestamp_type(150 + i));
         expected.push_back(record);
-        auto accepted = ring.write_to_buffer(make_writer(record), test_timeout()).get();
-        persisted.push_back(std::move(accepted.persisted));
+        persisted.push_back(ring_write(ring, index, record));
     }
 
     BOOST_REQUIRE(flush_ctl.flushed_buffers.empty());
@@ -756,11 +928,12 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_flushes_partial_buffer_w
 // Checks that a paused tail flush can fill the ring, queue later writes, and then drain them without losing order.
 SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_paused_flush_fills_ring_then_drains) {
     auto schema = make_kv_schema();
+    primary_index index(noop_space_accounting, nullptr, false);
     constexpr size_t buffer_size = 4 * 1024;
     const auto large_value = make_single_buffer_value(schema, buffer_size);
 
     test_flush_controller flush_ctl{.pause_flushes = true};
-    write_buffer_ring ring(make_write_buffer_ring_config(buffer_size, 2), [&flush_ctl] (mixed_write_buffer& wb) {
+    write_buffer_ring ring(make_write_buffer_ring_config(buffer_size, 2), [&flush_ctl] (user_write_buffer& wb) {
         return flush_ctl(wb);
     });
 
@@ -774,35 +947,31 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_paused_flush_fills_ring_
         expected.push_back(make_write_buffer_ring_record(schema, i, large_value, api::timestamp_type(200 + i)));
     }
 
-    auto accepted0 = ring.write_to_buffer(make_writer(expected[0]), test_timeout()).get();
-    auto persisted0 = std::move(accepted0.persisted);
+    auto persisted0 = ring_write(ring, index, expected[0]);
     flush_ctl.wait_for_flush_starts(1);
     BOOST_REQUIRE(!persisted0.available());
 
-    auto accepted1 = ring.write_to_buffer(make_writer(expected[1]), test_timeout()).get();
-    auto persisted1 = std::move(accepted1.persisted);
+    auto persisted1 = ring_write(ring, index, expected[1]);
 
-    auto queued2 = ring.write_to_buffer(make_writer(expected[2]), test_timeout());
-    auto queued3 = ring.write_to_buffer(make_writer(expected[3]), test_timeout());
-    BOOST_REQUIRE(!queued2.available());
-    BOOST_REQUIRE(!queued3.available());
+    auto persisted2 = ring_write(ring, index, expected[2]);
+    auto persisted3 = ring_write(ring, index, expected[3]);
+    BOOST_REQUIRE(!persisted2.available());
+    BOOST_REQUIRE(!persisted3.available());
     BOOST_REQUIRE_EQUAL(ring.queued_write_count(), 2u);
 
     flush_ctl.release_one_flush();
     wait_for_persisted(persisted0);
     flush_ctl.wait_for_flush_starts(2);
 
-    auto accepted2 = queued2.get();
-    auto persisted2 = std::move(accepted2.persisted);
-    BOOST_REQUIRE(!queued3.available());
+    wait_for_queued_writes(ring, 1);
+    BOOST_REQUIRE(!persisted3.available());
     BOOST_REQUIRE_EQUAL(ring.queued_write_count(), 1u);
 
     flush_ctl.release_one_flush();
     wait_for_persisted(persisted1);
     flush_ctl.wait_for_flush_starts(3);
 
-    auto accepted3 = queued3.get();
-    auto persisted3 = std::move(accepted3.persisted);
+    wait_for_queued_writes(ring, 0);
     BOOST_REQUIRE_EQUAL(ring.queued_write_count(), 0u);
 
     flush_ctl.release_one_flush();
@@ -820,6 +989,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_paused_flush_fills_ring_
 // a tablet split and from finishing its stop() while the write is still to come.
 SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_queued_write_keeps_its_write_target) {
     auto schema = make_kv_schema();
+    primary_index index(noop_space_accounting, nullptr, false);
     constexpr size_t buffer_size = 4 * 1024;
     const auto large_value = make_single_buffer_value(schema, buffer_size);
 
@@ -829,7 +999,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_queued_write_keeps_its_w
     seastar::gate alive_gate;
 
     test_flush_controller flush_ctl{.pause_flushes = true};
-    write_buffer_ring ring(make_write_buffer_ring_config(buffer_size, 2), [&flush_ctl] (mixed_write_buffer& wb) {
+    write_buffer_ring ring(make_write_buffer_ring_config(buffer_size, 2), [&flush_ctl] (user_write_buffer& wb) {
         return flush_ctl(wb);
     });
 
@@ -844,19 +1014,17 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_queued_write_keeps_its_w
     }
 
     // Fill the ring: the first record is being flushed and the second holds the only other buffer.
-    auto accepted0 = ring.write_to_buffer(make_writer(expected[0]), test_timeout()).get();
-    auto persisted0 = std::move(accepted0.persisted);
+    auto persisted0 = ring_write(ring, index, expected[0]);
     flush_ctl.wait_for_flush_starts(1);
-    auto accepted1 = ring.write_to_buffer(make_writer(expected[1]), test_timeout()).get();
-    auto persisted1 = std::move(accepted1.persisted);
+    auto persisted1 = ring_write(ring, index, expected[1]);
 
     // The third record has nowhere to go, so it is queued rather than appended.
-    auto queued = ring.write_to_buffer(make_writer(expected[2]), test_timeout(), write_target{
+    auto persisted2 = ring_write(ring, index, expected[2], test_timeout(), write_target{
             .cg = nullptr,
             .non_empty_holder = non_empty_gate.hold(),
             .alive_holder = alive_gate.hold(),
     });
-    BOOST_REQUIRE(!queued.available());
+    BOOST_REQUIRE(!persisted2.available());
     BOOST_REQUIRE_EQUAL(ring.queued_write_count(), 1u);
 
     // The write is in flight, so its group is still held by both of the target's holders. Checked
@@ -870,9 +1038,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_queued_write_keeps_its_w
     wait_for_persisted(persisted0);
     flush_ctl.wait_for_flush_starts(2);
 
-    auto accepted2 = queued.get();
-    auto persisted2 = std::move(accepted2.persisted);
-    BOOST_REQUIRE_EQUAL(ring.queued_write_count(), 0u);
+    wait_for_queued_writes(ring, 0);
 
     flush_ctl.release_one_flush();
     wait_for_persisted(persisted1);
@@ -887,11 +1053,12 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_queued_write_keeps_its_w
 // Checks that queued writes are accepted and persisted in FIFO order once capacity becomes available.
 SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_queued_writes_preserve_fifo_order) {
     auto schema = make_kv_schema();
+    primary_index index(noop_space_accounting, nullptr, false);
     constexpr size_t buffer_size = 4 * 1024;
     const auto large_value = make_single_buffer_value(schema, buffer_size);
 
     test_flush_controller flush_ctl{.pause_flushes = true};
-    write_buffer_ring ring(make_write_buffer_ring_config(buffer_size, 2), [&flush_ctl] (mixed_write_buffer& wb) {
+    write_buffer_ring ring(make_write_buffer_ring_config(buffer_size, 2), [&flush_ctl] (user_write_buffer& wb) {
         return flush_ctl(wb);
     });
 
@@ -905,46 +1072,40 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_queued_writes_preserve_f
         expected.push_back(make_write_buffer_ring_record(schema, i, large_value, api::timestamp_type(300 + i)));
     }
 
-    auto accepted0 = ring.write_to_buffer(make_writer(expected[0]), test_timeout()).get();
-    auto persisted0 = std::move(accepted0.persisted);
+    auto persisted0 = ring_write(ring, index, expected[0]);
     flush_ctl.wait_for_flush_starts(1);
 
-    auto accepted1 = ring.write_to_buffer(make_writer(expected[1]), test_timeout()).get();
-    auto persisted1 = std::move(accepted1.persisted);
+    auto persisted1 = ring_write(ring, index, expected[1]);
 
-    auto queued2 = ring.write_to_buffer(make_writer(expected[2]), test_timeout());
-    auto queued3 = ring.write_to_buffer(make_writer(expected[3]), test_timeout());
-    auto queued4 = ring.write_to_buffer(make_writer(expected[4]), test_timeout());
+    auto persisted2 = ring_write(ring, index, expected[2]);
+    auto persisted3 = ring_write(ring, index, expected[3]);
+    auto persisted4 = ring_write(ring, index, expected[4]);
 
-    BOOST_REQUIRE(!queued2.available());
-    BOOST_REQUIRE(!queued3.available());
-    BOOST_REQUIRE(!queued4.available());
+    BOOST_REQUIRE(!persisted2.available());
+    BOOST_REQUIRE(!persisted3.available());
+    BOOST_REQUIRE(!persisted4.available());
     BOOST_REQUIRE_EQUAL(ring.queued_write_count(), 3u);
 
-    // FIFO acceptance is proven by the !available() checks after each drain step below:
-    // each step frees exactly one buffer, and only the oldest queued write may be
-    // accepted into it while every later one stays pending.
+    // Each drain step below frees one buffer, which takes one queued write, and the order of the
+    // flushed records at the end shows that it is the oldest one.
 
     flush_ctl.release_one_flush();
     wait_for_persisted(persisted0);
     flush_ctl.wait_for_flush_starts(2);
-    auto accepted2 = queued2.get();
-    auto persisted2 = std::move(accepted2.persisted);
-    BOOST_REQUIRE(!queued3.available());
-    BOOST_REQUIRE(!queued4.available());
+    wait_for_queued_writes(ring, 2);
+    BOOST_REQUIRE(!persisted3.available());
+    BOOST_REQUIRE(!persisted4.available());
 
     flush_ctl.release_one_flush();
     wait_for_persisted(persisted1);
     flush_ctl.wait_for_flush_starts(3);
-    auto accepted3 = queued3.get();
-    auto persisted3 = std::move(accepted3.persisted);
-    BOOST_REQUIRE(!queued4.available());
+    wait_for_queued_writes(ring, 1);
+    BOOST_REQUIRE(!persisted4.available());
 
     flush_ctl.release_one_flush();
     wait_for_persisted(persisted2);
     flush_ctl.wait_for_flush_starts(4);
-    auto accepted4 = queued4.get();
-    auto persisted4 = std::move(accepted4.persisted);
+    wait_for_queued_writes(ring, 0);
 
     flush_ctl.release_one_flush();
     wait_for_persisted(persisted3);
@@ -959,6 +1120,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_queued_writes_preserve_f
 // Checks that queued writes are rejected once max_queued_write_bytes would be exceeded.
 SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_rejects_when_max_queued_write_bytes_exceeded) {
     auto schema = make_kv_schema();
+    primary_index index(noop_space_accounting, nullptr, false);
     constexpr size_t buffer_size = 4 * 1024;
     const auto large_value = make_single_buffer_value(schema, buffer_size);
 
@@ -966,7 +1128,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_rejects_when_max_queued_
     const auto queued_write_budget = make_writer(record0).record_size() * 2;
 
     test_flush_controller flush_ctl{.pause_flushes = true};
-    write_buffer_ring ring(make_write_buffer_ring_config(buffer_size, 2, queued_write_budget), [&flush_ctl] (mixed_write_buffer& wb) {
+    write_buffer_ring ring(make_write_buffer_ring_config(buffer_size, 2, queued_write_budget), [&flush_ctl] (user_write_buffer& wb) {
         return flush_ctl(wb);
     });
 
@@ -980,33 +1142,30 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_rejects_when_max_queued_
         expected.push_back(make_write_buffer_ring_record(schema, i, large_value, api::timestamp_type(400 + i)));
     }
 
-    auto accepted0 = ring.write_to_buffer(make_writer(expected[0]), test_timeout()).get();
-    auto persisted0 = std::move(accepted0.persisted);
+    auto persisted0 = ring_write(ring, index, expected[0]);
     flush_ctl.wait_for_flush_starts(1);
 
-    auto accepted1 = ring.write_to_buffer(make_writer(expected[1]), test_timeout()).get();
-    auto persisted1 = std::move(accepted1.persisted);
+    auto persisted1 = ring_write(ring, index, expected[1]);
 
-    auto queued2 = ring.write_to_buffer(make_writer(expected[2]), test_timeout());
-    auto queued3 = ring.write_to_buffer(make_writer(expected[3]), test_timeout());
-    BOOST_REQUIRE(!queued2.available());
-    BOOST_REQUIRE(!queued3.available());
+    auto persisted2 = ring_write(ring, index, expected[2]);
+    auto persisted3 = ring_write(ring, index, expected[3]);
+    BOOST_REQUIRE(!persisted2.available());
+    BOOST_REQUIRE(!persisted3.available());
     BOOST_REQUIRE_EQUAL(ring.queued_write_count(), 2u);
 
     auto rejected = make_write_buffer_ring_record(schema, 4, large_value, api::timestamp_type(404));
-    BOOST_REQUIRE_THROW(ring.write_to_buffer(make_writer(rejected), test_timeout()).get(), replica::rate_limit_exception);
+    auto rejected_write = ring_write(ring, index, rejected);
+    BOOST_REQUIRE_THROW(rejected_write.get(), replica::rate_limit_exception);
 
     flush_ctl.release_one_flush();
     wait_for_persisted(persisted0);
     flush_ctl.wait_for_flush_starts(2);
-    auto accepted2 = queued2.get();
-    auto persisted2 = std::move(accepted2.persisted);
+    wait_for_queued_writes(ring, 1);
 
     flush_ctl.release_one_flush();
     wait_for_persisted(persisted1);
     flush_ctl.wait_for_flush_starts(3);
-    auto accepted3 = queued3.get();
-    auto persisted3 = std::move(accepted3.persisted);
+    wait_for_queued_writes(ring, 0);
 
     flush_ctl.release_one_flush();
     wait_for_persisted(persisted2);
@@ -1022,11 +1181,12 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_rejects_when_max_queued_
 // no failed future that nothing waits for.
 SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_queued_write_times_out) {
     auto schema = make_kv_schema();
+    primary_index index(noop_space_accounting, nullptr, false);
     constexpr size_t buffer_size = 4 * 1024;
     const auto large_value = make_single_buffer_value(schema, buffer_size);
 
     test_flush_controller flush_ctl{.pause_flushes = true};
-    write_buffer_ring ring(make_write_buffer_ring_config(buffer_size, 2), [&flush_ctl] (mixed_write_buffer& wb) {
+    write_buffer_ring ring(make_write_buffer_ring_config(buffer_size, 2), [&flush_ctl] (user_write_buffer& wb) {
         return flush_ctl(wb);
     });
 
@@ -1036,15 +1196,13 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_queued_write_times_out) 
         ring.stop().get();
     });
 
-    auto accepted0 = ring.write_to_buffer(make_writer(make_write_buffer_ring_record(schema, 0, large_value, api::timestamp_type(500))), test_timeout()).get();
-    auto persisted0 = std::move(accepted0.persisted);
+    auto persisted0 = ring_write(ring, index, make_write_buffer_ring_record(schema, 0, large_value, api::timestamp_type(500)));
     flush_ctl.wait_for_flush_starts(1);
 
-    auto accepted1 = ring.write_to_buffer(make_writer(make_write_buffer_ring_record(schema, 1, large_value, api::timestamp_type(501))), test_timeout()).get();
-    auto persisted1 = std::move(accepted1.persisted);
+    auto persisted1 = ring_write(ring, index, make_write_buffer_ring_record(schema, 1, large_value, api::timestamp_type(501)));
 
     const auto abandoned_before = seastar::engine().abandoned_failed_futures();
-    auto queued = ring.write_to_buffer(make_writer(make_write_buffer_ring_record(schema, 2, large_value, api::timestamp_type(502))),
+    auto queued = ring_write(ring, index, make_write_buffer_ring_record(schema, 2, large_value, api::timestamp_type(502)),
             db::timeout_clock::now() + std::chrono::milliseconds(10));
     BOOST_REQUIRE_EQUAL(ring.queued_write_count(), 1u);
     BOOST_REQUIRE_THROW(queued.get(), seastar::timed_out_error);
@@ -1056,14 +1214,16 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_queued_write_times_out) 
     wait_for_persisted(persisted1);
 }
 
-// Checks that write_to_buffer() stays pending while a request is queued and only persistence remains pending once it is accepted.
-SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_acceptance_stays_blocked_while_write_is_queued) {
+// Checks that a queued write stays on the queue until a buffer is free, and that it completes only
+// with the flush of the buffer that takes it.
+SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_queued_write_completes_with_the_flush_of_its_buffer) {
     auto schema = make_kv_schema();
+    primary_index index(noop_space_accounting, nullptr, false);
     constexpr size_t buffer_size = 4 * 1024;
     const auto large_value = make_single_buffer_value(schema, buffer_size);
 
     test_flush_controller flush_ctl{.pause_flushes = true};
-    write_buffer_ring ring(make_write_buffer_ring_config(buffer_size, 2), [&flush_ctl] (mixed_write_buffer& wb) {
+    write_buffer_ring ring(make_write_buffer_ring_config(buffer_size, 2), [&flush_ctl] (user_write_buffer& wb) {
         return flush_ctl(wb);
     });
 
@@ -1076,31 +1236,29 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_acceptance_stays_blocked
     auto record1 = make_write_buffer_ring_record(schema, 1, large_value, api::timestamp_type(501));
     auto record2 = make_write_buffer_ring_record(schema, 2, large_value, api::timestamp_type(502));
 
-    auto accepted0 = ring.write_to_buffer(make_writer(record0), test_timeout()).get();
-    auto persisted0 = std::move(accepted0.persisted);
+    auto persisted0 = ring_write(ring, index, record0);
     flush_ctl.wait_for_flush_starts(1);
 
-    auto accepted1 = ring.write_to_buffer(make_writer(record1), test_timeout()).get();
-    auto persisted1 = std::move(accepted1.persisted);
+    auto persisted1 = ring_write(ring, index, record1);
 
-    auto queued2 = ring.write_to_buffer(make_writer(record2), test_timeout());
-    BOOST_REQUIRE(!queued2.available());
+    auto persisted2 = ring_write(ring, index, record2);
+    BOOST_REQUIRE(!persisted2.available());
     BOOST_REQUIRE_EQUAL(ring.queued_write_count(), 1u);
 
     flush_ctl.release_one_flush();
     wait_for_persisted(persisted0);
     flush_ctl.wait_for_flush_starts(2);
 
-    auto accepted2 = queued2.get();
-    BOOST_REQUIRE(!accepted2.persisted.available());
+    wait_for_queued_writes(ring, 0);
+    BOOST_REQUIRE(!persisted2.available());
 
     flush_ctl.release_one_flush();
     wait_for_persisted(persisted1);
     flush_ctl.wait_for_flush_starts(3);
-    BOOST_REQUIRE(!accepted2.persisted.available());
+    BOOST_REQUIRE(!persisted2.available());
 
     flush_ctl.release_one_flush();
-    wait_for_persisted(accepted2.persisted);
+    wait_for_persisted(persisted2);
 
     const auto actual = flush_ctl.all_records();
     const std::vector<log_record> expected{record0, record1, record2};
@@ -1110,18 +1268,18 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_acceptance_stays_blocked
 // Checks that stop() waits for a blocked in-flight flush instead of dropping it.
 SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_stop_drains_blocked_in_flight_write) {
     auto schema = make_kv_schema();
+    primary_index index(noop_space_accounting, nullptr, false);
     constexpr size_t buffer_size = 4 * 1024;
     const auto record = make_write_buffer_ring_record(schema, 0, "value", api::timestamp_type(600));
 
     test_flush_controller flush_ctl{.pause_flushes = true};
-    write_buffer_ring ring(make_write_buffer_ring_config(buffer_size, 2), [&flush_ctl] (mixed_write_buffer& wb) {
+    write_buffer_ring ring(make_write_buffer_ring_config(buffer_size, 2), [&flush_ctl] (user_write_buffer& wb) {
         return flush_ctl(wb);
     });
 
     ring.start().get();
 
-    auto accepted = ring.write_to_buffer(make_writer(record), test_timeout()).get();
-    auto persisted = std::move(accepted.persisted);
+    auto persisted = ring_write(ring, index, record);
     flush_ctl.wait_for_flush_starts(1);
 
     auto stop_fut = ring.stop();
@@ -1140,11 +1298,12 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_stop_drains_blocked_in_f
 // a write that comes after stop() fails.
 SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_stop_drains_queued_writes) {
     auto schema = make_kv_schema();
+    primary_index index(noop_space_accounting, nullptr, false);
     constexpr size_t buffer_size = 4 * 1024;
     const auto large_value = make_single_buffer_value(schema, buffer_size);
 
     test_flush_controller flush_ctl{.pause_flushes = true};
-    write_buffer_ring ring(make_write_buffer_ring_config(buffer_size, 2), [&flush_ctl] (mixed_write_buffer& wb) {
+    write_buffer_ring ring(make_write_buffer_ring_config(buffer_size, 2), [&flush_ctl] (user_write_buffer& wb) {
         return flush_ctl(wb);
     });
 
@@ -1155,12 +1314,10 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_stop_drains_queued_write
         expected.push_back(make_write_buffer_ring_record(schema, i, large_value, api::timestamp_type(800 + i)));
     }
 
-    auto accepted0 = ring.write_to_buffer(make_writer(expected[0]), test_timeout()).get();
-    auto persisted0 = std::move(accepted0.persisted);
+    auto persisted0 = ring_write(ring, index, expected[0]);
     flush_ctl.wait_for_flush_starts(1);
-    auto accepted1 = ring.write_to_buffer(make_writer(expected[1]), test_timeout()).get();
-    auto persisted1 = std::move(accepted1.persisted);
-    auto queued = ring.write_to_buffer(make_writer(expected[2]), test_timeout());
+    auto persisted1 = ring_write(ring, index, expected[1]);
+    auto persisted2 = ring_write(ring, index, expected[2]);
     BOOST_REQUIRE_EQUAL(ring.queued_write_count(), 1u);
 
     auto stop_fut = ring.stop();
@@ -1168,8 +1325,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_stop_drains_queued_write
     flush_ctl.release_one_flush();
     wait_for_persisted(persisted0);
     flush_ctl.wait_for_flush_starts(2);
-    auto accepted2 = queued.get();
-    auto persisted2 = std::move(accepted2.persisted);
+    wait_for_queued_writes(ring, 0);
 
     flush_ctl.release_one_flush();
     wait_for_persisted(persisted1);
@@ -1181,13 +1337,15 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_stop_drains_queued_write
     assert_records_in_order(schema, flush_ctl.all_records(), expected);
 
     auto late = make_write_buffer_ring_record(schema, 3, "value", api::timestamp_type(803));
-    BOOST_REQUIRE_THROW(ring.write_to_buffer(make_writer(late), test_timeout()).get(), seastar::gate_closed_exception);
+    auto late_write = ring_write(ring, index, late);
+    BOOST_REQUIRE_THROW(late_write.get(), seastar::gate_closed_exception);
 }
 
 // Checks that a flush failure is propagated to every write that was already accepted into that buffer,
 // and that the ring goes on taking and flushing writes after it.
 SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_flush_failure_fails_all_writes_in_buffer) {
     auto schema = make_kv_schema();
+    primary_index index(noop_space_accounting, nullptr, false);
     constexpr size_t buffer_size = 4 * 1024;
 
     auto record0 = make_write_buffer_ring_record(schema, 0, "value0", api::timestamp_type(700));
@@ -1199,7 +1357,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_flush_failure_fails_all_
 
     test_flush_controller flush_ctl{.fail_flush_index = 0};
     // long sync period so both writes land in the same buffer.
-    write_buffer_ring ring(make_write_buffer_ring_config(buffer_size, 3, 0, std::chrono::hours(1)), [&flush_ctl] (mixed_write_buffer& wb) {
+    write_buffer_ring ring(make_write_buffer_ring_config(buffer_size, 3, 0, std::chrono::hours(1)), [&flush_ctl] (user_write_buffer& wb) {
         return flush_ctl(wb);
     });
 
@@ -1208,13 +1366,13 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_flush_failure_fails_all_
         ring.stop().get();
     });
 
-    auto accepted0 = ring.write_to_buffer(make_writer(record0), test_timeout()).get();
-    auto accepted1 = ring.write_to_buffer(make_writer(record1), test_timeout()).get();
+    auto persisted0 = ring_write(ring, index, record0);
+    auto persisted1 = ring_write(ring, index, record1);
 
     auto flush = ring.flush();
 
-    BOOST_REQUIRE_THROW(accepted0.persisted.get(), std::runtime_error);
-    BOOST_REQUIRE_THROW(accepted1.persisted.get(), std::runtime_error);
+    BOOST_REQUIRE_THROW(persisted0.get(), std::runtime_error);
+    BOOST_REQUIRE_THROW(persisted1.get(), std::runtime_error);
 
     flush.get();
 
@@ -1226,9 +1384,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_ring_flush_failure_fails_all_
     std::vector<log_record> expected;
     for (size_t i = 0; i < 3; ++i) {
         expected.push_back(make_write_buffer_ring_record(schema, 2 + i, fmt::format("value{}", 2 + i), api::timestamp_type(702 + i)));
-        auto accepted = ring.write_to_buffer(make_writer(expected.back()), test_timeout()).get();
-        auto persisted = std::move(accepted.persisted);
-        // The flush completes only once the record's holder is released.
+        auto persisted = ring_write(ring, index, expected.back());
         auto flushed = ring.flush();
         wait_for_persisted(persisted);
         flushed.get();
