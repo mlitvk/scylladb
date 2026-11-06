@@ -1373,10 +1373,10 @@ future<> segment_manager_impl::write_full_segment(rewrite_buffer& wb, logstor_gr
     _stats.bytes_written[static_cast<size_t>(source)] += chunk.size();
     _stats.data_bytes_written[static_cast<size_t>(source)] += wb.record_bytes();
 
-    // The records are on disk and the index already points into this segment, so if adding it to
-    // the compaction group fails, the segment must not be freed when the reference below is
-    // released. Marking the reference as failed leaves it allocated instead, so the records stay
-    // readable, at the cost of the segment never being reclaimed.
+    // The records are on disk, and complete_writes() below points the index into this segment, so if
+    // a later step fails, the segment must not be freed when the reference below is released.
+    // Marking the reference as failed leaves it allocated instead, so the records stay readable, at
+    // the cost of the segment never being reclaimed.
     auto seg_ref = seg->ref();
     auto add_to_group_failed = defer([seg_ref] mutable noexcept {
         seg_ref.set_flush_failure();
