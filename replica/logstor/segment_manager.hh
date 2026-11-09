@@ -207,6 +207,20 @@ public:
     // Allocates a new local segment and returns an output stream for writing to the segment.
     future<std::unique_ptr<segment_stream_sink>> create_segment_output_stream(recovery_catalog&);
 
+    // Calls `fn` with each chunk of the segment, in order, with all the records of the chunk, the
+    // dead records too. The chunk is valid until `fn` returns.
+    // Holds a reference to the segment during the read, so that the segment is not freed and used
+    // again under the read.
+    // Throws std::runtime_error if the segment is free.
+    // The caller must not discard the group of the segment during the read, because
+    // discard_segments() fails with an internal error at a segment that has another reference.
+    future<> read_chunks(log_segment_id, noncopyable_function<future<>(const scanned_chunk&)> fn);
+
+    // Makes a source that sends the live records of the group as a record stream. Returns nullptr
+    // if the group has no live record. Compaction of the group stays disabled until the source is
+    // destroyed.
+    future<std::unique_ptr<record_stream_source>> make_record_stream_source(logstor_group&);
+
     // Makes a sink that receives a record stream of the table.
     // The sink is work in progress of the segment manager until it is closed or aborted, so stop()
     // waits for it.
