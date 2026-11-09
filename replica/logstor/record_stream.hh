@@ -17,12 +17,14 @@
 
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
+#include <seastar/core/iostream.hh>
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/util/noncopyable_function.hh>
 
 #include "replica/logstor/compaction.hh"
 #include "replica/logstor/segment_io.hh"
 #include "replica/logstor/write_buffer.hh"
+#include "utils/chunked_vector.hh"
 #include "utils/phased_barrier.hh"
 
 namespace replica::logstor {
@@ -33,11 +35,54 @@ class table_catalog;
 // sender, and no segment is larger than this.
 inline constexpr size_t max_stream_chunk_size = segment_descriptor_hist_options.max_size;
 
-// The sink throws this error when a record stream is not valid, for example when a chunk does not
-// parse, a record is not of the table of the stream, or the stream ends inside a chunk.
+// The sink and the source throw this error when a record stream is not valid, for example when a
+// chunk does not parse, a record is not of the table of the stream, the stream ends inside a chunk,
+// or a segment of the sender is not a full segment of the table.
 class record_stream_error : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;
+};
+
+// The sender of a record stream. It gives one chunk for each segment in its list that has live
+// records, and then an empty buffer. A record is live if the index points at it when the source
+// reads its segment.
+//
+// The source owns a guard that keeps compaction of the group disabled for its life, so the
+// segments in the list stay in the group and their records do not move.
+// A tablet merge can move the segments of the group to its merge target during the stream, so the
+// source also owns a guard that keeps compaction of the merge target disabled, and the records do
+// not move after the merge either.
+// A segment that has no valid chunk, or that is not a full segment of the table, fails the
+// stream, so that the stream does not lose records without notice.
+//
+// Apart from a corruption on disk, such a segment is a bug, because a listed segment can change
+// like that only when it is freed and used again during the stream. Compaction and
+// discard_segments() free the segments of a group. The guards keep compaction from running, and a
+// discard runs only at a truncate and at a tablet cleanup, which the topology coordinator does not
+// run on a tablet while the tablet streams.
+class record_stream_source final : public data_source_impl {
+public:
+    // Calls the function with each chunk of the segment, in order.
+    using chunk_reader = noncopyable_function<future<>(log_segment_id, noncopyable_function<future<>(const scanned_chunk&)>)>;
+
+    record_stream_source(table_id table, const primary_index& index, compaction_reenabler compaction_guard,
+            compaction_reenabler merge_target_guard, utils::chunked_vector<log_segment_id> segments, size_t segment_size,
+            chunk_reader read_chunks);
+
+    future<temporary_buffer<char>> get() override;
+
+private:
+    table_id _table;
+    const primary_index& _index;
+    compaction_reenabler _compaction_guard;
+    compaction_reenabler _merge_target_guard;
+    utils::chunked_vector<log_segment_id> _segments;
+    size_t _next_segment = 0;
+    chunk_reader _read_chunks;
+    raw_write_buffer _buffer;
+
+    future<> collect_live_records(log_segment_id segment_id);
+    temporary_buffer<char> take_chunk();
 };
 
 // Cuts the bytes of a stream into chunks. The bytes arrive in buffers of any size, so a chunk can

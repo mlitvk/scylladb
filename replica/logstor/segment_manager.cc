@@ -23,6 +23,7 @@
 #include <array>
 #include <chrono>
 #include <concepts>
+#include <functional>
 #include <type_traits>
 #include <seastar/core/file.hh>
 #include <seastar/core/seastar.hh>
@@ -659,6 +660,8 @@ public:
 
     future<seastar::input_stream<char>> create_segment_input_stream(log_segment_id segment_id, const seastar::file_input_stream_options& opts);
     future<std::unique_ptr<segment_stream_sink>> create_segment_output_stream();
+    future<> read_chunks(log_segment_id, noncopyable_function<future<>(const scanned_chunk&)> fn);
+    future<std::unique_ptr<record_stream_source>> make_record_stream_source(logstor_group& group, logstor_group& merge_target);
     future<std::unique_ptr<record_stream_sink>> make_record_stream_sink(table_id, utils::phased_barrier::operation table_stream);
 
     uint64_t allocatable_new_segment_count() const noexcept {
@@ -711,6 +714,12 @@ private:
         requires std::invocable<Func&, seastar::input_stream<char>&>
     futurize_t<std::invoke_result_t<Func&, seastar::input_stream<char>&>>
     with_segment_input_stream(log_segment_id segment_id, size_t buffer_size, Func fn);
+
+    // Returns the ids of the segments of the group that `filter` accepts. The caller must keep
+    // compaction of the group disabled, so that no segment leaves the group and the positions in
+    // the segment set stay valid while the walk yields.
+    template <std::predicate<const segment_descriptor&> Filter>
+    future<utils::chunked_vector<log_segment_id>> collect_segment_ids(logstor_group&, Filter filter);
 
     segment_ref make_segment_ref(log_segment_id seg_id) {
         auto& desc = get_segment_descriptor(seg_id);
@@ -1550,6 +1559,22 @@ segment_manager_impl::with_segment_input_stream(log_segment_id segment_id, size_
     co_return co_await futurize_invoke(fn, in).finally([&in] {
         return in.close();
     });
+}
+
+template <std::predicate<const segment_descriptor&> Filter>
+future<utils::chunked_vector<log_segment_id>> segment_manager_impl::collect_segment_ids(logstor_group& group, Filter filter) {
+    const auto& segment_set = group.logstor_segments();
+    const auto segment_count = segment_set.segment_count();
+    utils::chunked_vector<log_segment_id> ids;
+    ids.reserve(segment_count);
+    for (size_t i = 0; i < segment_count; ++i) {
+        const auto& desc = segment_set.segment_at(i);
+        if (std::invoke(filter, desc)) {
+            ids.push_back(desc_to_segment_id(desc));
+        }
+        co_await coroutine::maybe_yield();
+    }
+    co_return ids;
 }
 
 future<> compaction_manager_impl::submit_group_compaction(logstor_group& cg, std::function<future<>(group_compaction_state&)> op, scheduling_group sg) {
@@ -2441,6 +2466,40 @@ future<utils::chunked_vector<segment_snapshot>> segment_manager_impl::make_snaps
     co_return std::move(snp);
 }
 
+future<> segment_manager_impl::read_chunks(log_segment_id segment_id, noncopyable_function<future<>(const scanned_chunk&)> fn) {
+    // A read of a segment is work in progress, as for a read of a record, so that stop() does not
+    // close the files under it.
+    auto segment_manager_holder = _async_gate.hold();
+    // A reference on a free segment would free the segment again when it is released.
+    if (get_segment_descriptor(segment_id).ref_count == 0) {
+        throw std::runtime_error(fmt::format("Cannot read the chunks of {}, because it is free", segment_id));
+    }
+    auto segment_holder = make_segment_ref(segment_id);
+    co_await for_each_chunk(segment_id, std::move(fn));
+}
+
+future<std::unique_ptr<record_stream_source>> segment_manager_impl::make_record_stream_source(logstor_group& group,
+        logstor_group& merge_target) {
+    auto compaction_guard = co_await _compaction_mgr.disable_compaction(group);
+    compaction_reenabler merge_target_guard;
+    if (&merge_target != &group) {
+        // A merge can move the segments in the list to `merge_target` during the stream, and
+        // compaction there would move their records before the source reads them.
+        merge_target_guard = co_await _compaction_mgr.disable_compaction(merge_target);
+    }
+
+    auto segments = co_await collect_segment_ids(group, &segment_descriptor::has_live_records);
+    if (segments.empty()) {
+        co_return nullptr;
+    }
+
+    co_return std::make_unique<record_stream_source>(group.table_id(), group.logstor_index(), std::move(compaction_guard),
+            std::move(merge_target_guard), std::move(segments), _cfg.segment_size,
+            [this] (log_segment_id segment_id, noncopyable_function<future<>(const scanned_chunk&)> fn) {
+                return read_chunks(segment_id, std::move(fn));
+            });
+}
+
 future<std::unique_ptr<record_stream_sink>> segment_manager_impl::make_record_stream_sink(table_id table,
         utils::phased_barrier::operation table_stream) {
     // This function holds the gate before it allocates buffers, so that no sink is made while the
@@ -2667,6 +2726,15 @@ future<utils::chunked_vector<segment_snapshot>> segment_manager::make_snapshot(l
 
 future<std::unique_ptr<segment_stream_sink>> segment_manager::create_segment_output_stream() {
     return _impl->create_segment_output_stream();
+}
+
+future<> segment_manager::read_chunks(log_segment_id segment_id, noncopyable_function<future<>(const scanned_chunk&)> fn) {
+    return _impl->read_chunks(segment_id, std::move(fn));
+}
+
+future<std::unique_ptr<record_stream_source>> segment_manager::make_record_stream_source(logstor_group& group,
+        logstor_group& merge_target) {
+    return _impl->make_record_stream_source(group, merge_target);
 }
 
 future<std::unique_ptr<record_stream_sink>> segment_manager::make_record_stream_sink(table_id table,

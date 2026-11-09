@@ -95,6 +95,10 @@ struct segment_descriptor : public log_heap_hook<segment_descriptor_hist_options
         return segment_size - free_space;
     }
 
+    bool has_live_records() const noexcept {
+        return record_count > 0;
+    }
+
     void on_write(size_t record_bytes, size_t cnt = 1) noexcept {
         free_space -= record_bytes;
         record_count += cnt;
