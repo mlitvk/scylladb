@@ -381,6 +381,35 @@ SEASTAR_THREAD_TEST_CASE(test_segment_pool_abort_ends_only_the_aborted_wait) {
     w2.get();
 }
 
+// Checks that several compactions can wait for a segment of an empty pool at the same time, and
+// that each freed segment goes to one waiter, in arrival order. A waiter must not fail while it
+// waits, as it did when the pool kept its segments in a seastar::queue, which allows only one
+// waiter (SCYLLADB-5865).
+SEASTAR_THREAD_TEST_CASE(test_segment_pool_serves_many_waiting_compactions) {
+    constexpr size_t waiter_count = 8;
+    test_pool tp(waiter_count, waiter_count, 2);
+    std::vector<seg_ptr> taken;
+    for (size_t i = 0; i < waiter_count; ++i) {
+        taken.push_back(tp.take_now(write_source::compaction));
+    }
+
+    std::vector<future<seg_ptr>> waiters;
+    for (size_t i = 0; i < waiter_count; ++i) {
+        waiters.push_back(tp.p.take(write_source::compaction));
+    }
+
+    for (size_t i = 0; i < waiter_count; ++i) {
+        const auto freed_id = taken[i]->id;
+        tp.free(std::move(taken[i]));
+        BOOST_REQUIRE(eventually_true([&] { return waiters[i].available(); }));
+        for (size_t j = i + 1; j < waiter_count; ++j) {
+            BOOST_REQUIRE(!waiters[j].available());
+        }
+        BOOST_REQUIRE_EQUAL(waiters[i].get()->id.value, freed_id.value);
+    }
+    BOOST_REQUIRE_EQUAL(tp.p.get_stats().segments_wait[static_cast<size_t>(write_source::compaction)], waiter_count);
+}
+
 // Checks that a failed refill fails the consumers that wait at that time, and that a consumer that
 // starts to wait after it waits for the next attempt.
 SEASTAR_THREAD_TEST_CASE(test_segment_pool_failed_refill_fails_the_waiters) {
