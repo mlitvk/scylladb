@@ -16,7 +16,7 @@
 #include "utils/error_injection.hh"
 #include "locator/host_id.hh"
 #include "replica/database.hh"
-#include "replica/logstor/segment_manager.hh"
+#include "replica/logstor/record_stream.hh"
 #include "sstables/sstables.hh"
 #include "sstables/sstables_manager.hh"
 #include "sstables/storage.hh"
@@ -153,7 +153,7 @@ lw_shared_ptr<tablet_stream_status> get_tablet_stream(file_stream_id ops_id) {
     return status;
 }
 
-using foreign_segment_sink = foreign_ptr<std::unique_ptr<replica::logstor::segment_stream_sink>>;
+using foreign_record_sink = foreign_ptr<std::unique_ptr<replica::logstor::record_stream_sink>>;
 using foreign_os = foreign_ptr<std::unique_ptr<output_stream<char>>>;
 
 struct foreign_data_sink : public data_sink_impl {
@@ -191,46 +191,64 @@ struct foreign_data_sink : public data_sink_impl {
     }
 };
 
-class logstor_sink {
+// Passes the bytes of a record stream to its sink. The sink is closed by the finish function of the
+// stream, not here: the stream closes its output also when it fails.
+class record_stream_data_sink final : public data_sink_impl {
+    replica::logstor::record_stream_sink& _sink;
+public:
+    explicit record_stream_data_sink(replica::logstor::record_stream_sink& sink) noexcept : _sink(sink) {}
+
+    future<> put(std::span<temporary_buffer<char>> data) override {
+        return _sink.put(data);
+    }
+
+    future<> close() override {
+        return make_ready_future<>();
+    }
+
+    size_t buffer_size() const noexcept override {
+        return file_stream_buffer_size;
+    }
+};
+
+// The sink of a record stream on the shard of its table, given the bytes from the shard that
+// receives the stream.
+class logstor_record_sink {
     sharded<replica::database>& _db;
-    table_id _tid;
     shard_id _target_shard;
-    foreign_segment_sink _segment_sink;
+    foreign_record_sink _sink;
 
 public:
-    logstor_sink(sharded<replica::database>& db, table_id tid, shard_id target_shard, foreign_segment_sink target_sink)
-        : _db(db), _tid(tid), _target_shard(target_shard), _segment_sink(std::move(target_sink)) {}
+    logstor_record_sink(sharded<replica::database>& db, shard_id target_shard, foreign_record_sink sink)
+        : _db(db), _target_shard(target_shard), _sink(std::move(sink)) {}
 
-    future<output_stream<char>> output(const file_open_options&, const file_output_stream_options&) {
-        auto foreign_out = co_await _db.invoke_on(_target_shard, [this] (replica::database& db) -> future<foreign_os> {
-            auto out = co_await _segment_sink->output();
-            co_return make_foreign(std::make_unique<output_stream<char>>(std::move(out)));
+    future<output_stream<char>> output() {
+        auto foreign_out = co_await _db.invoke_on(_target_shard, [this] (replica::database&) {
+            auto out = output_stream<char>(data_sink(std::make_unique<record_stream_data_sink>(*_sink)));
+            return make_foreign(std::make_unique<output_stream<char>>(std::move(out)));
         });
         auto ds = std::make_unique<foreign_data_sink>(_db, _target_shard, std::move(foreign_out));
-        auto out = output_stream<char>(data_sink(std::move(ds)), file_stream_buffer_size);
-        co_return std::move(out);
+        co_return output_stream<char>(data_sink(std::move(ds)), file_stream_buffer_size);
     }
 
     future<> close() {
-        return _db.invoke_on(_target_shard, [this] (replica::database& db) -> future<> {
-            return _segment_sink->close();
+        return _db.invoke_on(_target_shard, [this] (replica::database&) {
+            return _sink->close();
         });
     }
 
     future<> abort() {
-        return _db.invoke_on(_target_shard, [this] (replica::database& db) -> future<> {
-            return _segment_sink->abort();
+        return _db.invoke_on(_target_shard, [this] (replica::database&) {
+            return _sink->abort();
         });
     }
 };
 
-future<logstor_sink> make_logstor_sink(sharded<replica::database>& db, table_id tid, shard_id target_shard) {
-    auto sink = co_await db.invoke_on(target_shard, [tid] (replica::database& db) -> future<foreign_segment_sink> {
-        auto& table = db.find_column_family(tid);
-        auto segment_sink = co_await table.create_logstor_segment_sink(db);
-        co_return make_foreign(std::move(segment_sink));
+future<logstor_record_sink> make_logstor_record_sink(sharded<replica::database>& db, table_id tid, shard_id target_shard) {
+    auto sink = co_await db.invoke_on(target_shard, [tid] (replica::database& db) -> future<foreign_record_sink> {
+        co_return make_foreign(co_await db.find_column_family(tid).make_logstor_record_sink());
     });
-    co_return logstor_sink(db, tid, target_shard, std::move(sink));
+    co_return logstor_record_sink(db, target_shard, std::move(sink));
 }
 
 static void may_inject_error(const streaming::stream_blob_meta& meta, bool may_inject, const sstring& error) {
@@ -276,7 +294,7 @@ future<> stream_blob_handler(replica::database& db,
         // Reject any file_ops that is not support by this node
         if (meta.fops != streaming::file_ops::stream_sstables &&
             meta.fops != streaming::file_ops::load_sstables &&
-            meta.fops != streaming::file_ops::stream_logstor_segments) {
+            meta.fops != streaming::file_ops::stream_logstor_records) {
             auto msg = format("fstream[{}] Unsupported file_ops={} peer={} file={}",
                     meta.ops_id, int(meta.fops), from, meta.filename);
             blogger.warn("{}", msg);
@@ -499,14 +517,10 @@ future<> stream_blob_handler(replica::database& db, db::view::view_building_work
                 },
                 std::move(out)
             };
-        } else if (meta.fops == file_ops::stream_logstor_segments) {
-            blogger.debug("stream_logstor_segments[{}] Creating logstor segment stream sink on shard {}", meta.ops_id, meta.dst_shard_id);
-            auto& sharded_db = db.container();
-            auto target_shard = meta.dst_shard_id;
-            auto table_id = meta.table;
-
-            auto sink = co_await make_logstor_sink(sharded_db, table_id, target_shard);
-            auto out = co_await sink.output(foptions, stream_options);
+        } else if (meta.fops == file_ops::stream_logstor_records) {
+            blogger.debug("stream_logstor_records[{}] Creating logstor record stream sink on shard {}", meta.ops_id, meta.dst_shard_id);
+            auto sink = co_await make_logstor_record_sink(db.container(), meta.table, meta.dst_shard_id);
+            auto out = co_await sink.output();
 
             co_return output_result{
                 [sink = std::move(sink)](store_result res) mutable -> future<> {
@@ -799,19 +813,20 @@ future<stream_files_response> tablet_stream_files_handler(replica::database& db,
     bool is_logstor_table = table.uses_logstor();
 
     if (is_logstor_table) {
-        auto segments = co_await table.take_logstor_snapshot(req.range);
+        auto sources = co_await table.make_logstor_record_sources(req.range);
         // Tests hold this across topology operations; an expired wait aborts the node.
         co_await utils::get_local_injector().inject("wait_before_tablet_stream_files_after_snapshot", utils::wait_for_message(std::chrono::minutes(5)));
-        for (auto& seg : segments) {
+        for (size_t i = 0; i < sources.size(); ++i) {
             auto& info = files.emplace_back();
-            info.filename = format("logstor_segment_{}", seg.segment_id); // used only for logging
-            info.fops = file_ops::stream_logstor_segments;
-            info.source = [seg = std::move(seg)](const file_input_stream_options& options) {
-                return seg.source(options);
+            info.filename = fmt::format("logstor_records_{}", i); // used only for logging
+            info.fops = file_ops::stream_logstor_records;
+            // The blob owns the source, and so the compaction guard of its group, until it is sent.
+            info.source = [source = std::move(sources[i])] (const file_input_stream_options&) mutable {
+                return make_ready_future<input_stream<char>>(input_stream<char>(data_source(std::move(source))));
             };
         }
-        blogger.debug("stream_logstor_segments[{}] Started sending segment_nr={} range={}",
-                req.ops_id, segments.size(), req.range);
+        blogger.debug("stream_logstor_records[{}] Started sending group_nr={} range={}",
+                req.ops_id, sources.size(), req.range);
     } else {
         auto sstables = co_await table.take_storage_snapshot(req.range);
         co_await utils::get_local_injector().inject("wait_before_tablet_stream_files_after_snapshot", utils::wait_for_message(std::chrono::minutes(5)));
@@ -916,7 +931,7 @@ future<stream_files_response> tablet_stream_files_handler(replica::database& db,
     resp.stream_bytes = stream_bytes;
     auto duration = std::chrono::steady_clock::now() - ops_start_time;
     blogger.info("stream_{}[{}] Finished sending files_nr={} range={} stream_bytes={} stream_time={} stream_bw={}",
-            is_logstor_table ? "logstor_segments" : "sstables",
+            is_logstor_table ? "logstor_records" : "sstables",
             req.ops_id, files_nr, req.range, stream_bytes, duration, get_bw(stream_bytes, ops_start_time));
 
     co_return resp;

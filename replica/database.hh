@@ -1565,8 +1565,14 @@ public:
     // Takes snapshot of current sstable set all compaction groups.
     future<utils::chunked_vector<sstables::shared_sstable>> take_sstable_set_snapshot();
 
-    future<utils::chunked_vector<logstor::segment_snapshot>> take_logstor_snapshot(dht::token_range tr);
-    future<std::unique_ptr<logstor::segment_stream_sink>> create_logstor_segment_sink(replica::database&);
+    // Returns the sources of the record streams of the logstor compaction groups in the range, one
+    // for each group that has live records. The separator is flushed first, so the streams hold
+    // every write that completed before the call. Compaction of a group stays disabled until its
+    // source is destroyed.
+    future<std::vector<std::unique_ptr<logstor::record_stream_source>>> make_logstor_record_sources(dht::token_range tr);
+    // Returns a sink for a record stream of this table. The stream is in progress for the table
+    // until the sink is closed or aborted.
+    future<std::unique_ptr<logstor::record_stream_sink>> make_logstor_record_sink();
 
     // Clones storage of a given tablet. Memtable is flushed first to guarantee that the
     // snapshot (list of sstables) will include all the data written up to the time it was taken.
@@ -1853,7 +1859,7 @@ private:
     // Declared ahead of the tables, since a logstor table holds a pointer to it and its compaction
     // groups reach for its compaction manager as they are destroyed, so it has to outlive them.
     std::unique_ptr<logstor::logstor> _logstor;
-    // The tables of this shard as logstor recovery and the adoption of a streamed segment see them.
+    // The tables of this shard as logstor recovery sees them.
     // Set with _logstor.
     std::unique_ptr<logstor::recovery_catalog> _logstor_catalog;
 

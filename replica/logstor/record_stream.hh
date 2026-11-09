@@ -118,9 +118,10 @@ private:
 // written. A record that is older than the record of its key in the index stays in its segment
 // as dead space.
 //
-// The segment manager makes the sink. The sink holds a gate holder of the segment manager and a
-// buffer of its pool until close() or abort(). The caller must call one of the two, and must not
-// start a call while another call is in progress.
+// The segment manager makes the sink. The sink holds a gate holder of the segment manager, a
+// buffer of its pool and the target resolver, with what the resolver holds, until close() or
+// abort(). The caller must call one of the two, and must not start a call while another call is in
+// progress.
 class record_stream_sink {
 public:
     // Returns the compaction group of a token, with the holders that a write to the group takes.
@@ -167,7 +168,7 @@ private:
     future<> write_record(const chunk_record& record);
     future<> write_buffered_records();
     future<> flush();
-    future<> release_buffer() noexcept;
+    future<> release() noexcept;
 };
 
 }

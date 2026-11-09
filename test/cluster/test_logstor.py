@@ -1339,23 +1339,13 @@ async def test_recovery_after_tablet_migration(manager: ScyllaClusterManager):
 @pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
 async def test_tablet_migration_with_compaction(manager: ScyllaClusterManager):
     """
-    Test that tablet migration is correct when compaction runs concurrently on the source.
-    Verifies that data migrated to the destination is intact even when segments are freed
-    by compaction while they are being streamed.
+    Test that compaction does not run on a group while its records are streamed, and that the
+    migration moves the data intact.
 
-    Uses an injection to pause migration after the snapshot of segments is taken
-    but before they are streamed, then triggers compaction to free dead
-    segments, then unpauses streaming to verify data survives.
-
-    This test:
-    1. Writes several segments with overwrites to create dead data suitable for compaction
-    2. Flushes to assign all segments to the tablet's compaction group
-    3. Enables the injection
-    4. Starts intranode tablet migration asynchronously
-    5. Waits for the injection to be hit (snapshot taken, streaming paused)
-    6. Triggers and waits for compaction to free dead segments
-    7. Releases the injection to let streaming proceed
-    8. Verifies all data is correct on the destination after migration
+    The source of a record stream keeps compaction of its group disabled, so that the segments it
+    reads stay in the group and their records do not move. The test pauses the migration after the
+    sources are made, triggers compaction, and checks that the source shard refuses it and compacts
+    nothing. Then it lets the migration finish and reads every key.
     """
     cmdline = ['--logger-log-level', 'logstor=trace', '--logger-log-level', 'stream_blob=trace', '--smp=2']
     cfg = {'experimental_features': ['logstor']}
@@ -1364,13 +1354,14 @@ async def test_tablet_migration_with_compaction(manager: ScyllaClusterManager):
     cql, _ = await manager.get_ready_cql(servers)
 
     inj = 'wait_before_tablet_stream_files_after_snapshot'
+    server_log = await manager.server_open_log(s1.server_id)
 
     await manager.disable_tablet_balancing()
 
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets={'initial': 1}") as ks:
         await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v text) WITH storage_engine = 'logstor'")
-        # Automatic compaction is off, so that the dead segments are still there for the compaction that
-        # runs while the streaming is paused.
+        # Automatic compaction is off, so that the dead segments are still there when the test triggers
+        # compaction while the streaming is paused, and the source shard must refuse that compaction.
         await manager.api.disable_autocompaction(s1.ip_addr, ks, "test")
 
         value_size = 30 * 1024
@@ -1405,7 +1396,7 @@ async def test_tablet_migration_with_compaction(manager: ScyllaClusterManager):
         src_shard = replica[1]
         dst_shard = 1 - src_shard
 
-        # Enable the injection that pauses streaming after the snapshot is taken
+        # Enable the injection that pauses streaming after the record stream sources are made
         await manager.api.enable_injection(s1.ip_addr, inj, one_shot=True)
 
         # Start migration in the background; it will pause at the injection point
@@ -1413,23 +1404,151 @@ async def test_tablet_migration_with_compaction(manager: ScyllaClusterManager):
             manager.api.move_tablet(servers[0].ip_addr, ks, "test", h1, src_shard, h1, dst_shard, tablet_token)
         )
 
-        # Wait until streaming has taken the snapshot and is paused at the injection
+        # Wait until the record stream sources are made and streaming is paused at the injection
         await manager.api.wait_for_injection_enter(s1.ip_addr, inj)
 
-        # Trigger compaction while streaming is paused; the snapshot holds segment refs so
-        # compaction can compact and free dead segments without affecting the in-flight data
+        async def segments_in_on_source_shard() -> int:
+            metrics = await manager.metrics.query(s1.ip_addr)
+            return int(metrics.get("scylla_logstor_sm_compaction_segments_in", {'shard': str(src_shard)}) or 0)
+
+        # The source refuses compaction of the group while the stream is paused
+        segments_in_before = await segments_in_on_source_shard()
+        log_mark = await server_log.mark()
         await manager.api.logstor_compaction(s1.ip_addr)
-        await manager.api.logstor_flush(s1.ip_addr)
+        await server_log.wait_for('compaction is disabled', from_mark=log_mark, timeout=60)
+        assert await segments_in_on_source_shard() == segments_in_before
 
         # Release the injection to let streaming proceed
         await manager.api.message_injection(s1.ip_addr, inj)
         await migration_task
 
-        # Verify all data is correct on the destination after migration with concurrent compaction
+        # Verify all data is correct on the destination after the migration
         for pk, expected_v in expected.items():
             rows = await cql.run_async(f"SELECT pk, v FROM {ks}.test WHERE pk = {pk}")
-            assert len(rows) == 1, f"Key {pk} not found after migration with concurrent compaction"
-            assert rows[0].v == expected_v, f"Key {pk} has wrong value after migration with concurrent compaction"
+            assert len(rows) == 1, f"Key {pk} not found after migration"
+            assert rows[0].v == expected_v, f"Key {pk} has wrong value after migration"
+
+async def owned_live_record_bytes(manager: ScyllaClusterManager, server) -> int:
+    metrics = await manager.metrics.query(server.ip_addr)
+    return int(metrics.get("scylla_logstor_sm_owned_segments_live_record_bytes") or 0)
+
+async def table_segment_count(manager: ScyllaClusterManager, server, ks: str) -> int:
+    metrics = await manager.metrics.query(server.ip_addr)
+    return int(metrics.get("scylla_column_family_logstor_segments", {'ks': ks, 'cf': 'test'}) or 0)
+
+async def write_with_churn(cql, ks: str, nkeys: int, value: str, versions: int):
+    """Writes every key `versions` times, so all but the last version of each key are dead records"""
+    insert = cql.prepare(f"INSERT INTO {ks}.test (pk, v) VALUES (?, ?)")
+    for version in range(versions):
+        await asyncio.gather(*[cql.run_async(insert, [pk, f"{version}_{value}"]) for pk in range(nkeys)])
+
+async def check_values(cql, ks: str, nkeys: int, value: str):
+    rows = await cql.run_async(f"SELECT pk, v FROM {ks}.test")
+    assert sorted(r.pk for r in rows) == list(range(nkeys))
+    assert all(r.v == value for r in rows), "found a key with an old value"
+
+async def test_tablet_migration_sends_live_records(manager: ScyllaClusterManager):
+    """
+    Test that a tablet migration sends only the live records of the tablet, and that the destination
+    packs them into as few segments as their size needs.
+
+    Every key of the tablet is written four times, so most records in the segments of the source are
+    dead. The stream must carry about the live record bytes, not the occupied segments, and the
+    destination must hold the same live record bytes in fewer segments.
+    """
+    cmdline = ['--logger-log-level', 'stream_blob=debug', '--smp=1']
+    cfg = {'experimental_features': ['logstor'], 'enable_keyspace_column_family_metrics': True}
+    servers = await manager.servers_add(2, cmdline=cmdline, config=cfg, property_file={"dc": "dc1", "rack": "rack1"})
+    cql = manager.get_cql()
+    await manager.disable_tablet_balancing()
+
+    value_size = 30 * 1024
+    nkeys = 20
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets={'initial': 1}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v text) WITH storage_engine = 'logstor'")
+        # Automatic compaction is off, so that it does not free the dead segments of the source before
+        # the test counts them.
+        for s in servers:
+            await manager.api.disable_autocompaction(s.ip_addr, ks, "test")
+        value = 'x' * value_size
+        await write_with_churn(cql, ks, nkeys, value, versions=4)
+        for s in servers:
+            await manager.api.logstor_flush(s.ip_addr)
+
+        src_host, src_shard = await get_tablet_replica(manager, servers[0], ks, 'test', 0)
+        hosts = [await manager.get_host_id(s.server_id) for s in servers]
+        src, dst = (servers[0], servers[1]) if hosts[0] == src_host else (servers[1], servers[0])
+        dst_host = hosts[servers.index(dst)]
+
+        live_bytes = await owned_live_record_bytes(manager, src)
+        src_segments = await table_segment_count(manager, src, ks)
+        # A segment holds whole records, so it holds at most this many of them.
+        records_per_segment = segment_size // value_size
+        max_dst_segments = -(-nkeys // (records_per_segment - 1))
+        logger.info(f"source: live record bytes {live_bytes}, segments {src_segments}")
+        assert src_segments > max_dst_segments, "expected the churn to leave the source with dead records"
+
+        src_log = await manager.server_open_log(src.server_id)
+        mark = await src_log.mark()
+        await manager.api.move_tablet(servers[0].ip_addr, ks, "test", src_host, src_shard, dst_host, 0, 0)
+        _, matches = await src_log.wait_for(r'stream_logstor_records\[.*\] Finished sending .* stream_bytes=(\d+)', from_mark=mark, timeout=60)
+        stream_bytes = int(matches[0][1].group(1))
+
+        dst_live_bytes = await owned_live_record_bytes(manager, dst)
+        dst_segments = await table_segment_count(manager, dst, ks)
+        logger.info(f"sent {stream_bytes} bytes; destination: live record bytes {dst_live_bytes}, segments {dst_segments}")
+        assert dst_live_bytes == live_bytes
+        assert dst_segments <= max_dst_segments
+        # The chunk headers and the record padding are the only bytes above the live records.
+        assert live_bytes <= stream_bytes <= 1.1 * live_bytes
+        await check_values(cql, ks, nkeys, f"3_{value}")
+
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
+async def test_tablet_migration_retries_a_failed_record_stream(manager: ScyllaClusterManager):
+    """
+    Test that a record stream that fails after the destination wrote a segment leaves no extra live
+    records there when the coordinator retries the migration.
+
+    The destination fails the stream after its first segment. The segments it wrote before the
+    failure stay, and the retried stream writes the same records again. The index of the destination
+    must count each record once, before and after a restart.
+    """
+    cmdline = ['--logger-log-level', 'stream_blob=debug', '--smp=1']
+    cfg = {'experimental_features': ['logstor']}
+    servers = await manager.servers_add(2, cmdline=cmdline, config=cfg, property_file={"dc": "dc1", "rack": "rack1"})
+    cql = manager.get_cql()
+    await manager.disable_tablet_balancing()
+
+    value_size = 30 * 1024
+    nkeys = 20
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets={'initial': 1}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v text) WITH storage_engine = 'logstor'")
+        value = 'x' * value_size
+        await write_with_churn(cql, ks, nkeys, value, versions=2)
+        for s in servers:
+            await manager.api.logstor_flush(s.ip_addr)
+
+        src_host, src_shard = await get_tablet_replica(manager, servers[0], ks, 'test', 0)
+        hosts = [await manager.get_host_id(s.server_id) for s in servers]
+        src, dst = (servers[0], servers[1]) if hosts[0] == src_host else (servers[1], servers[0])
+        dst_host = hosts[servers.index(dst)]
+        live_bytes = await owned_live_record_bytes(manager, src)
+
+        dst_log = await manager.server_open_log(dst.server_id)
+        mark = await dst_log.mark()
+        await manager.api.enable_injection(dst.ip_addr, "logstor_stream_sink_after_flush", one_shot=True)
+        await manager.api.move_tablet(servers[0].ip_addr, ks, "test", src_host, src_shard, dst_host, 0, 0)
+        await dst_log.wait_for("logstor_stream_sink_after_flush injection", from_mark=mark, timeout=60)
+
+        assert await owned_live_record_bytes(manager, dst) == live_bytes
+        await check_values(cql, ks, nkeys, f"1_{value}")
+
+        await manager.server_restart(dst.server_id)
+        await manager.driver_connect()
+        cql = manager.get_cql()
+        await manager.api.logstor_flush(dst.ip_addr)
+        assert await owned_live_record_bytes(manager, dst) == live_bytes
+        await check_values(cql, ks, nkeys, f"1_{value}")
 
 @pytest.mark.asyncio
 async def test_cache(manager: ScyllaClusterManager):

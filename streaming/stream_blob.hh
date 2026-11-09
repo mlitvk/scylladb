@@ -44,7 +44,7 @@ using file_stream_id = utils::tagged_uuid<struct file_stream_id_tag>;
 enum class file_ops : uint16_t {
     stream_sstables,
     load_sstables,
-    stream_logstor_segments,
+    stream_logstor_records,
 };
 
 // For STREAM_BLOB verb

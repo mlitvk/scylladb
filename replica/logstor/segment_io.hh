@@ -212,31 +212,4 @@ private:
     void report_failed_chunks() const;
 };
 
-using streamed_buffer_consumer = std::function<future<>(bytes_view)>;
-
-// Rewrites the initial streamed logstor chunk header to the local segment sequence and
-// forwards subsequent bytes unchanged. This preserves the current branch's streaming
-// behavior, which only rewrites the first streamed chunk header.
-class streamed_segment_rewriter {
-    log_segment_id _target_segment;
-    segment_sequence _target_seq;
-    streamed_buffer_consumer _on_buffer;
-    std::vector<char> _pending_data;
-    std::optional<size_t> _initial_header_size;
-    bool _header_rewritten = false;
-
-    ondisk::chunk_header read_chunk_header() const;
-    void maybe_parse_initial_header();
-    void rewrite_chunk_header();
-    future<> flush_pending_data();
-
-public:
-    streamed_segment_rewriter(log_segment_id target_segment, segment_sequence target_seq, streamed_buffer_consumer on_buffer);
-
-    future<> put(std::span<temporary_buffer<char>> data);
-    future<> close();
-
-    size_t buffer_size() const noexcept;
-};
-
 }
