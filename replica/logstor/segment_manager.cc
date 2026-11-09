@@ -26,6 +26,8 @@
 #include <exception>
 #include <system_error>
 #include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
 #include <seastar/core/file.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/fstream.hh>
@@ -55,6 +57,7 @@
 #include "utils/disk-error-handler.hh"
 #include "utils/error_injection.hh"
 #include "utils/serialized_action.hh"
+#include "utils/small_vector.hh"
 #include "replica/logstor/recovery_catalog.hh"
 
 namespace replica::logstor {
@@ -687,16 +690,22 @@ public:
     void on_add_record(record_location) noexcept;
     void on_free_record(record_location) noexcept;
 
-    // Calls `fn` for each chunk of the segment, in order. The registry takes the entries of the
-    // chunk's schema table before `fn` is called, so that the records of the chunk can be rewritten.
+    using register_mappings = bool_class<class register_mappings_tag>;
+
+    // Calls `fn` for each chunk of the segment, in order. With register_mappings::yes, the registry
+    // takes the entries of the chunk's schema table before `fn` is called, so that the records of
+    // the chunk can be rewritten. A scan that rewrites only records whose versions the registry
+    // already has can use register_mappings::no.
     template <typename Func>
         requires std::same_as<std::invoke_result_t<Func&, const scanned_chunk&>, future<>>
-    future<> for_each_chunk(log_segment_id segment_id, Func fn) {
+    future<> for_each_chunk(log_segment_id segment_id, Func fn, register_mappings reg = register_mappings::yes) {
         const auto buffer_size = std::min<size_t>(_cfg.segment_size, max_scan_buffer_size);
         co_await with_segment_input_stream(segment_id, buffer_size, [&] (seastar::input_stream<char>& in) -> future<> {
             segment_scanner scanner(in, segment_id, _cfg.segment_size);
             while (auto* chunk = co_await scanner.next_chunk()) {
-                register_column_mappings(*chunk, segment_id);
+                if (reg) {
+                    register_column_mappings(*chunk, segment_id);
+                }
                 co_await fn(*chunk);
             }
         });
@@ -719,12 +728,12 @@ public:
     template <std::ranges::input_range Segments, typename Func>
         requires std::same_as<std::ranges::range_value_t<Segments>, log_segment_id>
             && std::same_as<std::invoke_result_t<Func&, const scanned_chunk&>, future<>>
-    future<> for_each_chunk(Segments&& segments, Func fn) {
+    future<> for_each_chunk(Segments&& segments, Func fn, register_mappings reg = register_mappings::yes) {
         std::vector<log_segment_id> sorted_segments(std::ranges::begin(segments), std::ranges::end(segments));
         std::ranges::sort(sorted_segments);
 
         for (auto segment_id : sorted_segments) {
-            co_await for_each_chunk(segment_id, std::ref(fn));
+            co_await for_each_chunk(segment_id, std::ref(fn), reg);
         }
     }
 
@@ -733,12 +742,12 @@ public:
     // and returns a ready future does not allocate.
     template <typename Segments, typename Func>
         requires std::same_as<std::invoke_result_t<Func&, const chunk_record&>, future<>>
-    future<> for_each_record(Segments&& segments, Func fn) {
+    future<> for_each_record(Segments&& segments, Func fn, register_mappings reg = register_mappings::yes) {
         co_await for_each_chunk(std::forward<Segments>(segments), [&fn] (const scanned_chunk& chunk) -> future<> {
             for (const auto& record : chunk.records()) {
                 co_await fn(record);
             }
-        });
+        }, reg);
     }
 
     struct recovery_stats {
@@ -772,20 +781,26 @@ public:
     // if the record does not belong to a table or compaction group of this shard.
     static index_resolver make_index_resolver(recovery_catalog&, recovery_stats& stats);
 
+    // The schema versions that the schema tables of a segment list, each once.
+    using segment_schema_versions = utils::small_vector<table_schema_version, 2>;
+    // The segments that list each schema version.
+    using segments_by_schema_version = std::unordered_map<table_schema_version, utils::chunked_vector<log_segment_id>>;
+
     struct rebuild_index_result {
         // The segment info of the first chunk of each scanned segment, by segment id. A segment
         // with no valid chunk has no segment info.
         utils::chunked_vector<std::optional<segment_info>> segment_infos;
         segment_sequence max_segment_seq{0};
+        segments_by_schema_version schema_version_segments;
     };
 
     // Scans every segment below segment_count into the indexes the resolver names, the way
     // recovery does.
     future<rebuild_index_result> rebuild_index(uint64_t segment_count, const index_resolver&);
 
-    // Scans one segment into the resolver's indexes. `cmp` decides between two records of the same
-    // key.
-    future<> index_segment_records(log_segment_id, const primary_index::entry_cmp_fn& cmp, const index_resolver&);
+    // Scans one segment into the resolver's indexes, and returns the schema versions that the
+    // segment lists. `cmp` decides between two records of the same key.
+    future<segment_schema_versions> index_segment_records(log_segment_id, const primary_index::entry_cmp_fn& cmp, const index_resolver&);
 
     future<> rebuild_index_from_disk(index_resolver resolve) {
         co_await rebuild_index(_file_mgr.allocated_file_count() * _segments_per_file, resolve);
@@ -2223,6 +2238,9 @@ class segment_manager_impl::recovery {
     // The segment info of the first chunk of each found segment, by segment id, which the scan
     // returns. The placement of the used segments reads it, so it does not read the segments again.
     utils::chunked_vector<std::optional<segment_info>> _segment_infos;
+    // The segments that list each schema version, which the scan returns. The trim of the column
+    // mappings reads it.
+    segments_by_schema_version _schema_version_segments;
     // The count of the files from the first one to the last one that holds a used segment.
     file_id_t _used_file_count{0};
 
@@ -2239,6 +2257,7 @@ private:
     future<> open_found_files();
     future<> index_found_segments();
     future<> place_found_segments();
+    future<> trim_column_mappings();
     future<> retire_unused_files();
     void resume_segment_sequence();
 };
@@ -2249,6 +2268,7 @@ future<recovery_summary> segment_manager_impl::recovery::run() {
     co_await open_found_files();
     co_await index_found_segments();
     co_await place_found_segments();
+    co_await trim_column_mappings();
     co_await retire_unused_files();
     resume_segment_sequence();
     co_await _files.finish();
@@ -2285,6 +2305,7 @@ future<> segment_manager_impl::recovery::open_found_files() {
 future<> segment_manager_impl::recovery::index_found_segments() {
     auto rebuilt = co_await _sm.rebuild_index(_summary.found_segments, _sm.make_index_resolver(_catalog, _stats));
     _segment_infos = std::move(rebuilt.segment_infos);
+    _schema_version_segments = std::move(rebuilt.schema_version_segments);
     for (uint64_t seg_idx = 0; seg_idx < _summary.found_segments; ++seg_idx) {
         const auto& info = _segment_infos[seg_idx];
         _sm.get_segment_descriptor(log_segment_id(seg_idx)).seq = info ? info->segment_seq : segment_sequence(0);
@@ -2330,6 +2351,39 @@ future<> segment_manager_impl::recovery::place_found_segments() {
         _sm._recovered.catalog = &_catalog;
     }
     logstor_logger.info("Found {} used segments and {} free segments", _summary.used_segments, _summary.free_segments);
+}
+
+// Erases the column mappings that no live record can use. The scan registered the schema versions
+// of every found segment, also of the free ones, because the data of a free segment stays on disk
+// until the segment is written again. The trim keeps only the versions that a used segment lists,
+// of a table that the catalog has. A used mixed segment can list the versions of a dropped table.
+//
+// No writer holds an erased entry, because the shard makes no writer before start(). The separation
+// in start() reads the used segments again, but does not register their versions, so the erased
+// entries do not come back. It rewrites only the live records of the tables that the catalog has,
+// and the used segment of such a record lists its version, so the trim kept that version.
+future<> segment_manager_impl::recovery::trim_column_mappings() {
+    std::unordered_set<table_schema_version> used_schema_versions;
+    for (const auto& [schema_version, segments] : _schema_version_segments) {
+        for (auto seg_id : segments) {
+            co_await coroutine::maybe_yield();
+            if (_sm.get_segment_descriptor(seg_id).record_count != 0) {
+                used_schema_versions.insert(schema_version);
+                break;
+            }
+        }
+    }
+    auto& registry = _sm._column_mappings;
+    const auto registered_count = registry.size();
+    const auto erased_count = registry.erase_if([&] (const schema_mapping& mapping) {
+        if (used_schema_versions.contains(mapping.schema_version) && _catalog.index(mapping.table)) {
+            return false;
+        }
+        logstor_logger.debug("Recovery: dropping the column mapping of schema version {} of table {}, which no live record can use",
+                mapping.schema_version, mapping.table);
+        return true;
+    });
+    logstor_logger.info("Recovery: kept {} of {} column mappings", registered_count - erased_count, registered_count);
 }
 
 // Removes the files at or above the configured count that come after the last file with a used
@@ -2416,7 +2470,9 @@ future<segment_manager_impl::rebuild_index_result> segment_manager_impl::rebuild
                 logstor_logger.trace("Recovering segment {} with sequence {}", seg_id, info->segment_seq);
                 result.max_segment_seq = std::max(result.max_segment_seq, info->segment_seq);
                 segment_infos[seg_idx] = std::move(info);
-                co_await index_segment_records(seg_id, cmp_with_seq, resolve);
+                for (auto schema_version : co_await index_segment_records(seg_id, cmp_with_seq, resolve)) {
+                    result.schema_version_segments[schema_version].push_back(seg_id);
+                }
             }
             on_segment_scanned();
         }
@@ -2425,16 +2481,26 @@ future<segment_manager_impl::rebuild_index_result> segment_manager_impl::rebuild
     co_return result;
 }
 
-future<> segment_manager_impl::index_segment_records(log_segment_id segment_id, const primary_index::entry_cmp_fn& cmp,
-        const index_resolver& resolve) {
-    co_await for_each_record(segment_id, [&] (const chunk_record& record) {
-        const auto& header = record.header;
-        logstor_logger.trace("Recovery: read record at {} key {} ts {}", record.location, header.key, header.timestamp);
-        if (auto* index = resolve(header)) {
-            index->insert(header.index_key(), index_entry{.location = record.location, .timestamp = header.timestamp}, cmp);
+future<segment_manager_impl::segment_schema_versions> segment_manager_impl::index_segment_records(log_segment_id segment_id,
+        const primary_index::entry_cmp_fn& cmp, const index_resolver& resolve) {
+    segment_schema_versions listed_versions;
+    co_await for_each_chunk(segment_id, [&] (const scanned_chunk& chunk) -> future<> {
+        // The chunks of a segment can list the same version many times.
+        for (const auto& e : chunk.schema_table()) {
+            if (!std::ranges::contains(listed_versions, e.schema_version)) {
+                listed_versions.push_back(e.schema_version);
+            }
         }
-        return make_ready_future<>();
+        for (const auto& record : chunk.records()) {
+            const auto& header = record.header;
+            logstor_logger.trace("Recovery: read record at {} key {} ts {}", record.location, header.key, header.timestamp);
+            if (auto* index = resolve(header)) {
+                index->insert(header.index_key(), index_entry{.location = record.location, .timestamp = header.timestamp}, cmp);
+            }
+            co_await coroutine::maybe_yield();
+        }
     });
+    co_return listed_versions;
 }
 
 void segment_manager::on_add_record(record_location location) noexcept {
@@ -2507,6 +2573,8 @@ future<> segment_manager_impl::separate_segment_records(recovery_catalog& catalo
     auto write_to_separator_failed = defer([seg_ref] mutable noexcept {
         seg_ref.set_flush_failure();
     });
+    // The scan does not register the versions of the segment. The scan that indexed the segment
+    // registered them, and recovery::trim_column_mappings() keeps the version of each live record.
     co_await for_each_record(seg_id, [this, seg_ref, &catalog, &stats] (const chunk_record& record) {
         const auto& header = record.header;
         auto key = header.index_key();
@@ -2533,7 +2601,7 @@ future<> segment_manager_impl::separate_segment_records(recovery_catalog& catalo
                 .prev_location = record.location,
             }
         );
-    });
+    }, register_mappings::no);
     write_to_separator_failed.cancel();
 }
 
