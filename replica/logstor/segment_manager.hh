@@ -118,21 +118,6 @@ struct segment_manager_usage {
     size_t memory_usage{0};
 };
 
-struct segment_snapshot {
-    log_segment_id segment_id;
-    segment_ref seg_ref;
-    noncopyable_function<future<seastar::input_stream<char>>(const file_input_stream_options&)> source;
-};
-
-class segment_stream_sink {
-public:
-    virtual ~segment_stream_sink() = default;
-    virtual log_segment_id segment_id() const noexcept = 0;
-    virtual future<output_stream<char>> output() = 0;
-    virtual future<> close() = 0;
-    virtual future<> abort() = 0;
-};
-
 class segment_manager_impl;
 class log_index;
 
@@ -200,12 +185,6 @@ public:
     segment_manager_usage get_usage() const noexcept;
 
     future<> await_pending_writes();
-
-    future<utils::chunked_vector<segment_snapshot>> make_snapshot(logstor_group& cg);
-
-    // Create an output stream to write a segment (for receiving from remote node)
-    // Allocates a new local segment and returns an output stream for writing to the segment.
-    future<std::unique_ptr<segment_stream_sink>> create_segment_output_stream(recovery_catalog&);
 
     // Returns the ids of the segments that the group owns, in no particular order. Waits for a
     // compaction of the group that runs, and keeps compaction of the group disabled during the walk.

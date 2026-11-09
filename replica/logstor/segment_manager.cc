@@ -511,9 +511,6 @@ public:
         uint64_t separated_segments{0};
     };
 
-    // Indexes the records of a segment received from another node, and places the segment.
-    future<> adopt_streamed_segment(recovery_catalog&, log_segment_id);
-
     using needs_separation = bool_class<class needs_separation_tag>;
 
     // Gives a full segment that holds a record of an index back to its compaction group. `info` is
@@ -610,10 +607,6 @@ public:
         return _writes_phaser.advance_and_await();
     }
 
-    future<utils::chunked_vector<segment_snapshot>> make_snapshot(logstor_group&);
-
-    future<seastar::input_stream<char>> create_segment_input_stream(log_segment_id segment_id, const seastar::file_input_stream_options& opts);
-    future<std::unique_ptr<segment_stream_sink>> create_segment_output_stream(recovery_catalog&);
     future<utils::chunked_vector<log_segment_id>> segment_ids(logstor_group&);
     future<> read_chunks(log_segment_id, noncopyable_function<future<>(const scanned_chunk&)> fn);
     future<std::unique_ptr<record_stream_source>> make_record_stream_source(logstor_group&);
@@ -719,7 +712,6 @@ private:
 
     friend class compaction_manager_impl;
     friend struct compaction_buffer;
-    friend class segment_stream_sink_impl;
 };
 
 future<> compaction_manager_impl::start() {
@@ -1424,7 +1416,8 @@ template <typename Func>
     requires std::invocable<Func&, seastar::input_stream<char>&>
 futurize_t<std::invoke_result_t<Func&, seastar::input_stream<char>&>>
 segment_manager_impl::with_segment_input_stream(log_segment_id segment_id, size_t buffer_size, Func fn) {
-    auto in = co_await create_segment_input_stream(segment_id, seastar::file_input_stream_options {
+    auto [file_id, file_offset] = _geometry.location_of(segment_id);
+    auto in = make_file_input_stream(_file_mgr.get_open_file(file_id), file_offset, _cfg.segment_size, seastar::file_input_stream_options {
         .buffer_size = buffer_size,
         .read_ahead = 0,
     });
@@ -2321,31 +2314,6 @@ future<> segment_manager_impl::separate_segment_records(recovery_catalog& catalo
     write_to_separator_failed.cancel();
 }
 
-future<utils::chunked_vector<segment_snapshot>> segment_manager_impl::make_snapshot(logstor_group& cg) {
-    auto compaction_disable_guard = co_await _compaction_mgr.disable_compaction(cg);
-
-    auto& segments = cg.logstor_segments();
-
-    // iterate the segment list by index - safe to do with yields.
-    // segments may be added to the end of the list, but not removed since compaction is disabled.
-    const auto segment_count = segments.segment_count();
-    utils::chunked_vector<segment_snapshot> snp;
-    snp.reserve(segment_count);
-    for (size_t i = 0; i < segment_count; ++i) {
-        auto seg_id = desc_to_segment_id(segments.segment_at(i));
-        snp.push_back(segment_snapshot{
-            .segment_id = seg_id,
-            .seg_ref = make_segment_ref(seg_id),
-            .source = [this, seg_id] (const file_input_stream_options& opts) {
-                return create_segment_input_stream(seg_id, opts);
-            }
-        });
-        co_await coroutine::maybe_yield();
-    }
-
-    co_return std::move(snp);
-}
-
 future<utils::chunked_vector<log_segment_id>> segment_manager_impl::segment_ids(logstor_group& group) {
     auto compaction_guard = co_await _compaction_mgr.disable_compaction(group);
     co_return co_await collect_segment_ids(group);
@@ -2472,131 +2440,6 @@ segment_manager_usage segment_manager::get_usage() const noexcept {
 
 future<> segment_manager::await_pending_writes() {
     return _impl->await_pending_writes();
-}
-
-// Writes a streamed segment to a local segment. A direct write needs memory that is aligned to the
-// block size and a size that is a multiple of it, and the streamed buffers can have any address and
-// size. Thus the sink copies the streamed bytes to an aligned buffer, and appends the buffer to the
-// segment when the buffer is full and when the stream closes.
-class segment_data_sink_impl : public data_sink_impl {
-    seg_ptr _segment;
-    streamed_segment_rewriter _rewriter;
-    temporary_buffer<char> _buf;
-    size_t _buf_used = 0;
-
-    future<> consume(bytes_view data) {
-        while (!data.empty()) {
-            const auto n = std::min(data.size(), _buf.size() - _buf_used);
-            std::copy_n(data.data(), n, _buf.get_write() + _buf_used);
-            _buf_used += n;
-            data.remove_prefix(n);
-            if (_buf_used == _buf.size()) {
-                co_await append_buffer();
-            }
-        }
-    }
-
-    future<> append_buffer() {
-        if (_buf_used == 0) {
-            co_return;
-        }
-        // The data comes from another node, thus bad data fails the stream, and does not reach the
-        // direct write of the segment.
-        if (_buf_used % ondisk::block_alignment != 0) [[unlikely]] {
-            co_await coroutine::return_exception(std::runtime_error(fmt::format("Streamed data for {} ends with {} bytes, which is not a multiple of the block size {}",
-                    _segment->id(), _buf_used, ondisk::block_alignment)));
-        }
-        co_await _segment->append(bytes_view(reinterpret_cast<const int8_t*>(_buf.get()), _buf_used));
-        _buf_used = 0;
-    }
-
-public:
-    segment_data_sink_impl(seg_ptr segment)
-        : _segment(std::move(segment))
-        , _rewriter(_segment->id(), _segment->seq_num(), [this] (bytes_view data) {
-            return consume(data);
-        })
-        , _buf(temporary_buffer<char>::aligned(ondisk::block_alignment, _rewriter.buffer_size()))
-    {}
-
-    virtual future<> put(std::span<temporary_buffer<char>> data) override {
-        // The caller can release the buffers of `data` when put() returns, which is before the
-        // rewriter is done with them, so put() moves the buffers before the first suspension.
-        std::vector<temporary_buffer<char>> buffers;
-        buffers.reserve(data.size());
-        std::ranges::move(data, std::back_inserter(buffers));
-        co_await _rewriter.put(buffers);
-    }
-
-    virtual future<> close() override {
-        co_await _rewriter.close();
-        co_await append_buffer();
-    }
-
-    virtual size_t buffer_size() const noexcept override {
-        return _rewriter.buffer_size();
-    }
-};
-
-future<seastar::input_stream<char>> segment_manager_impl::create_segment_input_stream(log_segment_id segment_id, const seastar::file_input_stream_options& opts) {
-    auto [file_id, file_offset] = _geometry.location_of(segment_id);
-    auto stream = make_file_input_stream(_file_mgr.get_open_file(file_id), file_offset, _cfg.segment_size, opts);
-    co_return std::move(stream);
-}
-
-class segment_stream_sink_impl : public segment_stream_sink {
-    segment_manager_impl& _sm;
-    recovery_catalog& _catalog;
-    seg_ptr _seg;
-public:
-    segment_stream_sink_impl(segment_manager_impl& sm, recovery_catalog& catalog, seg_ptr seg)
-        : _sm(sm), _catalog(catalog), _seg(std::move(seg))
-    {}
-public:
-    log_segment_id segment_id() const noexcept override {
-        return _seg->id();
-    }
-    future<output_stream<char>> output() override {
-        auto sink = std::make_unique<segment_data_sink_impl>(_seg);
-        auto stream = output_stream<char>(data_sink(std::move(sink)));
-        co_return std::move(stream);
-    }
-    future<> close() override {
-        co_await _seg->stop();
-        co_await _sm.adopt_streamed_segment(_catalog, _seg->id());
-    }
-    future<> abort() override {
-        co_await _seg->stop();
-    }
-};
-
-future<> segment_manager_impl::adopt_streamed_segment(recovery_catalog& catalog, log_segment_id seg_id) {
-    recovery_stats stats;
-    const auto info = co_await read_segment_info(seg_id);
-    if (!info) {
-        // The segment has no valid chunk, so it holds no record.
-        co_return;
-    }
-    co_await index_segment_records(seg_id, primary_index::default_entry_cmp{}, make_index_resolver(catalog, stats));
-    if (place_recovered_segment(catalog, seg_id, *info, stats) == needs_separation::yes) {
-        co_await separate_segment_records(catalog, seg_id, stats);
-    }
-    if (stats.dropped_records) {
-        logstor_logger.warn("Dropped {} records of streamed segment {} that belong to no compaction group of this shard", stats.dropped_records, seg_id);
-    }
-}
-
-future<std::unique_ptr<segment_stream_sink>> segment_manager_impl::create_segment_output_stream(recovery_catalog& catalog) {
-    auto seg = co_await get_segment(write_source::streaming);
-    co_return std::make_unique<segment_stream_sink_impl>(*this, catalog, std::move(seg));
-}
-
-future<utils::chunked_vector<segment_snapshot>> segment_manager::make_snapshot(logstor_group& cg) {
-    return _impl->make_snapshot(cg);
-}
-
-future<std::unique_ptr<segment_stream_sink>> segment_manager::create_segment_output_stream(recovery_catalog& catalog) {
-    return _impl->create_segment_output_stream(catalog);
 }
 
 future<utils::chunked_vector<log_segment_id>> segment_manager::segment_ids(logstor_group& group) {

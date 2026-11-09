@@ -5517,8 +5517,8 @@ future<> storage_service::clone_tablets_in_intranode_migration() {
             if (!leaving) {
                 on_internal_error(slogger, format("Tablet {} in intra-node migration has no leaving replica", locator::global_tablet_id{table, tid}));
             }
-            // A logstor table migrates by file streaming, into files the pending shard owns
-            // and recovers by itself on startup.
+            // A logstor table migrates by streaming its records into segments that the pending
+            // shard owns, and the pending shard recovers them by itself on startup.
             if (_db.local().find_column_family(table).uses_logstor()) {
                 continue;
             }
