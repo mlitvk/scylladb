@@ -1440,6 +1440,57 @@ async def test_truncate_pauses_writes(manager: ScyllaClusterManager):
         await assert_no_dropped_records(server_log, log_mark)
 
 @pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
+async def test_truncate_while_migration_holds_its_source_snapshot(manager: ScyllaClusterManager):
+    """
+    A migration takes a snapshot of the segments of the source tablet first, and the destination
+    takes the segment that it streams into, and so the sequence of that segment, only when the
+    first bytes arrive. A truncate that completes between the two leaves the source snapshot
+    pointing at records from before the truncate, and the destination segment above the sequence
+    of the truncate, so the next recovery would not filter the adopted records either. The
+    topology coordinator takes the truncate request only after the running migration completes,
+    which closes the window. The test holds the migration after the source snapshot, checks that a
+    truncate issued meanwhile waits, releases the stream, and expects the table empty.
+    """
+    cmdline = ['--logger-log-level', 'logstor=trace', '--logger-log-level', 'stream_blob=trace', '--smp=2']
+    cfg = {'experimental_features': ['logstor']}
+    s1 = await manager.server_add(cmdline=cmdline, config=cfg, property_file={"dc": "dc1", "rack": "rack1"})
+    servers = [s1]
+    cql, _ = await manager.get_ready_cql(servers)
+    inj = 'wait_before_tablet_stream_files_after_snapshot'
+
+    await manager.disable_tablet_balancing()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets={'initial': 1}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v text) WITH storage_engine = 'logstor'")
+
+        value = 'x' * (30 * 1024)
+        for i in range(20):
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, v) VALUES ({i}, '{value}')")
+        # The flush moves the records into the tablet's own segments, which the migration takes a
+        # snapshot of.
+        await manager.api.logstor_flush(s1.ip_addr)
+
+        tablet_token = 0
+        h1, src_shard = await get_tablet_replica(manager, s1, ks, 'test', tablet_token)
+        dst_shard = 1 - src_shard
+
+        await manager.api.enable_injection(s1.ip_addr, inj, one_shot=True)
+        migration = asyncio.ensure_future(
+            manager.api.move_tablet(s1.ip_addr, ks, "test", h1, src_shard, h1, dst_shard, tablet_token))
+        await manager.api.wait_for_injection_enter(s1.ip_addr, inj)
+
+        truncate = asyncio.ensure_future(cql.run_async(f"TRUNCATE TABLE {ks}.test"))
+        await asyncio.sleep(3)
+        assert not truncate.done(), "the truncate did not wait for the migration that holds its source snapshot"
+
+        await manager.api.message_injection(s1.ip_addr, inj)
+        await migration
+        await truncate
+
+        rows = await cql.run_async(f"SELECT pk FROM {ks}.test")
+        assert len(rows) == 0, f"{len(rows)} rows came back after the truncate through the migration"
+
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
 async def test_tablet_migration_with_compaction(manager: ScyllaClusterManager):
     """
     Test that tablet migration is correct when compaction runs concurrently on the source.
