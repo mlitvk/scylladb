@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 
+#include <seastar/core/on_internal_error.hh>
 #include <seastar/core/simple-stream.hh>
 #include <seastar/core/when_all.hh>
 #include <seastar/coroutine/as_future.hh>
@@ -20,6 +21,64 @@
 #include "serializer.hh"
 
 namespace replica::logstor {
+
+record_stream_source::record_stream_source(table_id table, const primary_index& index, compaction_reenabler compaction_guard,
+        utils::chunked_vector<log_segment_id> segments, size_t segment_size, chunk_reader read_chunks)
+    : _table(table)
+    , _index(index)
+    , _compaction_guard(std::move(compaction_guard))
+    , _segments(std::move(segments))
+    , _read_chunks(std::move(read_chunks))
+    , _buffer(segment_size, segment_kind::full)
+{}
+
+future<temporary_buffer<char>> record_stream_source::get() {
+    // An empty buffer ends the stream, so a segment without live records gives no buffer.
+    while (_next_segment < _segments.size()) {
+        co_await collect_live_records(_segments[_next_segment++]);
+        if (_buffer.has_data()) {
+            co_return take_chunk();
+        }
+    }
+    co_return temporary_buffer<char>();
+}
+
+future<> record_stream_source::collect_live_records(log_segment_id segment_id) {
+    bool found_chunk = false;
+    co_await _read_chunks(segment_id, [this, segment_id, &found_chunk] (const scanned_chunk& chunk) {
+        found_chunk = true;
+        const auto& info = chunk.info();
+        if (!chunk.body_valid() || info.kind != segment_kind::full || std::get<segment_info::full>(info.v).table != _table) {
+            throw record_stream_error(fmt::format("Record stream of table {} cannot send {}: it is not a valid full segment of the table",
+                    _table, segment_id));
+        }
+        for (const auto& record : chunk.records()) {
+            if (!_index.is_record_alive(record.header.index_key(), record.location)) {
+                continue;
+            }
+            // The records of a segment fit a chunk of the segment size.
+            auto writer = log_record_bytes_writer(record.header, record.bytes);
+            if (!_buffer.can_fit(writer)) {
+                on_internal_error(logstor_logger, fmt::format("The live records of {} do not fit a chunk of {} bytes",
+                        segment_id, _buffer.buffer_size()));
+            }
+            _buffer.append(writer);
+        }
+        return make_ready_future<>();
+    });
+    if (!found_chunk) {
+        throw record_stream_error(fmt::format("Record stream of table {} cannot send {}: it has no valid chunk", _table, segment_id));
+    }
+}
+
+temporary_buffer<char> record_stream_source::take_chunk() {
+    // The receiver does not read the segment sequence.
+    _buffer.seal(segment_sequence{0}, _table, ondisk::record_alignment);
+    const auto chunk = _buffer.chunk();
+    temporary_buffer<char> buf(reinterpret_cast<const char*>(chunk.data()), chunk.size());
+    _buffer.reset();
+    return buf;
+}
 
 void stream_chunk_assembler::push(temporary_buffer<char> buf) {
     if (buf.empty()) {
