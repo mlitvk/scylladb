@@ -1328,12 +1328,6 @@ future<> compaction_group::flush_separator() {
     return _logstor_state->flush_separator();
 }
 
-future<utils::chunked_vector<logstor::segment_snapshot>> compaction_group::take_logstor_snapshot() {
-    auto& logstor_cg = as_logstor_group();
-    auto snp = co_await get_logstor_segment_manager().make_snapshot(logstor_cg);
-    co_return std::move(snp);
-}
-
 future<> storage_group::split(compaction::compaction_type_options::split opt, tasks::task_info tablet_split_task_info) {
     if (set_split_mode()) {
         co_return;
@@ -1370,26 +1364,6 @@ lw_shared_ptr<const sstables::sstable_set> storage_group::make_sstable_set() con
         underlying.emplace_back(cg->make_sstable_set());
     }
     return make_lw_shared(sstables::make_compound_sstable_set(schema, std::move(underlying)));
-}
-
-future<utils::chunked_vector<logstor::segment_snapshot>> storage_group::take_logstor_snapshot() const {
-    if (_split_ready_groups.empty() && _merging_groups.empty()) {
-        co_return co_await _main_cg->take_logstor_snapshot();
-    }
-    utils::chunked_vector<logstor::segment_snapshot> snp;
-    auto append = [&snp] (utils::chunked_vector<logstor::segment_snapshot> cg_snp) {
-        snp.insert(snp.end(), std::make_move_iterator(cg_snp.begin()), std::make_move_iterator(cg_snp.end()));
-    };
-    append(co_await _main_cg->take_logstor_snapshot());
-    for (const auto& cg : _merging_groups) {
-        if (!cg->empty()) {
-            append(co_await cg->take_logstor_snapshot());
-        }
-    }
-    for (const auto& cg : _split_ready_groups) {
-        append(co_await cg->take_logstor_snapshot());
-    }
-    co_return std::move(snp);
 }
 
 lw_shared_ptr<const sstables::sstable_set> storage_group::make_repaired_sstable_set() const {
@@ -1831,23 +1805,47 @@ future<utils::chunked_vector<sstables::shared_sstable>> table::take_sstable_set_
     co_return result;
 }
 
-future<utils::chunked_vector<logstor::segment_snapshot>> table::take_logstor_snapshot(dht::token_range tr) {
+future<std::vector<std::unique_ptr<logstor::record_stream_source>>> table::make_logstor_record_sources(dht::token_range tr) {
     co_await _logstor->flush_to_separator();
 
-    utils::chunked_vector<logstor::segment_snapshot> snp;
+    std::vector<std::unique_ptr<logstor::record_stream_source>> sources;
     for (auto& sg : storage_groups_for_token_range(tr)) {
         co_await sg->flush_separator();
-
-        auto deletion_guard = co_await get_sstable_list_permit();
-
-        auto sg_snp = co_await sg->take_logstor_snapshot();
-        snp.insert(snp.end(), std::make_move_iterator(sg_snp.begin()), std::make_move_iterator(sg_snp.end()));
+        // The tablet map does not change while the tablet streams, but a split decision can add
+        // split-ready groups to the storage group while the sources are made.
+        // No record is lost, because the main group comes first, and its source waits for a split
+        // compaction that runs and keeps a later one from starting, so each segment is in the list
+        // of one source.
+        // A group that is added after the loop starts gets only new writes, which the write-both
+        // stage also sends to the new replica.
+        //
+        // After a tablet merge, the storage group also has merging groups until the merge fiber
+        // moves their segments to the main group.
+        // A stream finds merging groups only when a merge fiber failed and left them, because the
+        // fiber keeps the token metadata from before the merge until it ends, and a migration waits
+        // at a barrier until that token metadata is released.
+        // The permit keeps a move of a later merge fiber from running while the sources list the
+        // segments, so each segment is in the list of one source.
+        // The barrier does not cover a source that outlives its migration, so the source of a
+        // merging group keeps compaction of the main group disabled, and a move after the loop does
+        // not let compaction move the records before the source reads them.
+        auto permit = co_await get_sstable_list_permit();
+        auto main_group = sg->main_compaction_group();
+        for (auto& cg : sg->compaction_groups_immediate()) {
+            auto& merge_target = std::ranges::contains(sg->merging_groups(), cg) ? *main_group : *cg;
+            if (auto source = co_await get_logstor_segment_manager().make_record_stream_source(cg->as_logstor_group(),
+                    merge_target.as_logstor_group())) {
+                sources.push_back(std::move(source));
+            }
+        }
     }
-    co_return std::move(snp);
+    co_return sources;
 }
 
-future<std::unique_ptr<logstor::segment_stream_sink>> table::create_logstor_segment_sink() {
-    return get_logstor_segment_manager().create_segment_output_stream();
+future<std::unique_ptr<logstor::record_stream_sink>> table::make_logstor_record_sink() {
+    // The sink keeps the stream in progress for the table until the sink is closed or aborted, so
+    // the stop of the table and await_pending_ops() wait for the sink.
+    return get_logstor_segment_manager().make_record_stream_sink(schema()->id(), stream_in_progress());
 }
 
 future<utils::chunked_vector<sstables::entry_descriptor>>

@@ -21,6 +21,7 @@
 #include "replica/logstor/index.hh"
 #include "replica/logstor/table_catalog.hh"
 #include "serializer.hh"
+#include "utils/error_injection.hh"
 
 namespace replica::logstor {
 
@@ -339,6 +340,9 @@ future<> record_stream_sink::write_buffered_records() {
 future<> record_stream_sink::flush(group_buffer& gb) {
     if (gb.buffer->has_data()) {
         co_await _write_segment(*gb.buffer, *gb.target.cg);
+        utils::get_local_injector().inject("logstor_stream_sink_after_flush", [] {
+            throw std::runtime_error("logstor_stream_sink_after_flush injection");
+        });
     }
     auto updates = std::exchange(gb.index_updates, {});
     co_await when_all_succeed(updates.begin(), updates.end());
