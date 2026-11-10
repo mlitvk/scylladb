@@ -36,6 +36,7 @@
 #include <seastar/core/scheduling.hh>
 #include <seastar/core/when_all.hh>
 #include <seastar/core/on_internal_error.hh>
+#include <seastar/core/shard_id.hh>
 #include <seastar/coroutine/parallel_for_each.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/coroutine/exception.hh>
@@ -977,6 +978,7 @@ static const segment_manager_config& validated_geometry(const segment_manager_co
 static file_manager_config make_file_manager_config(const segment_manager_config& config) {
     return file_manager_config{
         .base_dir = config.base_dir,
+        .shard = this_shard_id(),
         .file_size = config.file_size,
         .file_count = config.disk_size / config.file_size,
         // The format of a file is background work of the store, not of a write.
