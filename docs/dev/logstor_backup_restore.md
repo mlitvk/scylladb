@@ -2,6 +2,10 @@
 
 ## Status
 
+> **Note, Nov 10 2026.** The branch names and the terms of the erase changed after this
+> document was written. The body keeps the old names, and the
+> [addendum](#addendum-branches-and-terms-since-this-document-was-written) at the end maps them to the current ones.
+
 Design document. The overall approach — reuse the tablet-aware cluster
 backup/restore pipeline, treat a logstor **full segment** as the unit of
 backup, and splice logstor's existing snapshot/stream primitives into the
@@ -2475,3 +2479,42 @@ can land in parallel with any of them.
   GC frontier on its shard while held; the cursor and A2 bound it, and the GC
   design's purge journal removes the dependence. Recorded as an input to the
   GC design's Stage B decision.
+
+## Addendum: branches and terms since this document was written
+
+This document was written against `logstor_recovery1`, which is no longer developed. On
+Nov 10 2026, its work is in two branches:
+
+- `logstor_recovery_rebuild` (PR 32520) holds the changes to recovery.
+- `logstor_erase_range` holds the durable erase, and it stacks on `logstor_recovery_rebuild`.
+
+The erase changed in these ways since `logstor_recovery1`:
+
+- The erase has one entry point, `logstor::erase()`, and the erase finds the groups of the
+  table in the range itself, so the caller does not give a list of groups.
+- The write fence is on the primary index of the table, for the token range of the erase
+  (`primary_index::fence_writes()`), and not on a group.
+- The erase does not zero the first block of the segments that it frees. A freed segment keeps
+  its chunks on disk, and the erased range covers their records.
+- The erase leaves a segment that a migration streams out to its last reference.
+- The erase switches the active segment above its sequence also when a step of the erase fails.
+- `erased_ranges::with()` drops the erased ranges that later erases cover, so the size of the
+  set does not grow with the number of erases.
+- The data files are now `ls-{shard}-Data-{file_id}.db`, and the erased range file is
+  `ls-{shard}-Erase.db`. These names replace `ls_{shard}-{file_id}-Data.db` and
+  `ls_{shard}-Erase.db`.
+
+The terms of the erase changed as follows:
+
+| Old term | Current term |
+|----------|--------------|
+| erase watermark, the entry {table, token range, S} that an erase saves | erased range (`erased_range`) |
+| erase watermarks, the erase watermark file | the erased ranges (`erased_ranges`), the erased range file |
+| `replica/logstor/erase_watermarks.{hh,cc}` | `replica/logstor/erased_ranges.{hh,cc}` |
+| "the watermark", when it means the level S of an erase | the sequence of the erase |
+| `erase_watermarks::erased()` | `erased_ranges::covers()` |
+| `erase_watermarks::gc()`, a spent watermark | `erased_ranges::drop_obsolete()`, an obsolete erased range |
+| rule P2, "erase implies a watermark" | rule P2, "erase implies an erased range" |
+| metric `erase_watermarks` | metric `erased_ranges` |
+
+The other uses of "watermark" in this document keep their names, because they are not the erase: the per-shard seq-watermark store, the backup and repair seq-watermarks, the `segment_seq` watermarks of the incremental read skip and of the snapshot-scoped GC grace, and the low watermark of automatic compaction. The seq-watermark store is still a generalization of the erased range file.
