@@ -82,6 +82,50 @@ Only step 4 writes to the disk - all other steps only update in-memory metadata.
 5. A job that runs next to another job starts only if its batch reclaims at least 75% of what the best batch of the shard reclaims per byte copied.
 6. Automatic compaction skips the compaction groups of a table whose automatic compaction is off, for example after `nodetool disableautocompaction`. A compaction that is asked for through the logstor compaction API still runs.
 
+**Erase:**
+
+Tablet cleanup and truncate remove records from the index, and no newer record on disk shadows
+them. So the erase saves an erased range in the erased range file of the shard (see
+[Erased Ranges](#erased-ranges)) before it erases the index entries. The erased range holds the
+table, the token range of the erase and `S`, the last segment sequence that the shard issued. The
+erase does this work:
+- It drains the write path and the separator buffers of the groups and disables their compaction
+  before it chooses `S`, so every record of the range is in a segment at a sequence of at most `S`.
+- It finds the groups of the table in the range only after it holds the erase semaphore of the
+  index. A group leaves the registry of the compaction manager only between erases of its index, so
+  no group of the list goes away during the erase.
+- It updates and saves the erased ranges one erase at a time, because the erases of every table
+  share the erased range file of the shard.
+- It erases the index range, frees the segments of the groups that have no live record, and
+  raises the floor of the active segment to `S`, so that the next write to the range lands at a
+  sequence above `S`. The erase does not wait for a new active segment, and the next write takes
+  it.
+
+The erase does not hold the writes to the range, so its caller must allow no write to the range
+until the erase ends. The caller must also make sure that no group of the table that overlaps the
+range joins during the erase, for example a child of a tablet split or the group of a tablet that
+migrates in, because the erase does not disable the compaction of such a group. The callers are in
+these cases:
+- A tablet cleanup stops the group first, so no write reaches the range.
+- A drop removes the table and waits for its writes before the erase.
+- A truncate does not stop the writes to the table, which is a known limit. A write that runs
+  during the truncate can get a wrong result at the next restart:
+  - When the truncate kept the write, reads return it until the restart, and the restart loses it,
+    because the write is in the active segment at a sequence of at most `S`.
+  - When the truncate erased the write, the restart brings it back, because the separator writes
+    the copy of the write in its buffer to a segment above `S`.
+
+A tablet split adds no group to a stopped storage group, and adds none while the compaction of the
+group that it splits is disabled. A tablet cleanup stops the storage group first, and a truncate or
+a drop disables the compaction of every group of the table first, so no split adds a group during
+their erase. No tablet migrates in during their erase either:
+- The topology coordinator runs a truncate only when no tablet transition runs.
+- A cleanup is a stage of the transition of its tablet.
+- A drop removes the table from the database before its erase, and a change of the tablet map
+  reaches only the tables of the database.
+
+The comment at `segment_manager::erase()` gives the steps in order, and the reason for each step.
+
 ## Usage
 
 ### Enabling Logstor
