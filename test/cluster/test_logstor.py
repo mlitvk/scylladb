@@ -774,6 +774,52 @@ async def test_table_disk_space_metrics(manager: ScyllaClusterManager):
             f"got {load_after_truncate}"
         )
 
+async def test_table_partition_estimates(manager: ScyllaClusterManager):
+    """
+    Verify that the column_family API, which nodetool cfstats reads, reports the partition count and
+    the mean partition size of a logstor table from its index, although the table has no sstables.
+    """
+    key_count = 100
+    value_size = 1000
+
+    cmdline = ['--logger-log-level', 'logstor=debug', '--smp=2']
+    cfg = {'experimental_features': ['logstor']}
+    servers = await manager.servers_add(1, cmdline=cmdline, config=cfg)
+    server = servers[0]
+    cql = manager.get_cql()
+
+    async def get_estimates(ks: str) -> tuple[int, int]:
+        """Returns the partition count and the mean partition size of ks.test, summed over the shards"""
+        count = await manager.api.client.get_json(f"/column_family/metrics/estimated_row_count/{ks}:test", host=server.ip_addr)
+        mean_size = await manager.api.client.get_json(f"/column_family/metrics/mean_row_size/{ks}:test", host=server.ip_addr)
+        return int(count), int(mean_size)
+
+    async with new_test_keyspace(manager, "WITH tablets={'initial':4}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v text) WITH storage_engine = 'logstor'")
+        assert await get_estimates(ks) == (0, 0)
+
+        insert = cql.prepare(f"INSERT INTO {ks}.test (pk, v) VALUES (?, ?)")
+        value = 'x' * value_size
+        await asyncio.gather(*[cql.run_async(insert, [pk, value]) for pk in range(key_count)])
+
+        count, mean_size = await get_estimates(ks)
+        logger.info(f"after writes: count={count} mean_size={mean_size}")
+        assert count == key_count
+        # the mean size is the frame size of a record, which adds the record header to the value
+        assert value_size < mean_size < 2 * value_size
+
+        # an overwrite replaces the record of a key, and a delete writes a tombstone record that the
+        # index keeps for the key, so neither changes the count
+        await asyncio.gather(*[cql.run_async(insert, [pk, value]) for pk in range(key_count // 2)])
+        await asyncio.gather(*[cql.run_async(f"DELETE FROM {ks}.test WHERE pk = {pk}") for pk in range(key_count // 2, key_count)])
+        count, mean_size_after_deletes = await get_estimates(ks)
+        logger.info(f"after overwrites and deletes: count={count} mean_size={mean_size_after_deletes}")
+        assert count == key_count
+        assert mean_size_after_deletes < mean_size
+
+        await cql.run_async(f"TRUNCATE {ks}.test")
+        assert await get_estimates(ks) == (0, 0)
+
 async def test_compaction(manager: ScyllaClusterManager):
     """
     Test log compaction by creating dead data and verifying space reclamation.
