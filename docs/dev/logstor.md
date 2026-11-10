@@ -139,6 +139,16 @@ SELECT * FROM keyspace.table_name;
 DELETE FROM keyspace.table_name WHERE pk = 1;
 ```
 
+### Snapshots
+
+A snapshot copies the sstables of a table, so it cannot hold the data of a logstor table, and
+logstor tables do not support snapshots or backup:
+
+- A request that names a logstor table fails.
+- A snapshot or backup of a whole keyspace skips its logstor tables and logs a warning.
+- DROP and TRUNCATE of a logstor table skip the auto-snapshot and log a warning.
+- The snapshot that scrub takes first skips logstor tables.
+
 ### Inspecting a Table
 
 `SELECT ... FROM MUTATION_FRAGMENTS()` dumps the raw mutations of a logstor table as the

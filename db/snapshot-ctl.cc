@@ -189,6 +189,7 @@ future<> snapshot_ctl::do_take_cluster_column_family_snapshot(std::vector<sstrin
     };
 
     auto ks = ks_names[0];
+    check_snapshot_supported(ks, tables);
     co_await check_snapshot_not_exist(ks, tag, tables);
 
     co_await _sp.local().snapshot_keyspace(
@@ -219,10 +220,20 @@ sstring snapshot_ctl::resolve_table_name(const sstring& ks_name, const sstring& 
     }
 }
 
+void snapshot_ctl::check_snapshot_supported(const sstring& ks_name, const std::vector<sstring>& tables) const {
+    auto& db = _db.local();
+    for (const auto& table : tables) {
+        if (db.has_schema(ks_name, table)) {
+            replica::database::check_snapshot_supported(*db.find_schema(ks_name, table));
+        }
+    }
+}
+
 future<> snapshot_ctl::do_take_column_family_snapshot(sstring ks_name, std::vector<sstring> tables, sstring tag, snapshot_options opts) {
     for (auto& t : tables) {
         t = resolve_table_name(ks_name, t);
     }
+    check_snapshot_supported(ks_name, tables);
     co_await check_snapshot_not_exist(ks_name, tag, tables);
     snap_log.debug("take_snapshot: tag={} keyspace={} tables={}: skip_flush={} created_at={} expires_at={}",
             tag, ks_name, fmt::join(tables, ","),
@@ -374,12 +385,17 @@ future<tasks::task_id> snapshot_ctl::start_global_backup(std::unordered_map<sstr
     if (tables.empty()) {
         for (auto& ks_name : ks_names) {
             auto& ks = _db.local().find_keyspace(ks_name);
-            for (auto& cf_name : ks.metadata()->cf_meta_data() | std::views::keys) {
+            for (auto& [cf_name, schema] : ks.metadata()->cf_meta_data()) {
+                if (!replica::database::snapshot_supported(*schema)) {
+                    snap_log.warn("Not backing up {}.{} in snapshot {}: snapshots of logstor tables are not supported", ks_name, cf_name, tag);
+                    continue;
+                }
                 ks_tables.emplace(ks_name, cf_name);
             }
         }
     } else {
         auto ks_name = ks_names[0];
+        check_snapshot_supported(ks_name, tables);
         for (auto& cf_name : tables) {
             ks_tables.emplace(ks_name, cf_name);
         }

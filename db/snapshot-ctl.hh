@@ -182,6 +182,10 @@ private:
     // matches a column family.
     sstring resolve_table_name(const sstring& ks_name, const sstring& name) const;
 
+    // Throws if a snapshot of one of the named tables cannot hold its data. A name that is not a
+    // table is left to the checks that follow.
+    void check_snapshot_supported(const sstring& ks_name, const std::vector<sstring>& tables) const;
+
     template <typename Func>
     std::invoke_result_t<Func> run_snapshot_list_operation(Func&& f) {
         return with_gate(_ops, [f = std::move(f), this] () {

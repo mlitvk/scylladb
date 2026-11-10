@@ -147,6 +147,26 @@ static scrub_info parse_scrub_options(const http_context& ctx, std::unique_ptr<h
     return info;
 }
 
+// Takes the snapshot that a scrub takes before it starts. The snapshot leaves out the logstor
+// tables, because it cannot hold their data, and the scrub does not change them.
+static future<> take_pre_scrub_snapshot(sharded<replica::database>& db, sharded<db::snapshot_ctl>& snap_ctl, const scrub_info& info) {
+    if (info.snapshot_tag.empty()) {
+        co_return;
+    }
+    std::vector<sstring> tables;
+    for (const auto& table : info.column_families) {
+        if (replica::database::snapshot_supported(*db.local().find_schema(info.keyspace, table))) {
+            tables.push_back(table);
+        } else {
+            apilog.warn("Not snapshotting {}.{} before the scrub: snapshots of logstor tables are not supported", info.keyspace, table);
+        }
+    }
+    if (!tables.empty()) {
+        db::snapshot_options opts = {.skip_flush = false};
+        co_await snap_ctl.local().take_column_family_snapshot(info.keyspace, std::move(tables), info.snapshot_tag, opts);
+    }
+}
+
 void set_tasks_compaction_module(http_context& ctx, routes& r, sharded<replica::database>& db, sharded<db::snapshot_ctl>& snap_ctl) {
     t::force_keyspace_compaction_async.set(r, [&ctx, &db](std::unique_ptr<http::request> req) -> future<json::json_return_type> {
         auto task = co_await force_keyspace_compaction(ctx, db, std::move(req));
@@ -190,10 +210,7 @@ void set_tasks_compaction_module(http_context& ctx, routes& r, sharded<replica::
     t::scrub_async.set(r, [&ctx, &db, &snap_ctl] (std::unique_ptr<http::request> req) -> future<json::json_return_type> {
         auto info = parse_scrub_options(ctx, std::move(req));
 
-        if (!info.snapshot_tag.empty()) {
-            db::snapshot_options opts = {.skip_flush = false};
-            co_await snap_ctl.local().take_column_family_snapshot(info.keyspace, info.column_families, info.snapshot_tag, opts);
-        }
+        co_await take_pre_scrub_snapshot(db, snap_ctl, info);
 
         auto& compaction_module = db.local().get_compaction_manager().get_task_manager_module();
         auto task = co_await compaction_module.start_scrub_sstables_keyspace_compaction(db, std::move(info.keyspace), std::move(info.column_families), info.opts, nullptr);
@@ -204,10 +221,7 @@ void set_tasks_compaction_module(http_context& ctx, routes& r, sharded<replica::
     ss::scrub.set(r, [&ctx, &db, &snap_ctl] (std::unique_ptr<http::request> req) -> future<json::json_return_type> {
         auto info = parse_scrub_options(ctx, std::move(req));
 
-        if (!info.snapshot_tag.empty()) {
-            db::snapshot_options opts = {.skip_flush = false};
-            co_await snap_ctl.local().take_column_family_snapshot(info.keyspace, info.column_families, info.snapshot_tag, opts);
-        }
+        co_await take_pre_scrub_snapshot(db, snap_ctl, info);
 
         compaction::compaction_stats stats;
         auto& compaction_module = db.local().get_compaction_manager().get_task_manager_module();

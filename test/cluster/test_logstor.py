@@ -9,6 +9,7 @@ import random
 import time
 from pathlib import Path
 from test.pylib.scylla_cluster_manager import ScyllaClusterManager
+from test.pylib.rest_client import HTTPError
 from test.cluster.util import new_test_keyspace
 from cassandra import WriteFailure, WriteTimeout
 from cassandra.protocol import ConfigurationException, ServerError
@@ -819,6 +820,59 @@ async def test_table_partition_estimates(manager: ScyllaClusterManager):
 
         await cql.run_async(f"TRUNCATE {ks}.test")
         assert await get_estimates(ks) == (0, 0)
+
+async def test_snapshot_skips_logstor_tables(manager: ScyllaClusterManager):
+    """
+    Verify that a snapshot never looks complete without the data of a logstor table: a snapshot copies
+    sstables, so a request that names a logstor table fails, and a keyspace-wide snapshot, the
+    snapshot before a scrub and the auto-snapshot of TRUNCATE and DROP skip the table with a warning.
+    The cluster snapshot needs three nodes, because it writes its entries at QUORUM.
+    """
+    cmdline = ['--logger-log-level', 'logstor=debug']
+    cfg = {'experimental_features': ['logstor'], 'auto_snapshot': True}
+    servers = await manager.servers_add(3, cmdline=cmdline, config=cfg, auto_rack_dc="dc1")
+    server = servers[0]
+    cql = manager.get_cql()
+    workdir = Path(await manager.server_get_workdir(server.server_id))
+    server_log = await manager.server_open_log(server.server_id)
+
+    def snapshot_tags(ks: str, table: str) -> set[str]:
+        return {p.name for p in (workdir / "data" / ks).glob(f"{table}-*/snapshots/*")}
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.ls (pk int PRIMARY KEY, v int) WITH storage_engine = 'logstor'")
+        await cql.run_async(f"CREATE TABLE {ks}.sst (pk int PRIMARY KEY, v int)")
+        await asyncio.gather(*[cql.run_async(f"INSERT INTO {ks}.{table} (pk, v) VALUES ({pk}, {pk})")
+                               for table in ("ls", "sst") for pk in range(10)])
+
+        # a request that names the logstor table fails before it snapshots any table
+        for take_snapshot in (manager.api.take_snapshot, manager.api.take_cluster_snapshot):
+            with pytest.raises(HTTPError, match="snapshots of logstor tables are not supported"):
+                await take_snapshot(server.ip_addr, ks, "named", tables=["sst", "ls"])
+        assert snapshot_tags(ks, "sst") == set()
+
+        await manager.api.take_snapshot(server.ip_addr, ks, "node")
+        await manager.api.take_cluster_snapshot(server.ip_addr, ks, "cluster")
+        assert snapshot_tags(ks, "sst") == {"node", "cluster"}
+        assert snapshot_tags(ks, "ls") == set()
+
+        await manager.api.keyspace_scrub_sstables(server.ip_addr, ks, "VALIDATE", "ls")
+        assert snapshot_tags(ks, "ls") == set()
+
+        # a keyspace that has only logstor tables has nothing to snapshot, and the requests succeed
+        async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3}") as ls_only_ks:
+            await cql.run_async(f"CREATE TABLE {ls_only_ks}.ls (pk int PRIMARY KEY, v int) WITH storage_engine = 'logstor'")
+            await manager.api.take_snapshot(server.ip_addr, ls_only_ks, "node")
+            await manager.api.take_cluster_snapshot(server.ip_addr, ls_only_ks, "cluster")
+            assert snapshot_tags(ls_only_ks, "ls") == set()
+
+        log_mark = await server_log.mark()
+        await cql.run_async(f"TRUNCATE {ks}.ls")
+        await cql.run_async(f"DROP TABLE {ks}.ls")
+        assert snapshot_tags(ks, "ls") == set()
+        skipped = await server_log.grep("Not snapshotting dropped/truncated table .* snapshots of logstor tables are not supported",
+                                        from_mark=log_mark)
+        assert len(skipped) == 2
 
 async def test_compaction(manager: ScyllaClusterManager):
     """

@@ -2289,6 +2289,12 @@ public:
 
     using snapshot_callback = std::function<future<>(const db::snapshot_entries&)>;
 
+    // Returns true if a snapshot of the table holds its data. A snapshot copies the sstables of a
+    // table, so it cannot hold the data of a table that uses logstor.
+    static bool snapshot_supported(const schema& s) noexcept;
+    // Throws std::runtime_error if snapshot_supported() is false for the table.
+    static void check_snapshot_supported(const schema& s);
+
     static future<> snapshot_table_on_all_shards(sharded<database>& sharded_db, table_id id, sstring tag, db::snapshot_options opts, snapshot_callback = {});
     static future<> snapshot_tables_on_all_shards(sharded<database>& sharded_db, std::string_view ks_name, std::vector<sstring> table_names, sstring tag, db::snapshot_options opts, snapshot_callback = {});
     static future<> snapshot_keyspace_on_all_shards(sharded<database>& sharded_db, std::string_view ks_name, sstring tag, db::snapshot_options opts, snapshot_callback = {});

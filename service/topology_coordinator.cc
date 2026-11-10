@@ -4256,16 +4256,26 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
                 if (topology_requests_entry.snapshot_expiry) {
                     expiry = gc_clock::from_time_t(db_clock::to_time_t(*topology_requests_entry.snapshot_expiry));
                 }
+                std::unordered_set<table_id> snapshot_ids;
                 for (auto& id : *topology_requests_entry.snapshot_table_ids) {
                     lw_shared_ptr<replica::table> table = _db.get_tables_metadata().get_table_if_exists(id);
                     if (!table) {
                         throw std::invalid_argument(fmt::format("Cannot SNAPSHOT table with UUID {} because it does not exist.", id));
                     }
+                    // A request can name a logstor table, for example a request from a node of an
+                    // older version. A replica refuses to snapshot it, and a failed replica makes
+                    // this operation retry forever, so the table is left out here.
+                    if (!replica::database::snapshot_supported(*table->schema())) {
+                        rtlogger.warn("Not snapshotting {}.{}: snapshots of logstor tables are not supported",
+                                table->schema()->ks_name(), table->schema()->cf_name());
+                        continue;
+                    }
                     ids.emplace_back(id);
                     tables.emplace_back(table);
+                    snapshot_ids.insert(id);
                 }
                 rtlogger.info("Performing SNAPSHOT TABLES for {}", ids);
-                return *topology_requests_entry.snapshot_table_ids;
+                return snapshot_ids;
             }
             , [&](const std::unordered_set<table_id>& tables, const service::frozen_topology_guard& frozen_guard, utils::UUID) {
                 return send_to_tablet_replica_hosts(tables, desc, [&] (locator::host_id host_id) {

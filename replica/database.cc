@@ -3277,6 +3277,16 @@ uint64_t database::disk_space_used() const {
     return get_logstor_disk_space_used() + sstable_bytes;
 }
 
+bool database::snapshot_supported(const schema& s) noexcept {
+    return !s.logstor_enabled();
+}
+
+void database::check_snapshot_supported(const schema& s) {
+    if (!snapshot_supported(s)) {
+        throw std::runtime_error(fmt::format("Cannot snapshot {}.{}: snapshots of logstor tables are not supported", s.ks_name(), s.cf_name()));
+    }
+}
+
 future<> database::snapshot_table_on_all_shards(sharded<database>& sharded_db, table_id uuid, sstring tag, db::snapshot_options opts, snapshot_callback ssc) {
     if (!opts.skip_flush) {
         co_await flush_table_on_all_shards(sharded_db, uuid);
@@ -3295,6 +3305,10 @@ future<> database::snapshot_tables_on_all_shards(sharded<database>& sharded_db, 
 future<> database::snapshot_keyspace_on_all_shards(sharded<database>& sharded_db, std::string_view ks_name, sstring tag, db::snapshot_options opts, snapshot_callback ssc) {
     auto& ks = sharded_db.local().find_keyspace(ks_name);
     co_await coroutine::parallel_for_each(ks.metadata()->cf_meta_data(), [&, tag = std::move(tag), opts] (const auto& pair) -> future<> {
+        if (!snapshot_supported(*pair.second)) {
+            dblog.warn("Not snapshotting {}.{} in snapshot {}: snapshots of logstor tables are not supported", ks_name, pair.first, tag);
+            co_return;
+        }
         auto uuid = pair.second->id();
         co_await snapshot_table_on_all_shards(sharded_db, uuid, tag, opts, ssc);
     });
@@ -3337,6 +3351,10 @@ future<> database::truncate_table_on_all_shards(sharded<database>& sharded_db, s
     }
     if (with_snapshot && !table_shards->get_storage_options().is_local_type()) {
         dblog.warn("Not snapshotting dropped/truncated table {}.{} despite auto_snapshot=true - table is not using local disk", s->ks_name(), s->cf_name());
+        with_snapshot = false;
+    }
+    if (with_snapshot && !snapshot_supported(*s)) {
+        dblog.warn("Not snapshotting dropped/truncated table {}.{} despite auto_snapshot=true - snapshots of logstor tables are not supported", s->ks_name(), s->cf_name());
         with_snapshot = false;
     }
 

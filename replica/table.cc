@@ -4516,6 +4516,7 @@ public:
 
 // Runs the orchestration code on an arbitrary shard to balance the load.
 future<> database::snapshot_table_on_all_shards(sharded<database>& sharded_db, const global_table_ptr& table_shards, sstring name, db::snapshot_options opts, snapshot_callback ssc) {
+    check_snapshot_supported(*table_shards->schema());
     auto writer = std::visit(overloaded_functor{
         [&name, &opts] (const data_dictionary::storage_options::local& loc) -> std::unique_ptr<snapshot_writer> {
             if (loc.dir.empty()) {

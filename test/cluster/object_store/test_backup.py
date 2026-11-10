@@ -3061,3 +3061,56 @@ async def test_restore_tablets_fails_when_the_snapshot_does_not_hold_the_compone
             refs = sstable_refs(object_storage, sid)
             assert not any(r.startswith('nodes/') for r in refs), f'The failed restore left node references of sstable {sid}: {sorted(refs)}'
         assert_objects_intact(crafted, bucket_objects(object_storage), 'the failed restore')
+
+@pytest.mark.asyncio
+async def test_cluster_backup_skips_logstor_tables(manager: ScyllaClusterManager, object_storage):
+    """
+    Verify that a cluster snapshot and a backup of a whole keyspace leave out its logstor tables,
+    because a snapshot copies sstables and cannot hold their data, and that a backup request that
+    names a logstor table fails.
+    """
+    topology = topo(rf=3, nodes=3, racks=3, dcs=1)
+    servers, _ = await create_cluster(topology, manager, logger, object_storage,
+                                      extra_config={'experimental_features': ['logstor']})
+    server = servers[0]
+    cql = manager.get_cql()
+    bucket = object_storage.get_resource().Bucket(object_storage.bucket_name)
+
+    async def backup_keyspace(ks: str, snapshot_name: str, prefix: str, tables: list[str] = None) -> None:
+        tid = await manager.api.backup_cluster_snapshot(server.ip_addr, ks, snapshot_name, server.datacenter,
+                                                        object_storage.address, object_storage.bucket_name,
+                                                        prefix, tables=tables)
+        status = await manager.api.wait_task(server.ip_addr, tid)
+        assert status is not None and status.get('state') == 'done', f"Cluster backup of {ks} failed: {status}"
+
+    def backed_up_tables(ks: str, prefix: str) -> set[str]:
+        return {o.key.split('/')[3] for o in bucket.objects.filter(Prefix=f"{prefix}/snapshots/{ks}/")}
+
+    def snapshot_tables(snapshot_name: str) -> set[str]:
+        return {r.table_name for r in cql.execute(
+            f"SELECT table_name FROM system_distributed.snapshot_tables WHERE snapshot_name = '{snapshot_name}'")}
+
+    rf3 = "WITH REPLICATION = { 'replication_factor' : 3 }"
+    async with new_test_keyspace(manager, rf3) as ks, new_test_keyspace(manager, rf3) as ls_only_ks:
+        await cql.run_async(f"CREATE TABLE {ks}.ls (pk int PRIMARY KEY, v int) WITH storage_engine = 'logstor'")
+        await cql.run_async(f"CREATE TABLE {ks}.sst (pk int PRIMARY KEY, v int)")
+        await cql.run_async(f"CREATE TABLE {ls_only_ks}.ls (pk int PRIMARY KEY, v int) WITH storage_engine = 'logstor'")
+        await asyncio.gather(*[cql.run_async(f"INSERT INTO {table} (pk, v) VALUES ({pk}, {pk})")
+                               for table in (f"{ks}.ls", f"{ks}.sst", f"{ls_only_ks}.ls") for pk in range(10)])
+
+        snapshot_name = unique_name('snap_')
+        await manager.api.take_cluster_snapshot(server.ip_addr, ks, tag=snapshot_name)
+        assert snapshot_tables(snapshot_name) == {"sst"}
+
+        prefix = unique_name('logstor_')
+        with pytest.raises(HTTPError, match="snapshots of logstor tables are not supported"):
+            await backup_keyspace(ks, snapshot_name, prefix, tables=["ls"])
+        await backup_keyspace(ks, snapshot_name, prefix)
+        assert backed_up_tables(ks, prefix) == {"sst"}
+
+        ls_only_snapshot_name = unique_name('snap_')
+        await manager.api.take_cluster_snapshot(server.ip_addr, ls_only_ks, tag=ls_only_snapshot_name)
+        assert snapshot_tables(ls_only_snapshot_name) == set()
+        # the backup of a keyspace that has only logstor tables fails as for a keyspace with no tables
+        with pytest.raises(HTTPError, match="No tables provided for backup"):
+            await backup_keyspace(ls_only_ks, ls_only_snapshot_name, unique_name('logstor_'))
