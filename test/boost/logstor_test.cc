@@ -3576,6 +3576,67 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_split_compaction_splits_segments_between_t
     BOOST_REQUIRE(right_records == expected_right);
 }
 
+// Checks a split compaction that has more records for each side than one buffer holds. The
+// compaction flushes a full buffer in the middle of its scan, and then rewrites the record that
+// did not fit.
+SEASTAR_THREAD_TEST_CASE(test_logstor_split_compaction_flushes_a_full_buffer) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    test_recovery_catalog no_tables;
+    ls.do_recovery(no_tables).get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group src(schema, ls);
+    test_logstor_group left(schema, ls, src.logstor_index());
+    test_logstor_group right(schema, ls, src.logstor_index());
+    auto setup_guard = std::make_optional(ls.get_compaction_manager().disable_compaction(src).get());
+
+    constexpr size_t straddling_segments = 4;
+    constexpr size_t records_per_side = tenth_of_segment_records / 2;
+    const auto keys = make_token_ordered_keys(schema, straddling_segments * tenth_of_segment_records);
+    const auto side_size = keys.size() / 2;
+    const auto boundary = dht::decorate_key(*schema, partition_key::from_single_value(*schema, serialized(keys[side_size - 1]))).token();
+    auto classify = [boundary] (dht::token t) -> mutation_writer::token_group_id {
+        return t <= boundary ? 0 : 1;
+    };
+
+    // Each segment holds as many records of the left side as of the right side, so each side gets
+    // the records of two full segments.
+    std::vector<mutation> written;
+    for (size_t s = 0; s < straddling_segments; ++s) {
+        std::vector<mutation> ms;
+        for (size_t i = 0; i < records_per_side; ++i) {
+            for (const auto& key : {keys[s * records_per_side + i], keys[side_size + s * records_per_side + i]}) {
+                ms.push_back(make_kv_mutation(schema, key, sstring(tenth_of_segment_value_size, 'x'), api::timestamp_type(1)));
+            }
+        }
+        write_and_flush_segment(ls, src, ms);
+        written.insert(written.end(), ms.begin(), ms.end());
+    }
+    BOOST_REQUIRE_EQUAL(src.logstor_segments().segment_count(), straddling_segments);
+
+    setup_guard.reset();
+    ls.get_compaction_manager().submit_split_compaction(src, classify,
+            [&] (log_segment_id, dht::token first_token, dht::token last_token) -> logstor_group& {
+                BOOST_REQUIRE_EQUAL(classify(first_token), classify(last_token));
+                return classify(first_token) == 0 ? static_cast<logstor_group&>(left) : right;
+            }).get();
+
+    BOOST_REQUIRE_EQUAL(src.logstor_segments().segment_count(), 0u);
+    BOOST_REQUIRE_EQUAL(left.logstor_segments().segment_count(), straddling_segments / 2);
+    BOOST_REQUIRE_EQUAL(right.logstor_segments().segment_count(), straddling_segments / 2);
+
+    for (const auto& expected : written) {
+        auto actual = read_mutation(ls, schema, src.logstor_index(), expected.decorated_key(), schema->full_slice()).get();
+        BOOST_REQUIRE(actual);
+        assert_that(*actual).is_equal_to(expected);
+    }
+}
+
 // Everything a reader test needs: a started logstor holding a single compaction group, and a
 // semaphore to take read permits from. Tests fill the group with populate() and read it back
 // through make_reader().
