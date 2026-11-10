@@ -497,3 +497,26 @@ def test_logstor_partition_estimates(cql, test_keyspace):
 
         cql.execute(f"TRUNCATE {table}")
         assert get_estimates() == (0, 0)
+
+# Test that the column_family API, which nodetool cfstats reads, counts the
+# writes of a logstor table and times them, although the writes do not go to a
+# memtable.
+def test_logstor_write_stats(cql, test_keyspace):
+    # The logstor disk of the test server is small and all the tests share it,
+    # so the test writes few keys.
+    key_count = 10
+    value_size = 64 * 1024
+    with new_test_table(cql, test_keyspace, "pk int PRIMARY KEY, v text",
+                        " WITH storage_engine = 'logstor'") as table:
+        insert = cql.prepare(f"INSERT INTO {table} (pk, v) VALUES (?, ?)")
+        value = 'x' * value_size
+        for pk in range(key_count):
+            cql.execute(insert, [pk, value])
+
+        count = rest_api.get_column_family_metric(cql, 'write', table)
+        latency = rest_api.get_column_family_metric(cql, 'write_latency/moving_average_histogram', table)
+        assert count == key_count
+        assert latency['hist']['count'] == key_count
+        # The time of a write includes the copy of its value, which takes more
+        # than the resolution of 1 us.
+        assert latency['hist']['max'] > 0
