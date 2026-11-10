@@ -80,12 +80,12 @@ struct compaction_limits {
     size_t batch_cap = min_segments_per_compaction;
 };
 
-// A compaction job allocates its output segments as it goes but frees its inputs only when it is
-// done, so every job in flight can hold up to `batch_cap` segments of the free-segment target at
-// once. Deriving both limits from `low` is what keeps `auto_parallelism * batch_cap <= low`: without
-// it, concurrent jobs can consume the whole target and then wait for a segment that only one of them
-// could free. `max_batch_cap` is segment_manager_config::max_segments_per_compaction, the upper bound
-// the derived cap is clamped to.
+// Derives both limits from `low`, which keeps `auto_parallelism * batch_cap <= low`: the jobs in
+// flight rewrite no more segments at the same time than the free-segment target. This bounds the
+// work in flight, not the space that the jobs hold, because a compaction job frees each of its
+// segments when the live records of the segment are in new segments, before it takes the next new
+// segment, and so holds one new segment at a time. `max_batch_cap` is segment_manager_config::max_segments_per_compaction, the
+// upper bound that the derived cap is clamped to.
 //
 // The invariant cannot hold on a disk so small that the target is below one batch; there the floor
 // of make_free_segment_watermarks() has already been capped by the disk size and a batch of

@@ -67,7 +67,7 @@ Only step 4 writes to the disk - all other steps only update in-memory metadata.
 2. A segment set from a single compaction group is submitted for compaction.
 3. Compaction picks segments for compaction from the segment set. It chooses segments with the lowest utilization such that compacting them results in net gain of free segments.
 4. It reads the segments, finding all live records, and writing them into a write buffer. When the buffer is full it is flushed into a new segment, and for each recording updating the index location to the new location.
-5. After all live records are rewritten the old segments are freed.
+5. After a flush, the old segments whose live records are all in new segments are freed, before the next flush takes a new segment. A compaction takes one new segment for each flush and frees at least one old segment for it, so it can run on the segments that the segment pool reserves for compaction. A split compaction frees its old segments only when all their live records are rewritten.
 
 ## Usage
 
