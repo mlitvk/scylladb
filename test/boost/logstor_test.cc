@@ -4529,6 +4529,45 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_erase_switches_above_its_sequence) {
     require_recovery_matches(ls, schema->id(), cg.logstor_index());
 }
 
+// An erase that fails after its erased range is durable still switches above its sequence before
+// the caller releases the fence. Otherwise the next write lands in the active segment, at or below
+// the sequence of the erase, and the next recovery drops it.
+SEASTAR_THREAD_TEST_CASE(test_logstor_failed_erase_switches_above_its_sequence) {
+    auto schema = make_kv_schema();
+    started_logstor store;
+    auto& ls = store.ls();
+
+    test_logstor_group cg(schema, ls);
+    auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+
+    utils::get_local_injector().enable("logstor_erase_fail_after_save", true);
+    BOOST_REQUIRE_THROW(ls.erase(schema->id(), cg.logstor_index(), dht::token_range()).get(), std::runtime_error);
+
+    ls.write(make_kv_mutation(schema, "pk0", "v0"), write_target(&cg, {}), db::no_timeout).get();
+    ls.flush_to_separator().get();
+    BOOST_REQUIRE_EQUAL(cg.logstor_index().get_key_count(), 1u);
+    require_recovery_matches(ls, schema->id(), cg.logstor_index());
+}
+
+// An erase that cannot switch above its sequence drops the active segment, so the next write
+// takes a new one above that sequence. The erase itself took effect, so it does not fail.
+SEASTAR_THREAD_TEST_CASE(test_logstor_erase_drops_the_active_segment_when_the_switch_fails) {
+    auto schema = make_kv_schema();
+    started_logstor store;
+    auto& ls = store.ls();
+
+    test_logstor_group cg(schema, ls);
+    auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+
+    utils::get_local_injector().enable("logstor_switch_fail", true);
+    ls.erase(schema->id(), cg.logstor_index(), dht::token_range()).get();
+
+    ls.write(make_kv_mutation(schema, "pk0", "v0"), write_target(&cg, {}), db::no_timeout).get();
+    ls.flush_to_separator().get();
+    BOOST_REQUIRE_EQUAL(cg.logstor_index().get_key_count(), 1u);
+    require_recovery_matches(ls, schema->id(), cg.logstor_index());
+}
+
 // The erase finds the groups of the table in the range itself, so it drains the separator buffer
 // of every one of them. A record left in the buffer of a group that the erase did not drain would
 // be written out later, in a segment above the sequence of the erase, and the next recovery would
