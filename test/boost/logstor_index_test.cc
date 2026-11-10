@@ -20,6 +20,7 @@
 #include "db/cache_tracker.hh"
 #include <seastar/core/on_internal_error.hh>
 #include <seastar/util/defer.hh>
+#include <seastar/util/alloc_failure_injector.hh>
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -821,6 +822,43 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_cache_survives_lsa_compaction_before_excha
     populate(index, keys[2], replacement);
     assert_that(schema, lookup(index, keys[2], schema)).is_equal_to(replacement.partition());
     index.drain_cache().get();
+}
+
+// An allocation failure inside the insert of a new key makes the insert throw before it changes the
+// index. This test injects a failure at each allocation of each insert in turn. An insert that
+// throws must leave the key as absent or as present as it was before, and at the end the index must
+// hold every key once, with its location.
+SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_insert_survives_allocation_failures) {
+    auto schema = make_logstor_schema();
+    primary_index index(noop_space_accounting, nullptr, false);
+
+    constexpr int key_count = 200;
+    const auto entry_of = [] (int i) { return make_index_entry(1, uint32_t(i) * 8, 8, 1); };
+
+    std::vector<primary_index_key> keys;
+    keys.reserve(key_count);
+    for (int i = 0; i < key_count; ++i) {
+        keys.push_back(make_primary_index_key(*schema, format("pk-{:06d}", i)));
+    }
+    for (int i = 0; i < key_count; ++i) {
+        memory::with_allocation_failures([&] {
+            const bool present = lookup_location(index, keys[i], *schema).has_value();
+            try {
+                BOOST_REQUIRE(index.insert(keys[i], entry_of(i)).inserted());
+            } catch (const std::bad_alloc&) {
+                BOOST_REQUIRE_EQUAL(lookup_location(index, keys[i], *schema).has_value(), present);
+                throw;
+            }
+        });
+    }
+
+    BOOST_REQUIRE_EQUAL(index.get_usage().key_count, size_t(key_count));
+    for (int i = 0; i < key_count; ++i) {
+        auto location = lookup_location(index, keys[i], *schema);
+        BOOST_REQUIRE(location);
+        BOOST_REQUIRE(*location == entry_of(i).location);
+    }
+    index.clear().get();
 }
 
 SEASTAR_THREAD_TEST_CASE(test_logstor_cache_upgrades_cached_partition_after_schema_change) {
