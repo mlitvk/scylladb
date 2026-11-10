@@ -422,8 +422,12 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_range_erase_and_clear_space_
     BOOST_REQUIRE_EQUAL(std::count(accounting.freed_locations.begin(), accounting.freed_locations.end(), entries[4].loc), 1);
 }
 
-// The `memory_usage` of an index counts the B+tree, and its `entries_memory_usage` does not, so the
-// first has to be the larger of the two, and it has to follow the index up and back down.
+// The `memory_usage` of an index is the space of its region, and its `entries_memory_usage` is the
+// entries alone, so the first has to be the larger of the two. An erase gives a segment back only
+// when the segment becomes empty, and the holes in the other segments stay until the region
+// compacts, so the region figure can stay the same after an erase. clear() erases element-wise and
+// leaves the root node standing, which keeps the segment it is in, and the active segment stays
+// with the region.
 SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_memory_usage) {
     auto schema = make_logstor_schema();
     primary_index index(noop_space_accounting, nullptr, false);
@@ -452,21 +456,19 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_memory_usage) {
     BOOST_REQUIRE_GT(allocated, entries);
     testlog.info("primary index over {} keys: entries {} bytes, allocated {} bytes", key_count, entries, allocated);
 
-    // Erasing gives back both.
     for (size_t i = 0; i < key_count / 2; ++i) {
         BOOST_REQUIRE(index.erase(keys[i],
                 record_location{.segment = log_segment_id{1}, .offset = uint32_t(i * 64), .size = 32}));
     }
     BOOST_REQUIRE_LT(index.get_usage().entries_memory_usage, entries);
-    BOOST_REQUIRE_LT(index.get_usage().memory_usage, allocated);
+    BOOST_REQUIRE_LE(index.get_usage().memory_usage, allocated);
     BOOST_REQUIRE_GT(index.get_usage().memory_usage, index.get_usage().entries_memory_usage);
 
-    // Clearing gives back everything but the root, which an element-wise erase leaves standing.
-    // More than that left behind would mean the accounting had drifted.
     index.clear().get();
     BOOST_REQUIRE_EQUAL(index.get_usage().key_count, 0u);
     BOOST_REQUIRE_EQUAL(index.get_usage().entries_memory_usage, 0u);
     const size_t after_clear = index.get_usage().memory_usage;
+    BOOST_REQUIRE_LE(after_clear, 2 * logalloc::segment_size);
     testlog.info("primary index after clear: allocated {} bytes", after_clear);
 }
 
@@ -824,10 +826,11 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_cache_survives_lsa_compaction_before_excha
     index.drain_cache().get();
 }
 
-// An allocation failure inside the insert of a new key makes the insert throw before it changes the
-// index. This test injects a failure at each allocation of each insert in turn. An insert that
-// throws must leave the key as absent or as present as it was before, and at the end the index must
-// hold every key once, with its location.
+// An allocation failure inside the insert of a new key makes the allocating section of the index
+// run the insert again, or makes the insert throw before it changes the index. This test injects a
+// failure at each allocation of each insert in turn. An insert that throws must leave the key as
+// absent or as present as it was before, and at the end the index must hold every key once, with
+// its location.
 SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_insert_survives_allocation_failures) {
     auto schema = make_logstor_schema();
     primary_index index(noop_space_accounting, nullptr, false);
