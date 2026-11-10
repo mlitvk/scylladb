@@ -8,6 +8,8 @@
 #############################################################################
 
 import json
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from cassandra.protocol import ConfigurationException
@@ -520,3 +522,32 @@ def test_logstor_write_stats(cql, test_keyspace):
         # The time of a write includes the copy of its value, which takes more
         # than the resolution of 1 us.
         assert latency['hist']['max'] > 0
+
+# Test that toppartitions samples the reads of a logstor table.
+# The toppartitions request blocks for its whole sampling period, so the test
+# sends the request from a different thread and reads during the period. The
+# period grows on a retry, in case the reads missed the period on a slow
+# machine.
+def test_logstor_toppartitions_reads(cql, test_keyspace):
+    hot_key = 7
+    with new_test_table(cql, test_keyspace, "pk int PRIMARY KEY, v int",
+                        " WITH storage_engine = 'logstor'") as table:
+        for pk in range(10):
+            cql.execute(f"INSERT INTO {table} (pk, v) VALUES ({pk}, {pk})")
+        select = cql.prepare(f"SELECT v FROM {table} WHERE pk = ?")
+        ks, cf = table.split('.')
+
+        period = 0.5
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            while True:
+                request = executor.submit(rest_api.get_request, cql,
+                    f"storage_service/toppartitions?table_filters={ks}:{cf}&duration={int(period * 1000)}")
+                time.sleep(period / 4)
+                for _ in range(10):
+                    assert cql.execute(select, [hot_key]).one().v == hot_key
+                result = request.result()
+                print(f"toppartitions with a period of {period}s: {result}")
+                if any(r['partition'].split(' ')[-1] == str(hot_key) for r in result.get('read', [])):
+                    break
+                period *= 2
+                assert period <= 8, "toppartitions did not sample the reads of the logstor table"
