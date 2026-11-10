@@ -149,8 +149,7 @@ private:
     shared_future<> _completion{make_ready_future<>()};
     // The slots of the automatic jobs. The size is max_auto_compaction_parallelism, which leaves
     // compaction buffers for a split compaction. The driver holds back the difference between the
-    // size and the parallelism that the space floor allows, so that the jobs in flight do not hold
-    // more than the space floor.
+    // size and the parallelism that the space floor allows, see make_compaction_limits().
     seastar::semaphore _job_slots{max_auto_compaction_parallelism};
     semaphore_units<> _held_back{consume_units(_job_slots, 0)};
     // The scores of the automatic jobs in flight, for the marginal admission gate.

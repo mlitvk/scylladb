@@ -194,8 +194,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_marginal_compaction_admission) {
     BOOST_REQUIRE(!rich.efficiency_at_least(all_dead, compaction_marginal_admission_ratio));
 }
 
-// A job frees its inputs only when it ends, so the jobs in flight must fit in the space floor, and
-// each batch must still be large enough to reclaim.
+// The jobs in flight rewrite no more segments at the same time than the space floor holds, and each
+// batch must still be large enough to reclaim.
 SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_limits_fit_the_space_floor) {
     const auto nan = std::numeric_limits<double>::quiet_NaN();
     for (double fraction : {nan, -0.1, 0.0, 0.001, 0.03, 0.2, max_space_floor_fraction, 1.5}) {
