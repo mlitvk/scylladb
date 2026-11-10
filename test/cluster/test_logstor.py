@@ -850,6 +850,43 @@ async def test_table_write_stats(manager: ScyllaClusterManager):
         # the time of a write covers the copy of its value, which takes more than the 1 us resolution
         assert latency['hist']['max'] > 0
 
+async def test_toppartitions_reads(manager: ScyllaClusterManager):
+    """
+    Verify that toppartitions samples the reads of a logstor table. The toppartitions request blocks
+    for its whole sampling period, so the reads run next to it, and the period grows on a retry in
+    case the reads missed the window on a slow machine.
+    """
+    hot_key = 7
+
+    cmdline = ['--logger-log-level', 'logstor=debug']
+    cfg = {'experimental_features': ['logstor']}
+    servers = await manager.servers_add(1, cmdline=cmdline, config=cfg)
+    server = servers[0]
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v int) WITH storage_engine = 'logstor'")
+        await asyncio.gather(*[cql.run_async(f"INSERT INTO {ks}.test (pk, v) VALUES ({pk}, {pk})") for pk in range(10)])
+        select = cql.prepare(f"SELECT v FROM {ks}.test WHERE pk = ?")
+
+        async def read_hot_key(delay: float) -> None:
+            await asyncio.sleep(delay)
+            for _ in range(10):
+                rows = await cql.run_async(select, [hot_key])
+                assert rows[0].v == hot_key
+
+        period = 0.5
+        while True:
+            params = {'table_filters': f'{ks}:test', 'duration': str(int(period * 1000))}
+            result, _ = await asyncio.gather(
+                manager.api.client.get_json("/storage_service/toppartitions", host=server.ip_addr, params=params),
+                read_hot_key(period / 4))
+            logger.info(f"toppartitions with a period of {period}s: {result}")
+            if any(r['partition'].split(' ')[-1] == str(hot_key) for r in result.get('read', [])):
+                break
+            period *= 2
+            assert period <= 8, "toppartitions did not sample the reads of the logstor table"
+
 async def test_snapshot_skips_logstor_tables(manager: ScyllaClusterManager):
     """
     Verify that a snapshot never looks complete without the data of a logstor table: a snapshot copies
