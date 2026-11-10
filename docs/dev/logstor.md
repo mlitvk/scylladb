@@ -67,12 +67,12 @@ Only step 4 writes to the disk - all other steps only update in-memory metadata.
 2. A segment set from a single compaction group is submitted for compaction.
 3. Compaction picks segments for compaction from the segment set. It chooses segments with the lowest utilization such that compacting them results in net gain of free segments.
 4. It reads the segments, finding all live records, and writing them into a write buffer. When the buffer is full it is flushed into a new segment, and for each recording updating the index location to the new location.
-5. After all live records are rewritten the old segments are freed.
+5. After a flush, the old segments whose live records are all in new segments are freed, before the next flush takes a new segment. A compaction takes one new segment for each flush and frees at least one old segment for it, so it can run on the segments that the segment pool reserves for compaction. A split compaction frees its old segments only when all their live records are rewritten.
 
 **Automatic compaction:**
 1. A segment is a candidate when its utilization (live record bytes / segment size) is at most the utilization threshold, `logstor_compaction_utilization_threshold` (default 0.5).
 2. The threshold is a function of the free level, the number of available segments on the shard, and it is linear between three points:
-   - At the space floor (`logstor_compaction_space_floor`, default 3% of the disk, at least two batches and at most a quarter of the disk) and below, the threshold is 1.
+   - At the space floor (`logstor_compaction_space_floor`, default 3% of the disk, at least 16 segments and at most a quarter of the disk) and below, the threshold is 1.
    - At the anchor (twice the space floor, at most half of the disk), the threshold is the configured value.
    - At the ceiling (one segment above the anchor) and above, the threshold is a minimum, `logstor_compaction_min_utilization_threshold` (default 0.1).
 

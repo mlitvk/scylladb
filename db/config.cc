@@ -1030,7 +1030,7 @@ db::config::config(std::shared_ptr<db::extensions> exts)
     , logstor_compaction_space_floor(this, "logstor_compaction_space_floor", liveness::LiveUpdate, value_status::Used, 0.03,
         "The free space, as a fraction of the logstor disk, at which logstor compaction takes any segment from which it can reclaim space, at logstor_compaction_max_shares. Writes can still use this space. "
         "A smaller value leaves more of the disk for data, but less room for a burst of writes until compaction reclaims again. "
-        "It is at least two compaction batches and at most 0.25.")
+        "It is at least 16 segments, or an eighth of a smaller disk, and at most 0.25.")
     , logstor_compaction_utilization_threshold(this, "logstor_compaction_utilization_threshold", liveness::LiveUpdate, value_status::Used, 0.5,
         "A logstor segment is compacted when the fraction of it that holds live data is at most this value, while twice logstor_compaction_space_floor of the disk is free. "
         "When less of the disk is free, compaction also takes fuller segments. When more is free, it takes only segments under logstor_compaction_min_utilization_threshold. "

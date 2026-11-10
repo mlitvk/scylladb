@@ -38,11 +38,10 @@ constexpr size_t max_auto_compaction_parallelism = std::min<size_t>(4, max_compa
 
 // The smallest batch worth compacting. A batch reclaims only when its mean utilization is below
 // `1 - 1/n_in`, so a smaller batch could not reclaim anything from a disk that is even moderately
-// packed. It also sets the minimum of the space floor.
+// packed.
 constexpr size_t min_segments_per_compaction = 8;
 
-// The largest batch. A job frees its inputs only when it ends, so a larger batch holds more of the
-// space floor for longer.
+// The largest batch. A larger batch makes a single job rewrite more segments before it ends.
 constexpr size_t max_segments_per_compaction = 32;
 static_assert(max_segments_per_compaction >= min_segments_per_compaction);
 
@@ -62,13 +61,19 @@ constexpr double compaction_batch_extension_tolerance = 0.8;
 // every batch on a disk that is more than half full.
 constexpr double compaction_marginal_admission_ratio = 0.75;
 
+// The smallest space floor, in segments. With the default anchor, the pressure band is as wide as
+// the space floor, so with a space floor of a few segments, the threshold and the shares go from their configured values to
+// their maximum in a few segments. Then the write path has only a few segments for a burst after
+// compaction runs at its maximum, before the writes wait for a segment.
+constexpr uint64_t min_space_floor_segments = 16;
+
 // Returns the space floor, the free level at which the space pressure is 1, see
-// compaction_space_pressure(). The jobs in flight can hold this many segments. The write path can
-// also use these segments, and only the compaction reserve of the segment pool keeps segments for
-// compaction. The space floor is `fraction` of the disk, logstor_compaction_space_floor, with a
-// minimum of two batches for a small disk. The option is a fraction and not a number of segments,
-// because on a large disk the space floor is the room that the write path has for a burst until
-// compaction reclaims again. A larger `fraction` is limited to max_space_floor_fraction.
+// compaction_space_pressure(). The write path can use these segments, and only the compaction
+// reserve of the segment pool keeps segments for compaction. The space floor is `fraction` of the
+// disk, logstor_compaction_space_floor, with a minimum of min_space_floor_segments for a small disk.
+// The option is a fraction and not a number of segments, because on a large disk the space floor
+// is the room that the write path has for a burst until compaction reclaims again. A larger
+// `fraction` is limited to max_space_floor_fraction.
 uint64_t compaction_space_floor(uint64_t segment_count, double fraction) noexcept;
 
 // The largest space floor, as a fraction of the disk. With the default anchor at twice the space
@@ -85,10 +90,11 @@ struct compaction_limits {
     size_t batch_cap = min_segments_per_compaction;
 };
 
-// A job allocates its output segments while it runs and frees its inputs only when it ends, so each
-// job in flight can hold up to `batch_cap` segments. Both limits come from the space floor, so that
-// `auto_parallelism * batch_cap <= space_floor`. Otherwise the jobs can use all of the space floor
-// and then wait for a segment that only one of them can free. The batch cap is at most
+// Both limits come from the space floor, so that `auto_parallelism * batch_cap <= space_floor`, and
+// the jobs in flight rewrite no more segments at the same time than the space floor holds. This
+// bounds the work in flight, not the space that the jobs hold, because a job frees each of its
+// segments when the live records of the segment are in new segments, before it takes the next new
+// segment, and so holds one new segment at a time. The batch cap is at most
 // max_segments_per_compaction.
 //
 // When the space floor is less than one batch the relation cannot hold, and the limits are one job

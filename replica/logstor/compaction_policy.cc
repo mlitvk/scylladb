@@ -18,10 +18,8 @@ uint64_t compaction_space_floor(uint64_t segment_count, double fraction) noexcep
     // The fraction is a config value with no range check at the config layer. Anything that is not
     // a fraction leaves only the minimum.
     fraction = std::isfinite(fraction) ? std::clamp(fraction, 0.0, max_space_floor_fraction) : 0.0;
-    // The floor is at least two batches, so that a job can hold one batch while the write path has
-    // the other. The minimum has its own limit, so that the space floor is not most of a small
-    // disk.
-    const auto minimum = std::min<uint64_t>(2 * min_segments_per_compaction, std::max<uint64_t>(1, segment_count / 8));
+    // The minimum has its own limit, so that the space floor is not most of a small disk.
+    const auto minimum = std::min<uint64_t>(min_space_floor_segments, std::max<uint64_t>(1, segment_count / 8));
     return std::max(static_cast<uint64_t>(fraction * double(segment_count)), minimum);
 }
 
@@ -32,7 +30,7 @@ compaction_limits make_compaction_limits(uint64_t space_floor) noexcept {
     // Spend the budget on concurrency first, up to the number of jobs the buffer pool can carry,
     // then give what is left to the batch. Both directions of the clamp matter: a batch below
     // min_segments_per_compaction cannot reclaim, and one above max_segments_per_compaction makes a
-    // single job hold too much of the space floor.
+    // single job rewrite too many segments.
     const auto parallelism = std::clamp<uint64_t>(budget / min_segments_per_compaction, 1, max_auto_compaction_parallelism);
     const auto batch_cap = std::clamp<uint64_t>(budget / parallelism, min_segments_per_compaction, max_segments_per_compaction);
 
