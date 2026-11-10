@@ -171,6 +171,13 @@ compaction reclaims them.
 A write counts in the live record bytes of a group only after the separator moves it into a segment
 of the group.
 
+The `column_family` API, and so `nodetool cfstats`, takes the partition estimate of a table from the
+key count of its index, and the mean partition size from the live record bytes of the index divided
+by that count. The key count includes the keys whose last record is a tombstone, as the sstable
+estimate includes deleted partitions. Logstor does not track the minimum and maximum partition size
+or the partition size histogram, so the API reports them from the sstables only, and they are 0 for
+a logstor table.
+
 ## Measuring Performance
 
 Two tests measure the cost of a logstor operation on one node, at two levels.

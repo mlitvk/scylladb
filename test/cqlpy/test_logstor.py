@@ -14,6 +14,7 @@ from cassandra.protocol import ConfigurationException
 from cassandra.query import SimpleStatement
 from .util import new_test_table
 from . import nodetool
+from . import rest_api
 
 # All tests in this file are Scylla-only (logstor is not available on Cassandra).
 @pytest.fixture(scope="module", autouse=True)
@@ -455,3 +456,44 @@ def test_logstor_large_values(cql, test_keyspace):
             row = cql.execute(f"SELECT pk, v FROM {table} WHERE pk = {i}").one()
             assert row.pk == i
             assert row.v == f"{i}-{large_value}"
+
+# Test that the column_family API, which nodetool cfstats reads, reports the
+# partition count and the mean partition size of a logstor table from its
+# index, although the table has no sstables.
+def test_logstor_partition_estimates(cql, test_keyspace):
+    key_count = 100
+    value_size = 1000
+    with new_test_table(cql, test_keyspace, "pk int PRIMARY KEY, v text",
+                        " WITH storage_engine = 'logstor'") as table:
+        # Returns the partition count and the mean partition size of the
+        # table, summed over the shards.
+        def get_estimates():
+            return (rest_api.get_column_family_metric(cql, 'estimated_row_count', table),
+                    rest_api.get_column_family_metric(cql, 'mean_row_size', table))
+
+        assert get_estimates() == (0, 0)
+
+        insert = cql.prepare(f"INSERT INTO {table} (pk, v) VALUES (?, ?)")
+        value = 'x' * value_size
+        for pk in range(key_count):
+            cql.execute(insert, [pk, value])
+
+        count, mean_size = get_estimates()
+        assert count == key_count
+        # The mean size is the frame size of a record, which adds the record
+        # header to the value.
+        assert value_size < mean_size < 2 * value_size
+
+        # An overwrite replaces the record of a key, and a delete writes a
+        # tombstone record that the index keeps for the key, so neither
+        # changes the count.
+        for pk in range(key_count // 2):
+            cql.execute(insert, [pk, value])
+        for pk in range(key_count // 2, key_count):
+            cql.execute(f"DELETE FROM {table} WHERE pk = {pk}")
+        count, mean_size_after_deletes = get_estimates()
+        assert count == key_count
+        assert mean_size_after_deletes < mean_size
+
+        cql.execute(f"TRUNCATE {table}")
+        assert get_estimates() == (0, 0)
