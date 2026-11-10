@@ -821,6 +821,35 @@ async def test_table_partition_estimates(manager: ScyllaClusterManager):
         await cql.run_async(f"TRUNCATE {ks}.test")
         assert await get_estimates(ks) == (0, 0)
 
+async def test_table_write_stats(manager: ScyllaClusterManager):
+    """
+    Verify that the column_family API, which nodetool cfstats reads, counts the writes of a logstor
+    table and times them, although the writes do not go to a memtable.
+    """
+    key_count = 50
+    value_size = 64 * 1024
+
+    cmdline = ['--logger-log-level', 'logstor=debug', '--smp=2']
+    cfg = {'experimental_features': ['logstor']}
+    servers = await manager.servers_add(1, cmdline=cmdline, config=cfg)
+    server = servers[0]
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v text) WITH storage_engine = 'logstor'")
+        insert = cql.prepare(f"INSERT INTO {ks}.test (pk, v) VALUES (?, ?)")
+        value = 'x' * value_size
+        await asyncio.gather(*[cql.run_async(insert, [pk, value]) for pk in range(key_count)])
+
+        count = await manager.api.client.get_json(f"/column_family/metrics/write/{ks}:test", host=server.ip_addr)
+        latency = await manager.api.client.get_json(f"/column_family/metrics/write_latency/moving_average_histogram/{ks}:test",
+                                                    host=server.ip_addr)
+        logger.info(f"after writes: count={count} latency={latency['hist']}")
+        assert count == key_count
+        assert latency['hist']['count'] == key_count
+        # the time of a write covers the copy of its value, which takes more than the 1 us resolution
+        assert latency['hist']['max'] > 0
+
 async def test_snapshot_skips_logstor_tables(manager: ScyllaClusterManager):
     """
     Verify that a snapshot never looks complete without the data of a logstor table: a snapshot copies
