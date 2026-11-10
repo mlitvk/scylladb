@@ -4629,6 +4629,7 @@ future<> local_snapshot_writer::write_schema_as_cql(cql3::description schema_des
 
 // Runs the orchestration code on an arbitrary shard to balance the load.
 future<> database::snapshot_table_on_all_shards(sharded<database>& sharded_db, const global_table_ptr& table_shards, sstring name, db::snapshot_options opts, snapshot_callback ssc) {
+    check_snapshot_supported(*table_shards->schema());
     // A cluster snapshot attempt is named "{tag}/{attempt}" in the catalog.
     // The snapshot directory and the per-node manifest keep the user tag,
     // the catalog rows written through `ssc` keep the attempt name.
