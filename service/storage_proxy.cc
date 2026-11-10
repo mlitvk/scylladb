@@ -1052,6 +1052,13 @@ private:
                 slogger.warn("Snapshot '{}': table {} no longer exists, skipping", tag, id);
                 co_return;
             }
+            // A failure here makes the topology coordinator retry the operation forever, so a
+            // logstor table, which the coordinator of an older version can send, is skipped.
+            auto schema = _sp._db.local().find_schema(id);
+            if (!replica::database::snapshot_supported(*schema)) {
+                slogger.warn("Not snapshotting {}.{} in snapshot {}: snapshots of logstor tables are not supported", schema->ks_name(), schema->cf_name(), tag);
+                co_return;
+            }
             try {
                 co_await replica::database::snapshot_table_on_all_shards(_sp._db, id, tag, opts, [&](const db::snapshot_entries& e) -> future<> {
                     auto s = _sp._db.local().find_schema(id);
@@ -1318,8 +1325,13 @@ private:
                 for (auto& [ks_name, cf_name] : ks_cf_names) {
                     if (cf_name.empty()) {
                         auto& ks = db.find_keyspace(ks_name);
-                        auto id_range = ks.metadata()->cf_meta_data() | std::views::values | std::views::transform(std::mem_fn(&schema::id));
-                        ids.insert(id_range.begin(), id_range.end());
+                        for (const auto& [name, s] : ks.metadata()->cf_meta_data()) {
+                            if (!replica::database::snapshot_supported(*s)) {
+                                slogger.warn("Not snapshotting {}.{} in snapshot {}: snapshots of logstor tables are not supported", ks_name, name, tag);
+                                continue;
+                            }
+                            ids.insert(s->id());
+                        }
                     } else {
                         ids.insert(db.find_uuid(ks_name, cf_name));
                     }
