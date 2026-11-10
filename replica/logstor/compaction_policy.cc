@@ -32,7 +32,7 @@ compaction_limits make_compaction_limits(uint64_t space_floor) noexcept {
     // Spend the budget on concurrency first, up to the number of jobs the buffer pool can carry,
     // then give what is left to the batch. Both directions of the clamp matter: a batch below
     // min_segments_per_compaction cannot reclaim, and one above max_segments_per_compaction makes a
-    // single job hold too much of the space floor.
+    // single job rewrite too many segments.
     const auto parallelism = std::clamp<uint64_t>(budget / min_segments_per_compaction, 1, max_auto_compaction_parallelism);
     const auto batch_cap = std::clamp<uint64_t>(budget / parallelism, min_segments_per_compaction, max_segments_per_compaction);
 
