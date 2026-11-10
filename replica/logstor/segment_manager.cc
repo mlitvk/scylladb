@@ -1632,14 +1632,18 @@ void segment_manager_impl::free_segment(log_segment_id segment_id) noexcept {
 //    the fence when the erase returns. When the switch fails, the erase drops the active segment,
 //    and the next write takes a new one.
 //
-// The caller does step 1 and the drain of the write path in step 2, see logstor::erase(). The
-// caller can skip the drain when `range` is inside `stopped_group`, because the gate of a
-// stopped group closed after each write to the group was done (compaction_group::stop()).
+// The caller does step 1 with primary_index::fence_writes() and the drain of the write path in
+// step 2, see logstor::erase(). The caller can skip the drain when `range` is inside
+// `stopped_group`, because the gate of a stopped group closed after each write to the group was
+// done (compaction_group::stop()).
 //
 // The groups are the registered groups of `index` that overlap `range`, and `stopped_group` when
 // the caller gives one. A stopped group is no longer registered, so the erase cannot find it.
 future<> segment_manager_impl::erase(table_id table, primary_index& index, dht::token_range range, logstor_group* stopped_group) {
     auto holder = _async_gate.hold();
+    if (!index.writes_fenced(range)) {
+        on_internal_error(logstor_logger, fmt::format("Erasing table {} range {} with writes to the range not fenced", table, range));
+    }
     auto units = co_await get_units(index.erase_semaphore(), 1);
 
     // The erase finds the groups only after it holds the semaphore, because a group that the caller
@@ -1713,9 +1717,13 @@ future<> segment_manager_impl::erase_index_and_segments(table_id table, primary_
 
     co_await index.erase(range);
     if (index.has_keys_in(range)) {
-        // A write that lands in the range during the erase leaves a key in the range, so this is a
-        // warning and not an error.
-        logstor_logger.warn("Erase of table {} range {} left keys in the range", table, range);
+        // Nothing adds a key to the range during the erase:
+        // - The fence holds the writes.
+        // - The topology coordinator drains the tablet streams before a truncate and before the
+        //   cleanup of a pending replica, and a leaving replica receives no stream of its tablet.
+        // - A drop removes the table before its erase, so the adoption of a streamed segment finds
+        //   no index for the records of the table.
+        on_internal_error(logstor_logger, fmt::format("Erase of table {} range {} left keys in the range", table, range));
     }
     // A reader that took a location of the range before the index erase can still read it, so the
     // readers must finish before the segments are freed, see free_segment().

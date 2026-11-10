@@ -1398,6 +1398,49 @@ async def test_truncate_survives_restarts(manager: ScyllaClusterManager):
             assert (metrics.get("scylla_logstor_sm_erased_ranges") or 0) >= 1
 
 @pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
+async def test_truncate_pauses_writes(manager: ScyllaClusterManager):
+    """
+    A write to a logstor table during the erase of a truncate waits for the erase. An injection
+    holds the truncate after the save of the erased range, and the write must wait, and then
+    survive a restart.
+    """
+    cmdline = ['--logger-log-level', 'logstor=trace', '--smp=1']
+    cfg = {'experimental_features': ['logstor']}
+    servers = await manager.servers_add(1, cmdline=cmdline, config=cfg)
+    cql = manager.get_cql()
+    inj = 'logstor_erase_wait_after_save'
+
+    async with new_test_keyspace(manager, "WITH tablets={'initial': 1}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v text) WITH storage_engine = 'logstor'")
+        for pk in [0, 1]:
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, v) VALUES ({pk}, 'before')")
+
+        await manager.api.enable_injection(servers[0].ip_addr, inj, one_shot=True)
+        truncate = asyncio.ensure_future(cql.run_async(f"TRUNCATE TABLE {ks}.test"))
+        await manager.api.wait_for_injection_enter(servers[0].ip_addr, inj)
+
+        write = asyncio.ensure_future(cql.run_async(f"INSERT INTO {ks}.test (pk, v) VALUES (0, 'during')"))
+        await asyncio.sleep(0.5)
+        assert not write.done(), "the write did not wait for the truncate"
+
+        await manager.api.message_injection(servers[0].ip_addr, inj)
+        await truncate
+        await write
+
+        async def check(when: str):
+            rows = await cql.run_async(f"SELECT pk, v FROM {ks}.test")
+            assert [(row.pk, row.v) for row in rows] == [(0, 'during')], f"Wrong table content {when}"
+
+        await check("after the truncate")
+        server_log = await manager.server_open_log(servers[0].server_id)
+        log_mark = await server_log.mark()
+        await manager.server_stop_gracefully(servers[0].server_id)
+        await manager.server_start(servers[0].server_id)
+        cql, _ = await manager.get_ready_cql(servers)
+        await check("after the restart")
+        await assert_no_dropped_records(server_log, log_mark)
+
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
 async def test_tablet_migration_with_compaction(manager: ScyllaClusterManager):
     """
     Test that tablet migration is correct when compaction runs concurrently on the source.

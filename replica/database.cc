@@ -3447,7 +3447,8 @@ future<> database::truncate(db::system_keyspace& sys_ks, column_family& cf, std:
     // TODO: notify truncation
 
     // The erase does all the logstor work of the truncate. It drains the write path and the
-    // separator buffers and disables compaction itself.
+    // separator buffers and disables compaction itself, and it fences the writes to the table while
+    // it runs.
     co_await cf.truncate_logstor();
 
     db::replay_position rp = co_await cf.discard_sstables(truncated_at);

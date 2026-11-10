@@ -89,6 +89,9 @@ them. So the erase saves an erased range in the erased range file of the shard (
 [Erased Ranges](#erased-ranges)) before it erases the index entries. The erased range holds the
 table, the token range of the erase and `S`, the last segment sequence that the shard issued. The
 erase does this work:
+- It fences the writes to the range on the index of the table (`primary_index::fence_writes()`), so
+  the writes wait during the erase. The fence also covers a group that joins the table during the
+  erase.
 - It drains the write path and the separator buffers of the groups and disables their compaction
   before it chooses `S`, so every record of the range is in a segment at a sequence of at most `S`.
 - It finds the groups of the table in the range only after it holds the erase semaphore of the
@@ -98,7 +101,6 @@ erase does this work:
   share the erased range file of the shard.
 - It erases the index range, frees the segments of the groups that have no live record, and
   switches the active segment, so that the next write to the range lands at a sequence above `S`.
-- For tablet cleanup, the group is stopped, so no write reaches the range during the erase.
 
 The comment at `segment_manager::erase()` gives the steps in order, and the reason for each step.
 

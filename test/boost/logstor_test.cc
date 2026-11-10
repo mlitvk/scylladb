@@ -25,6 +25,8 @@
 #include <seastar/core/memory.hh>
 #include <seastar/util/closeable.hh>
 #include <seastar/core/semaphore.hh>
+#include <seastar/core/sleep.hh>
+#include <seastar/core/timed_out_error.hh>
 #include <seastar/core/format.hh>
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/core/shard_id.hh>
@@ -4407,6 +4409,13 @@ void wait_for_waiter(std::string_view name) {
     }
 }
 
+// Requires that the index holds `expected` for its key.
+void require_value(logstor& ls, const primary_index& index, const mutation& expected) {
+    auto actual = read_mutation(ls, expected.schema(), index, expected.decorated_key(), expected.schema()->full_slice()).get();
+    BOOST_REQUIRE(actual);
+    assert_that(*actual).is_equal_to(expected);
+}
+
 } // anonymous namespace
 
 // The erased range of an erase covers the range of the erase and nothing else, so the keys outside
@@ -4549,12 +4558,13 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_erase_switches_above_its_sequence) {
         }
     }
 
-    // The test calls segment_manager::erase() directly, because logstor::erase() drains the write
-    // path, and the drain waits for the held write. The sequence of the erase is above the sequence
-    // of the held switch. The group is empty, so after the save the erase does no I/O and reaches
-    // the running switch before the reactor is idle.
+    // The test calls segment_manager::erase() directly with its own fence, because logstor::erase()
+    // drains the write path, and the drain waits for the held write. The sequence of the erase is
+    // above the sequence of the held switch. The group is empty, so after the save the erase does
+    // no I/O and reaches the running switch before the reactor is idle.
     const auto hold_erase = "logstor_erase_wait_after_save";
     injector.enable(hold_erase, true);
+    std::optional<primary_index::write_fence> fence = cg.logstor_index().fence_writes(dht::token_range());
     auto erase = ls.get_segment_manager().erase(schema->id(), cg.logstor_index(), dht::token_range());
     wait_for_waiter(hold_erase);
     injector.receive_message(hold_erase);
@@ -4563,6 +4573,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_erase_switches_above_its_sequence) {
 
     injector.receive_message(hold_switch);
     erase.get();
+    fence.reset();
     held_write->get();
 
     auto after = make_kv_mutation(schema, "pk0", "v0");
@@ -4661,6 +4672,198 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_group_removal_waits_for_an_erase) {
     erase.get();
     destroy.get();
     BOOST_REQUIRE(cg.logstor_index().empty());
+    require_recovery_matches(ls, schema->id(), cg.logstor_index());
+}
+
+// A write to the range of a running erase waits for the erase. An injection holds the erase after
+// the save, and the write must wait, then land in a segment above the sequence of the erase, which
+// the recovery check confirms.
+SEASTAR_THREAD_TEST_CASE(test_logstor_erase_fences_writes_to_the_range) {
+    auto schema = make_kv_schema();
+    started_logstor store;
+    auto& ls = store.ls();
+
+    test_logstor_group cg(schema, ls);
+    auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+
+    write_and_flush_segment(ls, cg, make_kv_mutation(schema, "pk0", "v0", api::timestamp_type(2)));
+    write_and_flush_segment(ls, cg, make_kv_mutation(schema, "pk1", "v0", api::timestamp_type(2)));
+
+    auto& injector = utils::get_local_injector();
+    const auto hold = "logstor_erase_wait_after_save";
+    injector.enable(hold, true);
+    auto erase = ls.erase(schema->id(), cg.logstor_index(), dht::token_range());
+    wait_for_waiter(hold);
+    BOOST_REQUIRE(cg.logstor_index().writes_fenced(dht::token_range()));
+
+    // The write is older than the erased version of the key, so it stays only if the erased version
+    // is dead.
+    auto during = make_kv_mutation(schema, "pk0", "v1", api::timestamp_type(1));
+    auto write = ls.write(during, write_target(&cg, {}), db::no_timeout);
+    seastar::sleep(std::chrono::milliseconds(100)).get();
+    BOOST_REQUIRE(!write.available());
+
+    injector.receive_message(hold);
+    erase.get();
+    BOOST_REQUIRE(!cg.logstor_index().writes_fenced(dht::token_range()));
+    write.get();
+    ls.flush_to_separator().get();
+
+    BOOST_REQUIRE_EQUAL(cg.logstor_index().get_key_count(), 1u);
+    require_value(ls, cg.logstor_index(), during);
+    require_recovery_matches(ls, schema->id(), cg.logstor_index());
+}
+
+// A write that waits on the fence fails with timed_out_error at its own timeout, and the erase is
+// not affected.
+SEASTAR_THREAD_TEST_CASE(test_logstor_fenced_write_times_out) {
+    auto schema = make_kv_schema();
+    started_logstor store;
+    auto& ls = store.ls();
+
+    test_logstor_group cg(schema, ls);
+    auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+
+    write_and_flush_segment(ls, cg, make_kv_mutation(schema, "pk0", "v0", api::timestamp_type(1)));
+
+    auto& injector = utils::get_local_injector();
+    const auto hold = "logstor_erase_wait_after_save";
+    injector.enable(hold, true);
+    auto erase = ls.erase(schema->id(), cg.logstor_index(), dht::token_range());
+    wait_for_waiter(hold);
+
+    const auto failures_before = ls.write_failures();
+    auto during = make_kv_mutation(schema, "pk0", "v1", api::timestamp_type(2));
+    auto write = ls.write(during, write_target(&cg, {}), db::timeout_clock::now() + std::chrono::milliseconds(100));
+    BOOST_REQUIRE_THROW(write.get(), seastar::timed_out_error);
+    BOOST_REQUIRE_EQUAL(ls.write_failures(), failures_before + 1);
+    BOOST_REQUIRE(cg.logstor_index().writes_fenced(dht::token_range()));
+
+    injector.receive_message(hold);
+    erase.get();
+    BOOST_REQUIRE(cg.logstor_index().empty());
+    require_recovery_matches(ls, schema->id(), cg.logstor_index());
+}
+
+// A write that waited for one erase checks the fence again before it continues, because a second
+// erase can take its fence while the write wakes. Without the second check the write lands in the active
+// segment at or below the sequence of the second erase, and the next recovery drops it.
+SEASTAR_THREAD_TEST_CASE(test_logstor_woken_write_checks_the_fence_again) {
+    auto schema = make_kv_schema();
+    started_logstor store;
+    auto& ls = store.ls();
+
+    test_logstor_group cg(schema, ls);
+    auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+
+    auto& injector = utils::get_local_injector();
+    const auto hold_erase = "logstor_erase_wait_after_save";
+    const auto hold_woken_write = "logstor_write_wait_after_unfenced";
+    const auto hold_switch = "logstor_switch_wait_after_get_segment";
+
+    // The write waits for the first erase, and is held when it wakes.
+    injector.enable(hold_erase, true);
+    auto first_erase = ls.erase(schema->id(), cg.logstor_index(), dht::token_range());
+    wait_for_waiter(hold_erase);
+    injector.enable(hold_woken_write, true);
+    auto during = make_kv_mutation(schema, "pk0", "v0");
+    auto write = ls.write(during, write_target(&cg, {}), db::no_timeout);
+    injector.receive_message(hold_erase);
+    first_erase.get();
+    wait_for_waiter(hold_woken_write);
+
+    // The second erase takes its fence, and an injection holds the second erase in its last step,
+    // after its index erase.
+    injector.enable(hold_switch, true);
+    auto second_erase = ls.erase(schema->id(), cg.logstor_index(), dht::token_range());
+    wait_for_waiter(hold_switch);
+
+    injector.receive_message(hold_woken_write);
+    seastar::sleep(std::chrono::milliseconds(100)).get();
+    BOOST_REQUIRE(!write.available());
+
+    injector.receive_message(hold_switch);
+    second_erase.get();
+    write.get();
+    ls.flush_to_separator().get();
+
+    require_value(ls, cg.logstor_index(), during);
+    require_recovery_matches(ls, schema->id(), cg.logstor_index());
+}
+
+// The fence covers the range of the erase and nothing else. While the erase is held, a write
+// outside the range continues, and a write inside the range waits.
+SEASTAR_THREAD_TEST_CASE(test_logstor_erase_fences_only_its_range) {
+    auto schema = make_kv_schema();
+    started_logstor store;
+    auto& ls = store.ls();
+
+    test_logstor_group cg(schema, ls);
+    auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+
+    const auto range = dht::token_range::make_ending_with({dht::token::from_int64(0), true});
+    auto mutation_where = [&] (bool in_range) {
+        for (int i = 0;; ++i) {
+            auto m = make_kv_mutation(schema, fmt::format("pk{}", i), "v0");
+            if (range.contains(m.decorated_key().token(), dht::token_comparator()) == in_range) {
+                return m;
+            }
+        }
+    };
+    const auto inside = mutation_where(true);
+    const auto outside = mutation_where(false);
+
+    auto& injector = utils::get_local_injector();
+    const auto hold = "logstor_erase_wait_after_save";
+    injector.enable(hold, true);
+    auto erase = ls.erase(schema->id(), cg.logstor_index(), range);
+    wait_for_waiter(hold);
+
+    ls.write(outside, write_target(&cg, {}), db::no_timeout).get();
+    auto inside_write = ls.write(inside, write_target(&cg, {}), db::no_timeout);
+    seastar::sleep(std::chrono::milliseconds(100)).get();
+    BOOST_REQUIRE(!inside_write.available());
+
+    injector.receive_message(hold);
+    erase.get();
+    inside_write.get();
+    ls.flush_to_separator().get();
+
+    BOOST_REQUIRE_EQUAL(cg.logstor_index().get_key_count(), 2u);
+    require_recovery_matches(ls, schema->id(), cg.logstor_index());
+}
+
+// The fence is on the index of the table, so it covers a group that joins the table while the
+// erase runs, as when a tablet split or a migration adds a group. A write to the new group waits
+// like other writes.
+SEASTAR_THREAD_TEST_CASE(test_logstor_erase_fences_a_group_that_joins_during_it) {
+    auto schema = make_kv_schema();
+    started_logstor store;
+    auto& ls = store.ls();
+
+    test_logstor_group cg(schema, ls);
+    write_and_flush_segment(ls, cg, make_kv_mutation(schema, "pk0", "v0", api::timestamp_type(2)));
+
+    auto& injector = utils::get_local_injector();
+    const auto hold = "logstor_erase_wait_after_save";
+    injector.enable(hold, true);
+    auto erase = ls.erase(schema->id(), cg.logstor_index(), dht::token_range());
+    wait_for_waiter(hold);
+
+    test_logstor_group joined(schema, ls, cg.logstor_index());
+    // The write is older than the erased version of the key, so it stays only if the erased version
+    // is dead.
+    auto during = make_kv_mutation(schema, "pk0", "v1", api::timestamp_type(1));
+    auto write = ls.write(during, write_target(&joined, {}), db::no_timeout);
+    seastar::sleep(std::chrono::milliseconds(100)).get();
+    BOOST_REQUIRE(!write.available());
+
+    injector.receive_message(hold);
+    erase.get();
+    write.get();
+    ls.flush_to_separator().get();
+
+    require_value(ls, cg.logstor_index(), during);
     require_recovery_matches(ls, schema->id(), cg.logstor_index());
 }
 

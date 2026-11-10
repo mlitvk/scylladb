@@ -1262,9 +1262,10 @@ future<> compaction_group::split(compaction::compaction_type_options::split opt,
 }
 
 future<> compaction_group::erase_logstor() {
-    // The erase cannot find a stopped group in the registry, so the call gives the group when it is
-    // stopped. A live group is registered, so the erase finds it and drains its writes like the
-    // writes of other groups.
+    // logstor::erase() fences the writes to the range. The erase cannot find a stopped group in the
+    // registry, so the call gives the group when it is stopped, and the closed gate of a stopped
+    // group shows that no write to the group is queued. A live group is registered, so the erase
+    // finds it and drains its writes like the writes of other groups.
     co_await _t._logstor->erase(_t.schema()->id(), _t.logstor_index(), token_range(), stopped() ? &as_logstor_group() : nullptr);
 }
 
