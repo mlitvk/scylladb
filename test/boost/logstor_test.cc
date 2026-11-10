@@ -21,6 +21,7 @@
 #include <seastar/core/memory.hh>
 #include <seastar/core/metrics_api.hh>
 #include <seastar/core/seastar.hh>
+#include <seastar/core/sleep.hh>
 #include <seastar/util/closeable.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/format.hh>
@@ -3471,6 +3472,237 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_disabled_group_does_not_compact_on_submit)
     assert_that(*actual_pk0).is_equal_to(pk0_v1);
     assert_that(*actual_pk1).is_equal_to(pk1_v1);
     assert_that(*actual_pk2).is_equal_to(pk2_v0);
+}
+
+// The value size of the records of the compaction tests below. A segment holds 10 records of
+// this size, and has no room for one more.
+static constexpr size_t tenth_of_segment_value_size = 12000;
+static constexpr size_t tenth_of_segment_records = 10;
+
+// Returns the available segments above the compaction reserve, which are the segments that a
+// normal write or a separator flush can take.
+static uint64_t segments_above_compaction_reserve(const logstor& ls, const logstor_params& params) {
+    const auto segment_count = params.disk_size / params.segment_size;
+    const auto segments_in_use = ls.get_segment_manager().get_usage().segment_bytes_in_use / params.segment_size;
+    const auto available = segment_count - segments_in_use;
+    return available > max_compaction_parallelism ? available - max_compaction_parallelism : 0;
+}
+
+// Checks that compactions that run on the compaction reserve complete. Each compaction needs more
+// new segments than the reserve holds, and nothing else frees a segment, so the compactions
+// complete only if each one frees its segments while it runs (SCYLLADB-6165).
+SEASTAR_THREAD_TEST_CASE(test_logstor_compactions_complete_at_the_compaction_reserve) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    // With the trigger off, only the compactions that the test submits run.
+    const logstor_params params{.trigger_compaction_threshold = 0.0};
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path(), params), cache.shared_tracker);
+    test_recovery_catalog no_tables;
+    ls.do_recovery(no_tables).get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    // One group for each compaction buffer, so that the compactions of all groups run at the same
+    // time.
+    constexpr size_t group_count = max_compaction_parallelism;
+    constexpr size_t segments_per_group = 8;
+    constexpr size_t overwrites_per_segment = 2;
+    constexpr size_t group_segment_count = segments_per_group + overwrites_per_segment * segments_per_group / (tenth_of_segment_records - overwrites_per_segment);
+
+    auto make_version = [&] (size_t group, size_t segment, size_t record, unsigned version) {
+        return make_kv_mutation(schema, seastar::format("g{}s{}r{}", group, segment, record),
+                sstring(tenth_of_segment_value_size, char('a' + version)), api::timestamp_type(1 + version));
+    };
+    auto latest_version = [&] (size_t record) -> unsigned {
+        return record < overwrites_per_segment ? 1 : 0;
+    };
+
+    std::deque<test_logstor_group> groups;
+    std::vector<compaction_reenabler> guards;
+    for (size_t g = 0; g < group_count; ++g) {
+        auto& cg = groups.emplace_back(schema, ls);
+        guards.push_back(ls.get_compaction_manager().disable_compaction(cg).get());
+
+        for (size_t s = 0; s < segments_per_group; ++s) {
+            std::vector<mutation> ms;
+            for (size_t r = 0; r < tenth_of_segment_records; ++r) {
+                ms.push_back(make_version(g, s, r, 0));
+            }
+            write_and_flush_segment(ls, cg, ms);
+        }
+        // Overwrite a part of the records of each segment. Each segment of the overwrites holds as
+        // many live records as each of the first segments keeps, so the segments of the group have
+        // the same utilization, and a compaction needs several new segments to free one.
+        std::vector<mutation> ms;
+        for (size_t s = 0; s < segments_per_group; ++s) {
+            for (size_t r = 0; r < overwrites_per_segment; ++r) {
+                ms.push_back(make_version(g, s, r, 1));
+            }
+            if (ms.size() == tenth_of_segment_records - overwrites_per_segment) {
+                write_and_flush_segment(ls, cg, ms);
+                ms.clear();
+            }
+        }
+        BOOST_REQUIRE(ms.empty());
+        BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), group_segment_count);
+    }
+
+    // Fill the store until the compaction reserve and a few segments are left. A step of the fill
+    // can hold two segments at the same time, one for the active segment and one for the separator
+    // flush, and a step that cannot take a segment does not end. So the fill stops while a step
+    // can still take both.
+    constexpr uint64_t max_spare_segments = 2;
+    test_logstor_group filler(schema, ls);
+    auto filler_guard = ls.get_compaction_manager().disable_compaction(filler).get();
+    size_t filler_segments = 0;
+    auto fill_one_segment = [&] {
+        std::vector<mutation> ms;
+        for (size_t r = 0; r < tenth_of_segment_records; ++r) {
+            ms.push_back(make_kv_mutation(schema, seastar::format("f{}r{}", filler_segments, r),
+                    sstring(tenth_of_segment_value_size, 'f'), api::timestamp_type(1)));
+        }
+        write_and_flush_segment(ls, filler, ms);
+        ++filler_segments;
+    };
+    const auto segment_count = params.disk_size / params.segment_size;
+    while (segments_above_compaction_reserve(ls, params) > max_spare_segments && filler_segments < segment_count) {
+        fill_one_segment();
+    }
+    const auto spare_segments = segments_above_compaction_reserve(ls, params);
+    BOOST_REQUIRE_LE(spare_segments, max_spare_segments);
+
+    // Each compaction needs several new segments, and the compactions together need many more
+    // than the reserve and the spare segments hold.
+    guards.clear();
+    for (auto& cg : groups) {
+        ls.get_compaction_manager().submit(cg);
+    }
+    std::vector<future<compaction_reenabler>> compactions;
+    for (auto& cg : groups) {
+        compactions.push_back(ls.get_compaction_manager().disable_compaction(cg));
+    }
+    auto all_complete = [&] {
+        return std::ranges::all_of(compactions, [] (const auto& f) { return f.available(); });
+    };
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    while (!all_complete() && std::chrono::steady_clock::now() < deadline) {
+        seastar::sleep(std::chrono::milliseconds(10)).get();
+    }
+    BOOST_REQUIRE_MESSAGE(all_complete(), "the compactions did not complete on the compaction reserve");
+    for (auto& f : compactions) {
+        guards.push_back(f.get());
+    }
+
+    // Each compaction ran and freed a segment, so a write that needs new segments completes.
+    for (auto& cg : groups) {
+        BOOST_REQUIRE_LT(cg.logstor_segments().segment_count(), group_segment_count);
+    }
+    BOOST_REQUIRE_GE(segments_above_compaction_reserve(ls, params), spare_segments + group_count);
+    fill_one_segment();
+
+    for (size_t g = 0; g < group_count; ++g) {
+        for (size_t s = 0; s < segments_per_group; ++s) {
+            for (size_t r = 0; r < tenth_of_segment_records; ++r) {
+                const auto expected = make_version(g, s, r, latest_version(r));
+                auto actual = read_mutation(ls, schema, groups[g].logstor_index(), expected.decorated_key(), schema->full_slice()).get();
+                BOOST_REQUIRE(actual);
+                assert_that(*actual).is_equal_to(expected);
+            }
+        }
+    }
+}
+
+// Checks a compaction that fails after it freed a part of its segments. The freed segments are out
+// of the group, the other segments stay in the group, every record is readable, and the next
+// compaction of the group completes.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_that_fails_after_a_free_keeps_the_other_segments) {
+    if constexpr (!std::is_same_v<utils::error_injection_type, utils::error_injection<true>>) {
+        return;
+    }
+
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    test_recovery_catalog no_tables;
+    ls.do_recovery(no_tables).get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+    auto setup_guard = std::make_optional(ls.get_compaction_manager().disable_compaction(cg).get());
+
+    constexpr size_t input_count = 4;
+    constexpr size_t overwrites_per_segment = tenth_of_segment_records / 2;
+
+    auto make_version = [&] (size_t segment, size_t record, unsigned version) {
+        return make_kv_mutation(schema, seastar::format("s{}r{}", segment, record),
+                sstring(tenth_of_segment_value_size, char('a' + version)), api::timestamp_type(1 + version));
+    };
+    auto require_latest_versions = [&] {
+        for (size_t s = 0; s < input_count; ++s) {
+            for (size_t r = 0; r < tenth_of_segment_records; ++r) {
+                const auto expected = make_version(s, r, r < overwrites_per_segment ? 1 : 0);
+                auto actual = read_mutation(ls, schema, cg.logstor_index(), expected.decorated_key(), schema->full_slice()).get();
+                BOOST_REQUIRE(actual);
+                assert_that(*actual).is_equal_to(expected);
+            }
+        }
+    };
+    auto segment_ids = [&] {
+        return snapshot_segment_ids(ls.get_segment_manager().make_snapshot(cg).get());
+    };
+
+    for (size_t s = 0; s < input_count; ++s) {
+        std::vector<mutation> ms;
+        for (size_t r = 0; r < tenth_of_segment_records; ++r) {
+            ms.push_back(make_version(s, r, 0));
+        }
+        write_and_flush_segment(ls, cg, ms);
+    }
+    const auto input_ids = segment_ids();
+    BOOST_REQUIRE_EQUAL(input_ids.size(), input_count);
+
+    // Overwrite half of the records of each segment. The overwrites fill their own segments, so
+    // the compaction takes the first segments only. Their live records need two new segments, and
+    // the first flush comes before the end of the scan.
+    std::vector<mutation> ms;
+    for (size_t s = 0; s < input_count; ++s) {
+        for (size_t r = 0; r < overwrites_per_segment; ++r) {
+            ms.push_back(make_version(s, r, 1));
+        }
+        if (ms.size() == tenth_of_segment_records) {
+            write_and_flush_segment(ls, cg, ms);
+            ms.clear();
+        }
+    }
+    BOOST_REQUIRE(ms.empty());
+    const auto segment_count_before = cg.logstor_segments().segment_count();
+
+    utils::get_local_injector().enable("logstor_compaction_fail_after_free", true /* one shot */);
+
+    setup_guard.reset();
+    ls.get_compaction_manager().submit(cg);
+    setup_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+
+    // The compaction wrote one new segment and freed the segments that the new segment emptied.
+    const auto ids_after_failure = segment_ids();
+    const auto kept_inputs = std::ranges::count_if(input_ids, [&] (log_segment_id id) { return ids_after_failure.contains(id); });
+    BOOST_REQUIRE_GT(kept_inputs, 0);
+    BOOST_REQUIRE_LT(kept_inputs, input_count);
+    BOOST_REQUIRE_EQUAL(ids_after_failure.size(), segment_count_before - (input_count - kept_inputs) + 1);
+    require_latest_versions();
+
+    // The next compaction takes the inputs that the first one left, and frees them.
+    setup_guard.reset();
+    ls.get_compaction_manager().submit(cg);
+    setup_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+
+    BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), ids_after_failure.size() - kept_inputs + 1);
+    require_latest_versions();
 }
 
 // Split compaction hands every segment of a group to the group its records belong to after the

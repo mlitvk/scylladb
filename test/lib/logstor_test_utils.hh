@@ -72,6 +72,9 @@ struct logstor_params {
     std::chrono::milliseconds format_retry_interval = std::chrono::milliseconds(100);
     bool compaction_enabled = true;
     size_t max_segments_per_compaction = 8;
+    // The free level under which automatic compaction starts, as a fraction of the disk. With 0,
+    // only the compactions that a test submits run.
+    double trigger_compaction_threshold = 0.05;
 };
 
 inline replica::logstor::logstor_config make_test_logstor_config(const std::filesystem::path& base_dir, logstor_params params = {}) {
@@ -86,6 +89,7 @@ inline replica::logstor::logstor_config make_test_logstor_config(const std::file
             .format_retry_interval = params.format_retry_interval,
             .compaction_enabled = params.compaction_enabled,
             .max_segments_per_compaction = params.max_segments_per_compaction,
+            .trigger_compaction_threshold = utils::updateable_value<double>(params.trigger_compaction_threshold),
             .compaction_sg = seastar::current_scheduling_group(),
             .compaction_static_shares = utils::updateable_value<float>(0.0f),
             .compaction_max_shares = utils::updateable_value<float>(2000.0f),
