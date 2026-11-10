@@ -82,6 +82,26 @@ Only step 4 writes to the disk - all other steps only update in-memory metadata.
 5. A job that runs next to another job starts only if its batch reclaims at least 75% of what the best batch of the shard reclaims per byte copied.
 6. Automatic compaction skips the compaction groups of a table whose automatic compaction is off, for example after `nodetool disableautocompaction`. A compaction that is asked for through the logstor compaction API still runs.
 
+**Erase:**
+
+Tablet cleanup and truncate remove records from the index, and no newer record on disk shadows
+them. So the erase saves an erased range in the erased range file of the shard (see
+[Erased Ranges](#erased-ranges)) before it erases the index entries. The erased range holds the
+table, the token range of the erase and `S`, the last segment sequence that the shard issued. The
+erase does this work:
+- It drains the write path and the separator buffers of the groups and disables their compaction
+  before it chooses `S`, so every record of the range is in a segment at a sequence of at most `S`.
+- It finds the groups of the table in the range only after it holds the erase semaphore of the
+  index. A group leaves the registry of the compaction manager only between erases of its index, so
+  no group of the list goes away during the erase.
+- It updates and saves the erased ranges one erase at a time, because the erases of every table
+  share the erased range file of the shard.
+- It erases the index range, frees the segments of the groups that have no live record, and
+  switches the active segment, so that the next write to the range lands at a sequence above `S`.
+- For tablet cleanup, the group is stopped, so no write reaches the range during the erase.
+
+The comment at `segment_manager::erase()` gives the steps in order, and the reason for each step.
+
 ## Usage
 
 ### Enabling Logstor

@@ -190,10 +190,10 @@ public:
     // be called on the shard owning the segment.
     sstring get_segment_file_path(log_segment_id) const;
 
-    // Erases all the records of `table` in `range`, so that reads do not find them. The caller must
-    // fence the writes to the range until the erase ends, and must drain the write path first.
-    // `stopped_group` is a stopped group of the range, which is no longer registered, so the erase
-    // cannot find it.
+    // Erases all the records of `table` in `range`, so that reads do not find them and a restart
+    // does not bring them back. The caller must fence the writes to the range until the erase ends,
+    // and must drain the write path first. `stopped_group` is a stopped group of the range, which is
+    // no longer registered, so the erase cannot find it.
     future<> erase(table_id, primary_index&, dht::token_range, logstor_group* stopped_group = nullptr);
 
     segment_manager_usage get_usage() const noexcept;

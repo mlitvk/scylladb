@@ -736,9 +736,51 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_recovery_reproduces_index_after_split_comp
     require_equal_indexes(index, *rebuilt);
 }
 
+// An erase removes records from the index, and no newer record on disk shadows them. Recovery
+// leaves them out only because of the erased range that the erase saves. The write after the erase
+// has an older timestamp than the erased record, so the write wins only if the erased record is
+// never a candidate for the index.
+SEASTAR_THREAD_TEST_CASE(test_logstor_recovery_honors_an_erase) {
+    auto schema = make_kv_schema("cf");
+    tmpdir dir;
+
+    test_store store(dir);
+    auto& ls = store.ls();
+    test_recovery_catalog no_tables;
+    ls.do_recovery(no_tables).get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+    auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+
+    write_to_full_segment(ls, cg, make_kv_mutation(schema, "pk0", "v0", api::timestamp_type(1)));
+    write_to_full_segment(ls, cg, make_kv_mutation(schema, "pk0", "v1", api::timestamp_type(2)));
+    // The record stays only in the shared mixed segment, because the separator buffer that holds
+    // its copy is not flushed.
+    ls.write(make_kv_mutation(schema, "pk1", "v0", api::timestamp_type(2)), write_target(&cg, {}), db::no_timeout).get();
+    ls.flush_to_separator().get();
+    require_recovery_matches(ls, schema->id(), cg.logstor_index());
+
+    ls.erase(schema->id(), cg.logstor_index(), dht::token_range()).get();
+    BOOST_REQUIRE(cg.logstor_index().empty());
+    BOOST_REQUIRE(cg.logstor_segments().empty());
+    require_recovery_matches(ls, schema->id(), cg.logstor_index());
+
+    auto after = make_kv_mutation(schema, "pk0", "v2", api::timestamp_type(1));
+    ls.write(after, write_target(&cg, {}), db::no_timeout).get();
+    ls.flush_to_separator().get();
+    BOOST_REQUIRE_EQUAL(cg.logstor_index().get_key_count(), 1u);
+    require_recovery_matches(ls, schema->id(), cg.logstor_index());
+
+    auto actual = read_mutation(ls, schema, cg.logstor_index(), after.decorated_key(), schema->full_slice()).get();
+    BOOST_REQUIRE(actual);
+    assert_that(*actual).is_equal_to(after);
+}
+
 // A fixed pseudo-random mix of writes and overwrites, with timestamps that do not follow the write
-// order so that writes lose to earlier ones and ties happen, interleaved with separator flushes and
-// compactions.
+// order so that writes lose to earlier ones and ties happen, interleaved with separator flushes,
+// compactions and an erase.
 SEASTAR_THREAD_TEST_CASE(test_logstor_recovery_reproduces_index_under_mixed_workload) {
     auto schema = make_kv_schema("cf");
     tmpdir dir;
@@ -768,6 +810,11 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_recovery_reproduces_index_under_mixed_work
         if (i % 160 == 159) {
             ls.get_compaction_manager().submit(cg);
             ls.get_compaction_manager().disable_compaction(cg).get();
+        }
+        if (i == write_count / 2) {
+            // An erase of half the ring, as a tablet cleanup does, runs in the middle of the
+            // workload.
+            ls.erase(schema->id(), cg.logstor_index(), dht::token_range::make_ending_with({dht::token::from_int64(0), true})).get();
         }
     }
 

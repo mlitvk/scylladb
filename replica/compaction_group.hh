@@ -348,7 +348,7 @@ public:
         _repair_sstable_classifier = std::move(repair_sstable_classifier);
     }
 
-    // Erases the logstor records of the group.
+    // Erases the logstor records of the group, so that a restart does not bring them back.
     future<> erase_logstor();
 
     future<> flush_separator(std::optional<logstor::segment_sequence> seq_num = std::nullopt);

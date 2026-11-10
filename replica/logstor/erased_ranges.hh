@@ -68,6 +68,12 @@ public:
     // Adds `r` to the set in memory. When it throws, the set does not change.
     erased_ranges& insert(erased_range r);
 
+    // Saves the set with `r` added to the file of `shard` in `base_dir`, and then adds `r` to the
+    // set in memory, so the set in memory never holds an erased range that the file does not. When
+    // the save fails, the set does not change. The caller must not change the set until the
+    // returned future resolves.
+    future<> insert_and_save(erased_range r, const std::filesystem::path& base_dir, unsigned shard);
+
     // Returns the erased ranges, in the order of their table and then of their first token.
     std::vector<erased_range> all() const;
 
@@ -123,6 +129,12 @@ private:
         std::vector<step> steps;
     };
 
+    // The table whose state a save writes in place of the state in `_tables`.
+    struct replacement {
+        table_id table;
+        const table_state& state;
+    };
+
     std::unordered_map<table_id, table_state> _tables;
     // The number of erased ranges of all tables.
     size_t _size = 0;
@@ -138,6 +150,10 @@ private:
     // Puts `state` in place of the state of `table`, and raises the sequence floor to `seq`. The
     // caller must have added an entry of `table` to `_tables`.
     void replace(table_id table, table_state&& state, segment_sequence seq) noexcept;
+
+    // Writes the set, with `replaced` in place of the state of its table when it is given, to the
+    // file of `shard` in `base_dir`, atomically and durably.
+    future<> write_file(const std::filesystem::path& base_dir, unsigned shard, const replacement* replaced, segment_sequence seq_floor) const;
 };
 
 } // namespace replica::logstor

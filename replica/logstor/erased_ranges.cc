@@ -182,75 +182,7 @@ future<erased_ranges> erased_ranges::load(const std::filesystem::path& base_dir,
 }
 
 future<> erased_ranges::save(const std::filesystem::path& base_dir, unsigned shard) const {
-    utils::get_local_injector().inject("logstor_erased_ranges_save_fail", [] {
-        throw std::runtime_error("erased range save failed by injection");
-    });
-    const auto name = file_name::erase(shard);
-    const auto path = name.in(base_dir).string();
-    const auto tmp_path = name.tmp().in(base_dir).string();
-
-    // The save writes the tables in the order of their ids, so the bytes of the file do not depend
-    // on the order of the hash map.
-    std::vector<std::pair<table_id, const table_state*>> tables;
-    tables.reserve(_tables.size());
-    for (const auto& [table, state] : _tables) {
-        tables.emplace_back(table, &state);
-    }
-    const auto count = _size;
-    std::ranges::sort(tables, {}, &std::pair<table_id, const table_state*>::first);
-
-    // The save writes the temporary file whole and flushes the file before the rename to the final
-    // name, so a crash at any point leaves either the previous file or this one. Nothing reads a
-    // leftover temporary file, and the next save truncates it. The output stream closes the file.
-    auto out = co_await seastar::make_file_output_stream(
-            co_await seastar::open_file_dma(tmp_path, seastar::open_flags::wo | seastar::open_flags::create | seastar::open_flags::truncate),
-            seastar::file_output_stream_options{.buffer_size = stream_buffer_size});
-    auto written = co_await coroutine::as_future([&] () -> future<> {
-        utils::crc32 crc;
-        std::array<char, header_size> header_bytes;
-        auto header_out = seastar::simple_memory_output_stream(header_bytes.data(), header_bytes.size());
-        ser::serializer<file_header>::write(header_out, file_header{
-            .magic = file_magic,
-            .version = file_version,
-            .reserved = {},
-            .count = static_cast<uint32_t>(count),
-            .seq_floor = _seq_floor,
-        });
-        add_to_crc(crc, header_bytes.data(), header_bytes.size());
-        co_await out.write(header_bytes.data(), header_bytes.size());
-
-        auto batch = seastar::temporary_buffer<char>(ranges_per_batch * erased_range_size);
-        size_t batched = 0;
-        auto write_batch = [&] {
-            const auto size = batched * erased_range_size;
-            add_to_crc(crc, batch.get(), size);
-            batched = 0;
-            return out.write(batch.get(), size);
-        };
-        for (const auto& [table, state] : tables) {
-            for (const auto& r : state->ranges) {
-                auto range_out = seastar::simple_memory_output_stream(batch.get_write() + batched * erased_range_size, erased_range_size);
-                ser::serializer<erased_range>::write(range_out, erased_range{.table = table, .first_token = r.first_token, .last_token = r.last_token, .seq = r.seq});
-                if (++batched == ranges_per_batch) {
-                    co_await write_batch();
-                }
-            }
-        }
-        co_await write_batch();
-
-        std::array<char, crc_size> crc_bytes;
-        auto crc_out = seastar::simple_memory_output_stream(crc_bytes.data(), crc_bytes.size());
-        ser::serializer<uint32_t>::write(crc_out, crc.get());
-        co_await out.write(crc_bytes.data(), crc_bytes.size());
-        co_await out.flush();
-    }());
-    auto closed = co_await coroutine::as_future(out.close());
-    co_await std::move(written);
-    co_await std::move(closed);
-
-    co_await seastar::rename_file(tmp_path, path);
-    co_await seastar::sync_directory(base_dir.string());
-    logstor_logger.debug("Saved {} erased ranges to {}", count, path);
+    return write_file(base_dir, shard, nullptr, _seq_floor);
 }
 
 erased_ranges& erased_ranges::insert(erased_range r) {
@@ -258,6 +190,23 @@ erased_ranges& erased_ranges::insert(erased_range r) {
     _tables.try_emplace(r.table);
     replace(r.table, std::move(state), r.seq);
     return *this;
+}
+
+future<> erased_ranges::insert_and_save(erased_range r, const std::filesystem::path& base_dir, unsigned shard) {
+    auto state = with_range(r);
+    // The entry of the table exists before the save, so replace() cannot fail after the file holds
+    // `r`. A new entry has no steps and covers nothing, so the lookups during the save see the set
+    // as it was.
+    const bool inserted = _tables.try_emplace(r.table).second;
+    const replacement replaced{.table = r.table, .state = state};
+    auto saved = co_await coroutine::as_future(write_file(base_dir, shard, &replaced, std::max(_seq_floor, r.seq)));
+    if (saved.failed()) {
+        if (inserted) {
+            _tables.erase(r.table);
+        }
+        co_await std::move(saved);
+    }
+    replace(r.table, std::move(state), r.seq);
 }
 
 std::vector<erased_range> erased_ranges::all() const {
@@ -382,6 +331,85 @@ void erased_ranges::replace(table_id table, table_state&& state, segment_sequenc
     _size = _size - current.ranges.size() + state.ranges.size();
     current = std::move(state);
     _seq_floor = std::max(_seq_floor, seq);
+}
+
+future<> erased_ranges::write_file(const std::filesystem::path& base_dir, unsigned shard, const replacement* replaced, segment_sequence seq_floor) const {
+    utils::get_local_injector().inject("logstor_erased_ranges_save_fail", [] {
+        throw std::runtime_error("erased range save failed by injection");
+    });
+    const auto name = file_name::erase(shard);
+    const auto path = name.in(base_dir).string();
+    const auto tmp_path = name.tmp().in(base_dir).string();
+
+    // The save writes the tables in the order of their ids, so the bytes of the file do not depend
+    // on the order of the hash map.
+    std::vector<std::pair<table_id, const table_state*>> tables;
+    tables.reserve(_tables.size() + 1);
+    size_t count = 0;
+    for (const auto& [table, state] : _tables) {
+        if (!replaced || table != replaced->table) {
+            tables.emplace_back(table, &state);
+            count += state.ranges.size();
+        }
+    }
+    if (replaced) {
+        tables.emplace_back(replaced->table, &replaced->state);
+        count += replaced->state.ranges.size();
+    }
+    std::ranges::sort(tables, {}, &std::pair<table_id, const table_state*>::first);
+
+    // The save writes the temporary file whole and flushes the file before the rename to the final
+    // name, so a crash at any point leaves either the previous file or this one. Nothing reads a
+    // leftover temporary file, and the next save truncates it. The output stream closes the file.
+    auto out = co_await seastar::make_file_output_stream(
+            co_await seastar::open_file_dma(tmp_path, seastar::open_flags::wo | seastar::open_flags::create | seastar::open_flags::truncate),
+            seastar::file_output_stream_options{.buffer_size = stream_buffer_size});
+    auto written = co_await coroutine::as_future([&] () -> future<> {
+        utils::crc32 crc;
+        std::array<char, header_size> header_bytes;
+        auto header_out = seastar::simple_memory_output_stream(header_bytes.data(), header_bytes.size());
+        ser::serializer<file_header>::write(header_out, file_header{
+            .magic = file_magic,
+            .version = file_version,
+            .reserved = {},
+            .count = static_cast<uint32_t>(count),
+            .seq_floor = seq_floor,
+        });
+        add_to_crc(crc, header_bytes.data(), header_bytes.size());
+        co_await out.write(header_bytes.data(), header_bytes.size());
+
+        auto batch = seastar::temporary_buffer<char>(ranges_per_batch * erased_range_size);
+        size_t batched = 0;
+        auto write_batch = [&] {
+            const auto size = batched * erased_range_size;
+            add_to_crc(crc, batch.get(), size);
+            batched = 0;
+            return out.write(batch.get(), size);
+        };
+        for (const auto& [table, state] : tables) {
+            for (const auto& r : state->ranges) {
+                auto range_out = seastar::simple_memory_output_stream(batch.get_write() + batched * erased_range_size, erased_range_size);
+                ser::serializer<erased_range>::write(range_out, erased_range{.table = table, .first_token = r.first_token, .last_token = r.last_token, .seq = r.seq});
+                if (++batched == ranges_per_batch) {
+                    co_await write_batch();
+                }
+            }
+        }
+        co_await write_batch();
+
+        std::array<char, crc_size> crc_bytes;
+        auto crc_out = seastar::simple_memory_output_stream(crc_bytes.data(), crc_bytes.size());
+        ser::serializer<uint32_t>::write(crc_out, crc.get());
+        co_await out.write(crc_bytes.data(), crc_bytes.size());
+        co_await out.flush();
+    }());
+    auto closed = co_await coroutine::as_future(out.close());
+    co_await std::move(written);
+    co_await std::move(closed);
+
+    co_await seastar::rename_file(tmp_path, path);
+    co_await seastar::sync_directory(base_dir.string());
+    logstor_logger.debug("Saved {} erased ranges to {}", count, path);
 }
 
 } // namespace replica::logstor
