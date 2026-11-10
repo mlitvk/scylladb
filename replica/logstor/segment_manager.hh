@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <string_view>
 #include <vector>
 #include <seastar/core/shared_future.hh>
 #include <seastar/core/file.hh>
@@ -118,6 +119,9 @@ enum class recovery_step {
 };
 
 inline constexpr size_t recovery_step_count = static_cast<size_t>(recovery_step::finish_files) + 1;
+
+// Returns the name of a recovery step, as the log of a recovery gives it.
+std::string_view recovery_step_name(recovery_step) noexcept;
 
 // What one recovery step took. The I/O counts are the reactor's, so they cover all the I/O of the
 // shard while the step runs, which at startup is the I/O of recovery.

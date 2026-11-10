@@ -2406,6 +2406,8 @@ double to_mib(uint64_t bytes) noexcept {
     return double(bytes) / (1024 * 1024);
 }
 
+} // anonymous namespace
+
 std::string_view recovery_step_name(recovery_step step) noexcept {
     switch (step) {
     case recovery_step::open_files: return "open files";
@@ -2419,8 +2421,6 @@ std::string_view recovery_step_name(recovery_step step) noexcept {
     }
     return "unknown";
 }
-
-} // anonymous namespace
 
 // One recovery of the segments of the shard. do_recovery() makes one and runs it. The steps run in
 // the order of run(), and each step starts from the state that the step before it leaves.

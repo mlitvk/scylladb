@@ -66,6 +66,7 @@
 //   --file-size-in-mb,
 //   --disk-size-in-mb            the geometry of the segment pool of a shard
 //   --compaction                 let compaction run. On by default, see below
+//   --recoveries                 how many times the recover test recovers each shard
 //   --dir                        where to put the logstor files. Defaults to a temporary directory
 //   --json-result                write one file per test, suffixed with the name of the test
 //   --record-size-report         print what a record takes on disk for a matrix of row shapes and
@@ -148,6 +149,8 @@
 //                    partition is copied into the record value, and no mutation is built. Draws from
 //                    a pool of frozen mutations of up to 1024 keys, which is frozen before the test
 //                    starts, so the freeze, which the coordinator pays, is not in the number
+//   recover          a whole recovery of the shard from its files, as a node does at startup. Not
+//                    an operation that repeats: see Measuring recovery below
 //
 // Everything above `raw-read` touches no disk - the two cache tests touch the cache, the rest touch
 // neither it nor the disk. They run `cpu_test_batch` operations per invocation of the measurement
@@ -242,6 +245,32 @@
 //   pure CPU tests and 0.1% to 0.4% on `write` depending on how quiet the machine is.
 //
 //
+// Measuring recovery
+// ==================
+//
+// The recover test stops the logstor of each shard and recovers a new one from the files that it
+// left, `--recoveries` times, with the group of the dataset in the recovery catalog. The last
+// recovered logstor stays started, so the tests after it run on it. Each recovery prints its time,
+// the instructions, cycles and allocations of the shard while do_recovery() runs, what the scan found,
+// and the time, CPU and I/O of each step from the recovery summary, and then one `recover-result:`
+// line of key=value fields for scripts. The run ends with the median of each shard over its
+// recoveries.
+//
+// The dataset decides what a recovery scans. Every file of the pool is formatted at the first start,
+// so the scan reads every segment of `--disk-size-in-mb`. A segment that was never written costs one
+// read of its first block, and a written one costs that read and then one read of the whole segment.
+// A fresh dataset has each record twice: in the mixed segment that it was written to, and in the full
+// segment that the separator copied it to. `--partitions` against the disk size sets the share of
+// written segments, and `--columns` and `--value-size` set the records in a segment:
+//
+//   perf_logstor --smp 1 --idle-poll-time-us 0 --test recover --partitions 1000000 \
+//       --disk-size-in-mb 4096 --compaction 0
+//
+// For the CPU of a recovery, put the files on tmpfs (`--dir /dev/shm/...`), where no read waits.
+// For its time on a disk, use the disk, and read the waited bytes of the index step, which say how
+// much of the scan waited for the disk.
+//
+//
 // Profiling a step
 // ================
 //
@@ -268,7 +297,9 @@
 // functions are on the path, then add a test here for the ones that look expensive - a method on
 // `logstor_bench` and a name in `test_kinds`.
 
+#include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <filesystem>
 #include <ranges>
 #include <variant>
@@ -347,6 +378,7 @@ enum class test_kind {
     segment_read,
     write,
     write_frozen,
+    recover,
 };
 
 const std::vector<std::pair<std::string_view, test_kind>> test_kinds = {
@@ -367,6 +399,7 @@ const std::vector<std::pair<std::string_view, test_kind>> test_kinds = {
     {"segment-read", test_kind::segment_read},
     {"write", test_kind::write},
     {"write-frozen", test_kind::write_frozen},
+    {"recover", test_kind::recover},
 };
 
 std::string_view name_of(test_kind kind) {
@@ -396,6 +429,8 @@ struct test_config {
     size_t disk_size;
     bool compaction;
     bool stop_on_error;
+    // How many times the recover test recovers each shard.
+    unsigned recoveries;
 };
 
 std::ostream& operator<<(std::ostream& os, const test_config& cfg) {
@@ -600,21 +635,7 @@ public:
         , _serialization_buffer(std::make_unique<raw_write_buffer>(cfg.segment_size, segment_kind::mixed))
         , _dir(dir) {
         std::ranges::fill(_value, int8_t('v'));
-        auto logstor_cfg = tests::logstor::make_test_logstor_config(dir, {
-            .segment_size = cfg.segment_size,
-            .file_size = cfg.file_size,
-            .disk_size = cfg.disk_size,
-            // Preallocated rather than sparse, which is what a node writes into: a read of a hole
-            // is not a read of a disk, and a write into one pays for the extent it allocates.
-            .sparse_files = false,
-            .compaction_enabled = cfg.compaction,
-            // A perf test uses the curve of a node, because its disk is large enough for the curve.
-            .compaction_min_utilization_threshold = default_compaction_min_utilization_threshold,
-        });
-        // The same share of memory a node gives the writes it has taken but not yet flushed, which
-        // is what bounds how far ahead of the disk the write path may run.
-        logstor_cfg.max_queued_write_bytes = memory::stats().total_memory() / 100;
-        _logstor = std::make_unique<logstor>(std::move(logstor_cfg), _cache.shared_tracker);
+        _logstor = std::make_unique<logstor>(make_logstor_config(), _cache.shared_tracker);
     }
 
     future<> start() {
@@ -630,10 +651,7 @@ public:
     }
 
     future<> stop() {
-        if (_data_file) {
-            co_await _data_file.close();
-            _data_file = seastar::file();
-        }
+        co_await close_data_file();
         co_await drop_private_index();
         if (_group) {
             // The index evicts what it has in the cache before it goes, since a cached partition
@@ -650,6 +668,55 @@ public:
         co_await _logstor->stop();
         _permit.reset();
         co_await _semaphore.stop();
+    }
+
+    // What one recovery of the shard took: do_recovery(), and then start(), which separates the
+    // records of the mixed segments that the recovery listed. The counters of perf_sample count all
+    // the work of the thread of the shard while the step runs, which is the work of the recovery,
+    // because nothing else runs on the shard.
+    struct recovery_sample {
+        recovery_summary summary;
+        perf_sample recovery;
+        perf_sample start;
+    };
+
+    // Stops the logstor of the shard and recovers a new one from its files, as a node does at
+    // startup, with the group of the dataset in the recovery catalog. The new logstor stays
+    // started, so that the tests after this one run on it. Both separators are flushed before the
+    // stop, so that the stop discards no buffer and every record of the dataset is in a full
+    // segment of the group.
+    future<recovery_sample> recover() {
+        return seastar::async([this] {
+            _logstor->flush_to_separator().get();
+            _group->flush_separator().get();
+            close_data_file().get();
+            drop_private_index().get();
+            index().drain_cache().get();
+            _group.reset();
+            _logstor->stop().get();
+            // The old logstor goes before the new one is made, so that the two never hold the
+            // files at the same time.
+            _logstor.reset();
+
+            _logstor = std::make_unique<logstor>(make_logstor_config(), _cache.shared_tracker);
+            _group = std::make_unique<tests::logstor::test_logstor_group>(_schema, *_logstor, true /* cache_enabled */);
+            tests::logstor::test_recovery_catalog catalog;
+            catalog.add(*_group);
+            perf_sampler sampler;
+            recovery_sample sample;
+            sample.recovery = sampler.measure([&] {
+                sample.summary = _logstor->do_recovery(catalog).get();
+            });
+            sample.start = sampler.measure([&] {
+                _logstor->start().get();
+            });
+            if (index().get_key_count() != _keys.size()) {
+                on_internal_error(logstor_logger, fmt::format("recovery found {} keys of the {} keys of the dataset",
+                        index().get_key_count(), _keys.size()));
+            }
+            open_data_file().get();
+            return sample;
+        });
     }
 
     future<> do_write() {
@@ -975,6 +1042,31 @@ private:
         return m;
     }
 
+    logstor_config make_logstor_config() const {
+        auto logstor_cfg = tests::logstor::make_test_logstor_config(_dir, {
+            .segment_size = _cfg.segment_size,
+            .file_size = _cfg.file_size,
+            .disk_size = _cfg.disk_size,
+            // Preallocated rather than sparse, which is what a node writes into: a read of a hole
+            // is not a read of a disk, and a write into one pays for the extent it allocates.
+            .sparse_files = false,
+            .compaction_enabled = _cfg.compaction,
+            // A perf test uses the curve of a node, because its disk is large enough for the curve.
+            .compaction_min_utilization_threshold = default_compaction_min_utilization_threshold,
+        });
+        // The same share of memory a node gives the writes it has taken but not yet flushed, which
+        // is what bounds how far ahead of the disk the write path may run.
+        logstor_cfg.max_queued_write_bytes = memory::stats().total_memory() / 100;
+        return logstor_cfg;
+    }
+
+    future<> close_data_file() {
+        if (_data_file) {
+            co_await _data_file.close();
+            _data_file = seastar::file();
+        }
+    }
+
     // The first data file of the shard is as good as any for a read that is only about what the
     // read costs.
     future<> open_data_file() {
@@ -1106,8 +1198,89 @@ std::vector<perf_result_with_io> run_test(sharded<logstor_bench>& bench, test_ki
     case test_kind::write_frozen:
         bench.invoke_on_all(&logstor_bench::freeze_write_pool).get();
         return io_test(&logstor_bench::do_write_frozen);
+    case test_kind::recover:
+        on_internal_error(logstor_logger, "the recover test runs through run_recover_test()");
     }
     on_internal_error(logstor_logger, "unknown test kind");
+}
+
+double ratio(double count, double total) noexcept {
+    return total ? count / total : 0;
+}
+
+double to_mib(uint64_t bytes) noexcept {
+    return double(bytes) / (1024 * 1024);
+}
+
+// Prints what one recovery of one shard found and took, step by step, and one `recover-result:`
+// line of key=value fields for scripts.
+void print_recovery(unsigned recovery, shard_id shard, const logstor_bench::recovery_sample& sample) {
+    const auto& summary = sample.summary;
+    const auto& c = summary.counters;
+    const auto& rec = sample.recovery;
+    const auto valid_segments = c.segments_scanned - c.empty_segments;
+    fmt::print("recovery {} of shard {}: {:.3f}s, {} instructions ({:.2f} per cycle), {} allocations;"
+            " start {:.3f}s, {} instructions\n",
+            recovery, shard, rec.time.count(), rec.instructions, ratio(rec.instructions, rec.cycles), rec.allocations,
+            sample.start.time.count(), sample.start.instructions);
+    fmt::print("  scanned {} segments: {} with a valid chunk, {} used; {} chunks, {} records: {} new keys, {} replaced,"
+            " {} superseded, {} of gone tables, {} erased, {} dropped\n",
+            c.segments_scanned, valid_segments, summary.used_segments, c.chunks, c.records_read, c.records_new_key,
+            c.records_replaced, c.records_superseded, c.records_of_gone_tables, c.records_erased, c.dropped_records);
+    fmt::print("  instructions per scanned segment {:.0f}, per segment with a valid chunk {:.0f}, per record {:.0f};"
+            " allocations per record {:.2f}\n",
+            ratio(rec.instructions, c.segments_scanned), ratio(rec.instructions, valid_segments),
+            ratio(rec.instructions, c.records_read), ratio(rec.allocations, c.records_read));
+    for (size_t i = 0; i < recovery_step_count; ++i) {
+        const auto& step = summary.steps[i];
+        fmt::print("  {:<28} {:8.3f}s  cpu {:8.3f}s  {:7} reads {:9.1f} MiB  {:5} writes {:7.1f} MiB  streams {:9.1f} MiB,"
+                " {:9.1f} MiB waited\n",
+                recovery_step_name(recovery_step(i)), std::chrono::duration<double>(step.wall).count(),
+                std::chrono::duration<double>(step.cpu).count(), step.reads, to_mib(step.read_bytes), step.writes,
+                to_mib(step.write_bytes), to_mib(step.stream_read_bytes), to_mib(step.stream_read_bytes_waited));
+    }
+    const auto& index = summary.step(recovery_step::index);
+    fmt::print("recover-result: shard={} recovery={} seconds={:.6f} instructions={} cycles={} allocations={}"
+            " start_seconds={:.6f} start_instructions={} segments={} valid_segments={} used_segments={} chunks={}"
+            " records={} index_seconds={:.6f} index_cpu_seconds={:.6f} place_seconds={:.6f} reads={} read_bytes={}"
+            " stream_read_bytes={} waited_bytes={}\n",
+            shard, recovery, rec.time.count(), rec.instructions, rec.cycles, rec.allocations,
+            sample.start.time.count(), sample.start.instructions, c.segments_scanned, valid_segments,
+            summary.used_segments, c.chunks, c.records_read, std::chrono::duration<double>(index.wall).count(),
+            std::chrono::duration<double>(index.cpu).count(),
+            std::chrono::duration<double>(summary.step(recovery_step::place).wall).count(),
+            index.reads, index.read_bytes, index.stream_read_bytes, index.stream_read_bytes_waited);
+}
+
+// Runs the recover test: `cfg.recoveries` recoveries of every shard, each one from the files that
+// the one before it left. Prints each recovery of each shard, and then the median of each shard over
+// its recoveries.
+void run_recover_test(sharded<logstor_bench>& bench, const test_config& cfg) {
+    std::vector<std::vector<logstor_bench::recovery_sample>> samples(this_smp_shard_count());
+    for (unsigned recovery = 1; recovery <= cfg.recoveries; ++recovery) {
+        auto shard_samples = bench.map([] (logstor_bench& b) { return b.recover(); }).get();
+        for (shard_id shard = 0; shard < shard_samples.size(); ++shard) {
+            print_recovery(recovery, shard, shard_samples[shard]);
+            samples[shard].push_back(std::move(shard_samples[shard]));
+        }
+    }
+    const auto median = [] (std::vector<double> values) {
+        std::ranges::sort(values);
+        return values[values.size() / 2];
+    };
+    for (shard_id shard = 0; shard < samples.size(); ++shard) {
+        const auto& of_shard = samples[shard];
+        const auto median_of = [&] (auto value) {
+            return median(of_shard | std::views::transform(value) | std::ranges::to<std::vector<double>>());
+        };
+        fmt::print("median of {} recoveries of shard {}: {:.3f}s, index {:.3f}s, {:.0f} instructions,"
+                " {:.0f} instructions per record\n",
+                of_shard.size(), shard,
+                median_of([] (const auto& s) { return s.recovery.time.count(); }),
+                median_of([] (const auto& s) { return std::chrono::duration<double>(s.summary.step(recovery_step::index).wall).count(); }),
+                median_of([] (const auto& s) { return double(s.recovery.instructions); }),
+                median_of([] (const auto& s) { return ratio(s.recovery.instructions, s.summary.counters.records_read); }));
+    }
 }
 
 void write_json_result(const std::string& file, const test_config& cfg, test_kind kind, const aggregated_perf_results& agg,
@@ -1197,6 +1370,7 @@ run_config make_run_config(const boost::program_options::variables_map& config) 
             .disk_size = config["disk-size-in-mb"].as<unsigned>() * 1024ull * 1024ull,
             .compaction = config["compaction"].as<bool>(),
             .stop_on_error = config["stop-on-error"].as<bool>(),
+            .recoveries = config["recoveries"].as<unsigned>(),
         },
         .tests = parse_tests(config["test"].as<std::string>()),
         .dir = config.contains("dir") ? config["dir"].as<std::string>() : std::string(),
@@ -1213,6 +1387,9 @@ run_config make_run_config(const boost::program_options::variables_map& config) 
     }
     if (run.test.partitions == 0) {
         throw std::invalid_argument("--partitions must be at least one: every test reads or overwrites the dataset");
+    }
+    if (run.test.recoveries == 0) {
+        throw std::invalid_argument("--recoveries must be at least one: it is how many times the recover test recovers each shard");
     }
     if (run.test.concurrency == 0) {
         throw std::invalid_argument("--concurrency must be at least one: it is how many operations the tests that wait for the disk keep in flight");
@@ -1249,6 +1426,7 @@ int main(int argc, char** argv) {
         ("file-size-in-mb", bpo::value<unsigned>()->default_value(32), "size of a logstor data file")
         ("disk-size-in-mb", bpo::value<unsigned>()->default_value(512), "size of the logstor segment pool of a shard")
         ("compaction", bpo::value<bool>()->default_value(true), "let compaction run, which is what gives free segments back")
+        ("recoveries", bpo::value<unsigned>()->default_value(5), "how many times the recover test recovers each shard")
         ("dir", bpo::value<std::string>(), "directory for the logstor files (default: a temporary directory)")
         ("stop-on-error", bpo::value<bool>()->default_value(true), "stop after encountering the first error")
         ("json-result", bpo::value<std::string>(), "name of the json result file, suffixed with the name of the test")
@@ -1303,6 +1481,10 @@ int main(int argc, char** argv) {
                         frame_size, payload_bytes, payload_bytes ? double(frame_size) / payload_bytes : 0.0);
                 for (auto kind : run.tests) {
                     fmt::print("\n{}:\n", name_of(kind));
+                    if (kind == test_kind::recover) {
+                        run_recover_test(bench, cfg);
+                        continue;
+                    }
                     auto results = run_test(bench, kind, cfg);
                     std::vector<perf_result> throughput_results(results.begin(), results.end());
                     aggregated_perf_results agg(throughput_results);
