@@ -23,6 +23,7 @@
 #include <array>
 #include <chrono>
 #include <concepts>
+#include <span>
 #include <system_error>
 #include <type_traits>
 #include <seastar/core/file.hh>
@@ -286,6 +287,9 @@ private:
     }
 };
 
+struct compaction_buffer;
+struct compaction_buffer_stats;
+
 class compaction_manager_impl : public compaction_manager, private compaction_driver::host {
 public:
 
@@ -406,6 +410,8 @@ private:
     compaction_driver::shard_sample sample() const noexcept override;
 
     future<> submit_group_compaction(logstor_group&, std::function<future<>(group_compaction_state&)>, scheduling_group);
+    void free_compacted_segments(logstor_group&, std::span<const log_segment_id>) noexcept;
+    future<compaction_buffer_stats> rewrite_live_records(compaction_buffer&, std::span<const log_segment_id>);
     future<> do_compaction(logstor_group&, compaction_batch_limits, abort_source&);
     future<> do_split_compaction(logstor_group&, mutation_writer::classify_by_token_group, split_target_group, abort_source&);
 
@@ -1943,26 +1949,24 @@ struct compaction_buffer {
         buf.reset();
     }
 
-    // Rewrite a single live record into this buffer, updating the index atomically.
-    // Returns immediately after queuing the write; caller must co_await close()/flush()
-    // to ensure all pending updates complete.
-    future<> rewrite_record(primary_index& index, record_location read_location, const record_header& header, log_record_bytes_view record_view) {
+    bool can_fit(log_record_bytes_view record_view) const noexcept {
+        return buf->can_fit(record_view.header.size() + record_view.value.size());
+    }
+
+    // Rewrites a live record into the buffer. The next flush() writes the record and points the
+    // index at its new location. The caller must flush the buffer first if the record does not
+    // fit (can_fit()).
+    void rewrite_record(primary_index& index, record_location old_location, const record_header& header, log_record_bytes_view record_view) {
         auto* index_ptr = &index;
         auto key = header.index_key();
 
-        auto writer = log_record_bytes_writer(header, record_view);
-
-        if (!buf->can_fit(writer)) {
-            co_await flush();
-        }
-
-        auto write_and_update_index = buf->write(std::move(writer)).then_unpack(
-                [this, index_ptr, key = std::move(key), read_location]
+        auto write_and_update_index = buf->write(log_record_bytes_writer(header, record_view)).then_unpack(
+                [this, index_ptr, key = std::move(key), old_location]
                 (record_location new_location, seastar::gate::holder op) {
             utils::get_local_injector().inject("logstor_compaction_fail_index_update", [] {
                 throw std::runtime_error("compaction index update failed by injection");
             });
-            if (index_ptr->update_record_location(key, read_location, new_location)) {
+            if (index_ptr->update_record_location(key, old_location, new_location)) {
                 stats.records_rewritten++;
             } else {
                 // another write updated this key
@@ -1992,6 +1996,44 @@ struct split_buffer_pair {
     }
 };
 
+// Removes the segments from the segment set of `cg`, and frees each segment that has no other
+// reference. The caller must first move the live records of the segments, and wait for the reads
+// that use the old locations.
+void compaction_manager_impl::free_compacted_segments(logstor_group& cg, std::span<const log_segment_id> segments) noexcept {
+    auto& segment_set = cg.logstor_segments();
+    for (auto segment_id : segments) {
+        logstor_logger.trace("Free compacted {}", segment_id);
+        auto& desc = _sm.get_segment_descriptor(segment_id);
+        segment_set.remove_segment(desc);
+        if (desc.ref_count == 0) {
+            _sm.free_segment(segment_id);
+        }
+    }
+}
+
+// Rewrites the live records of the segments into new segments of the group of `cb`, one segment
+// at a time, in the order of `segments`.
+future<compaction_buffer_stats> compaction_manager_impl::rewrite_live_records(compaction_buffer& cb, std::span<const log_segment_id> segments) {
+    auto& index = cb.cg.logstor_index();
+    for (auto segment_id : segments) {
+        co_await _sm.for_each_record(segment_id, [&index, &cb] (const chunk_record& record) {
+            if (!index.is_record_alive(record.header.index_key(), record.location)) {
+                cb.stats.records_skipped++;
+                return make_ready_future<>();
+            }
+            if (!cb.can_fit(record.bytes)) {
+                return cb.flush().then([&index, &cb, &record] {
+                    cb.rewrite_record(index, record.location, record.header, record.bytes);
+                });
+            }
+            cb.rewrite_record(index, record.location, record.header, record.bytes);
+            return make_ready_future<>();
+        });
+    }
+    co_await cb.flush();
+    co_return cb.stats;
+}
+
 future<> compaction_manager_impl::do_compaction(logstor_group& cg, compaction_batch_limits limits, abort_source& as) {
     const auto segment_size = _sm.get_segment_size();
     auto batch = select_compaction_batch(cg.logstor_segments(), segment_size, limits);
@@ -2001,6 +2043,8 @@ future<> compaction_manager_impl::do_compaction(logstor_group& cg, compaction_ba
     auto segments = batch->segments
             | std::views::transform([this] (const segment_descriptor* desc) { return _sm.desc_to_segment_id(*desc); })
             | std::ranges::to<std::vector<log_segment_id>>();
+    // The compaction scans the segments in the order of their ids, one segment at a time.
+    std::ranges::sort(segments);
 
     logstor_logger.trace("Starting compaction of segments {} of table {}: {} in, {} out, {} reclaimed, efficiency {}",
             segments, cg.table_id(), batch->score.n_in, batch->score.n_out, batch->score.reclaimed(),
@@ -2022,16 +2066,8 @@ future<> compaction_manager_impl::do_compaction(logstor_group& cg, compaction_ba
         // throw - a compaction that fails part way through simply discards what it had buffered.
         cb_stats = co_await with_closeable(
                 compaction_buffer(_sm, co_await _sm._compaction_buffer_pool.allocate(as), cg, as),
-                [this, &index, &nonempty_segments] (compaction_buffer& cb) -> future<compaction_buffer_stats> {
-            co_await _sm.for_each_record(nonempty_segments, [&index, &cb] (const chunk_record& record) {
-                if (!index.is_record_alive(record.header.index_key(), record.location)) {
-                    cb.stats.records_skipped++;
-                    return make_ready_future<>();
-                }
-                return cb.rewrite_record(index, record.location, record.header, record.bytes);
-            });
-            co_await cb.flush();
-            co_return cb.stats;
+                [this, &nonempty_segments] (compaction_buffer& cb) {
+            return rewrite_live_records(cb, nonempty_segments);
         });
     }
 
@@ -2044,16 +2080,7 @@ future<> compaction_manager_impl::do_compaction(logstor_group& cg, compaction_ba
     co_await index.await_pending_reads();
     co_await utils::get_local_injector().inject("logstor_compaction_wait_before_remove_segments", utils::wait_for_message(std::chrono::seconds{60}));
 
-    // Free the compacted segments
-    auto& ss = cg.logstor_segments();
-    for (auto seg_id : segments) {
-        logstor_logger.trace("Free segment {} by compaction", seg_id);
-        auto& desc = _sm.get_segment_descriptor(seg_id);
-        ss.remove_segment(desc);
-        if (desc.ref_count == 0) {
-            _sm.free_segment(seg_id);
-        }
-    }
+    free_compacted_segments(cg, segments);
 
     _stats.segments_in += compaction_segments_in;
     _stats.segments_out += compaction_segments_out;
@@ -2138,7 +2165,13 @@ future<> compaction_manager_impl::do_split_compaction(logstor_group& src, mutati
                     return make_ready_future<>();
                 }
                 auto& cb = bufs.bufs[classifier(record.header.key.token())];
-                return cb.rewrite_record(index, record.location, record.header, record.bytes);
+                if (!cb.can_fit(record.bytes)) {
+                    return cb.flush().then([&index, &cb, &record] {
+                        cb.rewrite_record(index, record.location, record.header, record.bytes);
+                    });
+                }
+                cb.rewrite_record(index, record.location, record.header, record.bytes);
+                return make_ready_future<>();
             });
             co_await coroutine::parallel_for_each(bufs.bufs, &compaction_buffer::flush);
             co_return bufs.bufs[0].stats + bufs.bufs[1].stats;
@@ -2153,15 +2186,7 @@ future<> compaction_manager_impl::do_split_compaction(logstor_group& src, mutati
         // Await pending reads before freeing the source segments.
         co_await index.await_pending_reads();
 
-        // Remove and free the source segments of this batch.
-        for (auto seg_id : batch) {
-            logstor_logger.trace("Free segment {} by split", seg_id);
-            auto& desc = _sm.get_segment_descriptor(seg_id);
-            src_segments.remove_segment(desc);
-            if (desc.ref_count == 0) {
-                _sm.free_segment(seg_id);
-            }
-        }
+        free_compacted_segments(src, batch);
     }
 }
 
