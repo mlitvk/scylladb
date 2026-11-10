@@ -335,7 +335,8 @@ public:
                 }
 
                 next.last_token = token;
-                next.entries.reserve(next.entries.size() + token_entry_count);
+                // push_back() grows the vector geometrically. A reserve() of the exact size for
+                // each token would copy the batch again for each token.
                 for (; current != token_end; ++current) {
                     next.entries.push_back(std::cref(*current));
                 }
