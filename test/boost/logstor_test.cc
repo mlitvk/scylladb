@@ -1666,6 +1666,57 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_range_erase_and_clear_space_
     BOOST_REQUIRE_EQUAL(std::count(accounting.freed_locations.begin(), accounting.freed_locations.end(), entries[4].loc), 1);
 }
 
+namespace {
+
+// Returns the token range between the raw tokens `first` and `last`.
+dht::token_range raw_token_range(int64_t first, bool first_inclusive, int64_t last, bool last_inclusive) {
+    return dht::token_range::make({dht::token::from_int64(first), first_inclusive}, {dht::token::from_int64(last), last_inclusive});
+}
+
+} // anonymous namespace
+
+// A range that holds no token has no bounds, and the index reads nothing in it and erases nothing
+// in it, also when the index holds a key at the token that the range ends at or starts after.
+SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_range_that_holds_no_token) {
+    BOOST_REQUIRE(!raw_token_bounds::of(raw_token_range(10, false, 11, false)));
+    BOOST_REQUIRE(!raw_token_bounds::of(raw_token_range(20, true, 10, true)));
+    BOOST_REQUIRE(!raw_token_bounds::of(dht::token_range::make_starting_with({dht::token::from_int64(std::numeric_limits<int64_t>::max()), false})));
+    BOOST_REQUIRE(!raw_token_bounds::of(dht::token_range::make_ending_with({dht::token::from_int64(std::numeric_limits<int64_t>::min()), false})));
+    const auto bounds = raw_token_bounds::of(raw_token_range(10, false, 20, false));
+    BOOST_REQUIRE(bounds);
+    BOOST_REQUIRE_EQUAL(bounds->first, 11);
+    BOOST_REQUIRE_EQUAL(bounds->last, 19);
+
+    auto schema = make_kv_schema();
+    primary_index index(noop_space_accounting, nullptr, false);
+    std::vector<primary_index_key> keys;
+    for (int i = 0; i < 5; ++i) {
+        keys.push_back(make_index_key(*schema, make_kv_mutation(schema, fmt::format("pk{}", i), "v").decorated_key()));
+    }
+    std::ranges::sort(keys, {}, [] (const primary_index_key& key) { return key.token().raw(); });
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto outcome = index.insert(keys[i], index_entry{
+                .location = {.segment = log_segment_id{uint32_t(i)}, .offset = 0, .size = 8},
+                .timestamp = api::timestamp_type(1)});
+        BOOST_REQUIRE(outcome.inserted());
+    }
+
+    // Each range holds no token, and the index holds a key at both of its bounds.
+    const auto middle = keys[2].token().raw();
+    const auto empty_ranges = std::array{
+        raw_token_range(middle, false, middle, false),
+        raw_token_range(keys[3].token().raw(), true, keys[1].token().raw(), true),
+    };
+    for (const auto& range : empty_ranges) {
+        BOOST_REQUIRE(!raw_token_bounds::of(range));
+        BOOST_REQUIRE(!index.scan(range).next_batch(keys.size()));
+        index.erase(range).get();
+        for (const auto& key : keys) {
+            BOOST_REQUIRE(index.get(key).has_value());
+        }
+    }
+}
+
 // Checks that the segment scan returns mixed-segment record locations that can be used to read back the expected records.
 SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_mixed_chunks_report_readable_record_locations) {
     auto schema = make_kv_schema();

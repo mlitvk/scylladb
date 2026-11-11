@@ -9,6 +9,7 @@
 
 #include "dht/i_partitioner.hh"
 #include <functional>
+#include <limits>
 #include <seastar/coroutine/maybe_yield.hh>
 #include <optional>
 #include "dht/token.hh"
@@ -27,6 +28,42 @@
 namespace replica::logstor {
 
 extern seastar::logger logstor_logger;
+
+// Holds the first and the last raw token of a token range. Both bounds are inclusive. The index
+// orders its entries by raw token, so these are the bounds of the entries in the range.
+struct raw_token_bounds {
+    int64_t first;
+    int64_t last;
+
+    // Returns the bounds of `range`, or nullopt when the range holds no token.
+    static std::optional<raw_token_bounds> of(const dht::token_range& range) noexcept {
+        raw_token_bounds bounds{std::numeric_limits<int64_t>::min(), std::numeric_limits<int64_t>::max()};
+        if (range.start()) {
+            const auto raw = range.start()->value().raw();
+            if (range.start()->is_inclusive()) {
+                bounds.first = raw;
+            } else if (raw == std::numeric_limits<int64_t>::max()) {
+                return std::nullopt;
+            } else {
+                bounds.first = raw + 1;
+            }
+        }
+        if (range.end()) {
+            const auto raw = range.end()->value().raw();
+            if (range.end()->is_inclusive()) {
+                bounds.last = raw;
+            } else if (raw == std::numeric_limits<int64_t>::min()) {
+                return std::nullopt;
+            } else {
+                bounds.last = raw - 1;
+            }
+        }
+        if (bounds.first > bounds.last) {
+            return std::nullopt;
+        }
+        return bounds;
+    }
+};
 
 // One entry in the primary index B+tree.
 //
@@ -399,20 +436,16 @@ private:
         return self._partitions.find(key, primary_index_key_cmp{});
     }
 
+    // Returns the first entry in `tr`, or end() when the range holds no token.
     auto position_at_range_start(this auto& self, const dht::token_range& tr) -> decltype(self._partitions.begin()) {
-        return tr.start()
-                ? (tr.start()->is_inclusive()
-                    ? self._partitions.lower_bound(tr.start()->value().raw(), primary_index_key_cmp{})
-                    : self._partitions.upper_bound(tr.start()->value().raw(), primary_index_key_cmp{}))
-                : self._partitions.begin();
+        const auto bounds = raw_token_bounds::of(tr);
+        return bounds ? self._partitions.lower_bound(bounds->first, primary_index_key_cmp{}) : self._partitions.end();
     }
 
+    // Returns the entry after the last entry in `tr`, or end() when the range holds no token.
     auto position_at_range_end(this auto& self, const dht::token_range& tr) -> decltype(self._partitions.end()) {
-        return tr.end()
-                ? (tr.end()->is_inclusive()
-                    ? self._partitions.upper_bound(tr.end()->value().raw(), primary_index_key_cmp{})
-                    : self._partitions.lower_bound(tr.end()->value().raw(), primary_index_key_cmp{}))
-                : self._partitions.end();
+        const auto bounds = raw_token_bounds::of(tr);
+        return bounds ? self._partitions.upper_bound(bounds->last, primary_index_key_cmp{}) : self._partitions.end();
     }
 
     bool reads_cache() const noexcept {
