@@ -53,7 +53,8 @@ constexpr double compaction_shares_rise_time = 5.0;
 constexpr double compaction_shares_decay_time = 20.0;
 constexpr double compaction_shares_hold_decay_time = 120.0;
 
-// Paces automatic compaction and decides how much CPU to ask for it.
+// Paces automatic compaction and decides how much CPU to ask for it. The engine and
+// test/manual/logstor_compaction_sim.cc share it, so the simulated dynamics are the controller's own.
 //
 // The utilization threshold decides which segments to compact, and this controller decides how
 // fast. It commands a net reclaim rate, `n_in - n_out` per second:
