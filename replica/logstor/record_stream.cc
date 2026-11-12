@@ -36,6 +36,7 @@ record_stream_source::record_stream_source(table_id table, const primary_index& 
 {}
 
 future<temporary_buffer<char>> record_stream_source::get() {
+    co_await utils::get_local_injector().inject("logstor_record_source_wait", utils::wait_for_message(std::chrono::minutes(5)));
     // An empty buffer ends the stream, so a segment without live records gives no buffer.
     while (_next_segment < _segments.size()) {
         co_await collect_live_records(_segments[_next_segment++]);
