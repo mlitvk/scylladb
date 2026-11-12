@@ -139,8 +139,11 @@ void compaction_driver::tick_rate_controller() noexcept {
         // The bucket keeps one batch, so an idle period saves at most one job.
         .burst_cap = double(_limits.batch_cap),
         .dt = dt,
+        .candidates_empty = _no_candidates,
+        .throttled = _throttled_since_tick || _wait == wait_reason::credit,
     });
     _last_segments_allocated = allocated;
+    _throttled_since_tick = false;
 
     // A driver that waits for credit wakes up when the bucket holds what its candidate needs, or
     // when compaction is disabled.
@@ -218,6 +221,7 @@ future<> compaction_driver::run_step(ranking_state& ranking) {
         // Compaction is disabled on the shard. The driver treats this like a shard with nothing to
         // reclaim.
         ranking = {};
+        _no_candidates = true;
         _empty_ranking_start.reset();
         co_await wait_for_work(wait_reason::candidates, _cfg.wait_timeout);
         co_return;
@@ -304,7 +308,11 @@ future<bool> compaction_driver::rank(ranking_state& ranking) {
     }
     if (ranked.candidates.empty()) {
         // No group has a batch under the threshold with a net gain, or each such group is
-        // compacting, as on a shard with one compaction group while its job runs.
+        // compacting, as on a shard with one compaction group while its job runs. More CPU cannot
+        // change the first case, so the driver tells the controller which case applies. A split or
+        // a manual compaction does not use the rate, so a group that it holds counts only while an
+        // automatic job runs too.
+        _no_candidates = !ranked.skipped_busy_group || _jobs_in_flight.empty();
         _empty_ranking_start = before;
         co_return false;
     }
@@ -314,6 +322,7 @@ future<bool> compaction_driver::rank(ranking_state& ranking) {
                 _cfg.wait_timeout);
     }
 
+    _no_candidates = false;
     // The bar is computed first, because the initializer of `candidates` moves the candidates.
     auto bar = best_copying_score(ranked.candidates | std::views::transform(&candidate::score));
     ranking = {
@@ -343,6 +352,7 @@ std::optional<compaction_candidate_score> compaction_driver::admission_bar(const
 }
 
 future<> compaction_driver::wait_for_credit(size_t needed) {
+    _throttled_since_tick = true;
     _credit_needed = needed;
     co_await wait_for_work(wait_reason::credit, _cfg.wait_timeout);
 }

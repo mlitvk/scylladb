@@ -45,6 +45,10 @@ public:
         // The candidates are worst first, in the order that
         // top_compaction_candidates::take_sorted() returns them.
         std::vector<candidate> candidates;
+        // A group was not ranked because it is compacting. While an automatic job runs, an empty
+        // ranking then means that the candidates are behind the job, and not that the disk holds
+        // none, which the controller and the driver treat differently.
+        bool skipped_busy_group = false;
     };
 
     // The values that one controller tick reads from the shard.
@@ -141,9 +145,7 @@ public:
     // candidates ranks again when the inputs of the selection changed since its last ranking.
     void notify_segment_wait() noexcept;
 
-    // Returns the part of the range from the minimum to the maximum compaction shares that
-    // compaction asks for, in [0, 1].
-    double shares_demand() const noexcept { return _rate_controller.space_pressure(); }
+    double shares_demand() const noexcept { return _rate_controller.shares_demand(); }
     const compaction_rate_controller& rate_controller() const noexcept { return _rate_controller; }
     // Returns the threshold curve of the current configuration. Every input is live-updatable, so
     // the curve is built where it is used and not cached.
@@ -196,6 +198,9 @@ private:
     uint64_t _idle_notifications{0};
     // Counts the automatic jobs that ended, for the marginal admission gate.
     uint64_t _jobs_ended{0};
+    // True when the last ranking found no batch with a net gain. More CPU cannot change this state,
+    // so the driver gives it to the controller.
+    bool _no_candidates{false};
     // The inputs of the selection that can give a group a batch: the count of the changes to the
     // segment sets of the shard, and the limits of the selection. The count includes each change, so
     // equal inputs show that the segments and the limits are the same as at the last ranking.
@@ -221,6 +226,8 @@ private:
     // the state of the empty ranking and finds a batch, an event did not wake the driver, so the
     // ranking warns.
     bool _candidates_wait_timed_out{false};
+    // True when a job waited for credit since the last tick.
+    bool _throttled_since_tick{false};
     // The credit that the candidate of a driver that waits for credit needs.
     size_t _credit_needed{0};
 
