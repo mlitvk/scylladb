@@ -99,6 +99,10 @@ public:
     // The calls of sample(). The driver calls it in each controller tick, and at the start of each
     // ranking.
     mutable size_t samples = 0;
+    // The allocations that each sample reports. By default there are many, so the credit never
+    // holds a job back, because most tests are not about the throttle.
+    uint64_t allocations_per_sample = 1000;
+    mutable uint64_t segments_allocated = 0;
 
     bool can_submit_compaction() const noexcept override {
         return true;
@@ -148,10 +152,12 @@ public:
 
     compaction_driver::shard_sample sample() const noexcept override {
         ++samples;
+        segments_allocated += allocations_per_sample;
         return compaction_driver::shard_sample{
             .available_segments = available_segments,
             .utilization = utilization,
             .set_changes = set_changes,
+            .reclaimable_segments_allocated = segments_allocated,
         };
     }
 

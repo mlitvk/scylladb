@@ -55,6 +55,7 @@ void compaction_driver::start(disk_geometry geometry) {
         set_space_floor(fraction);
     }));
 
+    _last_rate_tick = lowres_clock::now() - compaction_rate_control_period;
     tick_rate_controller();
     _rate_timer.arm_periodic(compaction_rate_control_period);
     _completion = shared_future(with_scheduling_group(_cfg.sg, [this] {
@@ -119,13 +120,27 @@ utilization_threshold_curve compaction_driver::threshold_curve() const noexcept 
 }
 
 void compaction_driver::tick_rate_controller() noexcept {
+    const auto now = lowres_clock::now();
+    const auto dt = std::chrono::duration<double>(now - _last_rate_tick).count();
+    // A period of zero gives no rate. Its counts go to the next tick.
+    if (!(dt > 0)) {
+        return;
+    }
+    _last_rate_tick = now;
+
     const auto shard = _host.sample();
+    const auto allocated = shard.reclaimable_segments_allocated;
 
     _rate_controller.tick({
         .available_segments = shard.available_segments,
         .curve = threshold_curve(),
         .utilization = shard.utilization,
+        .segments_allocated = allocated - _last_segments_allocated,
+        // The bucket keeps one batch, so an idle period saves at most one job.
+        .burst_cap = double(_limits.batch_cap),
+        .dt = dt,
     });
+    _last_segments_allocated = allocated;
 
     wake_if_inputs_changed(shard);
 }
