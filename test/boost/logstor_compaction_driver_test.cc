@@ -43,6 +43,8 @@ constexpr uint64_t segment_count = 1024;
 // the rich one.
 const compaction_candidate_score rich{.n_in = 8, .n_out = 2, .live_bytes = 2 * segment_size};
 const compaction_candidate_score poor{.n_in = 8, .n_out = 7, .live_bytes = 7 * segment_size};
+// Poor, but it reclaims as much as a full admission credit.
+const compaction_candidate_score poor_large{.n_in = 32, .n_out = 24, .live_bytes = 24 * segment_size};
 
 class fake_group final : public logstor_group {
 public:
@@ -558,6 +560,77 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_wakes_when_the_minimum_b
 
     BOOST_REQUIRE(wait_until([&] { return host.jobs.size() == 1; }));
     BOOST_REQUIRE_LT(host.ranking_limits[1].min_batch, host.ranking_limits[0].min_batch);
+}
+
+// The gate refuses a poor candidate at once, and the candidate does not first wait for credit.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_refuses_before_waiting_for_credit) {
+    fake_host host;
+    fake_group a, b;
+    // One segment per period. The rich job takes the credit, and the poor batch needs 8 more.
+    host.allocations_per_sample = 1;
+    host.rankings = {{candidate_of(a, rich)}, {candidate_of(b, poor_large)}};
+    compaction_driver driver(host, make_config());
+    start(driver);
+    auto stop_driver = seastar::defer([&] noexcept { stop(driver, host); });
+
+    BOOST_REQUIRE(wait_until([&] { return host.jobs.size() == 1; }));
+    // Without allocations the credit does not grow, so a driver that waits for credit before the
+    // gate never refuses the poor batch.
+    host.allocations_per_sample = 0;
+    BOOST_REQUIRE(wait_until([&] { return driver.stats().batches_refused == 1; }));
+}
+
+// When the limits change while a candidate waits for credit, the driver ranks again, and the job
+// runs under the new limits.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_ranks_again_after_a_credit_wait) {
+    fake_host host;
+    fake_group a;
+    // Without allocations the credit does not grow, so the candidate waits until the limits change.
+    host.allocations_per_sample = 0;
+    host.available_segments = 500;
+    host.rankings = {{candidate_of(a, rich)}, {candidate_of(a, rich)}};
+    compaction_driver driver(host, make_config());
+    start(driver);
+    auto stop_driver = seastar::defer([&] noexcept { stop(driver, host); });
+
+    BOOST_REQUIRE(wait_until([&] { return host.ranking_limits.size() == 1; }));
+    // Between the space floor (32) and the anchor (64): the threshold and the minimum batch move.
+    host.available_segments = 40;
+    BOOST_REQUIRE(wait_until([&] { return driver.automatic_batch_limits() != host.ranking_limits[0]; }));
+    host.allocations_per_sample = 1;
+
+    BOOST_REQUIRE(wait_until([&] { return host.jobs.size() == 1; }));
+    // The ranking after the job started comes back empty.
+    BOOST_REQUIRE_GE(host.ranking_limits.size(), 2u);
+    BOOST_REQUIRE(host.ranking_limits[1] != host.ranking_limits[0]);
+    BOOST_REQUIRE(host.jobs[0]->limits == host.ranking_limits[1]);
+}
+
+// A job in flight holds its charge, so a second job waits until the bucket refills. When a job ends,
+// the difference between what it reclaimed and its charge is settled.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_job_holds_its_charge) {
+    fake_host host;
+    fake_group a, b;
+    // One segment per period: a rich batch, which reclaims 6, waits about 6 periods for credit.
+    host.allocations_per_sample = 1;
+    host.rankings = {{candidate_of(a, rich), candidate_of(b, rich)}};
+    compaction_driver driver(host, make_config());
+    start(driver);
+    auto stop_driver = seastar::defer([&] noexcept { stop(driver, host); });
+
+    BOOST_REQUIRE(wait_until([&] { return host.jobs.size() == 1; }));
+    BOOST_REQUIRE_EQUAL(host.jobs[0]->group, &a);
+    // Without allocations the credit does not grow, so only the refund of the first job can pay
+    // for the second job.
+    host.allocations_per_sample = 0;
+    BOOST_REQUIRE_LT(driver.rate_controller().credit(), double(rich.reclaimed()));
+    wait_for_ticks(host, 3);
+    BOOST_REQUIRE_EQUAL(host.jobs.size(), 1u);
+
+    // The job reclaimed nothing, so its charge comes back and the second job starts.
+    end_job(host, 0);
+    BOOST_REQUIRE(wait_until([&] { return host.jobs.size() == 2; }));
+    BOOST_REQUIRE_EQUAL(host.jobs[1]->group, &b);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

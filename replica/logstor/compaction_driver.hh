@@ -172,12 +172,17 @@ private:
     // The scores of the automatic jobs in flight, for the marginal admission gate.
     std::list<compaction_candidate_score> _jobs_in_flight;
 
-    // The reason the driver waits, and the condition variable that it waits on. A controller tick
-    // signals it when the backlog changes, notify_group_idle() when a group can be ranked again,
-    // and the end of a job when the marginal admission gate waits for one. Nothing signals a wait
-    // after a failure, so only the delay or a stop ends it.
+    // The reason the driver waits, and the condition variable that it waits on. These events
+    // signal a wait:
+    // - A wait for credit: a controller tick, or the refund of a job that ends.
+    // - A wait for candidates: a tick when the backlog changes, or notify_group_idle() when a
+    //   group can be ranked again.
+    // - A wait for a job end: the end of a job, for the marginal admission gate.
+    //
+    // Nothing signals a wait after a failure, so only the delay or a stop ends it.
     enum class wait_reason {
         nothing,
+        credit,
         candidates,
         failure,
         job_end,
@@ -211,6 +216,8 @@ private:
         uint64_t idle_notifications;
     };
     std::optional<ranking_start> _empty_ranking_start;
+    // The credit that the candidate of a driver that waits for credit needs.
+    size_t _credit_needed{0};
 
     // The anchor and the ceiling of the threshold curve, as fractions of the disk. 0 selects the
     // default points: the anchor at twice the space floor, and the ceiling one segment above the
@@ -247,12 +254,15 @@ private:
     // the best batch of the ranking that copies data, or a job in flight that reclaims better. It
     // returns nothing while no job runs, so that the first job always starts.
     std::optional<compaction_candidate_score> admission_bar(const ranking_state& ranking) const;
+    // Waits until the bucket holds the credit for a batch that reclaims `needed` segments. A
+    // controller tick fills the bucket, and a job that ends can give back part of its charge.
+    future<> wait_for_credit(size_t needed);
     future<> wait_for_job_end();
     // Returns true when the marginal admission gate refuses `c`, a batch that would run next to the
     // jobs in flight, against `admission_bar`. It counts each refusal in batches_refused.
     bool refuse_marginal(const candidate& c, const compaction_candidate_score& admission_bar);
-    // Submits the job of `c` under `limits`. The job holds `units` of the driver's semaphore until
-    // the job finishes.
+    // Charges the batch of `c` to the rate controller and submits its job under `limits`. The job
+    // holds `units` of the driver's semaphore until the job finishes, and then settles the charge.
     void start_job(candidate c, compaction_batch_limits limits, semaphore_units<> units);
     void on_job_end(std::list<compaction_candidate_score>::iterator job) noexcept;
     // Waits for the jobs still in flight, so that the end of run() is the end of the driver.

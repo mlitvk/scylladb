@@ -147,9 +147,14 @@ void compaction_driver::tick_rate_controller() noexcept {
     };
     _last_segments_allocated = allocated;
 
-    // A driver that found nothing to compact wakes up when the inputs of the selection differ from
-    // the inputs of the ranking that found nothing.
-    if (_wait == wait_reason::candidates && (!_empty_ranking_start || _ranking_inputs != _empty_ranking_start->inputs)) {
+    // A driver that waits for credit wakes up when the bucket holds what its candidate needs, or
+    // when compaction is disabled. A driver that found nothing to compact wakes up when the inputs of
+    // the selection differ from the inputs of the ranking that found nothing.
+    if (_wait == wait_reason::credit) {
+        if (!_host.can_submit_compaction() || _rate_controller.can_afford(_credit_needed)) {
+            _work_wanted.signal();
+        }
+    } else if (_wait == wait_reason::candidates && (!_empty_ranking_start || _ranking_inputs != _empty_ranking_start->inputs)) {
         _work_wanted.signal();
     }
 }
@@ -233,12 +238,32 @@ future<> compaction_driver::run_step(ranking_state& ranking) {
         co_return;
     }
 
+    // The gate comes before the throttle, so that a candidate that the gate refuses does not
+    // wait for credit. The bar cannot increase while the driver waits for credit, because only
+    // the driver starts jobs.
     if (auto bar = admission_bar(ranking); bar && refuse_marginal(c, *bar)) {
         // The driver takes the candidates best first, so no later candidate passes either, and the
         // bar does not change until a job ends. Wait for one job to end, and then rank again.
         ranking = {};
         slot.return_all();
         co_await wait_for_job_end();
+        co_return;
+    }
+
+    // The throttle makes compaction run at the commanded rate, and not as fast as it can when
+    // there is a candidate. It also paces a batch of dead segments, because a job costs more
+    // than its copy.
+    if (!_rate_controller.can_afford(c.score.reclaimed())) {
+        // This candidate is the best, and compaction_admission_credit limits its wait, so keep
+        // it for when the bucket fills. If the limits changed during the wait, the ranking is
+        // out of date, and the driver ranks again.
+        const auto needed = c.score.reclaimed();
+        ranking.candidates.push_back(std::move(c));
+        slot.return_all();
+        co_await wait_for_credit(needed);
+        if (automatic_batch_limits() != ranking.limits) {
+            ranking = {};
+        }
         co_return;
     }
 
@@ -295,6 +320,11 @@ std::optional<compaction_candidate_score> compaction_driver::admission_bar(const
     return std::max(ranking.bar, best_copying_score(_jobs_in_flight));
 }
 
+future<> compaction_driver::wait_for_credit(size_t needed) {
+    _credit_needed = needed;
+    co_await wait_for_work(wait_reason::credit, _cfg.wait_timeout);
+}
+
 future<> compaction_driver::wait_for_job_end() {
     // The wait counts the jobs that end, and not the free slots, because a change of the space
     // floor also changes the slots.
@@ -316,10 +346,32 @@ bool compaction_driver::refuse_marginal(const candidate& c, const compaction_can
 }
 
 void compaction_driver::start_job(candidate c, compaction_batch_limits limits, semaphore_units<> units) {
+    // The job is charged the estimate of what its batch reclaims, because the real count is known
+    // only when the job ends, and the charge holds while the job runs. When the job ends, the
+    // difference to what it reclaimed is settled. At the space floor the throttle is off, so a job
+    // that starts there is not charged.
+    const auto estimate = double(c.score.reclaimed());
+    const bool charged = !_rate_controller.bypassed();
+    if (charged) {
+        _rate_controller.charge_job(estimate);
+    }
+
     auto job = _jobs_in_flight.insert(_jobs_in_flight.end(), c.score);
-    (void)_host.submit_normal_compaction(*c.group, limits).discard_result().handle_exception([] (std::exception_ptr ep) {
-        logstor_logger.debug("An automatic compaction job failed: {}. Ignored", ep);
-    }).finally([this, job, units = std::move(units)] {
+    (void)_host.submit_normal_compaction(*c.group, limits).then_wrapped(
+            [this, job, estimate, charged, units = std::move(units)] (future<job_result> f) {
+        job_result result;
+        if (f.failed()) {
+            logstor_logger.debug("An automatic compaction job failed: {}. Ignored", f.get_exception());
+        } else {
+            result = f.get();
+        }
+        if (charged) {
+            _rate_controller.settle_job(estimate, double(result.reclaimed()));
+            // A refund can pay for the candidate that waits for credit.
+            if (_wait == wait_reason::credit && _rate_controller.can_afford(_credit_needed)) {
+                _work_wanted.signal();
+            }
+        }
         on_job_end(job);
     });
 }
