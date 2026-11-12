@@ -1034,7 +1034,7 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "The utilization threshold of logstor compaction while more than twice logstor_compaction_space_floor of the disk is free. It limits the space that segments with a few long-lived records hold, "
         "at a lower write amplification than logstor_compaction_utilization_threshold. A value at or above logstor_compaction_utilization_threshold keeps that threshold also when more of the disk is free.")
     , logstor_compaction_max_shares(this, "logstor_compaction_max_shares", liveness::LiveUpdate, value_status::Used, 2000,
-        "Maximum CPU shares of the logstor compaction scheduling group, reached at logstor_compaction_space_floor. As the free space falls from twice the space floor to the space floor, the shares increase linearly from 50.")
+        "Maximum CPU shares of the logstor compaction scheduling group, reached when compaction cannot keep up with the write rate or at logstor_compaction_space_floor. As the free space falls from twice the space floor to the space floor, the shares increase at least linearly to this value. While compaction is idle or throttled, the shares decrease to 50.")
     , file_cache_size_in_mb(this, "file_cache_size_in_mb", value_status::Unused, 512,
         "Total memory to use for SSTable-reading buffers.")
     , memtable_flush_queue_size(this, "memtable_flush_queue_size", value_status::Unused, 4,

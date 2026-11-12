@@ -471,6 +471,8 @@ struct controller_bench {
     double threshold = 0.5;
     uint64_t allocated_per_tick = 0;
     double burst_cap = 32;
+    bool candidates_empty = false;
+    bool throttled = false;
     static constexpr double dt = 0.25;
 
     compaction_rate_controller::sample make_sample() const noexcept {
@@ -481,6 +483,8 @@ struct controller_bench {
             .segments_allocated = allocated_per_tick,
             .burst_cap = burst_cap,
             .dt = dt,
+            .candidates_empty = candidates_empty,
+            .throttled = throttled,
         };
     }
 
@@ -517,6 +521,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_rate_controller_follows_the_wri
         }
     }
     BOOST_REQUIRE_CLOSE(charged, accrual * ticks, 1);
+    // A controller that spends its rate does not ask for more CPU.
+    BOOST_REQUIRE_EQUAL(controller.shares_demand(), 0.0);
 
     bench.run(controller, 40);
     BOOST_REQUIRE_LE(controller.credit(), bench.burst_cap + accrual);
@@ -573,6 +579,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_rate_controller_space_pressure)
             BOOST_REQUIRE_EQUAL(controller.utilization_threshold(), effective_utilization_threshold(available, curve));
             BOOST_REQUIRE_EQUAL(controller.min_batch(), effective_min_batch(pressure));
             BOOST_REQUIRE_GT(controller.backlog().candidate_segments, previous_candidates);
+            BOOST_REQUIRE_GE(controller.shares_demand(), pressure);
             BOOST_REQUIRE_EQUAL(controller.bypassed(), available <= bench.space_floor);
         }
         previous_candidates = controller.backlog().candidate_segments;
@@ -587,6 +594,73 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_rate_controller_space_pressure)
     bench.run(controller, 1);
     BOOST_REQUIRE(!controller.bypassed());
     BOOST_REQUIRE_GE(controller.credit(), 0.0);
+}
+
+// The shares demand increases while compaction cannot use its rate, and decreases while the throttle
+// holds compaction back or there is nothing to compact.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_rate_controller_shares_demand) {
+    controller_bench bench;
+    bench.allocated_per_tick = 10;
+    compaction_rate_controller controller;
+
+    // Nothing spends the credit, so it spills over the cap.
+    bench.run(controller, 40);
+    const auto starved = controller.shares_demand();
+    BOOST_REQUIRE_GT(starved, 0.5);
+
+    bench.throttled = true;
+    bench.run(controller, 8);
+    BOOST_REQUIRE_LT(controller.shares_demand(), starved);
+
+    bench.throttled = false;
+    bench.candidates_empty = true;
+    const auto before = controller.shares_demand();
+    bench.run(controller, 8);
+    BOOST_REQUIRE_LT(controller.shares_demand(), before);
+
+    // With no writes and no backlog there is no rate, and the demand decays to nothing.
+    bench.candidates_empty = false;
+    bench.allocated_per_tick = 0;
+    bench.run(controller, 800);
+    BOOST_REQUIRE_LT(controller.shares_demand(), 1e-3);
+}
+
+// The credit that spills while there is nothing to compact does not count as unused rate, so the
+// demand does not jump when candidates come back and compaction spends its rate.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_rate_controller_no_demand_after_idle) {
+    controller_bench bench;
+    bench.allocated_per_tick = 10;
+    bench.candidates_empty = true;
+    compaction_rate_controller controller;
+    bench.run(controller, 400);
+    BOOST_REQUIRE_EQUAL(controller.shares_demand(), 0.0);
+
+    bench.candidates_empty = false;
+    double peak = 0;
+    for (size_t i = 0; i < 40; ++i) {
+        bench.run(controller, 1);
+        while (controller.can_afford(compaction_admission_credit)) {
+            controller.charge_job(compaction_admission_credit);
+        }
+        peak = std::max(peak, controller.shares_demand());
+    }
+    BOOST_REQUIRE_LT(peak, 0.1);
+}
+
+// The space pressure is the lowest demand, but the demand does not keep it: when the pressure ends
+// and compaction spends its rate, the demand falls at once.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_rate_controller_demand_after_pressure) {
+    controller_bench bench;
+    bench.allocated_per_tick = 10;
+    bench.available = bench.space_floor;
+    compaction_rate_controller controller;
+    bench.run(controller, 40);
+    BOOST_REQUIRE_EQUAL(controller.shares_demand(), 1.0);
+
+    bench.available = 10000;
+    bench.run(controller, 1);
+    BOOST_REQUIRE_EQUAL(controller.space_pressure(), 0.0);
+    BOOST_REQUIRE_LT(controller.shares_demand(), 0.1);
 }
 
 // When a tick drops debt that jobs in flight hold, the refunds of those jobs do not give back the
@@ -608,6 +682,32 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_rate_controller_refund_after_dr
     BOOST_REQUIRE_EQUAL(controller.credit(), -bench.burst_cap + 19);
     controller.settle_job(13, 0);
     BOOST_REQUIRE_EQUAL(controller.credit(), 0.0);
+}
+
+// A refund does not take the credit over the cap, so a job that reclaims less than its estimate
+// does not increase the unspent rate.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_rate_controller_refund_does_not_spill) {
+    controller_bench bench;
+    bench.allocated_per_tick = 10;
+    compaction_rate_controller controller;
+    bench.run(controller, 1);
+    // A job that holds a charge of one batch.
+    controller.charge_job(bench.burst_cap);
+
+    // The other jobs spend the credit as fast as it fills.
+    for (size_t i = 0; i < 20; ++i) {
+        bench.run(controller, 1);
+        while (controller.can_afford(compaction_admission_credit)) {
+            controller.charge_job(compaction_admission_credit);
+        }
+    }
+    BOOST_REQUIRE_EQUAL(controller.unspent_rate(), 0.0);
+
+    // The job reclaims nothing.
+    controller.settle_job(bench.burst_cap, 0);
+    BOOST_REQUIRE_EQUAL(controller.credit(), bench.burst_cap);
+    bench.run(controller, 1);
+    BOOST_REQUIRE_EQUAL(controller.unspent_rate(), 0.0);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -133,9 +133,9 @@ public:
             auto gate = ranking_gate->get_future();
             co_await std::move(gate);
         }
-        std::erase_if(candidates, [this] (const compaction_driver::candidate& c) { return running.contains(c.group); });
+        const auto skipped = std::erase_if(candidates, [this] (const compaction_driver::candidate& c) { return running.contains(c.group); });
         std::ranges::reverse(candidates);
-        co_return compaction_driver::ranking{.candidates = std::move(candidates)};
+        co_return compaction_driver::ranking{.candidates = std::move(candidates), .skipped_busy_group = skipped != 0};
     }
 
     bool can_start(const logstor_group* group) const noexcept override {

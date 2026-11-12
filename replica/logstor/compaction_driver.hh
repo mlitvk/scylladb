@@ -45,6 +45,10 @@ public:
         // The candidates are worst first, in the order that
         // top_compaction_candidates::take_sorted() returns them.
         std::vector<candidate> candidates;
+        // A group was not ranked because it is compacting. While an automatic job runs, an empty
+        // ranking then means that the candidates are behind the job, and not that the disk holds
+        // none, which the controller and the driver treat differently.
+        bool skipped_busy_group = false;
     };
 
     // The values that one controller tick reads from the shard.
@@ -138,9 +142,7 @@ public:
     // again.
     void notify_group_idle() noexcept;
 
-    // Returns the part of the range from the minimum to the maximum compaction shares that
-    // compaction asks for, in [0, 1].
-    double shares_demand() const noexcept { return _rate_controller.space_pressure(); }
+    double shares_demand() const noexcept { return _rate_controller.shares_demand(); }
     const compaction_rate_controller& rate_controller() const noexcept { return _rate_controller; }
     // Returns the threshold curve of the current configuration. Every input is live-updatable, so
     // the curve is built where it is used and not cached.
@@ -193,6 +195,9 @@ private:
     uint64_t _idle_notifications{0};
     // Counts the automatic jobs that ended, for the marginal admission gate.
     uint64_t _jobs_ended{0};
+    // True when the last ranking found no batch with a net gain. More CPU cannot change this state,
+    // so the driver gives it to the controller.
+    bool _no_candidates{false};
     // The inputs of the selection that can give a group a batch. They are the segments under the
     // threshold, as the backlog estimates them, the dead segments, and the limits that decide how
     // many candidates a batch needs and can take. The dead segments count apart, because they do
@@ -216,6 +221,8 @@ private:
         uint64_t idle_notifications;
     };
     std::optional<ranking_start> _empty_ranking_start;
+    // True when a job waited for credit since the last tick.
+    bool _throttled_since_tick{false};
     // The credit that the candidate of a driver that waits for credit needs.
     size_t _credit_needed{0};
 

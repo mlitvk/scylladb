@@ -249,10 +249,10 @@ future<> writeable_segment::do_write(segment_position pos, bytes_view data) {
 
 using seg_ptr = lw_shared_ptr<writeable_segment>;
 
-// Maps the shares demand of the rate controller, in [0, 1], to CPU shares: min_shares at 0, at or
-// above the threshold anchor, and logstor_compaction_max_shares at 1, at the space floor. The
-// function is linear, because the demand already has the shape of the shares ramp, see
-// compaction_rate_controller.
+// Maps the shares demand of the rate controller, in [0, 1], to CPU shares: min_shares at 0, when
+// compaction is idle or throttled above the threshold anchor, and logstor_compaction_max_shares at
+// 1, when compaction cannot use its rate or the disk is at the space floor. The function is linear,
+// because the demand already has the shape of the shares ramp, see compaction_rate_controller.
 class compaction_shares_controller : public backlog_controller {
 public:
     // The shares at or above the threshold anchor. It is the floor that the sstable compaction
@@ -1780,6 +1780,7 @@ future<compaction_driver::ranking>
 compaction_manager_impl::find_top_compaction_candidates(const compaction_batch_limits& limits, size_t max_candidates,
         compaction_driver::host::group_filter filter) {
     top_compaction_candidates<compaction_driver::candidate> best_candidates(max_candidates);
+    bool skipped_busy = false;
 
     std::vector<logstor_group*> group_snapshot;
     group_snapshot.reserve(_groups.size());
@@ -1796,7 +1797,15 @@ compaction_manager_impl::find_top_compaction_candidates(const compaction_batch_l
         }
 
         auto& state = *it->second;
-        if (state.running() || state.compaction_disabled_counter > 0 || !filter(*cg)) {
+        if (state.running()) {
+            skipped_busy = true;
+            continue;
+        }
+        // A group with compaction disabled, for example while it is streamed, truncated or split, or
+        // a group that the filter refuses, does not count as busy, because otherwise the shares
+        // demand would increase for candidates that cannot run. The driver ranks it again after the
+        // wait timeout.
+        if (state.compaction_disabled_counter > 0 || !filter(*cg)) {
             continue;
         }
 
@@ -1808,6 +1817,7 @@ compaction_manager_impl::find_top_compaction_candidates(const compaction_batch_l
 
     co_return compaction_driver::ranking{
         .candidates = std::move(best_candidates).take_sorted(),
+        .skipped_busy_group = skipped_busy,
     };
 }
 
