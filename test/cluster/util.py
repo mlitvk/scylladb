@@ -119,7 +119,7 @@ class FeatureConfigurations(Enum):
     )
     LOGSTOR_EVENTUAL_CONSISTENCY = FeatureConfig(
         table_opts=" WITH storage_engine = 'logstor'",
-        cluster_cfg={"logstor_disk_size_in_mb":20, "logstor_file_size_in_mb":1},
+        cluster_cfg={"logstor_total_space_in_mb":40, "logstor_file_size_in_mb":1},
     )
     # TODO: Re-evaluate existing tests for logstor + strong consistency combination
     # after it becomes supported (SCYLLADB-5759) and add a mark for it here.

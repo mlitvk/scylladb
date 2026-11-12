@@ -93,8 +93,10 @@ def make_scylla_conf(mode: str, host_addr: str, seed_addrs: List[str], cluster_n
                                   'views-with-tablets',
                                   'logstor',
                                   'strongly-consistent-tables'],
-        # Logstor refuses to start without a disk size.
-        'logstor_disk_size_in_mb': 8,
+        # Logstor refuses to start without a disk size. Each shard gets an equal part of the
+        # total, rounded down to whole files, so 20 MB gives 8 MB to each of 2 shards, and one
+        # file to each shard of a node with up to 5 shards, which is the most that a test uses.
+        'logstor_total_space_in_mb': 20,
         'logstor_file_size_in_mb': 4,
 
         'skip_wait_for_gossip_to_settle': 0,

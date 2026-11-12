@@ -1024,17 +1024,48 @@ public:
     }
 };
 
+// Returns the logstor disk size of this shard, in bytes.
+//
+// logstor_total_space_in_mb is the space of the node, and each shard gets an equal part of it. The
+// deprecated logstor_disk_size_in_mb is the space of each shard. The two options together are an
+// error, because they can give two different sizes.
+uint64_t logstor_shard_disk_size(const db::config& cfg) {
+    constexpr uint64_t mb = 1024 * 1024;
+    const auto& total_space = cfg.logstor_total_space_in_mb;
+    const auto& shard_space = cfg.logstor_disk_size_in_mb;
+    if (total_space.is_set() && shard_space.is_set()) {
+        throw exceptions::configuration_exception(fmt::format("Set only one of {} and the deprecated {}", total_space.name(), shard_space.name()));
+    }
+    if (shard_space.is_set()) {
+        if (this_shard_id() == 0) {
+            dblog.warn("{} is deprecated and gives the logstor space of each shard. Use {}, which gives the logstor space of the node",
+                    shard_space.name(), total_space.name());
+        }
+        return shard_space() * mb;
+    }
+    const uint64_t shard_count = this_smp_shard_count();
+    const uint64_t file_size = cfg.logstor_file_size_in_mb() * mb;
+    const uint64_t shard_disk_size = total_space() * mb / shard_count;
+    if (shard_disk_size < file_size) {
+        throw exceptions::configuration_exception(fmt::format("{} is {}, and it must be at least {} ({}) times the shard count {}, which is {}",
+                total_space.name(), total_space(), cfg.logstor_file_size_in_mb.name(), cfg.logstor_file_size_in_mb(), shard_count,
+                cfg.logstor_file_size_in_mb() * shard_count));
+    }
+    return shard_disk_size;
+}
+
 } // anonymous namespace
 
 future<>
 database::init_logstor() {
-    dblog.info("Initializing logstor");
+    const uint64_t disk_size = logstor_shard_disk_size(_cfg);
+    dblog.info("Initializing logstor with {} MB of disk space on this shard", disk_size >> 20);
 
     auto cfg = logstor::logstor_config{
         .segment_manager_cfg = {
             .base_dir = std::filesystem::path(_cfg.logstor_directory()),
             .file_size = _cfg.logstor_file_size_in_mb() * 1024ull * 1024ull,
-            .disk_size = _cfg.logstor_disk_size_in_mb() * 1024ull * 1024ull,
+            .disk_size = disk_size,
             .format_on_startup = _cfg.logstor_format_on_startup(),
             .sparse_files = _cfg.logstor_sparse_files(),
             .compaction_space_floor = _cfg.logstor_compaction_space_floor,
