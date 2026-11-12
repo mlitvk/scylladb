@@ -183,7 +183,9 @@ has live records (`table::make_logstor_record_sources()`). A source reads the se
 and sends, for each segment, a chunk of the records that the index still points at. It keeps
 compaction of the group disabled until its stream ends, so the segments it reads stay in the group
 and their records do not move. A write that comes during the stream goes to a segment that the
-source does not read, and the write-both stage of the migration sends it to the new replica.
+source does not read, and the write-both stage of the migration sends it to the new replica. A split
+compaction of the group waits until the stream ends, because the table can prepare a split of the
+tablet while the tablet streams.
 
 Each chunk of the stream is a chunk of a full segment, as in [Chunk Layout](#chunk-layout), sealed at
 `record_alignment` rather than `block_alignment`, so it has no padding to a block. The segment header
@@ -196,11 +198,17 @@ into full segments of its own size, as compaction does. When it writes a segment
 to the index and the segment to the compaction group of the records. A record that is older than the
 record of its key in the index, because a write of the write-both stage came first, stays in the
 segment as dead space. Only whole segments reach the disk: when a stream fails, the sink drops the
-records in its buffer, and the segments it wrote are sealed and indexed in their group. A migration
+records in its buffers, and the segments it wrote are sealed and indexed in their group. A migration
 that is rolled back erases them with the rest of the tablet.
 
+The tablet on the receiving node can be in split mode, because the table can prepare a split while
+the tablet streams. Then the sink gives each record to the left or the right group of the split, and
+a sender that did not split yet sends the records of the two groups mixed. So the sink has a buffer
+for each of two groups, and packs the records of each group into segments of their own, as split
+compaction does.
+
 A shard receives at most `tablet_streaming_write_concurrency_per_shard` streams at once, because each
-sink holds a write buffer for its life. The `stream_records_sent`, `stream_records_received` and
+sink holds two write buffers for its life. The `stream_records_sent`, `stream_records_received` and
 `stream_records_superseded` metrics count the records of the streams, and `stream_bytes_written` the
 bytes that the sinks write.
 
