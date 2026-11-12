@@ -393,7 +393,7 @@ public:
     compaction_reenabler disable_compaction_no_wait(logstor_group&) override;
     // `limits` bound the batch that the job selects: the limits of the automatic policy, or any
     // batch with a net gain for a compaction that was asked for explicitly.
-    future<> submit_normal_compaction(logstor_group&, compaction_batch_limits limits) override;
+    future<compaction_driver::job_result> submit_normal_compaction(logstor_group&, compaction_batch_limits limits) override;
     future<> submit_split_compaction(logstor_group&, mutation_writer::classify_by_token_group, split_target_group) override;
 
 private:
@@ -404,7 +404,7 @@ private:
     compaction_driver::shard_sample sample() const noexcept override;
 
     future<> submit_group_compaction(logstor_group&, std::function<future<>(group_compaction_state&)>, scheduling_group);
-    future<> do_compaction(logstor_group&, compaction_batch_limits, abort_source&);
+    future<compaction_driver::job_result> do_compaction(logstor_group&, compaction_batch_limits, abort_source&);
     future<> do_split_compaction(logstor_group&, mutation_writer::classify_by_token_group, split_target_group, abort_source&);
 
     group_compaction_state& get_group_state(logstor_group&);
@@ -1659,10 +1659,16 @@ future<> compaction_manager_impl::submit_group_compaction(logstor_group& cg, std
     co_await coroutine::return_exception(std::runtime_error("logstor compaction submission is closed"));
 }
 
-future<> compaction_manager_impl::submit_normal_compaction(logstor_group& cg, compaction_batch_limits limits) {
-    co_await submit_group_compaction(cg, [this, &cg, limits] (group_compaction_state& state) {
-        return do_compaction(cg, limits, state.as);
+future<compaction_driver::job_result> compaction_manager_impl::submit_normal_compaction(logstor_group& cg, compaction_batch_limits limits) {
+    // submit_group_compaction() waits for the job, so the job can write `result`, which is in this
+    // coroutine frame.
+    compaction_driver::job_result result;
+    co_await submit_group_compaction(cg, [this, &cg, limits, &result] (group_compaction_state& state) {
+        return do_compaction(cg, limits, state.as).then([&result] (compaction_driver::job_result r) {
+            result = r;
+        });
     }, _cfg.compaction_sg);
+    co_return result;
 }
 
 future<> compaction_manager_impl::submit_split_compaction(logstor_group& src, mutation_writer::classify_by_token_group classifier, split_target_group target_group) {
@@ -1672,7 +1678,7 @@ future<> compaction_manager_impl::submit_split_compaction(logstor_group& src, mu
 }
 
 void compaction_manager_impl::submit(logstor_group& cg) {
-    (void)submit_normal_compaction(cg, _driver.explicit_batch_limits()).handle_exception([table_id = cg.table_id()] (std::exception_ptr ep) {
+    (void)submit_normal_compaction(cg, _driver.explicit_batch_limits()).discard_result().handle_exception([table_id = cg.table_id()] (std::exception_ptr ep) {
         logstor_logger.debug("logstor compaction for table {} failed: {}. Ignored", table_id, ep);
     });
 }
@@ -1900,11 +1906,11 @@ struct split_buffer_pair {
     }
 };
 
-future<> compaction_manager_impl::do_compaction(logstor_group& cg, compaction_batch_limits limits, abort_source& as) {
+future<compaction_driver::job_result> compaction_manager_impl::do_compaction(logstor_group& cg, compaction_batch_limits limits, abort_source& as) {
     const auto segment_size = _sm.get_segment_size();
     auto batch = select_compaction_batch(cg.logstor_segments(), segment_size, limits);
     if (!batch) {
-        co_return;
+        co_return compaction_driver::job_result{};
     }
     auto segments = batch->segments
             | std::views::transform([this] (const segment_descriptor* desc) { return _sm.desc_to_segment_id(*desc); })
@@ -1943,10 +1949,9 @@ future<> compaction_manager_impl::do_compaction(logstor_group& cg, compaction_ba
         });
     }
 
-    const size_t compaction_segments_in = segments.size();
-    const size_t compaction_segments_out = cb_stats.flush_count;
+    const compaction_driver::job_result result{.n_in = segments.size(), .n_out = cb_stats.flush_count};
 
-    logstor_logger.debug("Compaction complete: in {} out {}", compaction_segments_in, compaction_segments_out);
+    logstor_logger.debug("Compaction complete: in {} out {}", result.n_in, result.n_out);
 
     // wait for read operations that use the old locations
     co_await index.await_pending_reads();
@@ -1963,11 +1968,12 @@ future<> compaction_manager_impl::do_compaction(logstor_group& cg, compaction_ba
         }
     }
 
-    _stats.segments_in += compaction_segments_in;
-    _stats.segments_out += compaction_segments_out;
+    _stats.segments_in += result.n_in;
+    _stats.segments_out += result.n_out;
     _stats.records_rewritten += cb_stats.records_rewritten;
     _stats.records_skipped += cb_stats.records_skipped;
     _stats.bytes_read += nonempty_segments.size() * _sm.get_segment_size();
+    co_return result;
 }
 
 future<> compaction_manager_impl::do_split_compaction(logstor_group& src, mutation_writer::classify_by_token_group classifier, split_target_group target_group, abort_source& as) {

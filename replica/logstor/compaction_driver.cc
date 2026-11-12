@@ -302,7 +302,7 @@ bool compaction_driver::refuse_marginal(const candidate& c, const compaction_can
 
 void compaction_driver::start_job(candidate c, compaction_batch_limits limits, semaphore_units<> units) {
     auto job = _jobs_in_flight.insert(_jobs_in_flight.end(), c.score);
-    (void)_host.submit_normal_compaction(*c.group, limits).handle_exception([] (std::exception_ptr ep) {
+    (void)_host.submit_normal_compaction(*c.group, limits).discard_result().handle_exception([] (std::exception_ptr ep) {
         logstor_logger.debug("An automatic compaction job failed: {}. Ignored", ep);
     }).finally([this, job, units = std::move(units)] {
         on_job_end(job);

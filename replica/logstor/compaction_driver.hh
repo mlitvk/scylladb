@@ -54,6 +54,18 @@ public:
         uint64_t dead_segments;
     };
 
+    // Holds the segments that one compaction job read (`n_in`) and wrote (`n_out`).
+    struct job_result {
+        size_t n_in = 0;
+        size_t n_out = 0;
+
+        // Returns the segments that the job freed, which is `n_in - n_out`, or 0 if `n_out` is
+        // larger.
+        size_t reclaimed() const noexcept {
+            return n_in > n_out ? n_in - n_out : 0;
+        }
+    };
+
     // The services that the driver needs from the compaction manager.
     class host {
     public:
@@ -70,7 +82,8 @@ public:
         // Returns true when the group of a candidate is still registered, idle and enabled. The
         // function only compares `group`, because the group can be gone.
         virtual bool can_start(const logstor_group* group) const noexcept = 0;
-        virtual future<> submit_normal_compaction(logstor_group&, compaction_batch_limits) = 0;
+        // Returns what the job did. A job that finds no batch returns an empty result.
+        virtual future<job_result> submit_normal_compaction(logstor_group&, compaction_batch_limits) = 0;
         virtual shard_sample sample() const noexcept = 0;
     };
 

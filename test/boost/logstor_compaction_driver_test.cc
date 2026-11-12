@@ -73,7 +73,7 @@ protected:
 struct submitted_job {
     logstor_group* group;
     compaction_batch_limits limits;
-    promise<> done;
+    promise<compaction_driver::job_result> done;
     bool ended = false;
 };
 
@@ -136,11 +136,12 @@ public:
         return !running.contains(group);
     }
 
-    future<> submit_normal_compaction(logstor_group& group, compaction_batch_limits limits) override {
+    future<compaction_driver::job_result> submit_normal_compaction(logstor_group& group, compaction_batch_limits limits) override {
         running.insert(&group);
-        auto& job = *jobs.emplace_back(std::make_unique<submitted_job>(&group, limits, promise<>()));
-        co_await job.done.get_future();
+        auto& job = *jobs.emplace_back(std::make_unique<submitted_job>(&group, limits, promise<compaction_driver::job_result>()));
+        const auto result = co_await job.done.get_future();
         running.erase(&group);
+        co_return result;
     }
 
     compaction_driver::shard_sample sample() const noexcept override {
@@ -202,9 +203,9 @@ void wait_for_ticks(const fake_host& host, size_t n) {
     BOOST_REQUIRE(wait_until([&] { return host.ticks >= target; }));
 }
 
-void end_job(fake_host& host, size_t i) {
+void end_job(fake_host& host, size_t i, compaction_driver::job_result result = {}) {
     host.jobs[i]->ended = true;
-    host.jobs[i]->done.set_value();
+    host.jobs[i]->done.set_value(result);
 }
 
 void stop(compaction_driver& driver, fake_host& host) {
