@@ -98,7 +98,7 @@ compaction_limits make_compaction_limits(uint64_t space_floor) noexcept;
 // The utilization threshold as a function of the free level, in available segments: a
 // piecewise-linear curve through three points.
 //
-//     available <= space floor          -> 1         any batch with a net gain
+//     available <= space floor          -> 1         any batch with a net gain; the throttle is off
 //     space floor < available < anchor  -> 1 .. u    space pressure increases the threshold
 //     available == anchor               -> u         the configured threshold
 //     anchor < available < ceiling      -> u .. m    more free space decreases it
@@ -218,6 +218,8 @@ struct compaction_batch_limits {
     // The fraction of the best efficiency that a longer batch must keep, see
     // compaction_batch_extension_tolerance.
     double extension_tolerance = compaction_batch_extension_tolerance;
+
+    bool operator==(const compaction_batch_limits&) const noexcept = default;
 };
 
 // Picks the segments one compaction job should read, out of the ones a group owns.
