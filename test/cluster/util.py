@@ -119,12 +119,12 @@ class FeatureConfigurations(Enum):
     )
     LOGSTOR_EVENTUAL_CONSISTENCY = FeatureConfig(
         table_opts=" WITH storage_engine = 'logstor'",
-        cluster_cfg={"logstor_disk_size_in_mb":20, "logstor_file_size_in_mb":1},
+        cluster_cfg={"logstor_total_space_in_mb":40, "logstor_file_size_in_mb":1},
     )
     LOGSTOR_STRONG_CONSISTENCY = FeatureConfig(
         ks_opts=" WITH consistency = 'global'",
         table_opts=" WITH storage_engine = 'logstor'",
-        cluster_cfg={"logstor_disk_size_in_mb":20, "logstor_file_size_in_mb":1},
+        cluster_cfg={"logstor_total_space_in_mb":40, "logstor_file_size_in_mb":1},
     )
 
     def with_marks(self, *marks):

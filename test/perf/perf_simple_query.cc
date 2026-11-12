@@ -526,7 +526,7 @@ int scylla_simple_query_main(int argc, char** argv) {
         ("collection", bpo::value<unsigned>()->default_value(0), "add map<text,text> collection column with N cells per row (excludes --counters)")
         ("tablets", "use tablets")
         ("logstor", "store the table with the logstor storage engine instead of sstables (implies --tablets)")
-        ("logstor-disk-size-in-mb", bpo::value<unsigned>()->default_value(1024), "size of the logstor segment pool")
+        ("logstor-total-space-in-mb", bpo::value<unsigned>()->default_value(1024), "logstor disk space of the node, which the shards share equally")
         ("logstor-file-size-in-mb", bpo::value<unsigned>()->default_value(32), "size of a logstor data file")
         ("logstor-format-on-startup", bpo::value<bool>()->default_value(true), "format the logstor files upfront, so that no write pays for formatting")
         ("logstor-sparse-files", bpo::value<bool>()->default_value(false), "create the logstor data files sparse instead of preallocating them")
@@ -595,11 +595,11 @@ int scylla_simple_query_main(int argc, char** argv) {
             }
             if (logstor) {
                 experimental_features.push_back(db::experimental_features_t::feature::LOGSTOR);
-                cfg.db_config->logstor_disk_size_in_mb(app.configuration()["logstor-disk-size-in-mb"].as<unsigned>());
+                cfg.db_config->logstor_total_space_in_mb(app.configuration()["logstor-total-space-in-mb"].as<unsigned>());
                 cfg.db_config->logstor_file_size_in_mb(app.configuration()["logstor-file-size-in-mb"].as<unsigned>());
                 cfg.db_config->logstor_format_on_startup(app.configuration()["logstor-format-on-startup"].as<bool>());
                 cfg.db_config->logstor_sparse_files(app.configuration()["logstor-sparse-files"].as<bool>());
-                std::cout << "logstor-disk-size-in-mb=" << cfg.db_config->logstor_disk_size_in_mb() << '\n';
+                std::cout << "logstor-total-space-in-mb=" << cfg.db_config->logstor_total_space_in_mb() << '\n';
             }
             if (!experimental_features.empty()) {
                 cfg.db_config->experimental_features(std::move(experimental_features), db::config::config_source::CommandLine);
