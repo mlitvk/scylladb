@@ -256,7 +256,7 @@ async def test_recovery_with_segment_reuse(manager: ScyllaClusterManager):
 
     cmdline = ['--logger-log-level', 'logstor=trace', '--smp=1']
     cfg = {
-        'logstor_disk_size_in_mb': disk_size_mb,
+        'logstor_total_space_in_mb': disk_size_mb,
         'logstor_file_size_in_mb': file_size_mb,
         'experimental_features': ['logstor']
     }
@@ -320,7 +320,7 @@ async def test_grow_logstor_disk_size(manager: ScyllaClusterManager):
 
     cmdline = ['--logger-log-level', 'logstor=debug', '--smp=1']
     cfg = {
-        'logstor_disk_size_in_mb': old_disk_size_mb,
+        'logstor_total_space_in_mb': old_disk_size_mb,
         'logstor_file_size_in_mb': file_size_mb,
         'logstor_format_on_startup': True,
         'experimental_features': ['logstor'],
@@ -338,7 +338,7 @@ async def test_grow_logstor_disk_size(manager: ScyllaClusterManager):
         old_free_segments = metrics.get("scylla_logstor_sm_free_segments") or 0
 
         await manager.server_stop_gracefully(servers[0].server_id)
-        await manager.server_update_config(servers[0].server_id, 'logstor_disk_size_in_mb', new_disk_size_mb)
+        await manager.server_update_config(servers[0].server_id, 'logstor_total_space_in_mb', new_disk_size_mb)
         await manager.server_start(servers[0].server_id)
         cql, _ = await manager.get_ready_cql(servers)
 
@@ -367,7 +367,7 @@ async def test_shrink_logstor_disk_size_no_data(manager: ScyllaClusterManager):
 
     cmdline = ['--logger-log-level', 'logstor=debug', '--smp=1']
     cfg = {
-        'logstor_disk_size_in_mb': old_disk_size_mb,
+        'logstor_total_space_in_mb': old_disk_size_mb,
         'logstor_file_size_in_mb': file_size_mb,
         'logstor_format_on_startup': True,
         'experimental_features': ['logstor'],
@@ -382,7 +382,7 @@ async def test_shrink_logstor_disk_size_no_data(manager: ScyllaClusterManager):
         assert files_before_restart == old_disk_size_mb // file_size_mb
 
         await manager.server_stop_gracefully(servers[0].server_id)
-        await manager.server_update_config(servers[0].server_id, 'logstor_disk_size_in_mb', new_disk_size_mb)
+        await manager.server_update_config(servers[0].server_id, 'logstor_total_space_in_mb', new_disk_size_mb)
         await manager.server_start(servers[0].server_id)
         cql, _ = await manager.get_ready_cql(servers)
 
@@ -411,7 +411,7 @@ async def test_shrink_logstor_disk_size_dead_data(manager: ScyllaClusterManager)
 
     cmdline = ['--logger-log-level', 'logstor=trace', '--smp=1']
     cfg = {
-        'logstor_disk_size_in_mb': old_disk_size_mb,
+        'logstor_total_space_in_mb': old_disk_size_mb,
         'logstor_file_size_in_mb': file_size_mb,
         'logstor_format_on_startup': True,
         'experimental_features': ['logstor'],
@@ -436,7 +436,7 @@ async def test_shrink_logstor_disk_size_dead_data(manager: ScyllaClusterManager)
         await cql.run_async(f"DROP TABLE {ks}.test")
 
         await manager.server_stop_gracefully(servers[0].server_id)
-        await manager.server_update_config(servers[0].server_id, 'logstor_disk_size_in_mb', new_disk_size_mb)
+        await manager.server_update_config(servers[0].server_id, 'logstor_total_space_in_mb', new_disk_size_mb)
         await manager.server_start(servers[0].server_id)
         cql, _ = await manager.get_ready_cql(servers)
 
@@ -473,7 +473,7 @@ async def test_shrink_logstor_disk_size_live_data(manager: ScyllaClusterManager)
 
     cmdline = ['--logger-log-level', 'logstor=debug', '--smp=1']
     cfg = {
-        'logstor_disk_size_in_mb': old_disk_size_mb,
+        'logstor_total_space_in_mb': old_disk_size_mb,
         'logstor_file_size_in_mb': file_size_mb,
         'logstor_format_on_startup': True,
         'experimental_features': ['logstor'],
@@ -496,7 +496,7 @@ async def test_shrink_logstor_disk_size_live_data(manager: ScyllaClusterManager)
             await cql.run_async(f"INSERT INTO {ks}.test (pk, v) VALUES ({i}, '{value}')")
 
         await manager.server_stop_gracefully(servers[0].server_id)
-        await manager.server_update_config(servers[0].server_id, 'logstor_disk_size_in_mb', new_disk_size_mb)
+        await manager.server_update_config(servers[0].server_id, 'logstor_total_space_in_mb', new_disk_size_mb)
         await manager.server_start(servers[0].server_id)
         cql, _ = await manager.get_ready_cql(servers)
 
@@ -526,7 +526,7 @@ async def test_space_accounting_metrics(manager: ScyllaClusterManager):
 
     cmdline = ['--logger-log-level', 'logstor=trace', '--smp=1']
     cfg = {
-        'logstor_disk_size_in_mb': disk_size_mb,
+        'logstor_total_space_in_mb': disk_size_mb,
         'logstor_file_size_in_mb': file_size_mb,
         'experimental_features': ['logstor']
     }
@@ -830,7 +830,7 @@ async def test_automatic_compaction_skips_a_table_with_autocompaction_disabled(m
     cmdline = ['--logger-log-level', 'logstor=debug', '--smp=1']
     cfg = {
         'experimental_features': ['logstor'],
-        'logstor_disk_size_in_mb': 8,
+        'logstor_total_space_in_mb': 8,
         'logstor_file_size_in_mb': 1,
         'enable_keyspace_column_family_metrics': True,
     }
@@ -903,7 +903,7 @@ async def test_automatic_compaction_follows_the_utilization_threshold(manager: S
 
     cmdline = ['--logger-log-level', 'logstor=debug', '--smp=1']
     cfg = {
-        'logstor_disk_size_in_mb': 8,
+        'logstor_total_space_in_mb': 8,
         'logstor_file_size_in_mb': 1,
         'logstor_compaction_utilization_threshold': threshold,
         # A minimum at the threshold keeps the threshold constant above the anchor. The default
@@ -1063,7 +1063,7 @@ async def test_table_removal_during_logstor_compaction(manager: ScyllaClusterMan
     cmdline = ['--logger-log-level', 'logstor=trace', '--logger-log-level', 'debug_error_injection=debug', '--smp=1']
     cfg = {
         'experimental_features': ['logstor'],
-        'logstor_disk_size_in_mb': 8,
+        'logstor_total_space_in_mb': 8,
         'logstor_file_size_in_mb': 8,
     }
     server = await manager.server_add(cmdline=cmdline, config=cfg)
@@ -1134,7 +1134,7 @@ async def test_trigger_separator_flush(manager: ScyllaClusterManager):
 
     cmdline = ['--logger-log-level', 'logstor=debug', '--smp=1']
     cfg = {
-        'logstor_disk_size_in_mb': disk_size_mb,
+        'logstor_total_space_in_mb': disk_size_mb,
         'logstor_file_size_in_mb': file_size_mb,
         'experimental_features': ['logstor']
     }

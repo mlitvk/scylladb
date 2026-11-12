@@ -274,6 +274,7 @@ public:
     named_value<bool> defragment_memory_on_idle;
     named_value<sstring> memtable_allocation_type;
     named_value<double> memtable_cleanup_threshold;
+    named_value<uint32_t> logstor_total_space_in_mb;
     named_value<uint32_t> logstor_disk_size_in_mb;
     named_value<uint32_t> logstor_file_size_in_mb;
     named_value<bool> logstor_format_on_startup;

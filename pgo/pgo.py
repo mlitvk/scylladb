@@ -851,21 +851,22 @@ populators["repair_dataset"] = populate_repair
 # to about that, and the training workload then writes the free half of the pool several
 # times over, so that compaction is running for most of it.
 
-# The segment pool of one shard, and the rest of the logstor configuration of the training
-# cluster. Only the logstor cluster is started with these: every other workload runs
-# without the logstor feature and pays neither for the pool nor for formatting its files.
-LOGSTOR_DISK_SIZE_IN_MB = 256
+# The segment pool of one node, which its two shards share equally (256 MB each), and the
+# rest of the logstor configuration of the training cluster. Only the logstor cluster is
+# started with these: every other workload runs without the logstor feature and pays
+# neither for the pool nor for formatting its files.
+LOGSTOR_TOTAL_SPACE_IN_MB = 512
 LOGSTOR_NODE_OPTS = [
     "--experimental-features=logstor",
-    f"--logstor-disk-size-in-mb={LOGSTOR_DISK_SIZE_IN_MB}",
+    f"--logstor-total-space-in-mb={LOGSTOR_TOTAL_SPACE_IN_MB}",
 ]
 
 # Partitions of the dataset, which is what sizes it against the pool above. A row of
 # ./conf/logstor.yaml is ~1 KiB of values and measures ~1.9 KiB as a record, since a
 # record carries the description of the schema along with the frozen mutation. Every one
 # of the three RF=3 nodes holds the whole dataset, so the live bytes of the cluster come
-# to 3 * LOGSTOR_ROWS * 1.9 KiB against the 3 * 2 * LOGSTOR_DISK_SIZE_IN_MB of pool that
-# its six shards have between them - 0.83 GiB of 1.5 GiB, or 55%. The training mix deletes
+# to 3 * LOGSTOR_ROWS * 1.9 KiB against the 3 * LOGSTOR_TOTAL_SPACE_IN_MB of pool that
+# its three nodes have between them - 0.83 GiB of 1.5 GiB, or 55%. The training mix deletes
 # one partition for every six it inserts, which settles that at ~6/7 of what was
 # populated, leaving the run at about half a pool.
 LOGSTOR_ROWS = 150000

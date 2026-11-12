@@ -5,5 +5,5 @@ extra_scylla_cmdline_options:
   - '--experimental-features=logstor'
   - '--enable-tablets=true'
   - '--tablets-initial-scale-factor=1'
-  - '--logstor-disk-size-in-mb=8'
+  - '--logstor-total-space-in-mb=16'
   - '--logstor-file-size-in-mb=4'

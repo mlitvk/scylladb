@@ -346,7 +346,7 @@ def run_scylla_cmd(pid, dir):
         # The expiration scanner's period (started for Alternator but
         # now also CQL)
         '--alternator-ttl-period-in-seconds=0.5',
-        '--logstor-disk-size-in-mb=8',
+        '--logstor-total-space-in-mb=16',
         '--logstor-file-size-in-mb=4',
         # Don't waste disk space and I/O on formatting logstor files
         '--logstor-sparse-files=true',
@@ -417,6 +417,10 @@ def run_precompiled_scylla_cmd(exe, pid, dir):
         cmd.remove('--rf-rack-valid-keyspaces=1')
     if major < [2025,2]:
         cmd.remove('--group0-raft-op-timeout-in-ms=300000')
+    if major < [2027,1]:
+        # A release before 2027.1 has only the per-shard option, and the node
+        # has 2 shards, so 8 MB on each shard gives the same space.
+        cmd[cmd.index('--logstor-total-space-in-mb=16')] = '--logstor-disk-size-in-mb=8'
     if major < [2026,2]:
         cmd.remove('--experimental-features=logstor')
         cmd.remove('--logstor-disk-size-in-mb=8')

@@ -2644,7 +2644,7 @@ static future<> segment_of_applied_entries_is_reclaimed_impl(const bool use_logs
 
     if (use_logstor) {
         features.push_back(db::experimental_features_t::feature::LOGSTOR);
-        db_cfg_ptr->logstor_disk_size_in_mb(20);
+        db_cfg_ptr->logstor_total_space_in_mb(40);
         db_cfg_ptr->logstor_file_size_in_mb(1);
         table_opts = "WITH storage_engine = 'logstor'";
     }

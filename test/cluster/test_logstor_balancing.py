@@ -35,6 +35,8 @@ cfg = {
     # The default clamps every tablet of a test to 51 MiB, so they would all look the same size.
     'minimal_tablet_size_for_balancing': 1024,
     'enable_keyspace_column_family_metrics': True,
+    # The tests count the segments of a pool of 64 segments, which is 8 MiB on the one shard.
+    'logstor_total_space_in_mb': 8,
 }
 
 
