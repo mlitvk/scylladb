@@ -1555,6 +1555,80 @@ async def test_tablet_migration_retries_a_failed_record_stream(manager: ScyllaCl
         assert await owned_live_record_bytes(manager, dst) == live_bytes
         await check_values(cql, ks, nkeys, f"1_{value}")
 
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
+async def test_tablet_migration_into_a_tablet_in_split_mode(manager: ScyllaClusterManager):
+    """
+    Test that a tablet migration packs the records into few segments when the tablet on the
+    destination is in split mode.
+
+    The load balancer moves a tablet while its table prepares a split, so the destination makes the
+    tablet in split mode and gives each record to the left or the right group of the split. The source
+    does not split before the move, so its segment holds the records of both groups mixed. The
+    destination must still pack the records of each group into segments of their own, and not write
+    a segment each time the group of a record changes.
+    """
+    cmdline = ['--logger-log-level', 'stream_blob=debug', '--smp=1']
+    cfg = {
+        'experimental_features': ['logstor'],
+        'enable_keyspace_column_family_metrics': True,
+        'tablet_load_stats_refresh_interval_in_seconds': 1,
+        # The split must not finalize before the test checks the destination.
+        'error_injections_at_startup': ['tablet_resize_finalization_postpone'],
+    }
+    servers = await manager.servers_add(2, cmdline=cmdline, config=cfg, property_file={"dc": "dc1", "rack": "rack1"})
+    cql = manager.get_cql()
+
+    value_size = 1024
+    # Few enough records that the stream does not fill the pool of the destination even when the
+    # destination writes a segment for each change of group.
+    nkeys = 80
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets={'initial': 1}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v text) WITH storage_engine = 'logstor'")
+        value = 'x' * value_size
+        await write_with_churn(cql, ks, nkeys, value, versions=1)
+        for s in servers:
+            await manager.api.logstor_flush(s.ip_addr)
+
+        src_host, src_shard = await get_tablet_replica(manager, servers[0], ks, 'test', 0)
+        hosts = [await manager.get_host_id(s.server_id) for s in servers]
+        src, dst = (servers[0], servers[1]) if hosts[0] == src_host else (servers[1], servers[0])
+        dst_host = hosts[servers.index(dst)]
+        live_bytes = await owned_live_record_bytes(manager, src)
+
+        # The source stops before it splits its groups, so it sends the records of both groups of
+        # the split mixed.
+        await manager.api.enable_injection(src.ip_addr, 'split_storage_groups_wait', one_shot=False)
+        src_log = await manager.server_open_log(src.server_id)
+        mark = await src_log.mark()
+        await cql.run_async(f"ALTER TABLE {ks}.test WITH tablets = {{'min_tablet_count': 2}}")
+        await src_log.wait_for(f"Detected new split decision for table {ks}.test", from_mark=mark, timeout=60)
+        await src_log.wait_for('split_storage_groups_wait: wait', from_mark=mark, timeout=60)
+
+        await manager.disable_tablet_balancing()
+        # A stream that writes a segment for each change of group fills the pool, and the
+        # coordinator then retries it forever.
+        await asyncio.wait_for(manager.api.move_tablet(servers[0].ip_addr, ks, "test", src_host, src_shard, dst_host, 0, 0), timeout=120)
+
+        dst_live_bytes = await owned_live_record_bytes(manager, dst)
+        dst_segments = await table_segment_count(manager, dst, ks)
+        logger.info(f"live record bytes: source {live_bytes}, destination {dst_live_bytes}; destination segments {dst_segments}")
+        assert dst_live_bytes == live_bytes
+        # Each group of the split takes at most one segment more than its records fill.
+        assert dst_segments <= live_bytes // segment_size + 2
+        dst_metrics = await manager.metrics.query(dst.ip_addr)
+        assert int(dst_metrics.get("scylla_logstor_sm_stream_records_received") or 0) == nkeys
+
+        dst_log = await manager.server_open_log(dst.server_id)
+        mark = await dst_log.mark()
+        await manager.api.message_injection(src.ip_addr, 'split_storage_groups_wait')
+        await manager.api.disable_injection(src.ip_addr, 'split_storage_groups_wait')
+        for s in servers:
+            await manager.api.disable_injection(s.ip_addr, 'tablet_resize_finalization_postpone')
+        await manager.enable_tablet_balancing()
+        await dst_log.wait_for(f"Detected tablet split for table {ks}.test", from_mark=mark, timeout=60)
+        assert await get_tablet_count(manager, dst, ks, 'test') == 2
+        await check_values(cql, ks, nkeys, f"0_{value}")
+
 @pytest.mark.asyncio
 async def test_cache(manager: ScyllaClusterManager):
     """
