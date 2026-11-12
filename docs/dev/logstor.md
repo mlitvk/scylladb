@@ -240,9 +240,10 @@ The file holds these parts, in this order:
 - the **header**, which identifies the file and its format version, and gives the number of erased
   ranges and the sequence floor. The sequence floor is the highest sequence of every erased range
   that the shard ever had, and the drop of an erased range does not lower it.
-- the **erased ranges**, one per erase. An erased range gives a table, an inclusive range of raw
-  tokens and a segment sequence. It erases each record of the table in the range that is in a
-  chunk with a `segment_seq` of at most that sequence.
+- the **erased ranges**. An erased range gives a table, an inclusive range of raw tokens and a
+  segment sequence. It erases each record of the table in the range that is in a chunk with a
+  `segment_seq` of at most that sequence. The next save drops an erased range when later erases
+  cover its tokens at sequences of at least its own.
 - a **CRC32** of all the bytes before it.
 
 ### Segments

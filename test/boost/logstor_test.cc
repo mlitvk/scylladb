@@ -4955,6 +4955,37 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_erased_ranges_coverage) {
     }
 }
 
+// An erased range that later erases cover, at sequences of at least its own, sets no step and is
+// dropped, and an erased range that no later erase covers at some token stays.
+SEASTAR_THREAD_TEST_CASE(test_logstor_erased_ranges_drop_covered) {
+    const erased_ranges_example example;
+    auto r = [&] (int64_t first, int64_t last, uint64_t seq) {
+        return erased_range{.table = example.table_c, .first_token = first, .last_token = last, .seq = segment_sequence(seq)};
+    };
+    using list = std::vector<erased_range>;
+    erased_ranges set;
+    // Covered by a wider later erase.
+    set.insert(r(100, 300, 100)).insert(r(50, 500, 200));
+    BOOST_REQUIRE((set.all() == list{r(50, 500, 200)}));
+    // A narrower later erase leaves the wider one uncovered on both sides.
+    set.insert(r(100, 300, 300));
+    BOOST_REQUIRE((set.all() == list{r(50, 500, 200), r(100, 300, 300)}));
+    // Covered by two later erases together.
+    set.insert(r(50, 200, 400)).insert(r(201, 500, 500));
+    BOOST_REQUIRE((set.all() == list{r(50, 200, 400), r(201, 500, 500)}));
+    // At one sequence the wider one stays, whichever came first, and a retry of the same erase is
+    // one erased range.
+    BOOST_REQUIRE(erased_ranges().insert(r(0, 100, 5)).insert(r(10, 20, 5)).all() == list{r(0, 100, 5)});
+    BOOST_REQUIRE(erased_ranges().insert(r(10, 20, 5)).insert(r(0, 100, 5)).all() == list{r(0, 100, 5)});
+    BOOST_REQUIRE(erased_ranges().insert(r(10, 20, 5)).insert(r(10, 20, 5)).all() == list{r(10, 20, 5)});
+    // An erase of the whole ring leaves only itself for its table, and the other tables alone.
+    const auto whole = erased_ranges::make(example.table_c, dht::token_range(), segment_sequence(600));
+    set.insert(example.b).insert(whole);
+    BOOST_REQUIRE(std::ranges::is_permutation(set.all(), list{example.b, whole}));
+    BOOST_REQUIRE(set.covers(example.table_c, raw_token(0), segment_sequence(600)));
+    BOOST_REQUIRE(!set.covers(example.table_c, raw_token(0), segment_sequence(601)));
+}
+
 // The erased ranges survive a save and a load, and insert_and_save() adds an erased range to the
 // file and to the set in memory.
 SEASTAR_THREAD_TEST_CASE(test_logstor_erased_ranges_save_and_load) {

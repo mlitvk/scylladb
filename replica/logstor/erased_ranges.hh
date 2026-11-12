@@ -65,7 +65,8 @@ public:
     // Replaces the file of `shard` in `base_dir` with the current set, atomically and durably.
     future<> save(const std::filesystem::path& base_dir, unsigned shard) const;
 
-    // Adds `r` to the set in memory. When it throws, the set does not change.
+    // Adds `r` to the set in memory, and drops the erased ranges of its table that later erases now
+    // cover. When it throws, the set does not change.
     erased_ranges& insert(erased_range r);
 
     // Saves the set with `r` added to the file of `shard` in `base_dir`, and then adds `r` to the
@@ -123,6 +124,10 @@ private:
     // highest sequence of the erased ranges that cover the token. A step applies from its token up
     // to the token of the next step, and a step at sequence 0 covers nothing, because sequences
     // start at 1. Recovery looks the steps up once per record.
+    //
+    // The table keeps only the erased ranges that set a step, because a range that sets no step
+    // changes no lookup. So the ranges that no later erase covers limit the size of the set, and the
+    // number of erases does not.
     struct table_state {
         // Sorted by the first token.
         std::vector<range_in_table> ranges;
@@ -140,8 +145,8 @@ private:
     size_t _size = 0;
     segment_sequence _seq_floor{0};
 
-    // Returns the state of a table that has the erased ranges `ranges`: sorts them and computes the
-    // steps.
+    // Returns the state of a table that has the erased ranges `ranges`: sorts them, computes the
+    // steps, and drops the erased ranges that set no step.
     static table_state build(std::vector<range_in_table> ranges);
 
     // Returns the state of the table of `r` with `r` added. The set does not change.

@@ -271,7 +271,7 @@ erased_ranges::table_state erased_ranges::build(std::vector<range_in_table> rang
     //
     // When the sweep reaches the first token of a range, the sweep pushes the range on a heap that
     // is ordered by sequence. At each point, the top range of the heap that has not ended gives the
-    // value.
+    // value, and that range sets the step.
     std::vector<int64_t> bounds;
     bounds.reserve(2 * ranges.size() + 1);
     bounds.push_back(min_raw_token);
@@ -285,25 +285,33 @@ erased_ranges::table_state erased_ranges::build(std::vector<range_in_table> rang
     const auto [duplicates_begin, duplicates_end] = std::ranges::unique(bounds);
     bounds.erase(duplicates_begin, duplicates_end);
 
+    // Of two erased ranges at the same sequence, the one that ends later is at the top of the heap,
+    // so a range inside the other, or a retry of the same erase, sets no step and is dropped.
     struct covering {
         segment_sequence seq;
         int64_t last_token;
+        size_t index;
         auto operator<=>(const covering&) const noexcept = default;
     };
     std::priority_queue<covering> started;
+    std::vector<bool> sets_a_step(ranges.size(), false);
     std::vector<step> steps;
     steps.reserve(bounds.size());
     size_t next = 0;
     for (const auto from : bounds) {
         for (; next < ranges.size() && ranges[next].first_token <= from; ++next) {
-            started.push(covering{.seq = ranges[next].seq, .last_token = ranges[next].last_token});
+            started.push(covering{.seq = ranges[next].seq, .last_token = ranges[next].last_token, .index = next});
         }
         // The sweep pops an ended range only when the range is at the top, because only the top
         // range gives the value.
         while (!started.empty() && started.top().last_token < from) {
             started.pop();
         }
-        const auto seq = started.empty() ? segment_sequence{0} : started.top().seq;
+        auto seq = segment_sequence{0};
+        if (!started.empty()) {
+            seq = started.top().seq;
+            sets_a_step[started.top().index] = true;
+        }
         if (steps.empty() || steps.back().seq != seq) {
             steps.push_back(step{.from = from, .seq = seq});
         }
@@ -312,7 +320,12 @@ erased_ranges::table_state erased_ranges::build(std::vector<range_in_table> rang
     // The state keeps no spare capacity, because it lives until the next erase of its table.
     table_state state;
     state.steps.assign(steps.begin(), steps.end());
-    state.ranges.assign(ranges.begin(), ranges.end());
+    state.ranges.reserve(std::ranges::count(sets_a_step, true));
+    for (size_t i = 0; i < ranges.size(); ++i) {
+        if (sets_a_step[i]) {
+            state.ranges.push_back(ranges[i]);
+        }
+    }
     return state;
 }
 
