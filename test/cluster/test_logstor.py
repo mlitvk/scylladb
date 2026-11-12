@@ -306,6 +306,62 @@ async def test_recovery_with_segment_reuse(manager: ScyllaClusterManager):
             assert len(rows) == 1, f"Key {pk} not found after recovery"
             assert rows[0].v == expected_v, f"Key {pk} value mismatch after recovery"
 
+async def test_total_space_split_among_shards(manager: ScyllaClusterManager):
+    """
+    Test that each shard gets an equal part of logstor_total_space_in_mb, rounded down to whole
+    files: 10 MB on 3 shards gives each shard 3 files of 1 MB.
+    """
+    shard_count = 3
+    cfg = {
+        'logstor_total_space_in_mb': 10,
+        'logstor_file_size_in_mb': 1,
+        'logstor_format_on_startup': True,
+        'experimental_features': ['logstor'],
+    }
+    server = await manager.server_add(cmdline=[f'--smp={shard_count}'], config=cfg)
+
+    for shard in range(shard_count):
+        assert await count_logstor_data_files(manager, server.server_id, shard) == 3
+
+async def test_deprecated_disk_size_is_per_shard(manager: ScyllaClusterManager):
+    """
+    Test that the deprecated logstor_disk_size_in_mb still gives the logstor space of each shard,
+    and that the node logs a deprecation warning.
+    """
+    shard_count = 2
+    cfg = {
+        # A null value leaves the option unset, so that the value of the suite configuration does
+        # not apply.
+        'logstor_total_space_in_mb': None,
+        'logstor_disk_size_in_mb': 4,
+        'logstor_file_size_in_mb': 1,
+        'logstor_format_on_startup': True,
+        'experimental_features': ['logstor'],
+    }
+    server = await manager.server_add(cmdline=[f'--smp={shard_count}'], config=cfg)
+
+    for shard in range(shard_count):
+        assert await count_logstor_data_files(manager, server.server_id, shard) == 4
+    log = await manager.server_open_log(server.server_id)
+    assert await log.grep("logstor_disk_size_in_mb is deprecated")
+
+@pytest.mark.parametrize("space_cfg, expected_error", [
+    # 1 MB on 2 shards is less than one file of 1 MB on each shard.
+    ({'logstor_total_space_in_mb': 1},
+     "logstor_total_space_in_mb is 1, and it must be at least logstor_file_size_in_mb"),
+    ({'logstor_total_space_in_mb': 8, 'logstor_disk_size_in_mb': 4},
+     "Set only one of logstor_total_space_in_mb and the deprecated logstor_disk_size_in_mb"),
+], ids=["total_space_too_small", "both_options"])
+async def test_invalid_space_config(manager: ScyllaClusterManager, space_cfg: dict, expected_error: str):
+    """
+    Test that a node does not start with a logstor space configuration that is not valid.
+    """
+    cfg = {
+        'logstor_file_size_in_mb': 1,
+        'experimental_features': ['logstor'],
+    } | space_cfg
+    await manager.server_add(cmdline=['--smp=2'], config=cfg, expected_error=expected_error)
+
 async def test_grow_logstor_disk_size(manager: ScyllaClusterManager):
     """
     Test that increasing the configured logstor disk size works correctly.
