@@ -1528,6 +1528,7 @@ future<compaction_driver::ranking>
 compaction_manager_impl::find_top_compaction_candidates(const compaction_batch_limits& limits, size_t max_candidates,
         compaction_driver::host::group_filter filter) {
     top_compaction_candidates<compaction_driver::candidate> best_candidates(max_candidates);
+    bool skipped_busy = false;
 
     std::vector<logstor_group*> group_snapshot;
     group_snapshot.reserve(_groups.size());
@@ -1544,7 +1545,15 @@ compaction_manager_impl::find_top_compaction_candidates(const compaction_batch_l
         }
 
         auto& state = *it->second;
-        if (state.running() || state.compaction_disabled_counter > 0 || !filter(*cg)) {
+        if (state.running()) {
+            skipped_busy = true;
+            continue;
+        }
+        // A group with compaction disabled, for example while it is streamed, truncated or split, or
+        // a group that the filter refuses, does not count as busy, because otherwise the shares
+        // demand would increase for candidates that cannot run. The driver ranks it again after the
+        // wait timeout.
+        if (state.compaction_disabled_counter > 0 || !filter(*cg)) {
             continue;
         }
 
@@ -1556,6 +1565,7 @@ compaction_manager_impl::find_top_compaction_candidates(const compaction_batch_l
 
     co_return compaction_driver::ranking{
         .candidates = std::move(best_candidates).take_sorted(),
+        .skipped_busy_group = skipped_busy,
     };
 }
 
