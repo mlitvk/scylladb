@@ -70,8 +70,9 @@ struct segment_manager_config {
     utils::updateable_value<float> compaction_max_shares{2000};
     seastar::scheduling_group separator_sg;
     seastar::scheduling_group split_compaction_sg;
-    // A shard receives at most this many record streams at once. Each stream holds a write buffer
-    // for its life, so a stream above the limit waits for one to end.
+    // A shard receives at most this many record streams at once. Each stream holds
+    // record_stream_sink_buffers write buffers for its life, so a stream above the limit waits for
+    // one to end.
     size_t max_record_stream_sinks = 2;
 };
 

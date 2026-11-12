@@ -154,21 +154,29 @@ temporary_buffer<char> stream_chunk_assembler::take_front(size_t n) {
     return chunk;
 }
 
-record_stream_sink::record_stream_sink(table_id table, target_resolver resolve_target, owned_write_buffer buffer,
+record_stream_sink::record_stream_sink(table_id table, target_resolver resolve_target, std::vector<owned_write_buffer> buffers,
         segment_writer write_segment, seastar::gate::holder segment_manager_holder, record_stream_stats& stats)
     : _table(table)
     , _resolve_target(std::move(resolve_target))
-    , _buffer(std::move(buffer))
     , _write_segment(std::move(write_segment))
     , _segment_manager_holder(std::move(segment_manager_holder))
     , _stats(stats)
-{}
+{
+    if (buffers.size() != _buffers.size()) {
+        on_internal_error(logstor_logger, fmt::format("A record stream sink takes {} buffers, not {}", _buffers.size(), buffers.size()));
+    }
+    for (size_t i = 0; i < _buffers.size(); ++i) {
+        _buffers[i].buffer = std::move(buffers[i]);
+    }
+}
 
 record_stream_sink::~record_stream_sink() {
     // A sink that failed has index updates that wait for a segment that is not written. abort()
     // fails them. Consume them here, so that they are not reported as ignored.
-    for (auto& update : _index_updates) {
-        (void)std::move(update).handle_exception([] (std::exception_ptr) {});
+    for (auto& gb : _buffers) {
+        for (auto& update : gb.index_updates) {
+            (void)std::move(update).handle_exception([] (std::exception_ptr) {});
+        }
     }
 }
 
@@ -196,12 +204,14 @@ future<> record_stream_sink::close() {
 }
 
 future<> record_stream_sink::abort() {
-    if (_buffer) {
-        co_await _buffer->abort_writes(std::make_exception_ptr(record_stream_error(fmt::format(
-                "Record stream of table {} was aborted before its records were written", _table))));
-    }
-    for (auto& update : std::exchange(_index_updates, {})) {
-        co_await std::move(update).handle_exception([] (std::exception_ptr) {});
+    for (auto& gb : _buffers) {
+        if (gb.buffer) {
+            co_await gb.buffer->abort_writes(std::make_exception_ptr(record_stream_error(fmt::format(
+                    "Record stream of table {} was aborted before its records were written", _table))));
+        }
+        for (auto& update : std::exchange(gb.index_updates, {})) {
+            co_await std::move(update).handle_exception([] (std::exception_ptr) {});
+        }
     }
     co_await release();
 }
@@ -228,22 +238,21 @@ future<> record_stream_sink::write_record(const chunk_record& record) {
         throw record_stream_error(fmt::format("Record stream of table {} has a record of table {}", _table, header.table));
     }
     auto writer = log_record_bytes_writer(header, record.bytes);
-    if (writer.record_size() > _buffer->max_record_size()) {
+    // The buffers of a sink have the same size.
+    const auto max_record_size = _buffers[0].buffer->max_record_size();
+    if (writer.record_size() > max_record_size) {
         throw record_stream_error(fmt::format("Record stream of table {} has a record of {} bytes, more than the limit of {} bytes",
-                _table, writer.record_size(), _buffer->max_record_size()));
+                _table, writer.record_size(), max_record_size));
     }
 
     auto key = header.index_key();
-    auto target = _resolve_target(key.token());
-    if (_buffer->has_data() && (target.cg != _target.cg || !_buffer->can_fit(writer))) {
-        co_await flush();
-    }
-    if (!_target.cg) {
-        _target = std::move(target);
+    auto* gb = co_await buffer_for(_resolve_target(key.token()));
+    if (!gb->buffer->can_fit(writer)) {
+        co_await flush(*gb);
     }
 
-    auto* index = &_target.cg->logstor_index();
-    _index_updates.push_back(_buffer->write(std::move(writer)).then_unpack(
+    auto* index = &gb->target.cg->logstor_index();
+    gb->index_updates.push_back(gb->buffer->write(std::move(writer)).then_unpack(
             [stats = &_stats, index, key = std::move(key), timestamp = header.timestamp] (record_location location, seastar::gate::holder) {
         ++stats->records_received;
         if (!index->insert(key, index_entry{.location = location, .timestamp = timestamp}).inserted()) {
@@ -252,35 +261,64 @@ future<> record_stream_sink::write_record(const chunk_record& record) {
     }));
 }
 
+// Returns the buffer of the group of `target`. A group without a buffer takes a buffer without a
+// group, or else the buffer that the last record did not use, after its records are written. So
+// when a storage group enters split mode during the stream, the buffer of its main group goes to a
+// new group as soon as records of both new groups arrive, and the holders of the main group do not
+// keep the storage group from becoming ready for the split.
+future<record_stream_sink::group_buffer*> record_stream_sink::buffer_for(write_target target) {
+    static_assert(record_stream_sink_buffers == 2, "the choice of the buffer to write out assumes two buffers");
+    for (size_t i = 0; i < _buffers.size(); ++i) {
+        if (_buffers[i].target.cg == target.cg) {
+            _last_used = i;
+            co_return &_buffers[i];
+        }
+    }
+    auto unused = std::ranges::find_if(_buffers, [] (const group_buffer& gb) { return !gb.target.cg; });
+    const size_t i = unused != _buffers.end() ? size_t(unused - _buffers.begin()) : 1 - _last_used;
+    auto& gb = _buffers[i];
+    if (gb.target.cg) {
+        co_await flush(gb);
+    }
+    gb.target = std::move(target);
+    _last_used = i;
+    co_return &gb;
+}
+
 future<> record_stream_sink::write_buffered_records() {
     throw_if_failed();
     if (_assembler.has_partial_chunk()) {
         throw record_stream_error(fmt::format("Record stream of table {} ended inside a chunk", _table));
     }
-    co_await flush();
+    for (auto& gb : _buffers) {
+        co_await flush(gb);
+    }
 }
 
-future<> record_stream_sink::flush() {
-    if (_buffer->has_data()) {
-        co_await _write_segment(*_buffer, *_target.cg);
+// Writes the records of the buffer to a segment of its group and waits for their index updates.
+// The buffer keeps its group.
+future<> record_stream_sink::flush(group_buffer& gb) {
+    if (gb.buffer->has_data()) {
+        co_await _write_segment(*gb.buffer, *gb.target.cg);
         utils::get_local_injector().inject("logstor_stream_sink_after_flush", [] {
             throw std::runtime_error("logstor_stream_sink_after_flush injection");
         });
     }
-    auto updates = std::exchange(_index_updates, {});
+    auto updates = std::exchange(gb.index_updates, {});
     co_await when_all_succeed(updates.begin(), updates.end());
-    co_await _buffer->close();
-    _buffer->reset();
-    _target = {};
+    co_await gb.buffer->close();
+    gb.buffer->reset();
 }
 
 future<> record_stream_sink::release() noexcept {
-    if (_buffer) {
-        // The pool takes back only a closed buffer.
-        co_await _buffer->close();
-        _buffer.reset();
+    for (auto& gb : _buffers) {
+        if (gb.buffer) {
+            // The pool takes back only a closed buffer.
+            co_await gb.buffer->close();
+            gb.buffer.reset();
+        }
+        gb.target = {};
     }
-    _target = {};
     _resolve_target = {};
     _segment_manager_holder.release();
 }

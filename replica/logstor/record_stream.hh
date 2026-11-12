@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include <array>
 #include <deque>
 #include <optional>
 #include <span>
@@ -120,15 +121,20 @@ private:
     temporary_buffer<char> take_front(size_t n);
 };
 
-// The receiver of a record stream. It packs the records into full segments of their compaction
-// groups, as compaction does, and adds each record to the index of its group when its segment is
-// written. A record that is older than the record of its key in the index stays in its segment
-// as dead space.
+// A record stream sink has a buffer for each of two compaction groups, because a storage group in
+// split mode gives the records of one tablet to two groups, and the sender can send the records of
+// the two groups mixed.
+inline constexpr size_t record_stream_sink_buffers = 2;
+
+// The receiver of a record stream. It packs the records of each compaction group into full
+// segments of that group, as compaction does, and adds each record to the index of its group when
+// its segment is written. A record that is older than the record of its key in the index stays in
+// its segment as dead space.
 //
-// The segment manager makes the sink. The sink holds a gate holder of the segment manager, a
-// buffer of its pool and the target resolver, with what the resolver holds, until close() or
-// abort(). The caller must call one of the two, and must not start a call while another call is in
-// progress.
+// The segment manager makes the sink. The sink holds a gate holder of the segment manager,
+// record_stream_sink_buffers buffers of its pool and the target resolver, with what the resolver
+// holds, until close() or abort(). The caller must call one of the two, and must not start a call
+// while another call is in progress.
 class record_stream_sink {
 public:
     // Returns the compaction group of a token, with the holders that a write to the group takes.
@@ -136,7 +142,8 @@ public:
     // Writes the buffer as a full segment of the group, and completes the writes of the buffer.
     using segment_writer = noncopyable_function<future<>(write_buffer&, logstor_group&)>;
 
-    record_stream_sink(table_id table, target_resolver resolve_target, owned_write_buffer buffer,
+    // `buffers` holds record_stream_sink_buffers buffers.
+    record_stream_sink(table_id table, target_resolver resolve_target, std::vector<owned_write_buffer> buffers,
             segment_writer write_segment, seastar::gate::holder segment_manager_holder, record_stream_stats& stats);
     record_stream_sink(const record_stream_sink&) = delete;
     record_stream_sink& operator=(const record_stream_sink&) = delete;
@@ -146,27 +153,34 @@ public:
     // put() and close(), and the caller must call abort().
     future<> put(std::span<temporary_buffer<char>> data);
 
-    // Writes the records that are in the buffer. Fails and writes nothing if the stream ends inside
+    // Writes the records that are in the buffers. Fails and writes nothing if the stream ends inside
     // a chunk or if a put() failed. A close() that fails releases the sink as abort() does, so the
     // caller does not have to call abort() after it.
     future<> close();
 
-    // Drops the records that are in the buffer. The segments that the sink wrote stay in their
+    // Drops the records that are in the buffers. The segments that the sink wrote stay in their
     // groups.
     future<> abort();
 
 private:
+    // The records of one compaction group that wait for their segment.
+    struct group_buffer {
+        owned_write_buffer buffer;
+        // Holds the group of the records in the buffer, with its holders. The holders stay until
+        // the segment of the records is in the group, as for a normal write.
+        write_target target;
+        std::vector<future<>> index_updates;
+    };
+
     table_id _table;
     target_resolver _resolve_target;
-    owned_write_buffer _buffer;
+    std::array<group_buffer, record_stream_sink_buffers> _buffers;
+    // Holds the index in `_buffers` of the buffer of the last record.
+    size_t _last_used = 0;
     segment_writer _write_segment;
     seastar::gate::holder _segment_manager_holder;
     record_stream_stats& _stats;
     stream_chunk_assembler _assembler;
-    // Holds the group of the records in the buffer, with its holders. The holders stay until the
-    // segment of the records is in the group, as for a normal write.
-    write_target _target;
-    std::vector<future<>> _index_updates;
     // Is true while put() runs, and stays true if put() fails. A failed put() can leave part of a
     // chunk in the buffer and in the assembler, so the sink must not take more data after it.
     bool _failed = false;
@@ -174,8 +188,9 @@ private:
     void throw_if_failed() const;
     future<> write_chunk(temporary_buffer<char> bytes);
     future<> write_record(const chunk_record& record);
+    future<group_buffer*> buffer_for(write_target target);
     future<> write_buffered_records();
-    future<> flush();
+    future<> flush(group_buffer& gb);
     future<> release() noexcept;
 };
 

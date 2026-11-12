@@ -181,7 +181,15 @@ struct logstor_env {
     shared_logstor_cache cache;
     logstor ls;
 
-    logstor_env() : ls(make_test_logstor_config(dir.path()), cache.shared_tracker) {
+    // `configure` changes the segment manager config of make_test_logstor_config().
+    explicit logstor_env(noncopyable_function<void(segment_manager_config&)> configure = {})
+        : ls([&] {
+            auto cfg = make_test_logstor_config(dir.path());
+            if (configure) {
+                configure(cfg.segment_manager_cfg);
+            }
+            return cfg;
+        }(), cache.shared_tracker) {
         test_recovery_catalog no_tables;
         ls.do_recovery(no_tables).get();
         ls.start().get();
@@ -220,6 +228,45 @@ void require_reads_back(logstor& ls, schema_ptr schema, const primary_index& ind
     BOOST_REQUIRE(actual);
     assert_that(*actual).is_equal_to(expected);
 }
+
+// Returns true if the token goes to the lower of two groups, in a test whose records go to two
+// groups, as the two groups of a split.
+bool is_low(dht::token token) {
+    return token < dht::token::from_int64(0);
+}
+
+// A sink whose segment writes fail, with a pool and a segment manager gate of its own, so that a
+// test can check that the sink gives back what it holds.
+struct failing_sink {
+    write_buffer_pool pool{write_buffer_pool::config{
+        .capacity = record_stream_sink_buffers,
+        .buffer_size = segment_size,
+        .kind = segment_kind::full,
+        .preallocate = 0,
+        .max_cached = record_stream_sink_buffers,
+    }};
+    seastar::abort_source as;
+    seastar::gate segment_manager_gate;
+    record_stream_stats stats;
+    std::unique_ptr<record_stream_sink> sink;
+
+    failing_sink(schema_ptr schema, record_stream_sink::target_resolver resolve_target) {
+        sink = std::make_unique<record_stream_sink>(schema->id(), std::move(resolve_target),
+                pool.allocate_many(record_stream_sink_buffers, as).get(),
+                [] (write_buffer&, logstor_group&) -> future<> {
+                    return make_exception_future<>(std::runtime_error("injected segment write failure"));
+                },
+                segment_manager_gate.hold(), stats);
+    }
+
+    // Destroys the sink and checks that it gave back its buffers and its gate holder.
+    void require_released() {
+        BOOST_REQUIRE_EQUAL(pool.used_buffer_count(), 0);
+        sink.reset();
+        segment_manager_gate.close().get();
+        pool.stop().get();
+    }
+};
 
 // Writes the records through the write path and flushes them into one segment of the group.
 void write_segment(logstor& ls, test_logstor_group& group, schema_ptr schema, std::span<const test_record> records) {
@@ -421,38 +468,98 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_sink_packs_records_into_segments) {
     BOOST_REQUIRE_EQUAL(group.logstor_segments().live_record_bytes(), live_bytes);
 }
 
-SEASTAR_THREAD_TEST_CASE(test_logstor_record_sink_flushes_when_the_group_changes) {
+SEASTAR_THREAD_TEST_CASE(test_logstor_record_sink_packs_each_group_into_its_own_segments) {
     auto schema = make_schema();
     logstor_env env;
     test_logstor_group low(schema, env.ls);
     test_logstor_group high(schema, env.ls, low.logstor_index());
+    // Compaction would change the segment counts that the test checks.
+    auto low_guard = env.ls.get_compaction_manager().disable_compaction(low).get();
+    auto high_guard = env.ls.get_compaction_manager().disable_compaction(high).get();
     target_gates gates;
 
-    const auto records = make_records(20, 100);
-    auto group_of = [&] (dht::token token) -> test_logstor_group& {
-        return token < dht::token::from_int64(0) ? low : high;
-    };
-    auto pieces = cut_into_pieces(make_chunks(schema, records, 20), 4096);
+    // The records of the two groups come mixed, as from a group that did not split yet.
+    const auto records = make_records(400, 1000);
+    std::vector<test_record> low_records;
+    std::vector<test_record> high_records;
+    size_t group_changes = 0;
+    for (size_t i = 0; i < records.size(); ++i) {
+        const bool low_record = is_low(index_key_of(schema, records[i]).token());
+        (low_record ? low_records : high_records).push_back(records[i]);
+        if (i > 0 && low_record != is_low(index_key_of(schema, records[i - 1]).token())) {
+            ++group_changes;
+        }
+    }
+    const auto low_segments = segment_starts(schema, low_records).size();
+    const auto high_segments = segment_starts(schema, high_records).size();
+    BOOST_REQUIRE_GT(low_segments, 1);
+    BOOST_REQUIRE_GT(high_segments, 1);
+    BOOST_REQUIRE_GT(group_changes, low_segments + high_segments);
 
+    auto pieces = cut_into_pieces(make_chunks(schema, records, 20), 4096);
     auto sink = env.ls.get_segment_manager().make_record_stream_sink(schema->id(), [&] (dht::token token) {
-        return gates.target(group_of(token));
+        return gates.target(is_low(token) ? low : high);
     }).get();
     put_pieces(*sink, pieces);
     sink->close().get();
     sink.reset();
     gates.close();
 
+    BOOST_REQUIRE_EQUAL(low.logstor_segments().segment_count(), low_segments);
+    BOOST_REQUIRE_EQUAL(high.logstor_segments().segment_count(), high_segments);
     size_t low_bytes = 0;
     size_t high_bytes = 0;
     for (const auto& r : records) {
         require_reads_back(env.ls, schema, low.logstor_index(), r);
-        auto& group = group_of(index_key_of(schema, r).token());
-        (&group == &low ? low_bytes : high_bytes) += frame_size_of(schema, r);
+        (is_low(index_key_of(schema, r).token()) ? low_bytes : high_bytes) += frame_size_of(schema, r);
     }
-    BOOST_REQUIRE_GT(low_bytes, 0);
-    BOOST_REQUIRE_GT(high_bytes, 0);
     BOOST_REQUIRE_EQUAL(low.logstor_segments().live_record_bytes(), low_bytes);
     BOOST_REQUIRE_EQUAL(high.logstor_segments().live_record_bytes(), high_bytes);
+}
+
+// The records first go to the main group of a storage group, and then to the two groups of its
+// split, as when the storage group enters split mode during the stream.
+SEASTAR_THREAD_TEST_CASE(test_logstor_record_sink_writes_out_a_group_that_the_resolver_stops_returning) {
+    auto schema = make_schema();
+    logstor_env env;
+    test_logstor_group main(schema, env.ls);
+    test_logstor_group low(schema, env.ls, main.logstor_index());
+    test_logstor_group high(schema, env.ls, main.logstor_index());
+    target_gates main_gates;
+    target_gates gates;
+
+    const auto records = make_records(60, 100);
+    const auto before_split = std::span(records).first(10);
+    const auto after_split = std::span(records).subspan(10);
+    BOOST_REQUIRE(std::ranges::any_of(after_split, [&] (const test_record& r) { return is_low(index_key_of(schema, r).token()); }));
+    BOOST_REQUIRE(!std::ranges::all_of(after_split, [&] (const test_record& r) { return is_low(index_key_of(schema, r).token()); }));
+
+    bool split = false;
+    auto sink = env.ls.get_segment_manager().make_record_stream_sink(schema->id(), [&] (dht::token token) {
+        return split ? gates.target(is_low(token) ? low : high) : main_gates.target(main);
+    }).get();
+    auto first_chunks = make_chunks(schema, before_split, 7);
+    sink->put(first_chunks).get();
+    BOOST_REQUIRE_GT(main_gates.non_empty.get_count(), 0);
+
+    split = true;
+    auto rest_chunks = make_chunks(schema, after_split, 7);
+    sink->put(rest_chunks).get();
+    // Records of both new groups arrived, so the records of the main group are in a segment of
+    // their own, and the sink holds nothing that keeps the main group from being empty.
+    BOOST_REQUIRE_EQUAL(main_gates.non_empty.get_count(), 0);
+    BOOST_REQUIRE_EQUAL(main.logstor_segments().segment_count(), 1);
+
+    sink->close().get();
+    sink.reset();
+    gates.close();
+    main_gates.close();
+
+    BOOST_REQUIRE_EQUAL(low.logstor_segments().segment_count(), 1);
+    BOOST_REQUIRE_EQUAL(high.logstor_segments().segment_count(), 1);
+    for (const auto& r : records) {
+        require_reads_back(env.ls, schema, main.logstor_index(), r);
+    }
 }
 
 SEASTAR_THREAD_TEST_CASE(test_logstor_record_sink_keeps_a_newer_local_record) {
@@ -629,39 +736,48 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_sink_abort_keeps_the_written_segmen
     }
 }
 
+SEASTAR_THREAD_TEST_CASE(test_logstor_record_sink_abort_drops_the_records_of_both_groups) {
+    auto schema = make_schema();
+    logstor_env env;
+    test_logstor_group low(schema, env.ls);
+    test_logstor_group high(schema, env.ls, low.logstor_index());
+    target_gates gates;
+
+    // The records fit in a buffer of each group, so the sink writes no segment before abort().
+    const auto records = make_records(40, 100);
+    auto chunks = make_chunks(schema, records, 7);
+
+    auto sink = env.ls.get_segment_manager().make_record_stream_sink(schema->id(), [&] (dht::token token) {
+        return gates.target(is_low(token) ? low : high);
+    }).get();
+    sink->put(chunks).get();
+    sink->abort().get();
+    sink.reset();
+    gates.close();
+
+    BOOST_REQUIRE_EQUAL(low.logstor_segments().segment_count(), 0);
+    BOOST_REQUIRE_EQUAL(high.logstor_segments().segment_count(), 0);
+    for (const auto& r : records) {
+        BOOST_REQUIRE(!low.logstor_index().get(index_key_of(schema, r)));
+    }
+}
+
 SEASTAR_THREAD_TEST_CASE(test_logstor_record_sink_failed_segment_write_releases_the_sink) {
     auto schema = make_schema();
     logstor_env env;
     test_logstor_group group(schema, env.ls);
     target_gates gates;
 
-    write_buffer_pool pool(write_buffer_pool::config{
-        .capacity = 1,
-        .buffer_size = segment_size,
-        .kind = segment_kind::full,
-        .preallocate = 0,
-        .max_cached = 1,
-    });
-    seastar::abort_source as;
-    seastar::gate segment_manager_gate;
-
     const auto records = make_records(150, 2000);
     auto chunks = make_chunks(schema, records, 7);
 
-    record_stream_stats stats;
-    record_stream_sink sink(schema->id(), [&] (dht::token) { return gates.target(group); }, pool.allocate(as).get(),
-            [] (write_buffer&, logstor_group&) -> future<> {
-                return make_exception_future<>(std::runtime_error("injected segment write failure"));
-            },
-            segment_manager_gate.hold(), stats);
-    BOOST_REQUIRE_THROW(sink.put(chunks).get(), std::runtime_error);
-    sink.abort().get();
+    failing_sink fs(schema, [&] (dht::token) { return gates.target(group); });
+    BOOST_REQUIRE_THROW(fs.sink->put(chunks).get(), std::runtime_error);
+    fs.sink->abort().get();
 
-    BOOST_REQUIRE_EQUAL(pool.used_buffer_count(), 0);
-    BOOST_REQUIRE_EQUAL(stats.records_received, 0);
-    segment_manager_gate.close().get();
+    BOOST_REQUIRE_EQUAL(fs.stats.records_received, 0);
+    fs.require_released();
     gates.close();
-    pool.stop().get();
     for (const auto& r : records) {
         BOOST_REQUIRE(!group.logstor_index().get(index_key_of(schema, r)));
     }
@@ -670,43 +786,25 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_sink_failed_segment_write_releases_
 SEASTAR_THREAD_TEST_CASE(test_logstor_record_sink_failed_close_releases_the_sink) {
     auto schema = make_schema();
     logstor_env env;
-    test_logstor_group group(schema, env.ls);
+    test_logstor_group low(schema, env.ls);
+    test_logstor_group high(schema, env.ls, low.logstor_index());
     target_gates gates;
 
-    write_buffer_pool pool(write_buffer_pool::config{
-        .capacity = 1,
-        .buffer_size = segment_size,
-        .kind = segment_kind::full,
-        .preallocate = 0,
-        .max_cached = 1,
-    });
-    seastar::abort_source as;
-    seastar::gate segment_manager_gate;
-
-    // The records fit in one segment, so put() writes no segment and the write fails in close().
-    const auto records = make_records(10, 100);
+    // The records fit in a buffer of each group, so put() writes no segment, and the write of the
+    // first group fails in close() while the buffer of the second group holds records.
+    const auto records = make_records(40, 100);
     auto chunks = make_chunks(schema, records, 7);
 
-    record_stream_stats stats;
-    auto sink = std::make_unique<record_stream_sink>(schema->id(), [&] (dht::token) { return gates.target(group); },
-            pool.allocate(as).get(),
-            [] (write_buffer&, logstor_group&) -> future<> {
-                return make_exception_future<>(std::runtime_error("injected segment write failure"));
-            },
-            segment_manager_gate.hold(), stats);
-    sink->put(chunks).get();
-    BOOST_REQUIRE_THROW(sink->close().get(), std::runtime_error);
-    BOOST_REQUIRE_EQUAL(pool.used_buffer_count(), 0);
+    failing_sink fs(schema, [&] (dht::token token) { return gates.target(is_low(token) ? low : high); });
+    fs.sink->put(chunks).get();
+    BOOST_REQUIRE_THROW(fs.sink->close().get(), std::runtime_error);
+    BOOST_REQUIRE_EQUAL(fs.stats.records_received, 0);
     // A close() that fails releases the sink, so the sink is destroyed without abort(), and its
     // destructor must not find an open buffer.
-    sink.reset();
-
-    BOOST_REQUIRE_EQUAL(stats.records_received, 0);
-    segment_manager_gate.close().get();
+    fs.require_released();
     gates.close();
-    pool.stop().get();
     for (const auto& r : records) {
-        BOOST_REQUIRE(!group.logstor_index().get(index_key_of(schema, r)));
+        BOOST_REQUIRE(!low.logstor_index().get(index_key_of(schema, r)));
     }
 }
 
@@ -729,6 +827,26 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_stop_waits_for_record_stream_sink) {
     sink->abort().get();
     sink.reset();
     stop_f.get();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_logstor_record_sink_waits_for_the_buffers_of_another_sink) {
+    auto schema = make_schema();
+    logstor_env env([] (segment_manager_config& cfg) {
+        cfg.max_record_stream_sinks = 1;
+    });
+    auto& sm = env.ls.get_segment_manager();
+    // The streams send no record, so the sinks do not resolve a target.
+    auto resolve = [] (dht::token) { return write_target{}; };
+
+    auto first = sm.make_record_stream_sink(schema->id(), resolve).get();
+    auto second_f = sm.make_record_stream_sink(schema->id(), resolve);
+    seastar::sleep(std::chrono::milliseconds(100)).get();
+    BOOST_REQUIRE(!second_f.available());
+
+    first->close().get();
+    first.reset();
+    auto second = second_f.get();
+    second->close().get();
 }
 
 SEASTAR_THREAD_TEST_CASE(test_logstor_record_source_sends_only_live_records) {

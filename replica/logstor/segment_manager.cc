@@ -1038,14 +1038,14 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
             .preallocate = 0,
             .max_cached = separator_flush_reserve,
       })
-    // One buffer per record stream sink. The buffers are built at the point of use, and one is
-    // kept for the next stream.
+    // record_stream_sink_buffers buffers per record stream sink. The buffers are built at the point
+    // of use, and the buffers of one sink are kept for the next stream.
     , _stream_buffer_pool(write_buffer_pool::config{
-            .capacity = std::max<size_t>(config.max_record_stream_sinks, 1),
+            .capacity = record_stream_sink_buffers * std::max<size_t>(config.max_record_stream_sinks, 1),
             .buffer_size = config.segment_size,
             .kind = segment_kind::full,
             .preallocate = 0,
-            .max_cached = 1,
+            .max_cached = record_stream_sink_buffers,
       })
     , _separator_task_queue(separator_queue_depth)
     {
@@ -2639,11 +2639,12 @@ future<std::unique_ptr<record_stream_sink>> segment_manager_impl::make_record_st
         record_stream_sink::target_resolver resolve_target) {
     // Taken before the buffer, so that a sink is never made while the segment manager stops.
     auto segment_manager_holder = _async_gate.hold();
-    // Not requested at stop: stop() waits at the gate for the sinks, so a sink that waits for a
-    // buffer gets one when another sink ends.
+    // Not requested at stop: stop() waits at the gate for the sinks, so a sink that waits for its
+    // buffers gets them when another sink ends. The sink takes all its buffers in one call, because
+    // sinks that each hold a part of their buffers and wait for the rest would wait forever.
     abort_source never_aborted;
-    auto buffer = co_await _stream_buffer_pool.allocate(never_aborted);
-    co_return std::make_unique<record_stream_sink>(table, std::move(resolve_target), std::move(buffer),
+    auto buffers = co_await _stream_buffer_pool.allocate_many(record_stream_sink_buffers, never_aborted);
+    co_return std::make_unique<record_stream_sink>(table, std::move(resolve_target), std::move(buffers),
             [this] (write_buffer& wb, logstor_group& group) {
                 return write_full_segment(wb, group, write_source::streaming);
             },
