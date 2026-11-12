@@ -36,9 +36,43 @@ compaction_backlog reclaimable_backlog(const utilization_histogram& utilization,
 }
 
 void compaction_rate_controller::tick(const sample& s) noexcept {
+    // A sample with no period has no rate, so the tick ignores it.
+    if (!(s.dt > 0)) {
+        return;
+    }
+
     _pressure = compaction_space_pressure(s.available_segments, s.curve);
     _threshold = effective_utilization_threshold(s.available_segments, s.curve);
     _backlog = reclaimable_backlog(s.utilization, _threshold);
+    _bypassed = _pressure >= 1;
+
+    // The allocation rate is not smoothed. The credit bucket integrates it, so the next period
+    // corrects the error of one period, and a filter would only add delay when the write rate
+    // changes.
+    const auto alloc_rate = double(s.segments_allocated) / s.dt;
+    _rate = alloc_rate + _backlog.reclaimable_segments / _tuning.drain_time;
+    // The accrual of the period is always added in full. Only what the bucket keeps between periods
+    // is limited, in both directions, because a limit on the accrual would limit the rate to one
+    // batch per period. The debt comes from jobs that start on partial credit. While the throttle
+    // is off the bucket keeps no debt, because otherwise compaction would stall on that debt when
+    // the throttle comes back on.
+    const auto floor = _bypassed ? 0.0 : -s.burst_cap;
+    if (_credit < floor) {
+        _forgiven = std::min(_charged, _forgiven + (floor - _credit));
+    }
+    _credit = std::clamp(_credit, floor, s.burst_cap) + _rate * s.dt;
+}
+
+void compaction_rate_controller::settle_job(double estimate, double reclaimed) noexcept {
+    _charged = std::max(0.0, _charged - estimate);
+    auto refund = estimate - reclaimed;
+    if (refund > 0) {
+        const auto paid = std::min(refund, _forgiven);
+        _forgiven -= paid;
+        refund -= paid;
+    }
+    _credit += refund;
+    _forgiven = std::min(_forgiven, _charged);
 }
 
 } // namespace replica::logstor

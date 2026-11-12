@@ -52,6 +52,9 @@ public:
         uint64_t available_segments;
         const utilization_histogram& utilization;
         uint64_t dead_segments;
+        // The count since the start, which the driver subtracts from the count at the previous
+        // tick. See compaction_rate_controller::sample::segments_allocated.
+        uint64_t reclaimable_segments_allocated;
     };
 
     // Holds the segments that one compaction job read (`n_in`) and wrote (`n_out`).
@@ -217,6 +220,8 @@ private:
 
     compaction_rate_controller _rate_controller;
     timer<lowres_clock> _rate_timer;
+    lowres_clock::time_point _last_rate_tick{};
+    uint64_t _last_segments_allocated{0};
 
     // The candidates of the last ranking, worst first, the limits that ranked them, and the best
     // batch of the ranking that copies data, which the marginal admission gate measures against.

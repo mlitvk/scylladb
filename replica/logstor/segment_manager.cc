@@ -397,6 +397,10 @@ public:
     future<> submit_split_compaction(logstor_group&, mutation_writer::classify_by_token_group, split_target_group) override;
 
 private:
+    // The segments taken from the pool that compaction must reclaim, cumulative. See
+    // compaction_rate_controller::sample::segments_allocated.
+    uint64_t reclaimable_segments_allocated() const noexcept;
+
     // compaction_driver::host
     future<compaction_driver::ranking> find_top_compaction_candidates(const compaction_batch_limits&, size_t max_candidates,
             compaction_driver::host::group_filter filter) override;
@@ -453,6 +457,21 @@ static sstring write_source_to_string(write_source src) {
         case write_source::streaming: return "streaming";
     }
     return "unknown";
+}
+
+// Returns true when compaction must reclaim the segments that `src` takes from the pool. The
+// separator frees the mixed segments of normal writes, and the net reclaim of a compaction job
+// already counts the segments that the job writes.
+static constexpr bool is_reclaimable(write_source src) noexcept {
+    switch (src) {
+    case write_source::normal_write:
+    case write_source::compaction:
+        return false;
+    case write_source::separator:
+    case write_source::streaming:
+        return true;
+    }
+    return false;
 }
 
 class segment_pool {
@@ -920,6 +939,17 @@ private:
     friend class segment_stream_sink_impl;
 };
 
+uint64_t compaction_manager_impl::reclaimable_segments_allocated() const noexcept {
+    const auto& segments_get = _sm._segment_pool.get_stats().segments_get;
+    uint64_t allocated = 0;
+    for (size_t i = 0; i < write_source_count; ++i) {
+        if (is_reclaimable(static_cast<write_source>(i))) {
+            allocated += segments_get[i];
+        }
+    }
+    return allocated;
+}
+
 future<> compaction_manager_impl::start() {
     _driver.start({
         .segment_count = _sm._configured_max_segments,
@@ -932,6 +962,7 @@ compaction_driver::shard_sample compaction_manager_impl::sample() const noexcept
         .available_segments = _sm.available_segment_count(write_source::normal_write),
         .utilization = _sm._segment_stats.utilization,
         .dead_segments = _sm._segment_stats.dead_segments,
+        .reclaimable_segments_allocated = reclaimable_segments_allocated(),
     };
 }
 
