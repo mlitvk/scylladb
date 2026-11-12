@@ -3629,6 +3629,12 @@ future<> compaction_group::stop(sstring reason) noexcept {
     for (auto view : all_views()) {
         co_await _t._compaction_manager.stop_ongoing_compactions(reason, view);
     }
+    if (_t.uses_logstor()) {
+        // A split of this group holds the gate while its logstor split compaction waits for a
+        // record stream of the group to end, and the logstor remove() below comes after the gate
+        // drains, so the split must stop to wait here.
+        get_logstor_compaction_manager().mark_stopping(as_logstor_group());
+    }
     // compaction_manager::stop_ongoing_compactions swallows all encountered errors. So the closed_gate_fut
     // future will not get abandoned.
     co_await std::move(closed_gate_fut);

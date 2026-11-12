@@ -451,6 +451,10 @@ public:
 
     virtual future<compaction_reenabler> disable_compaction(logstor_group&) = 0;
     virtual compaction_reenabler disable_compaction_no_wait(logstor_group&) = 0;
+
+    // Marks the group as stopping. A split compaction of the group that waits for compaction to be
+    // enabled again ends without work, and so does a later split compaction of the group.
+    virtual void mark_stopping(logstor_group&) = 0;
 };
 
 // A compaction group in logstor.

@@ -339,6 +339,38 @@ record_stream_source::chunk_reader memory_chunk_reader(temporary_buffer<char> se
     };
 }
 
+// A group with one segment that holds records of both sides of a split at token 0, the two groups
+// of the split, and a record stream source of the group, which disables compaction of the group.
+struct split_during_stream {
+    schema_ptr schema = make_schema();
+    logstor_env env;
+    test_logstor_group src{schema, env.ls};
+    test_logstor_group low{schema, env.ls, src.logstor_index()};
+    test_logstor_group high{schema, env.ls, src.logstor_index()};
+    std::vector<test_record> records = make_records(20, 100);
+    std::unique_ptr<record_stream_source> source;
+
+    split_during_stream() {
+        write_segment(env.ls, src, schema, records);
+        BOOST_REQUIRE_EQUAL(src.logstor_segments().segment_count(), 1);
+        source = env.ls.get_segment_manager().make_record_stream_source(src).get();
+        BOOST_REQUIRE(source);
+    }
+
+    // Starts a split compaction of the group at token 0, and checks that it waits.
+    future<> start_split() {
+        auto split = env.ls.get_compaction_manager().submit_split_compaction(src,
+                [] (dht::token token) -> mutation_writer::token_group_id { return is_low(token) ? 0 : 1; },
+                [this] (log_segment_id, dht::token first_token, dht::token) -> logstor_group& {
+                    return is_low(first_token) ? static_cast<logstor_group&>(low) : high;
+                });
+        seastar::sleep(std::chrono::milliseconds(100)).get();
+        BOOST_REQUIRE(!split.available());
+        BOOST_REQUIRE_EQUAL(src.logstor_segments().segment_count(), 1);
+        return split;
+    }
+};
+
 } // anonymous namespace
 
 SEASTAR_THREAD_TEST_CASE(test_logstor_parse_chunk_gives_the_records_of_a_chunk) {
@@ -1022,4 +1054,44 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_stream_round_trip) {
     for (const auto& r : live) {
         require_reads_back(env.ls, schema, receiver.logstor_index(), r);
     }
+}
+
+SEASTAR_THREAD_TEST_CASE(test_logstor_split_compaction_waits_for_a_record_stream) {
+    split_during_stream t;
+    auto split = t.start_split();
+
+    // The stream reads its segment while the split waits.
+    BOOST_REQUIRE(timestamps_in(read_all(*t.source)) == timestamps_of({t.records}));
+    t.source.reset();
+    split.get();
+
+    BOOST_REQUIRE_EQUAL(t.src.logstor_segments().segment_count(), 0);
+    BOOST_REQUIRE_GT(t.low.logstor_segments().segment_count(), 0);
+    BOOST_REQUIRE_GT(t.high.logstor_segments().segment_count(), 0);
+    for (const auto& r : t.records) {
+        require_reads_back(t.env.ls, t.schema, t.src.logstor_index(), r);
+    }
+}
+
+SEASTAR_THREAD_TEST_CASE(test_logstor_split_compaction_stops_waiting_when_the_group_stops) {
+    split_during_stream t;
+    // A split holds the gate of its compaction group while it waits, and the group stops by closing
+    // that gate, so the gate closes only when the split ends.
+    seastar::gate group_gate;
+    auto split = t.start_split().finally([holder = group_gate.hold()] {});
+
+    t.env.ls.get_compaction_manager().mark_stopping(t.src);
+    group_gate.close().get();
+    split.get();
+    BOOST_REQUIRE_EQUAL(t.src.logstor_segments().segment_count(), 1);
+    t.source.reset();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_logstor_split_compaction_stops_waiting_when_the_group_is_removed) {
+    split_during_stream t;
+    auto split = t.start_split();
+
+    t.env.ls.get_compaction_manager().remove(t.src).get();
+    split.get();
+    t.source.reset();
 }

@@ -45,6 +45,7 @@
 #include <seastar/core/gate.hh>
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/semaphore.hh>
+#include <seastar/util/bool_class.hh>
 #include <seastar/util/memory-data-source.hh>
 #include <seastar/util/lazy.hh>
 #include <seastar/util/closeable.hh>
@@ -334,6 +335,11 @@ private:
         shared_future<> completion{make_ready_future<>()};
         abort_source as;
         int compaction_disabled_counter{0};
+        // Signalled when compaction of the group is enabled again, and when the group stops or is
+        // removed, to wake the split compactions that wait for it.
+        seastar::condition_variable compaction_enabled;
+        // Is true after mark_stopping().
+        bool stopping{false};
 
         bool running() const noexcept {
             return !completion.available();
@@ -391,6 +397,7 @@ public:
     future<> remove(logstor_group&) override;
     future<compaction_reenabler> disable_compaction(logstor_group&) override;
     compaction_reenabler disable_compaction_no_wait(logstor_group&) override;
+    void mark_stopping(logstor_group&) override;
     // `limits` bound the batch that the job selects: the limits of the automatic policy, or any
     // batch with a net gain for a compaction that was asked for explicitly.
     future<> submit_normal_compaction(logstor_group&, compaction_batch_limits limits) override;
@@ -403,7 +410,11 @@ private:
     bool can_start(const logstor_group*) const noexcept override;
     compaction_driver::shard_sample sample() const noexcept override;
 
-    future<> submit_group_compaction(logstor_group&, std::function<future<>(group_compaction_state&)>, scheduling_group);
+    // Tells submit_group_compaction() what to do when compaction of the group is disabled: fail, or
+    // wait until compaction of the group is enabled again.
+    using wait_if_disabled = bool_class<class wait_if_disabled_tag>;
+    future<> submit_group_compaction(logstor_group&, std::function<future<>(group_compaction_state&)>, scheduling_group, wait_if_disabled);
+    void enable_compaction(logstor_group&) noexcept;
     future<> do_compaction(logstor_group&, compaction_batch_limits, abort_source&);
     future<> do_split_compaction(logstor_group&, mutation_writer::classify_by_token_group, split_target_group, abort_source&);
 
@@ -423,6 +434,7 @@ future<> compaction_manager_impl::stop() {
     _driver.request_stop();
 
     for (auto& [cg, state] : _groups) {
+        state->compaction_enabled.broadcast();
         state->as.request_abort();
     }
     co_await coroutine::parallel_for_each(_groups, [] (auto& entry) -> future<> {
@@ -1663,10 +1675,18 @@ segment_manager_impl::with_segment_input_stream(log_segment_id segment_id, size_
     });
 }
 
-future<> compaction_manager_impl::submit_group_compaction(logstor_group& cg, std::function<future<>(group_compaction_state&)> op, scheduling_group sg) {
+// With `wait` set, a compaction of a group whose compaction is disabled waits until compaction of
+// the group is enabled again. It ends without work if the group stops or is removed, or if the
+// compaction manager stops, while it waits.
+future<> compaction_manager_impl::submit_group_compaction(logstor_group& cg, std::function<future<>(group_compaction_state&)> op,
+        scheduling_group sg, wait_if_disabled wait) {
+    bool waited = false;
     while (can_submit_compaction()) {
         auto* state = find_group_state(cg);
         if (!state) {
+            if (waited) {
+                co_return;
+            }
             co_await coroutine::return_exception(std::runtime_error("logstor group submitted for compaction but it is not registered"));
         }
 
@@ -1677,8 +1697,21 @@ future<> compaction_manager_impl::submit_group_compaction(logstor_group& cg, std
             continue;
         }
 
+        if (wait && state->stopping) {
+            co_return;
+        }
         if (state->compaction_disabled_counter > 0) {
-            co_await coroutine::return_exception(std::runtime_error("logstor group submitted for compaction but compaction is disabled"));
+            if (!wait) {
+                co_await coroutine::return_exception(std::runtime_error("logstor group submitted for compaction but compaction is disabled"));
+            }
+            if (!waited) {
+                logstor_logger.info("Split compaction of a group of table {} waits until compaction of the group is enabled again", cg.table_id());
+                waited = true;
+            }
+            // The state can be destroyed while the compaction waits, so the loop finds it again.
+            auto f = co_await coroutine::as_future(state->compaction_enabled.wait());
+            f.ignore_ready_future();
+            continue;
         }
 
         state->as = {};
@@ -1694,19 +1727,24 @@ future<> compaction_manager_impl::submit_group_compaction(logstor_group& cg, std
         co_return co_await std::move(f);
     }
 
+    if (waited) {
+        co_return;
+    }
     co_await coroutine::return_exception(std::runtime_error("logstor compaction submission is closed"));
 }
 
 future<> compaction_manager_impl::submit_normal_compaction(logstor_group& cg, compaction_batch_limits limits) {
     co_await submit_group_compaction(cg, [this, &cg, limits] (group_compaction_state& state) {
         return do_compaction(cg, limits, state.as);
-    }, _cfg.compaction_sg);
+    }, _cfg.compaction_sg, wait_if_disabled::no);
 }
 
 future<> compaction_manager_impl::submit_split_compaction(logstor_group& src, mutation_writer::classify_by_token_group classifier, split_target_group target_group) {
+    // A record stream of the group disables compaction for the length of the stream, and split
+    // compaction would free segments that the stream still reads, so the split waits for the stream.
     co_await submit_group_compaction(src, [this, &src, classifier = std::move(classifier), target_group = std::move(target_group)] (group_compaction_state& state) mutable {
         return do_split_compaction(src, std::move(classifier), std::move(target_group), state.as);
-    }, _cfg.split_compaction_sg);
+    }, _cfg.split_compaction_sg, wait_if_disabled::yes);
 }
 
 void compaction_manager_impl::submit(logstor_group& cg) {
@@ -1740,6 +1778,7 @@ future<> compaction_manager_impl::remove(logstor_group& cg) {
 
     _sm.update_group_count(_groups.size());
 
+    state->compaction_enabled.broadcast();
     state->as.request_abort();
     auto f = co_await coroutine::as_future(state->completion.get_future());
     f.ignore_ready_future();
@@ -1769,12 +1808,24 @@ compaction_reenabler compaction_manager_impl::disable_compaction_no_wait(logstor
 compaction_reenabler compaction_manager_impl::hold_compaction_disabled(logstor_group& cg, group_compaction_state& state) {
     ++state.compaction_disabled_counter;
     return compaction_reenabler([this, &cg] {
-        // The group can be removed while compaction of it is disabled.
-        auto it = _groups.find(&cg);
-        if (it != _groups.end() && --it->second->compaction_disabled_counter == 0) {
-            _driver.notify_group_idle();
-        }
+        enable_compaction(cg);
     });
+}
+
+void compaction_manager_impl::mark_stopping(logstor_group& cg) {
+    if (auto* state = find_group_state(cg)) {
+        state->stopping = true;
+        state->compaction_enabled.broadcast();
+    }
+}
+
+void compaction_manager_impl::enable_compaction(logstor_group& cg) noexcept {
+    // The group can be removed while compaction of it is disabled.
+    auto it = _groups.find(&cg);
+    if (it != _groups.end() && --it->second->compaction_disabled_counter == 0) {
+        it->second->compaction_enabled.broadcast();
+        _driver.notify_group_idle();
+    }
 }
 
 future<compaction_driver::ranking>
