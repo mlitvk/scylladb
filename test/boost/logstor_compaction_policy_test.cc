@@ -427,8 +427,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_select_compaction_batch_threshold) {
     }
 }
 
-// The backlog counts the segments under the threshold, and the count does not decrease as the
-// threshold increases.
+// The backlog counts the segments under the threshold. The segments that a compaction of them frees
+// are at most their number, and neither count decreases as the threshold increases.
 SEASTAR_THREAD_TEST_CASE(test_logstor_reclaimable_backlog) {
     utilization_histogram utilization{};
     // Ten dead segments, four in the bucket just under a half, two just over it, one full.
@@ -441,6 +441,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_reclaimable_backlog) {
     BOOST_REQUIRE_CLOSE(reclaimable_backlog(utilization, 0.0).candidate_segments, 10.0, 1e-9);
     BOOST_REQUIRE_CLOSE(reclaimable_backlog(utilization, 0.5).candidate_segments, 14.0, 1e-9);
     BOOST_REQUIRE_CLOSE(reclaimable_backlog(utilization, 1.0).candidate_segments, 17.0, 1e-9);
+    BOOST_REQUIRE_GT(reclaimable_backlog(utilization, 0.0).reclaimable_segments, 9.5);
 
     compaction_backlog previous{};
     for (int i = 0; i <= 100; ++i) {
@@ -448,6 +449,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_reclaimable_backlog) {
         const auto backlog = reclaimable_backlog(utilization, threshold);
         BOOST_TEST_CONTEXT("threshold=" << threshold) {
             BOOST_REQUIRE_GE(backlog.candidate_segments, previous.candidate_segments);
+            BOOST_REQUIRE_GE(backlog.reclaimable_segments, previous.reclaimable_segments);
+            BOOST_REQUIRE_LE(backlog.reclaimable_segments, backlog.candidate_segments);
         }
         previous = backlog;
     }

@@ -27,7 +27,10 @@ compaction_backlog reclaimable_backlog(const utilization_histogram& utilization,
             counted_upper = max_utilization;
         }
         const auto fraction = (counted_upper - lower) / (upper - lower);
-        backlog.candidate_segments += double(utilization[i]) * fraction;
+        const auto counted = double(utilization[i]) * fraction;
+        const auto mean_utilization = (lower + counted_upper) / 2;
+        backlog.candidate_segments += counted;
+        backlog.reclaimable_segments += counted * (1 - mean_utilization);
     }
     return backlog;
 }
