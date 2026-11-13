@@ -6287,6 +6287,7 @@ future<> table::truncate_tablet_locally(database& db, locator::tablet_id tid) {
     auto holder = async_gate().hold();
     auto& sg = storage_group_for_id(tid.value());
     auto sg_holder = sg.async_gate().hold();
+
     auto cgs = sg.compaction_groups_immediate();
 
     // Compaction stays disabled until the reenablers go out of scope, so no compaction
@@ -6304,6 +6305,15 @@ future<> table::truncate_tablet_locally(database& db, locator::tablet_id tid) {
     co_await coroutine::parallel_for_each(views, [&] (compaction::compaction_group_view* view) -> future<> {
         cres.push_back(co_await _compaction_manager.stop_and_disable_compaction("truncate", *view));
     });
+
+    // The sstables and memtables that the rest of this function drops do not hold the logstor
+    // records, so the erase removes them. The erased range keeps the erase across a restart, and
+    // writes to the range wait until the erase ends. The erase comes after compaction is disabled,
+    // because a tablet split adds no group while the compaction of the group that it splits is
+    // disabled, and no group may join the range of the erase, see segment_manager::erase().
+    if (uses_logstor()) {
+        co_await _logstor->erase(_schema->id(), *_logstor_index, sg.token_range());
+    }
 
     // Told apart because only the main sstables are charged to the backlog tracker below.
     struct captured_sstables {

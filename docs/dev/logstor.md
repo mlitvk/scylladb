@@ -108,9 +108,10 @@ The caller must make sure that no group of the table that overlaps the range joi
 erase, for example a child of a tablet split or the group of a tablet that migrates in, because the
 erase does not disable the compaction of such a group. A tablet split adds no group to a stopped
 storage group, and adds none while the compaction of the group that it splits is disabled. A tablet
-cleanup stops the storage group first, and a truncate or a drop disables the compaction of every
-group of the table first, so no split adds a group during their erase. No tablet migrates in during
-their erase either:
+cleanup stops the storage group first, a truncate or a drop disables the compaction of every group
+of the table first, and a truncate of a strongly consistent tablet disables the compaction of every
+group of the tablet first, so no split adds a group during their erase. No tablet migrates in during
+the erase of a cleanup, a truncate or a drop either:
 - The topology coordinator runs a truncate only when no tablet transition runs.
 - A cleanup is a stage of the transition of its tablet.
 - A drop removes the table from the database before its erase, and a change of the tablet map
