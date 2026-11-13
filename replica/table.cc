@@ -6224,6 +6224,15 @@ future<> table::truncate_tablet_locally(database& db, locator::tablet_id tid) {
     auto holder = async_gate().hold();
     auto& sg = storage_group_for_id(tid.value());
     auto sg_holder = sg.async_gate().hold();
+
+    // The sstables and memtables that the rest of this function drops do not hold the logstor
+    // records, so the erase removes them. The erased range keeps the erase across a restart, and
+    // writes to the range wait until the erase ends. The erase comes before cgs is taken, because
+    // there must be no preemption point between taking cgs and disabling its compaction.
+    if (uses_logstor()) {
+        co_await _logstor->erase(_schema->id(), *_logstor_index, sg.token_range());
+    }
+
     auto cgs = sg.compaction_groups_immediate();
 
     // Compaction stays disabled until the reenablers go out of scope, so no compaction
