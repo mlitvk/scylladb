@@ -263,8 +263,13 @@ WARN  2026-11-14 17:10:53,373 [shard 1: gms] raft_group_registry - ping(id = d0a
 
 def test_start_step_names_the_stuck_logstor_shard():
     import asyncio
+    from test.cluster.logstor_fuzz.known_issues import KnownIssues
     from test.cluster.logstor_fuzz.operations import _start_step
+    from test.cluster.logstor_fuzz.results import signature
     step = asyncio.run(_start_step(_FakeLog(_STUCK_START), 0))
     assert step == "logstor did not finish its start on shard 1"
+    sig = signature("hang", f"127.3.255.2 did not start in 60s: {step}")
+    assert KnownIssues().match(sig).id == "logstor-start-hang"
     other = asyncio.run(_start_step(_FakeLog(_STUCK_START[:1]), 0))
     assert other == "the last init step is 'recovering logstor'"
+    assert KnownIssues().match(signature("hang", f"127.3.255.2 did not start in 60s: {other}")) is None

@@ -108,6 +108,19 @@ KNOWN_ISSUES: tuple[KnownIssue, ...] = (
                     "out-of-space plan).",
     ),
     KnownIssue(
+        id="logstor-start-hang",
+        kind="bug",
+        trackers=("no ticket yet: the logstor re-separation plan",),
+        summary="After a kill, a shard whose recovery leaves only 8 of its 128 segments free logs "
+                "'Starting logstor' and nothing more, so the node does not start.  The shard stops "
+                "before the separation of the recovered segments, probably in the wait for a free "
+                "segment.  Found in 2 of 100 dev runs of the operations profiles in Nov 2026.",
+        disables=(),
+        signatures=(r"^hang: <ip> did not start in <n>s: logstor did not finish its start on shard",),
+        remove_when="A shard that recovery leaves with only the reserved segments free finishes its "
+                    "start (the logstor re-separation plan).",
+    ),
+    KnownIssue(
         id="logstor-partial-insert",
         kind="missing-feature",
         trackers=("no ticket yet: the logstor-cql plan (~/.claude/plans/logstor-cql.md)",),
