@@ -24,6 +24,9 @@ of the node that gets the query.  The checks run in this order:
      same state as before the restart, and a second scan at CL=ALL.  A
      difference on one replica is a loss in the recovery of logstor.
 
+Each check reads all the columns of a row, and requires each column to hold
+the value of the write of ``v``.
+
 When the first dump of a replica has no record of a key that another replica
 holds, a single-key dump of that replica tells whether the full dump missed a
 record that the node has.  The failure details of a later difference show the
@@ -118,13 +121,23 @@ def _state_of_source(wl: LogstorWorkload, pk: int, rows: list, errors: CheckErro
             tombstone = json.loads(r.metadata).get("tombstone") or {}
             tombstone_ts = tombstone.get("timestamp")
         elif r.mutation_fragment_kind == "clustering row":
-            column = json.loads(r.metadata).get("columns", {}).get("v")
-            if column and column.get("is_live"):
-                row = (column["timestamp"], bytes.fromhex(json.loads(r.value)["v"]))
+            columns = json.loads(r.metadata).get("columns", {})
+            values = json.loads(r.value) if r.value else {}
+
+            def cell(name: str) -> tuple:
+                column = columns.get(name)
+                if not column or not column.get("is_live"):
+                    return None, None
+                return values.get(name), column["timestamp"]
+
+            v, v_ts = cell("v")
+            if v is not None:
+                row = (v_ts, bytes.fromhex(v), {c.name: cell(c.name) for c in wl.extra})
     if row is not None and (tombstone_ts is None or row[0] > tombstone_ts):
-        ts, value = row
+        ts, value, cells = row
         try:
             seq = wl.decode_row(pk, value, ts)
+            wl.check_columns(pk, seq, cells)
         except CorruptValue as e:
             errors.add(f"{where} key={pk}: {e}")
             return None
@@ -297,8 +310,8 @@ def check_same_dumps(wl: LogstorWorkload, before: dict[str, ReplicaDump], after:
 
 async def scan_all(cql, wl: LogstorWorkload, errors: CheckErrors, what: str) -> None:
     """Reads all keys at CL=ALL and checks each one with the model."""
-    stmt = SimpleStatement(f"SELECT pk, v, writetime(v) FROM {wl.fqtn}", consistency_level=ConsistencyLevel.ALL,
-                           fetch_size=1000)
+    stmt = SimpleStatement(f"SELECT pk, {wl.selection(wl.extra)} FROM {wl.fqtn}",
+                           consistency_level=ConsistencyLevel.ALL, fetch_size=1000)
     rows = await cql.run_async(stmt)
     now = time.monotonic_ns()
     found: dict[int, int] = {}
@@ -307,7 +320,7 @@ async def scan_all(cql, wl: LogstorWorkload, errors: CheckErrors, what: str) -> 
             errors.add(f"{what} {wl.table_name}: key {r.pk} is outside the key space")
             continue
         try:
-            found[r.pk] = wl.decode_row(r.pk, r.v, r.writetime_v)
+            found[r.pk] = wl.check_row(r.pk, r, wl.extra)
         except CorruptValue as e:
             errors.add(f"{what} {wl.table_name} key={r.pk}: {e}")
             found[r.pk] = -1

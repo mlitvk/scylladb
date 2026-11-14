@@ -43,7 +43,7 @@ from test.cluster.logstor_fuzz.nemesis import (
     watchdog_task,
 )
 from test.cluster.logstor_fuzz.operations import EXCEPTION_POLICY, FuzzContext
-from test.cluster.logstor_fuzz.params import ENV_PREFIX, Profile, load_profile, utilization_estimate
+from test.cluster.logstor_fuzz.params import ENV_PREFIX, Profile, load_profile, utilization_estimate, workload_items
 from test.cluster.logstor_fuzz.results import FuzzFailure, RunResult, failure_of
 from test.cluster.logstor_fuzz.workload import LogstorWorkload, SegmentPeaks, preload, run_workloads
 from test.cluster.strong_consistency.outcomes import strict
@@ -92,8 +92,28 @@ def primary_failure(task_errors: list[BaseException]) -> FuzzFailure:
     return FuzzFailure(kind, message)
 
 
+def apply_known_issues(profile: Profile, known: KnownIssues) -> Profile:
+    """Returns ``profile`` without the workload items that a known issue disables.
+
+    Skips the test when a known issue disables the schema of the profile,
+    because the profile has no run without it.
+    """
+    for item in sorted(workload_items(profile)):
+        issue = known.blocking(item)
+        if issue is None:
+            continue
+        if item.startswith("schema:"):
+            pytest.skip(f"the known issue {issue.id} disables {item}")
+        logger.info("The known issue %s disables %s", issue.id, item)
+        if item == "workload:column_subset_reads":
+            profile = dataclasses.replace(
+                profile, workload=dataclasses.replace(profile.workload, column_subset_read_fraction=0.0))
+    return profile
+
+
 async def run_case(manager: ScyllaClusterManager, profile: Profile, request, tmp_path, case_id: str, mode: str) -> None:
     """Runs ``profile`` and writes its result file, also when the run fails."""
+    profile = apply_known_issues(profile, KnownIssues(profile.include_known))
     result = RunResult(run_id=request.node.name, case_id=case_id, profile=profile.name, seed=profile.seed, mode=mode)
     # The event log goes next to the result file, so that it outlives the run:
     # tmp_path of a test.py run is inside the dbuild container.
@@ -217,6 +237,13 @@ async def test_operations_skewed(manager: ScyllaClusterManager, build_mode, requ
     """Runs the operations profile with a zipf key distribution: a few hot keys take most of the load."""
     profile = load_profile("operations_skewed")
     await run_case(manager, profile, request, tmp_path, f"operations_skewed-{profile.seed}-{build_mode}", build_mode)
+
+
+@pytest.mark.check_nodes_for_errors
+async def test_multi_column(manager: ScyllaClusterManager, build_mode, request, tmp_path):
+    """Runs the operations profile on tables with more regular columns, of several types."""
+    profile = load_profile("multi_column")
+    await run_case(manager, profile, request, tmp_path, f"multi_column-{profile.seed}-{build_mode}", build_mode)
 
 
 @pytest.mark.check_nodes_for_errors
