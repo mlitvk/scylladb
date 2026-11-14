@@ -2738,9 +2738,17 @@ void logstor_group::switch_active_separator_buffer() {
 
 future<> logstor_group::allocate_active_separator_buffer() {
     auto buf = co_await logstor_compaction_manager().allocate_separator_buffer();
+    co_await utils::get_local_injector().inject("logstor_separator_buffer_allocated",
+            utils::wait_for_message(std::chrono::seconds{60}));
     if (_separator_enabled && !_active_buffer.allocated()) {
         _active_buffer.buf = std::move(buf);
+        co_return;
     }
+
+    // While the allocation waited, the group closed or another writer of the group allocated the
+    // active buffer. The pool takes back only a closed buffer, and nothing was written to this
+    // buffer, so the close completes at once.
+    co_await buf->close();
 }
 
 template <log_record_writer_concept Writer>
@@ -2820,7 +2828,8 @@ future<> logstor_group::flush_separator(std::optional<segment_sequence> seq_num)
 future<> logstor_group::close_separator() {
     // Before anything that can wait: a separator write that is parked on the pool or on the flush
     // below resumes into write_to_separator()'s check and fails there, rather than buffering a record
-    // into a group whose buffers are on their way back to the pool.
+    // into a group whose buffers are on their way back to the pool. A write that was parked on the
+    // pool closes the buffer that it got and gives it back.
     _separator_enabled = false;
 
     // A flush in progress owns the buffer it is writing out, and releases it when it is done, so let

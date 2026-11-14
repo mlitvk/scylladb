@@ -47,6 +47,7 @@
 #include "init.hh"
 #include <seastar/core/simple-stream.hh>
 #include "partition_slice_builder.hh"
+#include "test/lib/eventually.hh"
 #include "test/lib/logstor_test_utils.hh"
 #include "test/lib/mutation_assertions.hh"
 #include "test/lib/mutation_reader_assertions.hh"
@@ -2774,6 +2775,132 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_closed_group_takes_no_separator_writes) {
     auto actual = read_mutation(ls, schema, cg.logstor_index(), key, schema->full_slice()).get();
     BOOST_REQUIRE(actual);
     assert_that(*actual).is_equal_to(expected);
+}
+
+// Checks that a separator write that gets a pool buffer while its group closes gives the buffer back
+// closed. The pool takes back only a closed buffer, and an open buffer is an internal error, which
+// aborts the test.
+SEASTAR_THREAD_TEST_CASE(test_logstor_separator_write_to_a_closed_group_closes_its_buffer) {
+    if constexpr (!std::is_same_v<utils::error_injection_type, utils::error_injection<true>>) {
+        return;
+    }
+
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    test_recovery_catalog no_tables;
+    ls.do_recovery(no_tables).get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+
+    constexpr std::string_view allocated = "logstor_separator_buffer_allocated";
+    auto& injector = utils::get_local_injector();
+    injector.enable(allocated);
+    auto disable = seastar::defer([&injector, allocated] noexcept { injector.disable(allocated); });
+
+    auto expected = make_kv_mutation(schema, "pk0", "separator-value");
+    auto key = expected.decorated_key();
+    ls.write(expected, write_target(&cg, {}), db::no_timeout).get();
+
+    // After the write completes, the separator fiber takes the record, gets a buffer for the group,
+    // and waits at the injection.
+    auto separated = ls.flush_to_separator();
+    BOOST_REQUIRE(eventually_true([&] { return injector.waiters(allocated) == 1; }));
+
+    ls.get_compaction_manager().remove(cg).get();
+    injector.receive_message(allocated);
+    separated.get();
+
+    // The separator refused the record, so the group holds no buffer and no segment.
+    BOOST_REQUIRE(!cg.separator_has_data());
+    BOOST_REQUIRE_EQUAL(cg.separator_held_segment_count(), 0u);
+    BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 0u);
+
+    auto actual = read_mutation(ls, schema, cg.logstor_index(), key, schema->full_slice()).get();
+    BOOST_REQUIRE(actual);
+    assert_that(*actual).is_equal_to(expected);
+}
+
+// Checks that two separator writes of one group that both get a pool buffer keep one buffer, and
+// that the second write gives its buffer back closed. A group can have two writers, because the
+// separation of a streamed segment and the separator fiber can write to the same group.
+SEASTAR_THREAD_TEST_CASE(test_logstor_second_separator_writer_closes_its_buffer) {
+    if constexpr (!std::is_same_v<utils::error_injection_type, utils::error_injection<true>>) {
+        return;
+    }
+
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    test_recovery_catalog no_tables;
+    ls.do_recovery(no_tables).get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+
+    // Put two records in a full segment of the group. The test then separates them again from that
+    // segment, which holds the source segment the way a real separation does.
+    const sstring value = "separator-value";
+    const auto keys = std::array<sstring, 2>{"pk0", "pk1"};
+    for (const auto& pk : keys) {
+        ls.write(make_kv_mutation(schema, pk, value), write_target(&cg, {}), db::no_timeout).get();
+    }
+    ls.flush_to_separator().get();
+    cg.flush_separator().get();
+    auto snapshot = ls.get_segment_manager().make_snapshot(cg).get();
+    BOOST_REQUIRE_EQUAL(snapshot.size(), 1u);
+
+    constexpr std::string_view allocated = "logstor_separator_buffer_allocated";
+    auto& injector = utils::get_local_injector();
+    injector.enable(allocated);
+    auto disable = seastar::defer([&injector, allocated] noexcept { injector.disable(allocated); });
+
+    auto separate = [&] (const sstring& pk) {
+        auto record = make_log_record(schema, pk, value);
+        auto key = record.header.index_key();
+        auto entry = cg.logstor_index().get(key);
+        BOOST_REQUIRE(entry);
+        auto update = separator_index_update{
+            .index = &cg.logstor_index(),
+            .key = key,
+            .prev_location = entry->location,
+        };
+        return cg.write_to_separator(log_record_writer(std::move(record)), snapshot.front().seg_ref,
+                std::nullopt, std::move(update));
+    };
+
+    // The pool has a buffer for each group and a reserve, so both writes get a buffer at once and
+    // wait at the injection.
+    auto first = separate(keys[0]);
+    auto second = separate(keys[1]);
+    BOOST_REQUIRE(eventually_true([&] { return injector.waiters(allocated) == 2; }));
+
+    injector.receive_message(allocated);
+    first.get();
+    second.get();
+
+    // Both records are in the one buffer that the group kept, and its flush moves both of them.
+    BOOST_REQUIRE(cg.separator_has_data());
+    BOOST_REQUIRE_EQUAL(cg.separator_held_segment_count(), 1u);
+    cg.flush_separator().get();
+    BOOST_REQUIRE(!cg.separator_has_data());
+
+    for (const auto& pk : keys) {
+        auto m = make_kv_mutation(schema, pk, value);
+        auto entry = cg.logstor_index().get(make_index_key(*schema, m.decorated_key()));
+        BOOST_REQUIRE(entry);
+        BOOST_REQUIRE(entry->location.segment != snapshot.front().segment_id);
+        auto actual = read_mutation(ls, schema, cg.logstor_index(), m.decorated_key(), schema->full_slice()).get();
+        BOOST_REQUIRE(actual);
+        assert_that(*actual).is_equal_to(m);
+    }
 }
 
 // The live bytes of a segment set are maintained as segments are linked, freed from and unlinked,
