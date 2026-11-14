@@ -35,7 +35,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Sequence
 
-from test.cluster.logstor_fuzz.operations import OPERATIONS, FuzzContext
+from test.cluster.logstor_fuzz.operations import NODE_WINDOW, OPERATIONS, FuzzContext
 from test.cluster.logstor_fuzz.results import FuzzFailure, HangError
 from test.pylib.rest_client import ScyllaMetricsLine
 
@@ -182,7 +182,8 @@ async def nemesis_task(ctx: FuzzContext, schedule: Sequence[ScheduledOp], stop: 
         events.add("op_start", index=item.index, op=op.name)
         start = time.monotonic()
         timeout = ctx.limits.op_s(op.kind)
-        async with ctx.window(op.window):
+        lock = ctx.node_lock if op.window == NODE_WINDOW else contextlib.nullcontext()
+        async with lock, ctx.window(op.window):
             try:
                 skipped = await asyncio.wait_for(op.fn(ctx, rng), timeout)
             except asyncio.TimeoutError:

@@ -108,6 +108,18 @@ KNOWN_ISSUES: tuple[KnownIssue, ...] = (
                     "out-of-space plan).",
     ),
     KnownIssue(
+        id="logstor-separator-flush-errors",
+        kind="bug",
+        trackers=("no ticket yet: the branch logstor_separator_flush_errors",),
+        summary="A failed separator flush keeps its records in the mixed segment and not in the "
+                "segments of their compaction group, and nothing reports the failure, so a later "
+                "tablet migration or flush can miss the records.  A failed segment write can be "
+                "the write of a separator flush.",
+        disables=("failure:fail_separator_flush", "failure:fail_segment_write"),
+        remove_when="A failed separator flush is reported and its records are separated again "
+                    "(the branch logstor_separator_flush_errors and the logstor re-separation plan).",
+    ),
+    KnownIssue(
         id="logstor-start-hang",
         kind="bug",
         trackers=("no ticket yet: the logstor re-separation plan",),

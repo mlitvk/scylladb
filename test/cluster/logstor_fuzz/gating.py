@@ -58,7 +58,9 @@ SEEDS = (
     2963184529, 6620573311, 9147285503, 3388146091, 5876013449,
 )
 
-# The cases of the full set: (profile, number of seeds, mode).
+# The cases of the full set: (profile, number of seeds, mode).  The profile
+# ``failures`` is not a gating case yet: its failure points still find known
+# issues of the separator, so a run of it does not tell a regression from them.
 FULL = (
     ("workload_only", 2, "dev"),
     ("operations", 6, "dev"),
@@ -100,7 +102,8 @@ def case_from_id(case_id: str) -> Optional[GatingCase]:
 
 def items_of(profile: Profile) -> set[str]:
     """Returns the known-issue items that a run of ``profile`` does when nothing disables them."""
-    items = {f"profile:{profile.name}"} | {f"op:{op}" for op in profile.nemesis.ops}
+    items = ({f"profile:{profile.name}"} | {f"op:{op}" for op in profile.nemesis.ops}
+             | {f"failure:{f}" for f in profile.nemesis.failures})
     if profile.checks.replica_check:
         items.add("check:repair_and_compare_replicas")
     return items

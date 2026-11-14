@@ -66,12 +66,15 @@ logger = logging.getLogger(__name__)
 
 NODE_WINDOW = "node"
 TABLETS_WINDOW = "tablets"
+# The window of an injected failure that is not fatal (see failures.py).
+FAILURE_WINDOW = "failure"
 
 # The errors that the operations can cause, and when the run accepts them.
 EXCEPTION_POLICY: ExceptionPolicy = first_match(
     tolerate_resets,
     only_during(NODE_WINDOW, tolerate_reboot),
     only_during(TABLETS_WINDOW, tolerate_unavailability),
+    only_during(FAILURE_WINDOW, tolerate_unavailability),
 )
 
 # A move request that names a tablet which changed after the operation read the
@@ -131,6 +134,9 @@ class FuzzContext:
     balancing_enabled: bool = True
     # The use of the store of each shard, which the monitor samples.
     peaks: SegmentPeaks = field(default_factory=SegmentPeaks)
+    # A node operation and a fatal failure hold this lock, so that at most one
+    # node is down at a time.
+    node_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def too_full(self) -> Optional[str]:
         """Returns a reason when a shard is too full for an operation that moves data, or None."""

@@ -141,6 +141,11 @@ class NemesisParams:
     op_interval: tuple[float, float] = (5.0, 20.0)
     # The run fails as a hang when no write of a table is acknowledged for this long.
     stall_timeout_s: float = 90.0
+    # The injected failures (see failures.FAILURES).  A known issue can disable
+    # some of them.  They need a debug or dev build.
+    failures: tuple[str, ...] = ()
+    # The pause between two failures, in seconds.
+    failure_interval: tuple[float, float] = (5.0, 25.0)
     # An operation that moves data between shards (a tablet move, a resize) does
     # not run when a shard holds more live data than this fraction of its store,
     # so that the operations cannot fill a shard (see the known issue
@@ -237,6 +242,19 @@ PROFILES: dict[str, Profile] = {
         )),
     ),
 }
+
+# The operations profile with injected failures: delays, errors, pauses and a
+# fatal disk error at points of logstor (see failures.py).
+PROFILES["failures"] = dataclasses.replace(
+    PROFILES["operations"], name="failures",
+    nemesis=dataclasses.replace(PROFILES["operations"].nemesis, failures=(
+        "delay_segment_write", "delay_index_insert", "delay_segment_read", "delay_separator_flush",
+        "delay_compaction", "delay_stream_snapshot", "delay_stream_adopt",
+        "fail_segment_write", "fail_compaction_index_update", "fail_compaction_after_rewrite",
+        "fail_separator_flush", "pause_before_compaction_free", "pause_separator_buffer_allocated",
+        "segment_write_io_error",
+    )),
+)
 
 # The operations profile with a skewed load: the keys of a zipf distribution,
 # so that a few hot keys take most of the writes and the reads.  The hot keys

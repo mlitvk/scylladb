@@ -30,6 +30,8 @@ from pathlib import Path
 import pytest
 
 from test.cluster.logstor_fuzz.checks import final_checks
+from test.cluster.logstor_fuzz.failures import (ALLOWED_LOG_PATTERNS, enabled_failures, failure_task,
+                                                make_failure_schedule)
 from test.cluster.logstor_fuzz.gating import gating_cases
 from test.cluster.logstor_fuzz.known_issues import KnownIssues
 from test.cluster.logstor_fuzz.nemesis import (
@@ -120,7 +122,7 @@ async def run_profile(manager: ScyllaClusterManager, profile: Profile, tmp_path,
         rack_of = await boot_cluster(manager, profile)
     cql = manager.get_cql()
     c, w = profile.cluster, profile.workload
-    policy = EXCEPTION_POLICY if profile.nemesis.ops else strict
+    policy = EXCEPTION_POLICY if profile.nemesis.ops or profile.nemesis.failures else strict
 
     ks_opts = (f"WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': {c.rf}}} "
                f"AND tablets = {{'initial': {c.initial_tablets}}}")
@@ -151,6 +153,13 @@ async def run_profile(manager: ScyllaClusterManager, profile: Profile, tmp_path,
         extra = []
         if schedule:
             extra.append(("nemesis", lambda: nemesis_task(ctx, schedule, stop, events)))
+        failure_schedule = make_failure_schedule(profile.seed, enabled_failures(ctx), profile.duration_s,
+                                                 profile.nemesis.failure_interval)
+        if failure_schedule:
+            logger.info("Failure schedule: %s", [f.name for f in failure_schedule])
+            # The injected failures log errors that the teardown scan must accept.
+            manager.ignore_log_patterns.extend(ALLOWED_LOG_PATTERNS)
+            extra.append(("failures", lambda: failure_task(ctx, failure_schedule, stop, events)))
         extra.append(("watchdog", lambda: watchdog_task(ctx, stop, events)))
 
         # The tasks stop at ``duration_s``, and the nemesis waits for the operation that runs.
@@ -208,6 +217,14 @@ async def test_operations_skewed(manager: ScyllaClusterManager, build_mode, requ
     """Runs the operations profile with a zipf key distribution: a few hot keys take most of the load."""
     profile = load_profile("operations_skewed")
     await run_case(manager, profile, request, tmp_path, f"operations_skewed-{profile.seed}-{build_mode}", build_mode)
+
+
+@pytest.mark.check_nodes_for_errors
+@pytest.mark.skip_mode(mode="release", reason="error injections are not supported in release mode")
+async def test_failures(manager: ScyllaClusterManager, build_mode, request, tmp_path):
+    """Runs the operations profile with injected delays, errors, pauses and a fatal disk error in logstor."""
+    profile = load_profile("failures")
+    await run_case(manager, profile, request, tmp_path, f"failures-{profile.seed}-{build_mode}", build_mode)
 
 
 if os.environ.get(ENV_PREFIX + "GATING"):
