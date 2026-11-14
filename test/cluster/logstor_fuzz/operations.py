@@ -47,7 +47,8 @@ from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Optional, Sequence
 
 from test.cluster.logstor_fuzz.known_issues import KnownIssues
-from test.cluster.logstor_fuzz.params import Profile
+from test.cluster.logstor_fuzz.params import Profile, TimeLimits
+from test.cluster.logstor_fuzz.results import HangError
 from test.cluster.logstor_fuzz.workload import LogstorWorkload, SegmentPeaks
 from test.cluster.strong_consistency.outcomes import (
     ExceptionPolicy,
@@ -78,6 +79,40 @@ EXCEPTION_POLICY: ExceptionPolicy = first_match(
 # These are the messages of storage_service::move_tablet() and transit_tablet().
 STALE_MOVE = re.compile(r"is in transition|has no replica on|has replica on")
 
+# The log lines of the logstor start of a shard, with the shard in group 1.
+LOGSTOR_START = re.compile(r"\[shard (\d+):[^\]]*\] logstor - Starting logstor\b")
+LOGSTOR_STARTED = re.compile(r"\[shard (\d+):[^\]]*\] logstor - logstor started\b")
+INIT_STEP = re.compile(r"\] init - (.*)$")
+
+
+async def _start_step(log, mark: int) -> str:
+    """Returns the step of the node start that did not finish, from the node log after ``mark``."""
+    started = {m.group(1) for _, m in await log.grep(LOGSTOR_STARTED, from_mark=mark)}
+    stuck = sorted({m.group(1) for _, m in await log.grep(LOGSTOR_START, from_mark=mark)} - started, key=int)
+    if stuck:
+        return f"logstor did not finish its start on shard {', '.join(stuck)}"
+    steps = await log.grep(INIT_STEP, from_mark=mark)
+    if steps:
+        return f"the last init step is {steps[-1][1].group(1).strip()!r}"
+    return "the node logged no init step"
+
+
+async def start_node(manager, server: ServerInfo, limit_s: float) -> None:
+    """Starts the stopped node ``server``.
+
+    Raises HangError when the node does not serve CQL in ``limit_s``.  The
+    message names the step of the start that did not finish, from the node log,
+    so that the signature of the failure tells a stuck logstor start from the
+    other stuck starts.
+    """
+    log = await manager.server_open_log(server.server_id)
+    mark = await log.mark()
+    try:
+        await manager.server_start(server.server_id, timeout=limit_s)
+    except TimeoutError:
+        step = await _start_step(log, mark)
+        raise HangError(f"{server.ip_addr} did not start in {limit_s:.0f}s: {step}") from None
+
 
 @dataclass
 class FuzzContext:
@@ -87,6 +122,7 @@ class FuzzContext:
     profile: Profile
     workloads: Sequence[LogstorWorkload]
     known: KnownIssues
+    limits: TimeLimits = field(default_factory=TimeLimits)
     # The config and the command line of a new node.
     node_config: dict = field(default_factory=dict)
     node_cmdline: list[str] = field(default_factory=list)
@@ -129,7 +165,7 @@ class FuzzContext:
         """Waits until all nodes see each other as up and the driver can use each of them."""
         servers = await self.servers()
         await self.manager.servers_see_each_other(servers)
-        await wait_for_cql_and_get_hosts(self.manager.get_cql(), servers, time.time() + 120)
+        await wait_for_cql_and_get_hosts(self.manager.get_cql(), servers, time.time() + self.limits.node_start_s)
 
     async def set_balancing(self, enabled: bool) -> None:
         server = (await self.servers())[0]
@@ -150,13 +186,19 @@ class Operation:
     # The disruption window that the operation runs in, or None when no client
     # request may fail because of it.
     window: Optional[str]
+    # The kind of the operation, which selects its time limit (see
+    # ``TimeLimits.op_s``):
+    #   * ``quick``: a request that returns in seconds;
+    #   * ``node``: a stop and a start of one node;
+    #   * ``data``: an operation that moves or repairs data.
+    kind: str
     fn: OpFn
 
 
 async def restart_node(ctx: FuzzContext, rng: random.Random) -> Optional[str]:
     server = rng.choice(await ctx.servers())
     await ctx.manager.server_stop_gracefully(server.server_id)
-    await ctx.manager.server_start(server.server_id)
+    await start_node(ctx.manager, server, ctx.limits.node_start_s)
     await ctx.wait_healthy()
     return None
 
@@ -164,7 +206,7 @@ async def restart_node(ctx: FuzzContext, rng: random.Random) -> Optional[str]:
 async def kill_restart_node(ctx: FuzzContext, rng: random.Random) -> Optional[str]:
     server = rng.choice(await ctx.servers())
     await ctx.manager.server_stop(server.server_id, convict=False)
-    await ctx.manager.server_start(server.server_id)
+    await start_node(ctx.manager, server, ctx.limits.node_start_s)
     await ctx.wait_healthy()
     return None
 
@@ -328,18 +370,18 @@ async def repair(ctx: FuzzContext, rng: random.Random) -> Optional[str]:
 
 
 OPERATIONS: dict[str, Operation] = {op.name: op for op in (
-    Operation("restart_node", 3, NODE_WINDOW, restart_node),
-    Operation("kill_restart_node", 3, NODE_WINDOW, kill_restart_node),
-    Operation("pause_node", 2, NODE_WINDOW, pause_node),
-    Operation("add_node", 1, NODE_WINDOW, add_node),
-    Operation("decommission_node", 1, NODE_WINDOW, decommission_node),
-    Operation("remove_node", 1, NODE_WINDOW, remove_node),
-    Operation("move_tablet", 4, TABLETS_WINDOW, move_tablet),
-    Operation("intranode_move", 3, TABLETS_WINDOW, intranode_move),
-    Operation("split_merge", 2, TABLETS_WINDOW, split_merge),
-    Operation("balancing_toggle", 1, TABLETS_WINDOW, balancing_toggle),
-    Operation("flush", 2, None, flush),
-    Operation("compact", 2, None, compact),
-    Operation("alter_caching", 1, None, alter_caching),
-    Operation("repair", 1, TABLETS_WINDOW, repair),
+    Operation("restart_node", 3, NODE_WINDOW, "node", restart_node),
+    Operation("kill_restart_node", 3, NODE_WINDOW, "node", kill_restart_node),
+    Operation("pause_node", 2, NODE_WINDOW, "node", pause_node),
+    Operation("add_node", 1, NODE_WINDOW, "data", add_node),
+    Operation("decommission_node", 1, NODE_WINDOW, "data", decommission_node),
+    Operation("remove_node", 1, NODE_WINDOW, "data", remove_node),
+    Operation("move_tablet", 4, TABLETS_WINDOW, "data", move_tablet),
+    Operation("intranode_move", 3, TABLETS_WINDOW, "data", intranode_move),
+    Operation("split_merge", 2, TABLETS_WINDOW, "quick", split_merge),
+    Operation("balancing_toggle", 1, TABLETS_WINDOW, "quick", balancing_toggle),
+    Operation("flush", 2, None, "quick", flush),
+    Operation("compact", 2, None, "quick", compact),
+    Operation("alter_caching", 1, None, "quick", alter_caching),
+    Operation("repair", 1, TABLETS_WINDOW, "data", repair),
 )}

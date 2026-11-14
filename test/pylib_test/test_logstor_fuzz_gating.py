@@ -30,6 +30,14 @@ def test_signature_drops_the_variable_parts():
     assert signature("node_log", log_a) == signature("node_log", log_b)
 
 
+def test_signature_drops_a_time_limit():
+    # The limits of a debug run are larger, and a failure must have one signature in both modes.
+    dev = signature("hang", "operation 14 kill_restart_node did not finish in 120s")
+    debug = signature("hang", "operation 3 kill_restart_node did not finish in 360s")
+    assert dev == debug == "hang: operation <n> kill_restart_node did not finish in <n>s"
+    assert signature("hang", "a delay of 250ms") == "hang: a delay of <n>ms"
+
+
 def test_node_log_failure_takes_the_first_error_line():
     text = ("Server 3: found 2 error(s) (log: /x/scylla-3.log)\n"
             "  ERROR 2026-11-14 13:47:48,072 [shard 0:main] logstor - first\n"

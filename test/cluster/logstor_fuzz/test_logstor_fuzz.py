@@ -32,7 +32,14 @@ import pytest
 from test.cluster.logstor_fuzz.checks import final_checks
 from test.cluster.logstor_fuzz.gating import gating_cases
 from test.cluster.logstor_fuzz.known_issues import KnownIssues
-from test.cluster.logstor_fuzz.nemesis import EventLog, enabled_operations, make_schedule, nemesis_task, watchdog_task
+from test.cluster.logstor_fuzz.nemesis import (
+    EventLog,
+    enabled_operations,
+    make_schedule,
+    nemesis_task,
+    time_limit,
+    watchdog_task,
+)
 from test.cluster.logstor_fuzz.operations import EXCEPTION_POLICY, FuzzContext
 from test.cluster.logstor_fuzz.params import ENV_PREFIX, Profile, load_profile, utilization_estimate
 from test.cluster.logstor_fuzz.results import FuzzFailure, RunResult, failure_of
@@ -93,7 +100,7 @@ async def run_case(manager: ScyllaClusterManager, profile: Profile, request, tmp
     event_log = result_dir / (result.file_stem() + ".events.jsonl")
     result.event_log = str(event_log)
     try:
-        await run_profile(manager, profile, tmp_path, event_log)
+        await run_profile(manager, profile, tmp_path, event_log, mode)
     except BaseException as e:
         result.fail(*failure_of(e))
         raise
@@ -101,14 +108,16 @@ async def run_case(manager: ScyllaClusterManager, profile: Profile, request, tmp
         logger.info("Result: %s", result.write(result_dir))
 
 
-async def run_profile(manager: ScyllaClusterManager, profile: Profile, tmp_path, event_log: Path) -> None:
+async def run_profile(manager: ScyllaClusterManager, profile: Profile, tmp_path, event_log: Path, mode: str) -> None:
     logger.info("Logstor fuzz run: %s", profile.describe())
+    limits = profile.limits.for_mode(mode)
     logger.info("To run the same choices again, set LOGSTOR_FUZZ_SEED=%d", profile.seed)
     logger.info("Planned utilization of a full-copy shard: %.2f (%d keys per table)",
                 utilization_estimate(profile), profile.workload.keys)
     known = KnownIssues(profile.include_known)
     logger.info("Known issues (test/cluster/logstor_fuzz/known_issues.py):\n%s", known.summary())
-    rack_of = await boot_cluster(manager, profile)
+    async with time_limit("the start of the cluster", limits.boot_s):
+        rack_of = await boot_cluster(manager, profile)
     cql = manager.get_cql()
     c, w = profile.cluster, profile.workload
     policy = EXCEPTION_POLICY if profile.nemesis.ops else strict
@@ -127,12 +136,13 @@ async def run_profile(manager: ScyllaClusterManager, profile: Profile, tmp_path,
 
         peaks = SegmentPeaks(store_bytes=c.logstor_disk_size_in_mb * 2**20)
         if w.preload:
-            await asyncio.gather(*(preload(wl, cql) for wl in workloads))
+            async with time_limit("the preload", limits.preload_s):
+                await asyncio.gather(*(preload(wl, cql) for wl in workloads))
             await peaks.sample(manager)
             logger.info("Store use after the preload: %s", peaks.summary())
 
         config, cmdline = node_config(profile)
-        ctx = FuzzContext(manager=manager, profile=profile, workloads=workloads, known=known,
+        ctx = FuzzContext(manager=manager, profile=profile, workloads=workloads, known=known, limits=limits,
                           node_config=config, node_cmdline=cmdline, rack_of=rack_of, peaks=peaks)
         schedule = make_schedule(profile.seed, enabled_operations(ctx), profile.duration_s,
                                  profile.nemesis.op_interval)
@@ -143,8 +153,11 @@ async def run_profile(manager: ScyllaClusterManager, profile: Profile, tmp_path,
             extra.append(("nemesis", lambda: nemesis_task(ctx, schedule, stop, events)))
         extra.append(("watchdog", lambda: watchdog_task(ctx, stop, events)))
 
+        # The tasks stop at ``duration_s``, and the nemesis waits for the operation that runs.
+        run_limit = profile.duration_s + limits.data_op_s + limits.stop_s
         try:
-            task_errors = await run_workloads(manager, cql, workloads, profile.duration_s, peaks, extra)
+            async with time_limit("the run", run_limit):
+                task_errors = await run_workloads(manager, cql, workloads, profile.duration_s, peaks, extra)
         finally:
             events.close()
         logger.info("Store use during the run: %s", peaks.summary())
@@ -161,8 +174,10 @@ async def run_profile(manager: ScyllaClusterManager, profile: Profile, tmp_path,
                 raise FuzzFailure("no_progress", f"{wl.table_name}: {e}") from e
 
         write_quorum = {"ONE": 1, "QUORUM": c.rf // 2 + 1, "ALL": c.rf}[w.write_cl]
-        cql = await final_checks(manager, manager.get_cql(), workloads, write_quorum,
-                                 profile.checks.replica_check, profile.checks.final_restart, known)
+        async with time_limit("the checks after the run", limits.checks_s):
+            cql = await final_checks(manager, manager.get_cql(), workloads, write_quorum,
+                                     profile.checks.replica_check, profile.checks.final_restart, known,
+                                     limits.node_start_s)
 
         if profile.checks.porcupine:
             for wl in workloads:
