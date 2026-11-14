@@ -108,6 +108,9 @@ class WorkloadParams:
     delete_fraction: float = 0.1
     # The fraction of the reads that the model checks.
     read_sample: float = 1.0
+    # The fraction of the reads that use BYPASS CACHE, so that the reads test
+    # both the logstor cache and the read from the segments.
+    bypass_cache_fraction: float = 0.3
     # The pause of a client between two requests, in seconds.
     op_pause: tuple[float, float] = (0.005, 0.02)
     write_cl: str = "QUORUM"
