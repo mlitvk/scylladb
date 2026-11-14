@@ -273,3 +273,45 @@ def test_start_step_names_the_stuck_logstor_shard():
     other = asyncio.run(_start_step(_FakeLog(_STUCK_START[:1]), 0))
     assert other == "the last init step is 'recovering logstor'"
     assert KnownIssues().match(signature("hang", f"127.3.255.2 did not start in 60s: {other}")) is None
+
+
+def test_probe_missing_keys(monkeypatch):
+    import asyncio
+    from test.cluster.logstor_fuzz import checks
+    from test.cluster.logstor_fuzz.checks import CheckErrors, KeyState, ReplicaDump, probe_missing_keys
+    from test.cluster.logstor_fuzz.params import WorkloadParams
+    from test.cluster.logstor_fuzz.workload import LogstorWorkload
+    wl = LogstorWorkload(ks="ks", table_name="t0", name="t0", seed=5, params=WorkloadParams(keys=3), ts_base=0)
+
+    def dump(states: dict[int, KeyState]) -> ReplicaDump:
+        d = ReplicaDump()
+        for pk, state in states.items():
+            d[pk] = state
+            d.sources[pk] = f"logstor-log:{pk}"
+        return d
+
+    s = KeyState(Kind.WRITE, 4, 4)
+    # Node b has no record of key 1 in its full dump.  Its single-key dump finds the record,
+    # and a second full dump has it too.  Node c has no record of key 2 at all.
+    dumps = {"a": dump({0: s, 1: s, 2: s}), "b": dump({0: s, 2: s}), "c": dump({0: s, 1: s})}
+    replicas = {pk: {"a", "b", "c"} for pk in range(3)}
+    node_data = {"a": dumps["a"], "b": dump({0: s, 1: s, 2: s}), "c": dumps["c"]}
+
+    async def fake_dump(cql, host, wl, errors, pk=None):
+        data = node_data[host]
+        return dump({k: v for k, v in data.items() if pk is None or k == pk})
+
+    class FakeCql:
+        class cluster:
+            class metadata:
+                @staticmethod
+                def get_host(ip):
+                    return ip
+
+    monkeypatch.setattr(checks, "dump_replica", fake_dump)
+    errors = CheckErrors("test")
+    probes = asyncio.run(probe_missing_keys(FakeCql, wl, dumps, replicas, errors))
+    assert set(probes) == {("b", 1), ("c", 2)}
+    assert "which a single-key dump at the first dump found; a second full dump has it" in probes[("b", 1)]
+    assert probes[("c", 2)] == "a single-key dump at the first dump found no record either"
+    assert not errors.errors and len(errors.notes) == 2

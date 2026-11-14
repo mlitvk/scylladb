@@ -23,6 +23,11 @@ of the node that gets the query.  The checks run in this order:
   4. A restart of all nodes, a dump that requires each replica to hold the
      same state as before the restart, and a second scan at CL=ALL.  A
      difference on one replica is a loss in the recovery of logstor.
+
+When the first dump of a replica has no record of a key that another replica
+holds, a single-key dump of that replica tells whether the full dump missed a
+record that the node has.  The failure details of a later difference show the
+result, with the segment of each record.
 """
 
 from __future__ import annotations
@@ -53,6 +58,9 @@ logger = logging.getLogger(__name__)
 # The number of failed checks that a report lists.
 MAX_REPORTED = 20
 
+# The number of keys that the single-key dumps check after the first dump.
+MAX_PROBES = 10
+
 
 @dataclass(frozen=True)
 class KeyState:
@@ -71,18 +79,34 @@ class CheckErrors:
     def __init__(self, what: str) -> None:
         self.what = what
         self.errors: list[str] = []
+        # The facts that explain the errors, for the failure details.
+        self.notes: list[str] = []
 
     def add(self, message: str) -> None:
         if len(self.errors) < MAX_REPORTED:
             logger.error("%s: %s", self.what, message)
         self.errors.append(message)
 
+    def note(self, message: str) -> None:
+        logger.info("%s: %s", self.what, message)
+        self.notes.append(message)
+
     def raise_if_any(self) -> None:
         if self.errors:
             shown = "\n  ".join(self.errors[:MAX_REPORTED])
             more = f"\n  ... and {len(self.errors) - MAX_REPORTED} more" if len(self.errors) > MAX_REPORTED else ""
+            notes = "".join(f"\n  note: {n}" for n in self.notes[:MAX_REPORTED])
             raise FuzzFailure("final_check", self.errors[0],
-                              f"{self.what}: {len(self.errors)} errors:\n  {shown}{more}")
+                              f"{self.what}: {len(self.errors)} errors:\n  {shown}{more}{notes}")
+
+
+class ReplicaDump(dict):
+    """The state of each key that one node holds, with the log source of each record."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        # The ``logstor-log:`` mutation source of the record of each key.
+        self.sources: dict[int, str] = {}
 
 
 def _state_of_source(wl: LogstorWorkload, pk: int, rows: list, errors: CheckErrors, where: str) -> Optional[KeyState]:
@@ -110,20 +134,23 @@ def _state_of_source(wl: LogstorWorkload, pk: int, rows: list, errors: CheckErro
     return None
 
 
-async def dump_replica(cql, host, wl: LogstorWorkload, errors: CheckErrors) -> dict[int, KeyState]:
+_DUMP_COLUMNS = "pk, mutation_source, mutation_fragment_kind, metadata, value"
+
+
+async def dump_replica(cql, host, wl: LogstorWorkload, errors: CheckErrors, pk: Optional[int] = None) -> ReplicaDump:
     """Returns the state of each key that one node holds for the table of ``wl``.
 
-    Also checks that the cached state of a key equals the state in the log.
+    With ``pk``, the dump reads only that key.  Also checks that the cached
+    state of a key equals the state in the log.
     """
-    stmt = SimpleStatement(
-        f"SELECT pk, mutation_source, mutation_fragment_kind, metadata, value FROM MUTATION_FRAGMENTS({wl.fqtn})",
-        fetch_size=1000)
+    where_key = "" if pk is None else f" WHERE pk = {pk}"
+    stmt = SimpleStatement(f"SELECT {_DUMP_COLUMNS} FROM MUTATION_FRAGMENTS({wl.fqtn}){where_key}", fetch_size=1000)
     rows = await cql.run_async(stmt, host=host)
     by_key: dict[int, dict[str, list]] = {}
     for r in rows:
         by_key.setdefault(r.pk, {}).setdefault(r.mutation_source, []).append(r)
 
-    states: dict[int, KeyState] = {}
+    states = ReplicaDump()
     for pk, sources in by_key.items():
         where = f"{host.address} {wl.table_name}"
         log_sources = [s for s in sources if s.startswith("logstor-log:")]
@@ -137,6 +164,7 @@ async def dump_replica(cql, host, wl: LogstorWorkload, errors: CheckErrors) -> d
                 errors.add(f"{where} key={pk}: the cache holds {cached}, the log holds {state}")
         if state is not None:
             states[pk] = state
+            states.sources[pk] = log_sources[0]
     return states
 
 
@@ -154,7 +182,7 @@ async def key_replicas(manager, server, wl: LogstorWorkload) -> dict[int, set[st
     return replicas
 
 
-async def dump_all(manager, cql, wl: LogstorWorkload, errors: CheckErrors) -> dict[str, dict[int, KeyState]]:
+async def dump_all(manager, cql, wl: LogstorWorkload, errors: CheckErrors) -> dict[str, ReplicaDump]:
     """Returns the states that each running node holds for the table of ``wl``."""
     dumps = {}
     for server in await manager.running_servers():
@@ -218,8 +246,41 @@ def check_replicas_equal(wl: LogstorWorkload, dumps: dict[str, dict[int, KeyStat
             errors.add(f"{wl.table_name} after the repair: {error}")
 
 
-def check_same_dumps(wl: LogstorWorkload, before: dict[str, dict[int, KeyState]],
-                     after: dict[str, dict[int, KeyState]], errors: CheckErrors) -> None:
+async def probe_missing_keys(cql, wl: LogstorWorkload, dumps: dict[str, ReplicaDump],
+                             replicas: dict[int, set[str]], errors: CheckErrors) -> dict[tuple[str, int], str]:
+    """Dumps again, one key at a time, the keys that a replica has no record of and another replica holds.
+
+    A replica that was down during the writes of a key can have no record of
+    it, so a missing key is not an error here.  The single-key dump tells
+    whether the full dump missed a record that the node has.  When it did, a
+    second full dump of the node tells whether the miss repeats.  Returns a
+    note for each key that it checked, by the IP and the key.
+    """
+    probes: dict[tuple[str, int], str] = {}
+    candidates = [(ip, pk) for pk in range(wl.num_keys) for ip in sorted(replicas[pk])
+                  if ip in dumps and pk not in dumps[ip]
+                  and any(pk in dumps[other] for other in replicas[pk] if other in dumps)]
+    redumped: dict[str, ReplicaDump] = {}
+    for ip, pk in candidates[:MAX_PROBES]:
+        host = cql.cluster.metadata.get_host(ip)
+        single = await dump_replica(cql, host, wl, errors, pk)
+        if pk not in single:
+            probes[(ip, pk)] = "a single-key dump at the first dump found no record either"
+        else:
+            if ip not in redumped:
+                redumped[ip] = await dump_replica(cql, host, wl, errors)
+            again = "has it" if pk in redumped[ip] else "misses it again"
+            probes[(ip, pk)] = (f"the full dump missed {single[pk]} in {single.sources[pk]}, which a single-key "
+                                f"dump at the first dump found; a second full dump {again}")
+        errors.note(f"{ip} {wl.table_name} key={pk}: {probes[(ip, pk)]}")
+    if len(candidates) > MAX_PROBES:
+        errors.note(f"{wl.table_name}: {len(candidates)} keys are missing on a replica, the first {MAX_PROBES} "
+                    f"were checked")
+    return probes
+
+
+def check_same_dumps(wl: LogstorWorkload, before: dict[str, ReplicaDump], after: dict[str, ReplicaDump],
+                     errors: CheckErrors, probes: dict[tuple[str, int], str]) -> None:
     """Checks that each node holds the same state of each key after the restart as before it."""
     for ip in sorted(before):
         if ip not in after:
@@ -229,6 +290,9 @@ def check_same_dumps(wl: LogstorWorkload, before: dict[str, dict[int, KeyState]]
             if before[ip].get(pk) != after[ip].get(pk):
                 errors.add(f"{ip} {wl.table_name} key={pk}: holds {after[ip].get(pk)} after the restart, "
                            f"{before[ip].get(pk)} before it")
+                errors.note(f"{ip} {wl.table_name} key={pk}: the record before the restart is in "
+                            f"{before[ip].sources.get(pk)}, after it in {after[ip].sources.get(pk)}; "
+                            f"{probes.get((ip, pk), 'no single-key dump')}")
 
 
 async def scan_all(cql, wl: LogstorWorkload, errors: CheckErrors, what: str) -> None:
@@ -271,10 +335,12 @@ async def final_checks(manager, cql, workloads: Sequence[LogstorWorkload], write
         await scan_all(cql, wl, errors, "before the restart")
 
     last_dumps = {}
+    probes: dict[str, dict[tuple[str, int], str]] = {}
     if replica_check:
         for wl in workloads:
             replicas = await key_replicas(manager, servers[0], wl)
             dumps = await dump_all(manager, cql, wl, errors)
+            probes[wl.table_name] = await probe_missing_keys(cql, wl, dumps, replicas, errors)
             check_quorum(wl, dumps, replicas, write_quorum, errors)
             if known.enabled("check:repair_and_compare_replicas"):
                 await manager.api.repair(servers[0].ip_addr, wl.ks, wl.table_name)
@@ -296,7 +362,7 @@ async def final_checks(manager, cql, workloads: Sequence[LogstorWorkload], write
         for wl in workloads:
             if replica_check:
                 dumps = await dump_all(manager, cql, wl, errors)
-                check_same_dumps(wl, last_dumps[wl.table_name], dumps, errors)
+                check_same_dumps(wl, last_dumps[wl.table_name], dumps, errors, probes[wl.table_name])
             await scan_all(cql, wl, errors, "after the restart")
         errors.raise_if_any()
     return cql
