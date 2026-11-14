@@ -103,9 +103,13 @@ class RunResult:
         self.message = message
         self.signature = signature(kind, message)
 
+    def file_stem(self) -> str:
+        """Returns the name of the files of the run, without the suffix."""
+        return re.sub(r"[^\w.\-\[\]]", "_", self.run_id)
+
     def write(self, directory: Path) -> Path:
         directory.mkdir(parents=True, exist_ok=True)
-        path = directory / (re.sub(r"[^\w.\-\[\]]", "_", self.run_id) + ".json")
+        path = directory / (self.file_stem() + ".json")
         path.write_text(json.dumps(asdict(self), indent=1) + "\n")
         return path
 
