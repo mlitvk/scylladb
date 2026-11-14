@@ -85,11 +85,15 @@ def primary_failure(task_errors: list[BaseException]) -> FuzzFailure:
 
 async def run_case(manager: ScyllaClusterManager, profile: Profile, request, tmp_path, case_id: str, mode: str) -> None:
     """Runs ``profile`` and writes its result file, also when the run fails."""
-    result = RunResult(run_id=request.node.name, case_id=case_id, profile=profile.name, seed=profile.seed, mode=mode,
-                       event_log=str(tmp_path / "events.jsonl"))
+    result = RunResult(run_id=request.node.name, case_id=case_id, profile=profile.name, seed=profile.seed, mode=mode)
+    # The event log goes next to the result file, so that it outlives the run:
+    # tmp_path of a test.py run is inside the dbuild container.
     result_dir = Path(os.environ.get(ENV_PREFIX + "RESULT_DIR") or tmp_path)
+    result_dir.mkdir(parents=True, exist_ok=True)
+    event_log = result_dir / (result.file_stem() + ".events.jsonl")
+    result.event_log = str(event_log)
     try:
-        await run_profile(manager, profile, tmp_path)
+        await run_profile(manager, profile, tmp_path, event_log)
     except BaseException as e:
         result.fail(*failure_of(e))
         raise
@@ -97,7 +101,7 @@ async def run_case(manager: ScyllaClusterManager, profile: Profile, request, tmp
         logger.info("Result: %s", result.write(result_dir))
 
 
-async def run_profile(manager: ScyllaClusterManager, profile: Profile, tmp_path) -> None:
+async def run_profile(manager: ScyllaClusterManager, profile: Profile, tmp_path, event_log: Path) -> None:
     logger.info("Logstor fuzz run: %s", profile.describe())
     logger.info("To run the same choices again, set LOGSTOR_FUZZ_SEED=%d", profile.seed)
     logger.info("Planned utilization of a full-copy shard: %.2f (%d keys per table)",
@@ -132,7 +136,7 @@ async def run_profile(manager: ScyllaClusterManager, profile: Profile, tmp_path)
                           node_config=config, node_cmdline=cmdline, rack_of=rack_of, peaks=peaks)
         schedule = make_schedule(profile.seed, enabled_operations(ctx), profile.duration_s,
                                  profile.nemesis.op_interval)
-        events = EventLog(tmp_path / "events.jsonl")
+        events = EventLog(event_log)
         logger.info("Event log: %s; schedule: %s", events.path, [s.name for s in schedule])
         extra = []
         if schedule:
