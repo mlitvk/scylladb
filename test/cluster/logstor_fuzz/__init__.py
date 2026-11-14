@@ -9,6 +9,9 @@
   * ``params`` — the parameters, the profiles and the env var overrides;
   * ``model`` — the per-key history and the check of each read;
   * ``workload`` — the writers, the readers and the value codec;
+  * ``operations`` — the cluster operations, and the errors each one may cause;
+  * ``nemesis`` — the schedule of the operations, the event log and the hang checks;
+  * ``known_issues`` — the one list of the skips, with their trackers;
   * ``checks`` — the checks after the run: CL=ALL scans, replica dumps, restart;
   * ``test_logstor_fuzz`` — one test per profile.
 """
