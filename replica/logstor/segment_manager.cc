@@ -18,6 +18,7 @@
 #include "replica/logstor/compaction.hh"
 #include "replica/logstor/compaction_driver.hh"
 #include "replica/logstor/compaction_policy.hh"
+#include "replica/logstor/injected_delay.hh"
 #include <absl/container/flat_hash_map.h>
 #include <algorithm>
 #include <array>
@@ -1105,6 +1106,9 @@ future<> segment_manager_impl::write_full_segment(write_buffer& wb, logstor_grou
 
     auto seg = co_await get_segment(source);
     logstor_logger.trace("Write full segment {} seq {} from {}", seg->id(), seg->seq_num(), write_source_to_string(source));
+    if (auto delay = injected_delay("logstor_delay_segment_write")) {
+        co_await seastar::sleep(*delay);
+    }
 
     wb.seal(seg->seq_num(), cg.table_id(), block_alignment);
     const auto chunk = wb.chunk();
@@ -1189,6 +1193,9 @@ future<log_record> segment_manager_impl::read(record_location location) {
             location.segment, location.offset, location.size, _cfg.segment_size))));
     }
 
+    if (auto delay = injected_delay("logstor_delay_segment_read")) {
+        co_await seastar::sleep(*delay);
+    }
     auto [file_id, file_offset] = _geometry.location_of(location.segment);
     // The file it reads from outlives the read: it is held here, on the frame of this coroutine,
     // because the read is issued on it and seastar keeps reading from it after the first suspension.
@@ -1696,6 +1703,11 @@ future<> compaction_manager_impl::do_compaction(logstor_group& cg, compaction_ba
             segments, cg.table_id(), batch->score.n_in, batch->score.n_out, batch->score.reclaimed(),
             batch->score.efficiency(segment_size));
 
+    // A delay here lets writes overwrite the records of the batch before the batch rewrites them.
+    if (auto delay = injected_delay("logstor_delay_compaction")) {
+        co_await seastar::sleep(*delay);
+    }
+
     auto& index = cg.logstor_index();
 
     auto nonempty_segments = segments
@@ -1911,6 +1923,9 @@ future<> compaction_manager_impl::flush_separator_buffer(separator_buffer& buf, 
         utils::get_local_injector().inject("fail_flush_separator_buffer", []() {
             throw std::runtime_error("flush_separator_buffer failed by injection");
         });
+        if (auto delay = injected_delay("logstor_delay_separator_flush")) {
+            co_await seastar::sleep(*delay);
+        }
 
         if (!buf.empty()) {
             co_await with_scheduling_group(_cfg.separator_sg, [&] {
@@ -2277,6 +2292,9 @@ future<> segment_manager_impl::separate_segment_records(recovery_catalog& catalo
 
 future<utils::chunked_vector<segment_snapshot>> segment_manager_impl::make_snapshot(logstor_group& cg) {
     auto compaction_disable_guard = co_await _compaction_mgr.disable_compaction(cg);
+    if (auto delay = injected_delay("logstor_delay_stream_snapshot")) {
+        co_await seastar::sleep(*delay);
+    }
 
     auto& segments = cg.logstor_segments();
 
@@ -2470,6 +2488,9 @@ public:
     }
     future<> close() override {
         co_await _seg->stop();
+        if (auto delay = injected_delay("logstor_delay_stream_adopt")) {
+            co_await seastar::sleep(*delay);
+        }
         co_await _sm.adopt_streamed_segment(_catalog, _seg->id());
     }
     future<> abort() override {
