@@ -201,3 +201,29 @@ def test_profile_include_known():
     profile = load_profile("workload_only", {"LOGSTOR_FUZZ_INCLUDE_KNOWN": "logstor-repair"})
     assert profile.include_known == ("logstor-repair",)
     assert KnownIssues(profile.include_known).enabled("check:repair_and_compare_replicas")
+
+
+def test_schedule_is_stable_for_a_seed():
+    from test.cluster.logstor_fuzz.nemesis import make_schedule
+    from test.cluster.logstor_fuzz.operations import OPERATIONS
+    names = list(OPERATIONS)
+    a = make_schedule(11, names, 300, (5, 20))
+    assert a == make_schedule(11, names, 300, (5, 20))
+    assert a != make_schedule(12, names, 300, (5, 20))
+    assert sum(op.pause_s for op in a) < 300
+    assert make_schedule(11, [], 300, (5, 20)) == []
+
+
+def test_known_issues_filter_operations():
+    from test.cluster.logstor_fuzz.nemesis import enabled_operations
+    from test.cluster.logstor_fuzz.operations import FuzzContext
+    profile = load_profile("operations", {"LOGSTOR_FUZZ_SEED": "1"})
+    ctx = FuzzContext(manager=None, profile=profile, workloads=[], known=KnownIssues())
+    names = enabled_operations(ctx)
+    assert "remove_node" not in names and "repair" not in names
+    assert "restart_node" in names
+    ctx = FuzzContext(manager=None, profile=profile, workloads=[], known=KnownIssues(["logstor-repair"]))
+    assert "remove_node" in enabled_operations(ctx)
+    bad = load_profile("operations", {"LOGSTOR_FUZZ_SEED": "1", "LOGSTOR_FUZZ_OPS": "no_such_op"})
+    with pytest.raises(ValueError, match="unknown operation"):
+        enabled_operations(FuzzContext(manager=None, profile=bad, workloads=[], known=KnownIssues()))

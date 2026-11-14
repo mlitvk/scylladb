@@ -36,7 +36,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from itertools import accumulate
-from typing import Optional, Sequence
+from typing import Awaitable, Callable, Optional, Sequence
 
 from cassandra import ConsistencyLevel
 from cassandra.policies import FallthroughRetryPolicy
@@ -307,11 +307,14 @@ async def monitor_task(manager, workloads: Sequence[LogstorWorkload], stop: asyn
 
 
 async def run_workloads(manager, cql, workloads: Sequence[LogstorWorkload], duration_s: float,
-                        peaks: SegmentPeaks) -> list[BaseException]:
+                        peaks: SegmentPeaks,
+                        extra_tasks: Sequence[tuple[str, Callable[[], Awaitable[None]]]] = ()) -> list[BaseException]:
     """Runs the clients of all workloads for ``duration_s``, or until a check fails.
 
-    All workloads must share one stop_event.  Returns the exceptions that the
-    tasks raised, as run_workload() of register_workload does.
+    ``extra_tasks`` run beside the clients, and each one must return soon after
+    the shared stop_event is set.  All workloads must share one stop_event.
+    Returns the exceptions that the tasks raised, as run_workload() of
+    register_workload does.
     """
     stop = workloads[0].stop_event
     assert all(wl.stop_event is stop for wl in workloads)
@@ -329,6 +332,8 @@ async def run_workloads(manager, cql, workloads: Sequence[LogstorWorkload], dura
 
             tg.create_task(stop_timer(), name="stop-timer")
             tg.create_task(monitor_task(manager, workloads, stop, peaks), name="monitor")
+            for name, factory in extra_tasks:
+                tg.create_task(factory(), name=name)
             for wl in workloads:
                 for i in range(wl.num_writers):
                     tg.create_task(writer_task(wl, cql, i), name=f"{wl.table_name}-writer-{i}")

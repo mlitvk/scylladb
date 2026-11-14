@@ -96,14 +96,29 @@ class WorkloadParams:
 
 @dataclass(frozen=True)
 class ClusterParams:
-    # The number of nodes in each rack; the number of racks is the length.
+    # The number of nodes in each rack at the start; the number of racks is the length.
     nodes_per_rack: tuple[int, ...] = (1, 1, 1)
+    # The add_node operation does not grow a rack above this.
+    max_nodes_per_rack: int = 2
     rf: int = 3
     smp: int = 2
     initial_tablets: int = 8
     # Per shard.
     logstor_disk_size_in_mb: int = 64
     logstor_file_size_in_mb: int = 4
+
+
+@dataclass(frozen=True)
+class NemesisParams:
+    # The cluster operations that the nemesis picks from (see operations.OPERATIONS).
+    # A known issue can disable some of them.
+    ops: tuple[str, ...] = ()
+    # The pause between two operations, in seconds.
+    op_interval: tuple[float, float] = (5.0, 20.0)
+    # An operation that runs longer than this fails the run as a hang.
+    op_timeout_s: float = 600.0
+    # The run fails as a hang when no write of a table is acknowledged for this long.
+    stall_timeout_s: float = 90.0
 
 
 @dataclass(frozen=True)
@@ -124,6 +139,7 @@ class Profile:
     duration_s: float
     workload: WorkloadParams = field(default_factory=WorkloadParams)
     cluster: ClusterParams = field(default_factory=ClusterParams)
+    nemesis: NemesisParams = field(default_factory=NemesisParams)
     checks: CheckParams = field(default_factory=CheckParams)
     seed: int = 0
     # The ids of the known issues whose items this run includes anyway.
@@ -131,13 +147,24 @@ class Profile:
 
     def describe(self) -> str:
         return (f"profile={self.name} seed={self.seed} duration={self.duration_s}s "
-                f"workload={self.workload} cluster={self.cluster} checks={self.checks} "
+                f"workload={self.workload} cluster={self.cluster} nemesis={self.nemesis} checks={self.checks} "
                 f"include_known={self.include_known}")
 
 
 PROFILES: dict[str, Profile] = {
     # The workload and the checks, with no cluster operations and no failures.
     "workload_only": Profile(name="workload_only", duration_s=60),
+    # The workload under random cluster operations, with no injected failures.
+    "operations": Profile(
+        name="operations", duration_s=300,
+        cluster=ClusterParams(nodes_per_rack=(2, 1, 1)),
+        nemesis=NemesisParams(ops=(
+            "restart_node", "kill_restart_node", "pause_node",
+            "add_node", "decommission_node", "remove_node",
+            "move_tablet", "intranode_move", "split_merge", "balancing_toggle",
+            "flush", "compact", "alter_caching", "repair",
+        )),
+    ),
 }
 
 
@@ -174,6 +201,7 @@ def load_profile(name: str, env: dict[str, str] | None = None) -> Profile:
     used: set[str] = set()
     workload = _override(profile.workload, env, used)
     cluster = _override(profile.cluster, env, used)
+    nemesis = _override(profile.nemesis, env, used)
     checks = _override(profile.checks, env, used)
     duration_s = profile.duration_s
     if ENV_PREFIX + "DURATION" in env:
@@ -191,7 +219,7 @@ def load_profile(name: str, env: dict[str, str] | None = None) -> Profile:
     unknown = {k for k in env if k.startswith(ENV_PREFIX)} - used
     if unknown:
         raise ValueError(f"unknown logstor fuzz parameters: {sorted(unknown)}")
-    profile = dataclasses.replace(profile, workload=workload, cluster=cluster, checks=checks,
+    profile = dataclasses.replace(profile, workload=workload, cluster=cluster, nemesis=nemesis, checks=checks,
                                   duration_s=duration_s, seed=seed, include_known=include_known)
     validate(profile)
     return profile
@@ -214,7 +242,8 @@ MAX_LIVE_FRACTION = 0.25
 def live_bytes_per_shard(profile: Profile) -> float:
     """Returns an upper bound of the live data of one shard."""
     w, c = profile.workload, profile.cluster
-    nodes = sum(c.nodes_per_rack)
+    # The fewest nodes that the operations leave: one in each rack.
+    nodes = min(sum(c.nodes_per_rack), len(c.nodes_per_rack))
     per_value = ValueSize(w.value_size).max() + VALUE_OVERHEAD
     return w.tables * w.keys * per_value * c.rf / (nodes * c.smp) * SKEW
 
@@ -239,5 +268,7 @@ def validate(profile: Profile) -> None:
         raise ValueError(f"the live data of a shard can reach {live / 2**20:.1f} MB, which is more than "
                          f"{MAX_LIVE_FRACTION} of the {c.logstor_disk_size_in_mb} MB store of a shard; "
                          f"use fewer keys or smaller values, or a larger store")
+    if max(c.nodes_per_rack) > c.max_nodes_per_rack:
+        raise ValueError(f"nodes_per_rack={c.nodes_per_rack} is above max_nodes_per_rack={c.max_nodes_per_rack}")
     if profile.checks.final_restart not in ("full", "none"):
         raise ValueError(f"unknown final_restart {profile.checks.final_restart!r}")
