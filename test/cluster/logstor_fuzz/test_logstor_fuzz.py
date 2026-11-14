@@ -14,19 +14,28 @@ repeats a timing bug only by chance.
 The tests have the mark ``check_nodes_for_errors``, so the teardown fails a
 run whose node logs have an ERROR line that no pattern in
 ``manager.ignore_log_patterns`` allows.
+
+Each run writes a result file (see ``results``) to ``LOGSTOR_FUZZ_RESULT_DIR``,
+or to its ``tmp_path``.  ``test_gating`` runs the cases of ``gating``, and it
+exists only when ``LOGSTOR_FUZZ_GATING`` is set.
 """
 
 import asyncio
+import dataclasses
 import logging
+import os
 import time
+from pathlib import Path
 
 import pytest
 
 from test.cluster.logstor_fuzz.checks import final_checks
+from test.cluster.logstor_fuzz.gating import gating_cases
 from test.cluster.logstor_fuzz.known_issues import KnownIssues
 from test.cluster.logstor_fuzz.nemesis import EventLog, enabled_operations, make_schedule, nemesis_task, watchdog_task
 from test.cluster.logstor_fuzz.operations import EXCEPTION_POLICY, FuzzContext
-from test.cluster.logstor_fuzz.params import Profile, load_profile, live_bytes_per_shard
+from test.cluster.logstor_fuzz.params import ENV_PREFIX, Profile, load_profile, live_bytes_per_shard
+from test.cluster.logstor_fuzz.results import FuzzFailure, RunResult, failure_of
 from test.cluster.logstor_fuzz.workload import LogstorWorkload, SegmentPeaks, run_workloads
 from test.cluster.strong_consistency.outcomes import strict
 from test.cluster.strong_consistency.register_workload import check_linearizable
@@ -56,6 +65,36 @@ async def boot_cluster(manager: ScyllaClusterManager, profile: Profile) -> dict[
                                         property_file=[{"dc": "dc1", "rack": r} for r in racks])
     await wait_for_cql_and_get_hosts(manager.get_cql(), servers, time.time() + 60)
     return {s.server_id: rack for s, rack in zip(servers, racks)}
+
+
+def primary_failure(task_errors: list[BaseException]) -> FuzzFailure:
+    """Returns the failure of a run from the exceptions of its tasks.
+
+    A failure of the fuzz test itself (a hang, an operation error) comes first,
+    then a client error that no exception policy accepted.
+    """
+    for e in task_errors:
+        if isinstance(e, FuzzFailure):
+            return e
+    for e in task_errors:
+        if isinstance(e, AssertionError) and "not accepted by the exception policy" in str(e):
+            return FuzzFailure("client_error", str(e).splitlines()[0])
+    kind, message = failure_of(task_errors[0])
+    return FuzzFailure(kind, message)
+
+
+async def run_case(manager: ScyllaClusterManager, profile: Profile, request, tmp_path, case_id: str, mode: str) -> None:
+    """Runs ``profile`` and writes its result file, also when the run fails."""
+    result = RunResult(run_id=request.node.name, case_id=case_id, profile=profile.name, seed=profile.seed, mode=mode,
+                       event_log=str(tmp_path / "events.jsonl"))
+    result_dir = Path(os.environ.get(ENV_PREFIX + "RESULT_DIR") or tmp_path)
+    try:
+        await run_profile(manager, profile, tmp_path)
+    except BaseException as e:
+        result.fail(*failure_of(e))
+        raise
+    finally:
+        logger.info("Result: %s", result.write(result_dir))
 
 
 async def run_profile(manager: ScyllaClusterManager, profile: Profile, tmp_path) -> None:
@@ -100,10 +139,16 @@ async def run_profile(manager: ScyllaClusterManager, profile: Profile, tmp_path)
             events.close()
         logger.info("Store use during the run: %s", peaks.summary())
         violations = [v for wl in workloads for v in wl.violations]
-        assert not violations, f"seed={profile.seed}: {len(violations)} reads failed the check:\n" + "\n".join(violations[:20])
-        assert not task_errors, f"seed={profile.seed}: task(s) failed: {task_errors}"
+        if violations:
+            raise FuzzFailure("violation", violations[0],
+                              f"seed={profile.seed}: {len(violations)} reads failed the check:\n" + "\n".join(violations[:20]))
+        if task_errors:
+            raise primary_failure(task_errors)
         for wl in workloads:
-            wl.assert_progress(min_writes=100, min_reads=100)
+            try:
+                wl.assert_progress(min_writes=100, min_reads=100)
+            except AssertionError as e:
+                raise FuzzFailure("no_progress", f"{wl.table_name}: {e}") from e
 
         write_quorum = {"ONE": 1, "QUORUM": c.rf // 2 + 1, "ALL": c.rf}[w.write_cl]
         cql = await final_checks(manager, manager.get_cql(), workloads, write_quorum,
@@ -115,17 +160,33 @@ async def run_profile(manager: ScyllaClusterManager, profile: Profile, tmp_path)
 
 
 @pytest.mark.check_nodes_for_errors
-async def test_workload_only(manager: ScyllaClusterManager, tmp_path):
+async def test_workload_only(manager: ScyllaClusterManager, build_mode, request, tmp_path):
     """Runs the checked workload with no cluster operations and no failures.
 
     This profile checks the model and the checks themselves: a run with no
     disruption must pass, so any failure here is a bug in logstor or in the
     test.
     """
-    await run_profile(manager, load_profile("workload_only"), tmp_path)
+    profile = load_profile("workload_only")
+    await run_case(manager, profile, request, tmp_path, f"workload_only-{profile.seed}-{build_mode}", build_mode)
 
 
 @pytest.mark.check_nodes_for_errors
-async def test_operations(manager: ScyllaClusterManager, tmp_path):
+async def test_operations(manager: ScyllaClusterManager, build_mode, request, tmp_path):
     """Runs the checked workload under random cluster operations, with no injected failures."""
-    await run_profile(manager, load_profile("operations"), tmp_path)
+    profile = load_profile("operations")
+    await run_case(manager, profile, request, tmp_path, f"operations-{profile.seed}-{build_mode}", build_mode)
+
+
+if os.environ.get(ENV_PREFIX + "GATING"):
+    def pytest_generate_tests(metafunc):
+        if metafunc.function.__name__ == "test_gating":
+            cases = gating_cases(modes=metafunc.config.build_modes)
+            metafunc.parametrize("case", cases, ids=[c.id for c in cases])
+
+    @pytest.mark.check_nodes_for_errors
+    async def test_gating(manager: ScyllaClusterManager, build_mode, request, tmp_path, case):
+        """Runs one gating case: a profile with a fixed seed (see ``gating``)."""
+        assert case.mode == build_mode, f"case {case.id} is for {case.mode}, the run is {build_mode}"
+        env = dict(os.environ, **{ENV_PREFIX + "SEED": str(case.seed)})
+        await run_case(manager, load_profile(case.profile, env), request, tmp_path, case.id, build_mode)

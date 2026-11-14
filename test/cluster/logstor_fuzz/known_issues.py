@@ -6,10 +6,21 @@
 
 """The known issues and the missing features that disable parts of the logstor fuzz test.
 
-This module is the only place that turns off a part of the fuzz test because of
-a bug or a missing feature.  Each entry names the tracker (a Jira issue or a
-pull request), the items that it disables, and the condition to remove the
-entry.  When the fix lands, delete the entry, and the items run again.
+This module is the only place that turns off a part of the fuzz test, or
+documents a failure of it, because of a bug or a missing feature.  Each entry
+names the tracker (a Jira issue or a pull request), and the condition to remove
+the entry.  When the fix lands, delete the entry.
+
+An entry has two ways to act, and it must use at least one:
+
+  * ``disables`` lists the items that the run does not do (a skip).  Use it
+    for a failure that is frequent, or that ends the run early (a hang, a
+    crash) and so hides the rest of the run.
+  * ``signatures`` lists regexes that match the signature of a failure (see
+    ``results.signature``).  A failure that matches still fails a run, so CI
+    and a developer see it, but the gating procedure counts it as known and
+    does not blame the branch under test (a tolerate).  Use it for a failure
+    that is rare, when the run still checks everything else.
 
 An item is a string ``<category>:<name>``:
 
@@ -33,6 +44,7 @@ To list the entries with their trackers::
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
@@ -54,6 +66,12 @@ class KnownIssue:
     disables: tuple[str, ...]
     # The condition to delete the entry.
     remove_when: str
+    # Regexes that match the signatures of the failures that the issue causes.
+    signatures: tuple[str, ...] = ()
+
+    @property
+    def action(self) -> str:
+        return "+".join(a for a, on in (("skip", self.disables), ("tolerate", self.signatures)) if on)
 
 
 KNOWN_ISSUES: tuple[KnownIssue, ...] = (
@@ -109,10 +127,14 @@ def _validate(issues: Iterable[KnownIssue]) -> None:
         ids.add(issue.id)
         if issue.kind not in KINDS:
             raise ValueError(f"known issue {issue.id}: kind {issue.kind!r} is not one of {KINDS}")
-        if not issue.trackers or not issue.remove_when or not issue.disables:
-            raise ValueError(f"known issue {issue.id}: trackers, disables and remove_when must not be empty")
+        if not issue.trackers or not issue.remove_when:
+            raise ValueError(f"known issue {issue.id}: trackers and remove_when must not be empty")
+        if not issue.disables and not issue.signatures:
+            raise ValueError(f"known issue {issue.id}: it must have disables, signatures, or both")
         for item in issue.disables:
             check_item(item)
+        for pattern in issue.signatures:
+            re.compile(pattern)
 
 
 def check_item(item: str) -> None:
@@ -151,12 +173,51 @@ class KnownIssues:
             return False
         return True
 
+    def match(self, signature: str, included: bool = False) -> Optional[KnownIssue]:
+        """Returns the known issue whose signatures match the signature of a failure, or None.
+
+        With ``included`` False, the match skips the issues that this run
+        includes, because a run includes an issue to check its fix.  With
+        ``included`` True, the match looks only at those issues.
+        """
+        for issue in self.issues:
+            if (issue.id in self.included) == included and any(re.search(p, signature) for p in issue.signatures):
+                return issue
+        return None
+
     def summary(self) -> str:
         lines = []
         for issue in self.issues:
             state = "INCLUDED" if issue.id in self.included else "disables"
-            lines.append(f"{issue.id} [{issue.kind}, {', '.join(issue.trackers)}]: {state} {', '.join(issue.disables)}")
+            parts = [f"{state} {', '.join(issue.disables)}"] if issue.disables else []
+            if issue.signatures:
+                parts.append(f"tolerates {len(issue.signatures)} signature(s)")
+            lines.append(f"{issue.id} [{issue.kind}, {', '.join(issue.trackers)}]: {'; '.join(parts)}")
         return "\n".join(lines)
+
+
+_JIRA_KEY = re.compile(r"\b[A-Z][A-Z0-9]+-\d+\b")
+_PULL_URL = re.compile(r"/pull/(\d+)")
+
+
+def fixed_by(text: str, issues: tuple[KnownIssue, ...] = KNOWN_ISSUES) -> dict[str, str]:
+    """Returns the known issues whose trackers ``text`` names, each with the tracker found.
+
+    ``text`` is what a branch says about itself: its commit messages and its
+    machete annotation.  A Jira key matches as a word.  A pull request matches
+    as its URL, ``PR 123``, ``PR #123``, ``pull/123`` or ``#123``.
+    """
+    found = {}
+    for issue in issues:
+        for tracker in issue.trackers:
+            if _JIRA_KEY.fullmatch(tracker):
+                if re.search(rf"\b{re.escape(tracker)}\b", text):
+                    found.setdefault(issue.id, tracker)
+            elif m := _PULL_URL.search(tracker):
+                n = m.group(1)
+                if re.search(rf"(?:\bPR ?#?|pull/|#){n}\b", text):
+                    found.setdefault(issue.id, tracker)
+    return found
 
 
 def main() -> None:
@@ -165,6 +226,9 @@ def main() -> None:
         print(f"{issue.id} ({issue.kind})")
         print(f"  trackers:    {', '.join(issue.trackers)}")
         print(f"  disables:    {', '.join(issue.disables)}")
+        print(f"  action:      {issue.action}")
+        if issue.signatures:
+            print(f"  signatures:  {'; '.join(issue.signatures)}")
         print(f"  remove when: {issue.remove_when}")
         print(f"  summary:     {issue.summary}")
         print()

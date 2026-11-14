@@ -30,6 +30,12 @@ from typing import Any
 
 ENV_PREFIX = "LOGSTOR_FUZZ_"
 
+# The env vars with the prefix that are not parameters of a profile: the
+# gating procedure reads them (see ``gating``).
+NON_PARAMETER_ENV = {ENV_PREFIX + name for name in (
+    "GATING", "GATING_ONLY", "GATING_EXPLORE", "GATING_EXPLORE_SEED", "RESULT_DIR",
+)}
+
 
 @dataclass(frozen=True)
 class ValueSize:
@@ -216,7 +222,7 @@ def load_profile(name: str, env: dict[str, str] | None = None) -> Profile:
     if ENV_PREFIX + "INCLUDE_KNOWN" in env:
         include_known = tuple(x for x in env[ENV_PREFIX + "INCLUDE_KNOWN"].split(",") if x)
         used.add(ENV_PREFIX + "INCLUDE_KNOWN")
-    unknown = {k for k in env if k.startswith(ENV_PREFIX)} - used
+    unknown = {k for k in env if k.startswith(ENV_PREFIX)} - used - NON_PARAMETER_ENV
     if unknown:
         raise ValueError(f"unknown logstor fuzz parameters: {sorted(unknown)}")
     profile = dataclasses.replace(profile, workload=workload, cluster=cluster, nemesis=nemesis, checks=checks,
