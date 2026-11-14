@@ -275,6 +275,48 @@ def test_start_step_names_the_stuck_logstor_shard():
     assert KnownIssues().match(signature("hang", f"127.3.255.2 did not start in 60s: {other}")) is None
 
 
+def test_extra_columns_check_the_write_of_v():
+    from test.cluster.logstor_fuzz.workload import LogstorWorkload
+    from test.cluster.logstor_fuzz.params import WorkloadParams
+    wl = LogstorWorkload(ks="ks", table_name="t0", name="t0", seed=5, params=WorkloadParams(keys=10, columns=5),
+                         table_index=0, ts_base=1000)
+    assert [(c.name, c.cql_type) for c in wl.extra] == [("c1", "bigint"), ("c2", "text"), ("c3", "int"), ("c4", "blob")]
+    assert wl.selection(wl.extra[:1]) == "v, writetime(v), c1, writetime(c1)"
+    values = wl.insert_values(3, 7, 20)
+    assert values[0] == 3 and decode_value(5, 0, 3, values[1]) == 7
+    # The values of a read, and the values of a dump as text.
+    read = {c.name: (v, 1007) for c, v in zip(wl.extra, values[2:])}
+    dumped = {c.name: (c.dump_text(v), 1007) for c, v in zip(wl.extra, values[2:])}
+    wl.check_columns(3, 7, read)
+    wl.check_columns(3, 7, dumped)
+    wl.check_columns(3, 7, {})
+    # A column of another write, a null column, and another write time.
+    other = wl.insert_values(3, 8, 20)
+    for cells in ({**read, "c2": (other[3], 1007)}, {**read, "c4": (None, None)}, {**read, "c1": (values[2], 1008)}):
+        with pytest.raises(CorruptValue, match=r"^seq 7: 1 of 4 other columns are not the columns of the write of v$"):
+            wl.check_columns(3, 7, cells)
+    with pytest.raises(CorruptValue, match="no value in v"):
+        wl.decode_row(3, None, None)
+
+
+def test_multi_column_items_and_known_issues():
+    from test.cluster.logstor_fuzz.gating import items_of
+    from test.cluster.logstor_fuzz.params import workload_items
+    from test.cluster.logstor_fuzz.test_logstor_fuzz import apply_known_issues
+    profile = load_profile("multi_column", {"LOGSTOR_FUZZ_SEED": "1"})
+    assert workload_items(profile) == {"schema:multi_column", "workload:column_subset_reads"}
+    assert {"schema:multi_column", "workload:column_subset_reads"} <= items_of(profile)
+    assert workload_items(load_profile("operations", {"LOGSTOR_FUZZ_SEED": "1"})) == set()
+    # The read-repair issue turns off the subset reads, and keeps the profile.
+    assert apply_known_issues(profile, KnownIssues()).workload.column_subset_read_fraction == 0
+    included = apply_known_issues(profile, KnownIssues(["logstor-read-repair"]))
+    assert included.workload.column_subset_read_fraction == profile.workload.column_subset_read_fraction
+    schema_issue = KnownIssue(id="x", kind="bug", trackers=("SCYLLADB-1",), summary="s",
+                              disables=("schema:multi_column",), remove_when="fixed")
+    with pytest.raises(pytest.skip.Exception, match="known issue x disables schema:multi_column"):
+        apply_known_issues(profile, KnownIssues(issues=(schema_issue,)))
+
+
 def test_probe_missing_keys(monkeypatch):
     import asyncio
     from test.cluster.logstor_fuzz import checks

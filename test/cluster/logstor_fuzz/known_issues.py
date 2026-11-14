@@ -91,9 +91,10 @@ KNOWN_ISSUES: tuple[KnownIssue, ...] = (
         kind="missing-feature",
         trackers=("SCYLLADB-3493",),
         summary="Read repair sends a diff of the row to a stale replica, and logstor applies only whole "
-                "rows.  The default schema has one regular column and each write sets it, so a diff is "
-                "a whole row; a schema with more columns can make read repair write part of a row.",
-        disables=("schema:multi_column",),
+                "rows.  Each write of the workload sets all columns with one timestamp, so the diff of a "
+                "read of the whole row is the whole row.  A read of some of the columns gets a whole row "
+                "only because the replica readers return all columns today, which nothing guarantees.",
+        disables=("workload:column_subset_reads",),
         remove_when="Read repair sends whole rows to logstor replicas (SCYLLADB-3493).",
     ),
     KnownIssue(

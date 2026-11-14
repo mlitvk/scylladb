@@ -21,6 +21,9 @@ what logstor needs:
   * a value carries a header (table, key, seq) and a payload that the reader
     makes again from the seed, so a read finds a corrupted value without a
     copy of the payload in memory;
+  * a table can have more regular columns than ``v``.  Each of them holds a
+    value that the reader makes again from the seq of ``v``, so a read finds a
+    row whose columns come from different writes, or a column that is null;
   * each read is checked by :class:`~test.cluster.logstor_fuzz.model.Model`
     when it returns.
 """
@@ -50,7 +53,9 @@ from test.pylib.rest_client import ScyllaMetricsLine
 
 logger = logging.getLogger(__name__)
 
-TABLE_SCHEMA = "(pk bigint PRIMARY KEY, v blob) WITH storage_engine = 'logstor'"
+# The types of the regular columns after ``v``, in order.  A table with more
+# columns repeats the list.
+EXTRA_COLUMN_TYPES = ("bigint", "text", "int", "blob")
 
 _MAGIC = b"LSFZ"
 _HEADER = struct.Struct(">4sHqqI")
@@ -72,6 +77,36 @@ def make_payload(seed: int, table: int, pk: int, seq: int, size: int) -> bytes:
 
 def encode_value(seed: int, table: int, pk: int, seq: int, size: int) -> bytes:
     return _HEADER.pack(_MAGIC, table, pk, seq, size) + make_payload(seed, table, pk, seq, size)
+
+
+@dataclass(frozen=True)
+class ExtraColumn:
+    """A regular column after ``v``, whose value comes from the seq of the row."""
+
+    name: str
+    cql_type: str
+
+    def value(self, seed: int, table: int, pk: int, seq: int):
+        """Returns the value of the column in the write ``seq`` of key ``pk``, as the driver returns it."""
+        rng = random.Random(f"{seed}/{table}/{pk}/{seq}/{self.name}")
+        if self.cql_type == "bigint":
+            return rng.getrandbits(62)
+        if self.cql_type == "int":
+            return rng.getrandbits(30)
+        if self.cql_type == "text":
+            return f"{pk}-{seq}-" + "".join(rng.choices("abcdefghijklmnopqrstuvwxyz", k=rng.randint(0, 40)))
+        if self.cql_type == "blob":
+            return rng.randbytes(rng.randint(0, 64))
+        raise ValueError(f"unknown column type {self.cql_type}")
+
+    def dump_text(self, value) -> str:
+        """Returns ``value`` as a MUTATION_FRAGMENTS row shows it."""
+        return value.hex() if isinstance(value, bytes) else str(value)
+
+
+def extra_columns(columns: int) -> list[ExtraColumn]:
+    """Returns the regular columns after ``v`` of a table with ``columns`` regular columns."""
+    return [ExtraColumn(f"c{i}", EXTRA_COLUMN_TYPES[(i - 1) % len(EXTRA_COLUMN_TYPES)]) for i in range(1, columns)]
 
 
 def decode_value(seed: int, table: int, pk: int, value: bytes) -> int:
@@ -133,6 +168,11 @@ class LogstorWorkload(RegisterWorkload):
     # The read with BYPASS CACHE; read_stmt of RegisterWorkload is the read through the cache.
     bypass_read_stmt: Optional[PreparedStatement] = field(default=None, repr=False)
     bypass_reads: int = 0
+    # The regular columns after ``v``.
+    extra: list[ExtraColumn] = field(default_factory=list)
+    # The reads of ``v`` and one more column, by the column and by BYPASS CACHE.
+    subset_read_stmts: dict[tuple[str, bool], PreparedStatement] = field(default_factory=dict, repr=False)
+    subset_reads: int = 0
 
     def __post_init__(self) -> None:
         self.num_keys = self.params.keys
@@ -143,9 +183,16 @@ class LogstorWorkload(RegisterWorkload):
         rank = list(range(self.num_keys))
         self.rng_for("key-rank").shuffle(rank)
         self._rank = {k: r for r, k in enumerate(rank)}
+        self.extra = extra_columns(self.params.columns)
+
+    def selection(self, columns: Sequence[ExtraColumn]) -> str:
+        """Returns the selection of a read of ``v`` and ``columns``, with the write time of each one."""
+        return ", ".join(f"{c}, writetime({c})" for c in ["v"] + [c.name for c in columns])
 
     async def create_table(self, cql) -> None:
-        await cql.run_async(f"CREATE TABLE {self.fqtn} {TABLE_SCHEMA}")
+        extra = "".join(f", {c.name} {c.cql_type}" for c in self.extra)
+        await cql.run_async(f"CREATE TABLE {self.fqtn} (pk bigint PRIMARY KEY, v blob{extra}) "
+                            f"WITH storage_engine = 'logstor'")
         self.prepare(cql)
 
     def prepare(self, cql) -> None:
@@ -156,17 +203,30 @@ class LogstorWorkload(RegisterWorkload):
         """
         write_cl = getattr(ConsistencyLevel, self.params.write_cl)
         read_cl = getattr(ConsistencyLevel, self.params.read_cl)
-        self.insert_stmt = cql.prepare(f"INSERT INTO {self.fqtn} (pk, v) VALUES (?, ?) USING TIMESTAMP ?")
+        names = ["pk", "v"] + [c.name for c in self.extra]
+        self.insert_stmt = cql.prepare(f"INSERT INTO {self.fqtn} ({', '.join(names)}) "
+                                       f"VALUES ({', '.join('?' * len(names))}) USING TIMESTAMP ?")
         self.delete_stmt = cql.prepare(f"DELETE FROM {self.fqtn} USING TIMESTAMP ? WHERE pk = ?")
-        self.read_stmt = cql.prepare(f"SELECT v, writetime(v) FROM {self.fqtn} WHERE pk = ?")
-        self.bypass_read_stmt = cql.prepare(f"SELECT v, writetime(v) FROM {self.fqtn} WHERE pk = ? BYPASS CACHE")
+        whole_row = self.selection(self.extra)
+        self.read_stmt = cql.prepare(f"SELECT {whole_row} FROM {self.fqtn} WHERE pk = ?")
+        self.bypass_read_stmt = cql.prepare(f"SELECT {whole_row} FROM {self.fqtn} WHERE pk = ? BYPASS CACHE")
+        self.subset_read_stmts = {
+            (c.name, bypass): cql.prepare(f"SELECT {self.selection([c])} FROM {self.fqtn} WHERE pk = ?"
+                                          + (" BYPASS CACHE" if bypass else ""))
+            for c in self.extra for bypass in (False, True)
+        }
         self.write_stmt = self.insert_stmt
         for stmt in (self.insert_stmt, self.delete_stmt):
             stmt.retry_policy = FallthroughRetryPolicy()
             stmt.consistency_level = write_cl
-        for stmt in (self.read_stmt, self.bypass_read_stmt):
+        for stmt in (self.read_stmt, self.bypass_read_stmt, *self.subset_read_stmts.values()):
             stmt.retry_policy = FallthroughRetryPolicy()
             stmt.consistency_level = read_cl
+
+    def insert_values(self, pk: int, seq: int, size: int) -> list:
+        """Returns the bound values of the INSERT of the write ``seq`` of key ``pk``, without the timestamp."""
+        value = encode_value(self.seed, self.table_index, pk, seq, size)
+        return [pk, value] + [c.value(self.seed, self.table_index, pk, seq) for c in self.extra]
 
     def owned_keys(self, writer_id: int) -> list[int]:
         return [k for k in range(self.num_keys) if k % self.num_writers == writer_id]
@@ -180,9 +240,43 @@ class LogstorWorkload(RegisterWorkload):
         Raises CorruptValue for a wrong value, or for a write time that is not
         the write time of the seq in the value.
         """
+        if value is None:
+            raise CorruptValue("the row has no value in v")
         seq = decode_value(self.seed, self.table_index, pk, value)
         if writetime != self.ts_base + seq:
             raise CorruptValue(f"seq {seq}: write time {writetime} is not {self.ts_base + seq}")
+        return seq
+
+    def check_columns(self, pk: int, seq: int, cells: dict[str, tuple]) -> None:
+        """Checks the cells of the columns after ``v`` against the write ``seq``.
+
+        ``cells`` maps a column name to its value and its write time, in the
+        form of ``ExtraColumn.value`` or of ``ExtraColumn.dump_text``.  Raises
+        CorruptValue when a column is null, has a value of another write, or has
+        another write time.  The message names no column, so that each column
+        gives the same failure signature, and the log names the columns.
+        """
+        bad = []
+        for c in self.extra:
+            if c.name not in cells:
+                continue
+            value, writetime = cells[c.name]
+            expected = c.value(self.seed, self.table_index, pk, seq)
+            if isinstance(value, str) and c.cql_type != "text":
+                expected = c.dump_text(expected)
+            if value is None or value != expected or writetime != self.ts_base + seq:
+                bad.append(f"{c.name} {c.cql_type}={value!r} at {writetime}")
+        if bad:
+            logger.error("%s key=%d seq %d: the columns that do not match the write: %s",
+                         self.fqtn, pk, seq, "; ".join(bad))
+            raise CorruptValue(f"seq {seq}: {len(bad)} of {len(cells)} other columns are not the columns "
+                               f"of the write of v")
+
+    def check_row(self, pk: int, row, columns: Sequence[ExtraColumn]) -> int:
+        """Returns the seq of a row that a read of ``v`` and ``columns`` returned, and checks the row."""
+        seq = self.decode_row(pk, row.v, row.writetime_v)
+        self.check_columns(pk, seq, {c.name: (getattr(row, c.name), getattr(row, f"writetime_{c.name}"))
+                                     for c in columns})
         return seq
 
     def violation(self, message: str) -> None:
@@ -193,7 +287,8 @@ class LogstorWorkload(RegisterWorkload):
         self.stop_event.set()
 
     def progress_line(self) -> str:
-        return f"{self.table_name}: {self.stats()} bypass_cache_reads={self.bypass_reads} violations={len(self.violations)}"
+        return (f"{self.table_name}: {self.stats()} bypass_cache_reads={self.bypass_reads} "
+                f"subset_reads={self.subset_reads} violations={len(self.violations)}")
 
 
 async def writer_task(wl: LogstorWorkload, cql, writer_id: int) -> None:
@@ -210,8 +305,7 @@ async def writer_task(wl: LogstorWorkload, cql, writer_id: int) -> None:
             history_value = 0
         else:
             kind = Kind.WRITE
-            value = encode_value(wl.seed, wl.table_index, pk, seq, wl._value_size.sample(rng))
-            bound = wl.insert_stmt.bind([pk, value, ts])
+            bound = wl.insert_stmt.bind(wl.insert_values(pk, seq, wl._value_size.sample(rng)) + [ts])
             history_value = seq
 
         op_id, t_call_ns = wl.history.record_call(writer_id, "write", pk, history_value)
@@ -246,11 +340,11 @@ async def preload(wl: LogstorWorkload, cql) -> None:
     async def slot(client_id: int) -> None:
         for pk in keys:
             seq = wl.next_write_value()
-            value = encode_value(wl.seed, wl.table_index, pk, seq, wl._value_size.sample(rng))
+            values = wl.insert_values(pk, seq, wl._value_size.sample(rng))
             op_id, t_call_ns = wl.history.record_call(client_id, "write", pk, seq)
             entry = wl.model.write_started(pk, seq, Kind.WRITE, t_call_ns)
             try:
-                await cql.run_async(wl.insert_stmt.bind([pk, value, wl.ts_base + seq]))
+                await cql.run_async(wl.insert_stmt.bind(values + [wl.ts_base + seq]))
             except Exception as exc:
                 outcome = wl.record_failure(exc, op_id=op_id, client_id=client_id, op="write", key=pk,
                                             value=seq, t_call_ns=t_call_ns)
@@ -274,7 +368,13 @@ async def reader_task(wl: LogstorWorkload, cql, reader_id: int) -> None:
         pk = chooser.pick(rng)
         check = rng.random() < wl.params.read_sample
         bypass = rng.random() < wl.params.bypass_cache_fraction
-        stmt = wl.bypass_read_stmt if bypass else wl.read_stmt
+        if wl.extra and rng.random() < wl.params.column_subset_read_fraction:
+            columns = [rng.choice(wl.extra)]
+            stmt = wl.subset_read_stmts[(columns[0].name, bypass)]
+            wl.subset_reads += 1
+        else:
+            columns = wl.extra
+            stmt = wl.bypass_read_stmt if bypass else wl.read_stmt
         op_id, t_call_ns = wl.history.record_call(client_id, "read", pk)
         read_id = wl.model.read_started(t_call_ns)
         try:
@@ -288,7 +388,7 @@ async def reader_task(wl: LogstorWorkload, cql, reader_id: int) -> None:
             seq = None
             try:
                 if rows:
-                    seq = wl.decode_row(pk, rows[0].v, rows[0].writetime_v)
+                    seq = wl.check_row(pk, rows[0], columns)
             except CorruptValue as e:
                 wl.violation(f"{'BYPASS CACHE ' if bypass else ''}key={pk} read=[{t_call_ns}..{t_return_ns}]: {e}")
             else:

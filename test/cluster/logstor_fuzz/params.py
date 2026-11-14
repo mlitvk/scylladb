@@ -101,6 +101,15 @@ class WorkloadParams:
     key_dist: str = "uniform"
     zipf_s: float = 1.1
     value_size: str = "uniform:32-2048"
+    # The regular columns of a table: ``v``, and ``columns - 1`` more columns of
+    # several types (see ``workload.EXTRA_COLUMN_TYPES``).  Each write sets all
+    # of them, and each column holds a value that the reader makes again from
+    # the seq of ``v``.  More than 1 is the schema item ``multi_column``.
+    columns: int = 1
+    # The fraction of the reads that select ``v`` and one more column, and not
+    # the whole row.  It acts only when ``columns`` is more than 1, and it is the
+    # workload item ``column_subset_reads``.
+    column_subset_read_fraction: float = 0.2
     # The writer and reader tasks of each table.
     writers: int = 4
     readers: int = 2
@@ -243,6 +252,12 @@ PROFILES: dict[str, Profile] = {
     ),
 }
 
+# The operations profile on tables with 5 regular columns of several types.
+PROFILES["multi_column"] = dataclasses.replace(
+    PROFILES["operations"], name="multi_column",
+    workload=WorkloadParams(columns=5),
+)
+
 # The operations profile with injected failures: delays, errors, pauses and a
 # fatal disk error at points of logstor (see failures.py).
 PROFILES["failures"] = dataclasses.replace(
@@ -326,6 +341,16 @@ def load_profile(name: str, env: dict[str, str] | None = None) -> Profile:
     return profile
 
 
+def workload_items(profile: Profile) -> set[str]:
+    """Returns the schema and workload items of the known issues that ``profile`` uses."""
+    items = set()
+    if profile.workload.columns > 1:
+        items.add("schema:multi_column")
+        if profile.workload.column_subset_read_fraction > 0:
+            items.add("workload:column_subset_reads")
+    return items
+
+
 # The bytes of a record above the payload of its value: the value header of the
 # workload (26 B) and the logstor record (the header, the key and the mutation
 # framing, about 330 B for this one-column schema on master in Nov 2026).
@@ -337,9 +362,16 @@ RECORD_OVERHEAD = 356
 MAX_UTILIZATION = 0.6
 
 
+# The mean bytes of one more column in a record: the mean value of the column
+# types of ``workload.EXTRA_COLUMN_TYPES`` and the cell framing.  Calibrated in
+# Nov 2026: a plan of 0.50 with 40 B gave 0.59 after the preload of the
+# multi_column profile, where one column gives 0.49.
+EXTRA_COLUMN_BYTES = 120
+
+
 def record_bytes(w: WorkloadParams) -> float:
     """Returns the mean size of a record of the workload in the logstor store."""
-    return ValueSize(w.value_size).mean() + RECORD_OVERHEAD
+    return ValueSize(w.value_size).mean() + RECORD_OVERHEAD + (w.columns - 1) * EXTRA_COLUMN_BYTES
 
 
 def keys_for(w: WorkloadParams, c: ClusterParams) -> int:
@@ -373,6 +405,8 @@ def validate(profile: Profile) -> None:
     if w.key_dist not in ("uniform", "zipf"):
         raise ValueError(f"unknown key_dist {w.key_dist!r}")
     ValueSize(w.value_size)
+    if w.columns < 1:
+        raise ValueError(f"columns={w.columns}: a table needs the column v")
     if w.keys < w.writers:
         raise ValueError(f"keys={w.keys} is fewer than writers={w.writers}")
     if c.rf != len(c.nodes_per_rack):

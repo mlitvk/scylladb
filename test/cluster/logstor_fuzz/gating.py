@@ -48,7 +48,7 @@ from pathlib import Path
 from typing import Iterable, Mapping, Optional
 
 from test.cluster.logstor_fuzz.known_issues import KnownIssues, fixed_by
-from test.cluster.logstor_fuzz.params import ENV_PREFIX, PROFILES, Profile
+from test.cluster.logstor_fuzz.params import ENV_PREFIX, PROFILES, Profile, workload_items
 from test.cluster.logstor_fuzz.results import RunResult, node_log_failure, signature
 
 # The fixed seeds of the gating cases.  Do not change them: a case id names its
@@ -65,6 +65,7 @@ FULL = (
     ("workload_only", 2, "dev"),
     ("operations", 6, "dev"),
     ("operations_skewed", 4, "dev"),
+    ("multi_column", 2, "dev"),
     ("operations", 1, "debug"),
     ("operations_skewed", 1, "debug"),
 )
@@ -106,7 +107,7 @@ def items_of(profile: Profile) -> set[str]:
              | {f"failure:{f}" for f in profile.nemesis.failures})
     if profile.checks.replica_check:
         items.add("check:repair_and_compare_replicas")
-    return items
+    return items | workload_items(profile)
 
 
 def gating_cases(env: Mapping[str, str] | None = None, modes: Iterable[str] | None = None) -> list[GatingCase]:
