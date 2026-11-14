@@ -130,6 +130,9 @@ class LogstorWorkload(RegisterWorkload):
 
     insert_stmt: Optional[PreparedStatement] = field(default=None, repr=False)
     delete_stmt: Optional[PreparedStatement] = field(default=None, repr=False)
+    # The read with BYPASS CACHE; read_stmt of RegisterWorkload is the read through the cache.
+    bypass_read_stmt: Optional[PreparedStatement] = field(default=None, repr=False)
+    bypass_reads: int = 0
 
     def __post_init__(self) -> None:
         self.num_keys = self.params.keys
@@ -156,12 +159,14 @@ class LogstorWorkload(RegisterWorkload):
         self.insert_stmt = cql.prepare(f"INSERT INTO {self.fqtn} (pk, v) VALUES (?, ?) USING TIMESTAMP ?")
         self.delete_stmt = cql.prepare(f"DELETE FROM {self.fqtn} USING TIMESTAMP ? WHERE pk = ?")
         self.read_stmt = cql.prepare(f"SELECT v, writetime(v) FROM {self.fqtn} WHERE pk = ?")
+        self.bypass_read_stmt = cql.prepare(f"SELECT v, writetime(v) FROM {self.fqtn} WHERE pk = ? BYPASS CACHE")
         self.write_stmt = self.insert_stmt
         for stmt in (self.insert_stmt, self.delete_stmt):
             stmt.retry_policy = FallthroughRetryPolicy()
             stmt.consistency_level = write_cl
-        self.read_stmt.retry_policy = FallthroughRetryPolicy()
-        self.read_stmt.consistency_level = read_cl
+        for stmt in (self.read_stmt, self.bypass_read_stmt):
+            stmt.retry_policy = FallthroughRetryPolicy()
+            stmt.consistency_level = read_cl
 
     def owned_keys(self, writer_id: int) -> list[int]:
         return [k for k in range(self.num_keys) if k % self.num_writers == writer_id]
@@ -188,7 +193,7 @@ class LogstorWorkload(RegisterWorkload):
         self.stop_event.set()
 
     def progress_line(self) -> str:
-        return f"{self.table_name}: {self.stats()} violations={len(self.violations)}"
+        return f"{self.table_name}: {self.stats()} bypass_cache_reads={self.bypass_reads} violations={len(self.violations)}"
 
 
 async def writer_task(wl: LogstorWorkload, cql, writer_id: int) -> None:
@@ -268,10 +273,12 @@ async def reader_task(wl: LogstorWorkload, cql, reader_id: int) -> None:
     while not wl.stop_event.is_set():
         pk = chooser.pick(rng)
         check = rng.random() < wl.params.read_sample
+        bypass = rng.random() < wl.params.bypass_cache_fraction
+        stmt = wl.bypass_read_stmt if bypass else wl.read_stmt
         op_id, t_call_ns = wl.history.record_call(client_id, "read", pk)
         read_id = wl.model.read_started(t_call_ns)
         try:
-            rows = await cql.run_async(wl.read_stmt.bind([pk]))
+            rows = await cql.run_async(stmt.bind([pk]))
         except Exception as exc:
             wl.model.read_finished(read_id)
             wl.record_failure(exc, op_id=op_id, client_id=client_id, op="read", key=pk, value=0,
@@ -283,12 +290,13 @@ async def reader_task(wl: LogstorWorkload, cql, reader_id: int) -> None:
                 if rows:
                     seq = wl.decode_row(pk, rows[0].v, rows[0].writetime_v)
             except CorruptValue as e:
-                wl.violation(f"key={pk} read=[{t_call_ns}..{t_return_ns}]: {e}")
+                wl.violation(f"{'BYPASS CACHE ' if bypass else ''}key={pk} read=[{t_call_ns}..{t_return_ns}]: {e}")
             else:
                 if check:
                     error = wl.model.check_read(pk, t_call_ns, t_return_ns, seq)
                     if error:
-                        wl.violation(error)
+                        wl.violation(f"{'BYPASS CACHE ' if bypass else ''}{error}")
+            wl.bypass_reads += bypass
             wl.model.read_finished(read_id)
             wl.history.record_return(op_id, client_id, "read", pk, seq or 0, Outcome.OK, t_return_ns)
 
