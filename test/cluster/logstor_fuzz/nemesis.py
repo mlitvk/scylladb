@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Sequence
 
 from test.cluster.logstor_fuzz.operations import OPERATIONS, FuzzContext
+from test.cluster.logstor_fuzz.results import FuzzFailure
 from test.pylib.rest_client import ScyllaMetricsLine
 
 logger = logging.getLogger(__name__)
@@ -49,8 +50,9 @@ DIAGNOSTIC_METRICS = (
 )
 
 
-class HangError(Exception):
-    pass
+class HangError(FuzzFailure):
+    def __init__(self, reason: str) -> None:
+        super().__init__("hang", reason)
 
 
 @dataclass(frozen=True)
@@ -166,7 +168,7 @@ async def nemesis_task(ctx: FuzzContext, schedule: Sequence[ScheduledOp], stop: 
             except Exception as e:
                 events.add("op_error", index=item.index, op=op.name, error=repr(e))
                 stop.set()
-                raise
+                raise FuzzFailure("op_error", f"{op.name}: {type(e).__name__}: {e}") from e
         if skipped is not None:
             events.add("op_skip", index=item.index, op=op.name, reason=skipped)
         else:

@@ -41,6 +41,7 @@ from cassandra.query import SimpleStatement
 
 from test.cluster.logstor_fuzz.known_issues import KnownIssues
 from test.cluster.logstor_fuzz.model import Kind, Status
+from test.cluster.logstor_fuzz.results import FuzzFailure
 from test.cluster.logstor_fuzz.workload import CorruptValue, LogstorWorkload
 from test.cluster.util import reconnect_driver
 from test.pylib.tablets import get_all_tablet_replicas
@@ -79,7 +80,8 @@ class CheckErrors:
         if self.errors:
             shown = "\n  ".join(self.errors[:MAX_REPORTED])
             more = f"\n  ... and {len(self.errors) - MAX_REPORTED} more" if len(self.errors) > MAX_REPORTED else ""
-            raise AssertionError(f"{self.what}: {len(self.errors)} errors:\n  {shown}{more}")
+            raise FuzzFailure("final_check", self.errors[0],
+                              f"{self.what}: {len(self.errors)} errors:\n  {shown}{more}")
 
 
 def _state_of_source(wl: LogstorWorkload, pk: int, rows: list, errors: CheckErrors, where: str) -> Optional[KeyState]:
