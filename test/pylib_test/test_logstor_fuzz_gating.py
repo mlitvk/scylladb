@@ -128,3 +128,23 @@ def test_classify(tmp_path):
         # The two violations have one signature, and nothing knows it.
         ("unclassified", ["operations-s4-dev", "operations-s5-dev"]),
     ]
+
+
+def test_failure_schedule_and_filter():
+    from test.cluster.logstor_fuzz.failures import FAILURES, enabled_failures, make_failure_schedule
+    from test.cluster.logstor_fuzz.operations import FuzzContext
+    from test.cluster.logstor_fuzz.params import load_profile
+    profile = load_profile("failures", {"LOGSTOR_FUZZ_SEED": "3"})
+    names = list(profile.nemesis.failures)
+    assert set(names) <= set(FAILURES)
+    schedule = make_failure_schedule(3, names, 300, (5, 25))
+    assert schedule == make_failure_schedule(3, names, 300, (5, 25))
+    assert sum(f.pause_s for f in schedule) < 300
+    issue = KnownIssue(id="x", kind="bug", trackers=("SCYLLADB-1",), summary="s",
+                       disables=("failure:fail_separator_flush",), remove_when="fixed")
+    ctx = FuzzContext(manager=None, profile=profile, workloads=[], known=KnownIssues(issues=(issue,)))
+    assert "fail_separator_flush" not in enabled_failures(ctx)
+    assert "delay_compaction" in enabled_failures(ctx)
+    # A fatal failure leaves the node lock to the node operations, and it runs in their window.
+    assert FAILURES["segment_write_io_error"].window == "node"
+    assert FAILURES["delay_compaction"].window == "failure"
