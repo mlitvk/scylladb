@@ -190,6 +190,23 @@ hot path can be attributed to the step it moved. Its tests, its options, how its
 what a run has to get right are in the comment at the top of
 [test/perf/perf_logstor.cc](../../test/perf/perf_logstor.cc).
 
+## Testing With Injected Delays
+
+The logstor fuzz test (`test/cluster/logstor_fuzz/`) runs a checked workload under random cluster
+operations and injected failures. To change the order of the steps that run at the same time, it
+enables the delay injection points below through the error injection REST API, with the parameter
+`delay_ms`. The points exist in debug and dev builds only (`replica/logstor/injected_delay.hh`).
+
+| Point | Where it waits |
+| --- | --- |
+| `logstor_delay_segment_write` | before a write buffer is written to its segment (writes, the separator and compaction) |
+| `logstor_delay_index_insert` | after a write is in its segment, before the index points to it |
+| `logstor_delay_segment_read` | before a record is read from its segment |
+| `logstor_delay_separator_flush` | before a separator buffer is written to its segment |
+| `logstor_delay_compaction` | after compaction selects its segments, before it rewrites their records |
+| `logstor_delay_stream_snapshot` | after the source of a tablet stream disables compaction, before it lists the segments |
+| `logstor_delay_stream_adopt` | after a streamed segment is received, before its records are indexed |
+
 ## On-Disk Format
 
 This section describes the parts of the format and the purpose of each part. See these files for

@@ -12,8 +12,10 @@
 #include <seastar/util/log.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/metrics.hh>
+#include <seastar/core/sleep.hh>
 #include "keys/keys.hh"
 #include "mutation/frozen_mutation.hh"
+#include "replica/logstor/injected_delay.hh"
 #include "replica/logstor/key_utils.hh"
 #include "replica/logstor/record_value.hh"
 #include "replica/logstor/segment_manager.hh"
@@ -177,6 +179,9 @@ future<> logstor::do_write(const schema& s, dht::decorated_key dk, api::timestam
     auto [location, op] = co_await coroutine::try_future(
             _write_buffer.write(std::move(writer), timeout, std::move(target)));
 
+    if (auto delay = injected_delay("logstor_delay_index_insert")) {
+        co_await seastar::sleep(*delay);
+    }
     cg.logstor_index().insert(key, index_entry{
         .location = location,
         .timestamp = ts,
