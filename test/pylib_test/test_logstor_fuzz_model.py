@@ -227,3 +227,44 @@ def test_known_issues_filter_operations():
     bad = load_profile("operations", {"LOGSTOR_FUZZ_SEED": "1", "LOGSTOR_FUZZ_OPS": "no_such_op"})
     with pytest.raises(ValueError, match="unknown operation"):
         enabled_operations(FuzzContext(manager=None, profile=bad, workloads=[], known=KnownIssues()))
+
+
+def test_time_limits():
+    from test.cluster.logstor_fuzz.operations import OPERATIONS
+    profile = load_profile("operations", {"LOGSTOR_FUZZ_SEED": "1", "LOGSTOR_FUZZ_NODE_START_S": "30"})
+    assert profile.limits.node_start_s == 30
+    debug = profile.limits.for_mode("debug")
+    assert debug.node_start_s == 90 and debug.data_op_s == 3 * profile.limits.data_op_s
+    assert profile.limits.for_mode("dev") == profile.limits
+    for op in OPERATIONS.values():
+        assert profile.limits.op_s(op.kind) > 0, op.name
+
+
+class _FakeLog:
+    """A node log for ``_start_step``, with the ``grep`` of ``ScyllaLogFile``."""
+
+    def __init__(self, lines: list[str]) -> None:
+        self.lines = lines
+
+    async def grep(self, expr, from_mark=None):
+        return [(line, m) for line in self.lines if (m := expr.search(line))]
+
+
+# The lines of a node log from a run that hung in the logstor start of shard 1 (Nov 2026).
+_STUCK_START = """\
+INFO  2026-11-14 17:10:52,277 [shard 0:main] init - recovering logstor
+INFO  2026-11-14 17:10:52,284 [shard 1:main] logstor - Starting logstor
+INFO  2026-11-14 17:10:52,284 [shard 0:main] logstor - Starting logstor
+INFO  2026-11-14 17:10:52,284 [shard 0:main] logstor - Separating the records of 1 recovered segments
+INFO  2026-11-14 17:10:52,284 [shard 0:main] logstor - logstor started
+WARN  2026-11-14 17:10:53,373 [shard 1: gms] raft_group_registry - ping(id = d0ae08ba): node has no IP address mapping
+""".splitlines(keepends=True)
+
+
+def test_start_step_names_the_stuck_logstor_shard():
+    import asyncio
+    from test.cluster.logstor_fuzz.operations import _start_step
+    step = asyncio.run(_start_step(_FakeLog(_STUCK_START), 0))
+    assert step == "logstor did not finish its start on shard 1"
+    other = asyncio.run(_start_step(_FakeLog(_STUCK_START[:1]), 0))
+    assert other == "the last init step is 'recovering logstor'"

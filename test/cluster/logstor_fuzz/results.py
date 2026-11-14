@@ -47,6 +47,8 @@ _VARIABLE_PARTS = (
     (re.compile(r"\b\d{4}-\d\d-\d\d[ T]\d\d:\d\d:\d\d(?:[,.]\d+)?\b"), "<time>"),
     (re.compile(r"0x[0-9a-fA-F]+"), "<hex>"),
     (re.compile(r"(?:/[\w.+\-]+){2,}"), "<path>"),
+    # A number with a unit of time, for example a limit that depends on the build mode.
+    (re.compile(r"\b\d+(?:\.\d+)?(ms|s)\b"), r"<n>\1"),
     (re.compile(r"-?\b\d+(?:\.\d+)?\b"), "<n>"),
     (re.compile(r"\s+"), " "),
 )
@@ -79,6 +81,13 @@ class FuzzFailure(AssertionError):
         super().__init__(f"{kind}: {message}" + (f"\n{details}" if details else ""))
         self.kind = kind
         self.message = message
+
+
+class HangError(FuzzFailure):
+    """A part of the run that did not finish in its time limit."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__("hang", reason)
 
 
 @dataclass

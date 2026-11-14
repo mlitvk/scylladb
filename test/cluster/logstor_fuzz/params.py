@@ -139,8 +139,6 @@ class NemesisParams:
     ops: tuple[str, ...] = ()
     # The pause between two operations, in seconds.
     op_interval: tuple[float, float] = (5.0, 20.0)
-    # An operation that runs longer than this fails the run as a hang.
-    op_timeout_s: float = 600.0
     # The run fails as a hang when no write of a table is acknowledged for this long.
     stall_timeout_s: float = 90.0
     # An operation that moves data between shards (a tablet move, a resize) does
@@ -148,6 +146,48 @@ class NemesisParams:
     # so that the operations cannot fill a shard (see the known issue
     # logstor-full-store-hang).
     max_shard_utilization: float = 0.65
+
+
+@dataclass(frozen=True)
+class TimeLimits:
+    """The time limits of the parts of a run, in seconds, for a dev or a release build.
+
+    A part that runs longer than its limit fails the run as a hang, so that a
+    stuck node or a stuck check ends the test in minutes and not at the timeout
+    of pytest.  A debug build is slower, so ``for_mode()`` multiplies each limit
+    by ``MODE_TIME_SCALE``.  Each limit is three or more times the longest
+    time that the part took in a dev run in Nov 2026.
+    """
+
+    # The start of the cluster, and the preload of the tables.
+    boot_s: float = 120.0
+    preload_s: float = 120.0
+    # The time that the tasks of the run get to stop after ``duration_s``,
+    # above the limit of the longest operation.
+    stop_s: float = 120.0
+    # The checks after the run, with the restart of all nodes.
+    checks_s: float = 300.0
+    # The start of one node, until it serves CQL.
+    node_start_s: float = 60.0
+    # The operations of the nemesis, by the kind of the operation (see
+    # ``operations.Operation.kind``).
+    quick_op_s: float = 60.0
+    node_op_s: float = 120.0
+    data_op_s: float = 240.0
+
+    def op_s(self, kind: str) -> float:
+        """Returns the limit of an operation of ``kind``: ``quick``, ``node`` or ``data``."""
+        return getattr(self, f"{kind}_op_s")
+
+    def for_mode(self, mode: str) -> TimeLimits:
+        """Returns the limits for a build of ``mode``."""
+        scale = MODE_TIME_SCALE.get(mode, 1.0)
+        return dataclasses.replace(self, **{f.name: getattr(self, f.name) * scale for f in dataclasses.fields(self)})
+
+
+# A debug build runs the operations about one and a half to three times slower
+# than a dev build.
+MODE_TIME_SCALE = {"debug": 3.0}
 
 
 @dataclass(frozen=True)
@@ -170,6 +210,7 @@ class Profile:
     cluster: ClusterParams = field(default_factory=ClusterParams)
     nemesis: NemesisParams = field(default_factory=NemesisParams)
     checks: CheckParams = field(default_factory=CheckParams)
+    limits: TimeLimits = field(default_factory=TimeLimits)
     seed: int = 0
     # The ids of the known issues whose items this run includes anyway.
     include_known: tuple[str, ...] = ()
@@ -177,6 +218,7 @@ class Profile:
     def describe(self) -> str:
         return (f"profile={self.name} seed={self.seed} duration={self.duration_s}s "
                 f"workload={self.workload} cluster={self.cluster} nemesis={self.nemesis} checks={self.checks} "
+                f"limits={self.limits} "
                 f"include_known={self.include_known}")
 
 
@@ -241,6 +283,7 @@ def load_profile(name: str, env: dict[str, str] | None = None) -> Profile:
     cluster = _override(profile.cluster, env, used)
     nemesis = _override(profile.nemesis, env, used)
     checks = _override(profile.checks, env, used)
+    limits = _override(profile.limits, env, used)
     duration_s = profile.duration_s
     if ENV_PREFIX + "DURATION" in env:
         duration_s = float(env[ENV_PREFIX + "DURATION"])
@@ -260,7 +303,7 @@ def load_profile(name: str, env: dict[str, str] | None = None) -> Profile:
     if workload.keys == 0:
         workload = dataclasses.replace(workload, keys=keys_for(workload, cluster))
     profile = dataclasses.replace(profile, workload=workload, cluster=cluster, nemesis=nemesis, checks=checks,
-                                  duration_s=duration_s, seed=seed, include_known=include_known)
+                                  limits=limits, duration_s=duration_s, seed=seed, include_known=include_known)
     validate(profile)
     return profile
 

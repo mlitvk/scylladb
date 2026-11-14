@@ -17,8 +17,8 @@ Two more tasks watch the run for hangs:
   * the watchdog fails the run when a table has no acknowledged write for
     ``stall_timeout_s``, which the operations never cause, because at most one
     replica of a tablet is down at a time;
-  * the nemesis fails the run when an operation runs longer than
-    ``op_timeout_s``.
+  * the nemesis fails the run when an operation runs longer than the limit
+    of its kind (see ``params.TimeLimits``).
 
 Before either fails the run, it logs the diagnostics of the cluster.
 """
@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Sequence
 
 from test.cluster.logstor_fuzz.operations import OPERATIONS, FuzzContext
-from test.cluster.logstor_fuzz.results import FuzzFailure
+from test.cluster.logstor_fuzz.results import FuzzFailure, HangError
 from test.pylib.rest_client import ScyllaMetricsLine
 
 logger = logging.getLogger(__name__)
@@ -48,11 +48,6 @@ DIAGNOSTIC_METRICS = (
     "scylla_logstor_sm_segment_pool_size",
     "scylla_logstor_queued_write_count",
 )
-
-
-class HangError(FuzzFailure):
-    def __init__(self, reason: str) -> None:
-        super().__init__("hang", reason)
 
 
 @dataclass(frozen=True)
@@ -115,6 +110,22 @@ def make_schedule(seed: int, names: Sequence[str], duration_s: float,
         schedule.append(ScheduledOp(len(schedule), rng.choices(names, weights)[0], round(pause, 3)))
 
 
+@contextlib.asynccontextmanager
+async def time_limit(what: str, limit_s: float):
+    """Raises HangError when the body runs longer than ``limit_s``.
+
+    A TimeoutError of the body itself goes up unchanged.
+    """
+    timeout = asyncio.timeout(limit_s)
+    try:
+        async with timeout:
+            yield
+    except TimeoutError:
+        if not timeout.expired():
+            raise
+        raise HangError(f"{what} did not finish in {limit_s:.0f}s") from None
+
+
 async def _wait_or_stop(stop: asyncio.Event, seconds: float) -> bool:
     """Waits ``seconds`` and returns False, or returns True as soon as ``stop`` is set."""
     with contextlib.suppress(asyncio.TimeoutError):
@@ -122,9 +133,25 @@ async def _wait_or_stop(stop: asyncio.Event, seconds: float) -> bool:
     return stop.is_set()
 
 
+# The time limit of the diagnostics, in seconds: a hung cluster can also hang
+# the requests of the diagnostics.
+DIAGNOSTICS_LIMIT_S = 60
+
+
 async def diagnostics(ctx: FuzzContext, events: EventLog, reason: str) -> None:
     """Logs the state of the cluster for a hang."""
     logger.error("Hang: %s. Diagnostics follow.", reason)
+    try:
+        async with asyncio.timeout(DIAGNOSTICS_LIMIT_S):
+            await _log_cluster_state(ctx)
+    except TimeoutError:
+        logger.error("The diagnostics did not finish in %ds", DIAGNOSTICS_LIMIT_S)
+    for record in events.recent[-20:]:
+        logger.error("Recent event: %s", record)
+    events.add("hang", reason=reason)
+
+
+async def _log_cluster_state(ctx: FuzzContext) -> None:
     for server in await ctx.manager.running_servers():
         try:
             metrics = await ctx.manager.metrics.query(server.ip_addr)
@@ -143,14 +170,10 @@ async def diagnostics(ctx: FuzzContext, events: EventLog, reason: str) -> None:
         logger.error("Tablets in transition (%d): %s", len(moving), moving[:20])
     except Exception as e:
         logger.error("system.tablets is not available: %s", e)
-    for record in events.recent[-20:]:
-        logger.error("Recent event: %s", record)
-    events.add("hang", reason=reason)
 
 
 async def nemesis_task(ctx: FuzzContext, schedule: Sequence[ScheduledOp], stop: asyncio.Event,
                        events: EventLog) -> None:
-    timeout = ctx.profile.nemesis.op_timeout_s
     for item in schedule:
         if await _wait_or_stop(stop, item.pause_s):
             return
@@ -158,6 +181,7 @@ async def nemesis_task(ctx: FuzzContext, schedule: Sequence[ScheduledOp], stop: 
         rng = random.Random(f"{ctx.profile.seed}/nemesis/op/{item.index}")
         events.add("op_start", index=item.index, op=op.name)
         start = time.monotonic()
+        timeout = ctx.limits.op_s(op.kind)
         async with ctx.window(op.window):
             try:
                 skipped = await asyncio.wait_for(op.fn(ctx, rng), timeout)
@@ -165,6 +189,10 @@ async def nemesis_task(ctx: FuzzContext, schedule: Sequence[ScheduledOp], stop: 
                 reason = f"operation {item.index} {op.name} did not finish in {timeout:.0f}s"
                 await diagnostics(ctx, events, reason)
                 raise HangError(reason) from None
+            except HangError as e:
+                # A step of the operation has a limit of its own, for example the start of a node.
+                await diagnostics(ctx, events, f"operation {item.index} {op.name}: {e.message}")
+                raise
             except Exception as e:
                 events.add("op_error", index=item.index, op=op.name, error=repr(e))
                 stop.set()

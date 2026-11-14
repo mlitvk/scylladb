@@ -41,6 +41,7 @@ from cassandra.query import SimpleStatement
 
 from test.cluster.logstor_fuzz.known_issues import KnownIssues
 from test.cluster.logstor_fuzz.model import Kind, Status
+from test.cluster.logstor_fuzz.operations import start_node
 from test.cluster.logstor_fuzz.results import FuzzFailure
 from test.cluster.logstor_fuzz.workload import CorruptValue, LogstorWorkload
 from test.cluster.util import reconnect_driver
@@ -256,7 +257,7 @@ async def scan_all(cql, wl: LogstorWorkload, errors: CheckErrors, what: str) -> 
 
 
 async def final_checks(manager, cql, workloads: Sequence[LogstorWorkload], write_quorum: int,
-                       replica_check: bool, final_restart: str, known: KnownIssues):
+                       replica_check: bool, final_restart: str, known: KnownIssues, node_start_s: float):
     """Runs the checks of the module docstring, and returns the driver session to use after them.
 
     Raises AssertionError with the list of the failed checks.
@@ -288,9 +289,9 @@ async def final_checks(manager, cql, workloads: Sequence[LogstorWorkload], write
         for s in servers:
             await manager.server_stop_gracefully(s.server_id)
         for s in servers:
-            await manager.server_start(s.server_id)
+            await start_node(manager, s, node_start_s)
         cql = await reconnect_driver(manager)
-        await wait_for_cql_and_get_hosts(cql, servers, time.time() + 60)
+        await wait_for_cql_and_get_hosts(cql, servers, time.time() + node_start_s)
         errors = CheckErrors("checks after the restart")
         for wl in workloads:
             if replica_check:
