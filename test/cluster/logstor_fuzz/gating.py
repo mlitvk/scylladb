@@ -61,12 +61,15 @@ SEEDS = (
 # The cases of the full set: (profile, number of seeds, mode).
 FULL = (
     ("workload_only", 2, "dev"),
-    ("operations", 8, "dev"),
-    ("operations", 2, "debug"),
+    ("operations", 6, "dev"),
+    ("operations_skewed", 4, "dev"),
+    ("operations", 1, "debug"),
+    ("operations_skewed", 1, "debug"),
 )
 QUICK = (
     ("workload_only", 1, "dev"),
     ("operations", 1, "dev"),
+    ("operations_skewed", 1, "dev"),
 )
 # The number of seeds of a profile that the cases add for an unskipped item.
 EXTRA_SEEDS = 2
