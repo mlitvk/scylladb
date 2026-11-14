@@ -561,8 +561,8 @@ class RegisterWorkload:
         key: int,
         value: int,
         t_call_ns: int,
-    ) -> None:
-        """Ask the policy about a failed operation and record its outcome.
+    ) -> Outcome:
+        """Ask the policy about a failed operation, record its outcome and return it.
 
         Written once for both client kinds: the rule it implements is subtle
         enough that two copies would be two chances to get it wrong.
@@ -601,6 +601,7 @@ class RegisterWorkload:
         if outcome is not Outcome.UNKNOWN:
             self.history.record_return(
                 op_id, client_id, op, key, value, outcome, ctx.t_return_ns)
+        return outcome
 
     def stats(self, client_id: Optional[int] = None,
               within_ns: Optional[tuple[int, int]] = None) -> Stats:
