@@ -34,9 +34,9 @@ from test.cluster.logstor_fuzz.gating import gating_cases
 from test.cluster.logstor_fuzz.known_issues import KnownIssues
 from test.cluster.logstor_fuzz.nemesis import EventLog, enabled_operations, make_schedule, nemesis_task, watchdog_task
 from test.cluster.logstor_fuzz.operations import EXCEPTION_POLICY, FuzzContext
-from test.cluster.logstor_fuzz.params import ENV_PREFIX, Profile, load_profile, live_bytes_per_shard
+from test.cluster.logstor_fuzz.params import ENV_PREFIX, Profile, load_profile, utilization_estimate
 from test.cluster.logstor_fuzz.results import FuzzFailure, RunResult, failure_of
-from test.cluster.logstor_fuzz.workload import LogstorWorkload, SegmentPeaks, run_workloads
+from test.cluster.logstor_fuzz.workload import LogstorWorkload, SegmentPeaks, preload, run_workloads
 from test.cluster.strong_consistency.outcomes import strict
 from test.cluster.strong_consistency.register_workload import check_linearizable
 from test.cluster.util import new_test_keyspace
@@ -100,7 +100,8 @@ async def run_case(manager: ScyllaClusterManager, profile: Profile, request, tmp
 async def run_profile(manager: ScyllaClusterManager, profile: Profile, tmp_path) -> None:
     logger.info("Logstor fuzz run: %s", profile.describe())
     logger.info("To run the same choices again, set LOGSTOR_FUZZ_SEED=%d", profile.seed)
-    logger.info("Live data bound: %.1f MB per shard", live_bytes_per_shard(profile) / 2**20)
+    logger.info("Planned utilization of a full-copy shard: %.2f (%d keys per table)",
+                utilization_estimate(profile), profile.workload.keys)
     known = KnownIssues(profile.include_known)
     logger.info("Known issues (test/cluster/logstor_fuzz/known_issues.py):\n%s", known.summary())
     rack_of = await boot_cluster(manager, profile)
@@ -120,9 +121,15 @@ async def run_profile(manager: ScyllaClusterManager, profile: Profile, tmp_path)
             await wl.create_table(cql)
             workloads.append(wl)
 
+        peaks = SegmentPeaks(store_bytes=c.logstor_disk_size_in_mb * 2**20)
+        if w.preload:
+            await asyncio.gather(*(preload(wl, cql) for wl in workloads))
+            await peaks.sample(manager)
+            logger.info("Store use after the preload: %s", peaks.summary())
+
         config, cmdline = node_config(profile)
         ctx = FuzzContext(manager=manager, profile=profile, workloads=workloads, known=known,
-                          node_config=config, node_cmdline=cmdline, rack_of=rack_of)
+                          node_config=config, node_cmdline=cmdline, rack_of=rack_of, peaks=peaks)
         schedule = make_schedule(profile.seed, enabled_operations(ctx), profile.duration_s,
                                  profile.nemesis.op_interval)
         events = EventLog(tmp_path / "events.jsonl")
@@ -132,7 +139,6 @@ async def run_profile(manager: ScyllaClusterManager, profile: Profile, tmp_path)
             extra.append(("nemesis", lambda: nemesis_task(ctx, schedule, stop, events)))
         extra.append(("watchdog", lambda: watchdog_task(ctx, stop, events)))
 
-        peaks = SegmentPeaks()
         try:
             task_errors = await run_workloads(manager, cql, workloads, profile.duration_s, peaks, extra)
         finally:
@@ -176,6 +182,13 @@ async def test_operations(manager: ScyllaClusterManager, build_mode, request, tm
     """Runs the checked workload under random cluster operations, with no injected failures."""
     profile = load_profile("operations")
     await run_case(manager, profile, request, tmp_path, f"operations-{profile.seed}-{build_mode}", build_mode)
+
+
+@pytest.mark.check_nodes_for_errors
+async def test_operations_skewed(manager: ScyllaClusterManager, build_mode, request, tmp_path):
+    """Runs the operations profile with a zipf key distribution: a few hot keys take most of the load."""
+    profile = load_profile("operations_skewed")
+    await run_case(manager, profile, request, tmp_path, f"operations_skewed-{profile.seed}-{build_mode}", build_mode)
 
 
 if os.environ.get(ENV_PREFIX + "GATING"):

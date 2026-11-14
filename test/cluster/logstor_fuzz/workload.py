@@ -227,6 +227,39 @@ async def writer_task(wl: LogstorWorkload, cql, writer_id: int) -> None:
         await asyncio.sleep(rng.uniform(*wl.dml_pause_s))
 
 
+async def preload(wl: LogstorWorkload, cql) -> None:
+    """Writes each key of ``wl`` once, with ``preload_concurrency`` requests in flight.
+
+    Each request slot is a client of its own in the history, with one request
+    in flight at a time, as the Porcupine history needs.  The writes go into
+    the model like the writes of the run.
+    """
+    keys = iter(range(wl.num_keys))
+    rng = wl.rng_for("preload")
+    first_client = wl.reset_client_id + 1
+
+    async def slot(client_id: int) -> None:
+        for pk in keys:
+            seq = wl.next_write_value()
+            value = encode_value(wl.seed, wl.table_index, pk, seq, wl._value_size.sample(rng))
+            op_id, t_call_ns = wl.history.record_call(client_id, "write", pk, seq)
+            entry = wl.model.write_started(pk, seq, Kind.WRITE, t_call_ns)
+            try:
+                await cql.run_async(wl.insert_stmt.bind([pk, value, wl.ts_base + seq]))
+            except Exception as exc:
+                outcome = wl.record_failure(exc, op_id=op_id, client_id=client_id, op="write", key=pk,
+                                            value=seq, t_call_ns=t_call_ns)
+                wl.model.write_finished(pk, entry, _STATUS_OF_OUTCOME[outcome], time.monotonic_ns())
+            else:
+                t_return_ns = time.monotonic_ns()
+                wl.history.record_return(op_id, client_id, "write", pk, seq, Outcome.OK, t_return_ns)
+                wl.model.write_finished(pk, entry, Status.OK, t_return_ns)
+
+    start = time.monotonic()
+    await asyncio.gather(*(slot(first_client + i) for i in range(wl.params.preload_concurrency)))
+    logger.info("Preloaded %d keys of %s in %.1fs", wl.num_keys, wl.fqtn, time.monotonic() - start)
+
+
 async def reader_task(wl: LogstorWorkload, cql, reader_id: int) -> None:
     rng = wl.rng_for(f"reader/{reader_id}")
     client_id = wl.num_writers + reader_id
@@ -264,12 +297,18 @@ async def reader_task(wl: LogstorWorkload, cql, reader_id: int) -> None:
 
 @dataclass
 class SegmentPeaks:
-    """The peak use of the logstor store of each shard during a run."""
+    """The use of the logstor store of each shard during a run: the last sample and the peaks."""
 
+    # The size of the store of a shard, in bytes.
+    store_bytes: float = 1.0
     # (node ip, shard) -> the highest segments_in_use seen.
     in_use: dict[tuple[str, str], float] = field(default_factory=lambda: defaultdict(float))
     # (node ip, shard) -> the lowest free_segments seen.
     free: dict[tuple[str, str], float] = field(default_factory=dict)
+    # (node ip, shard) -> live_record_bytes / store_bytes, at the last sample of the node.
+    utilization: dict[tuple[str, str], float] = field(default_factory=dict)
+    # The highest utilization of a shard seen.
+    peak_utilization: float = 0.0
 
     def add(self, ip: str, lines: list[str]) -> None:
         for line in lines:
@@ -281,13 +320,31 @@ class SegmentPeaks:
                 self.in_use[key] = max(self.in_use[key], m.value)
             elif m.name == "scylla_logstor_sm_free_segments":
                 self.free[key] = min(self.free.get(key, m.value), m.value)
+            elif m.name == "scylla_logstor_sm_live_record_bytes":
+                self.utilization[key] = m.value / self.store_bytes
+                self.peak_utilization = max(self.peak_utilization, self.utilization[key])
+
+    def max_utilization(self) -> float:
+        """Returns the highest utilization of a shard at the last samples."""
+        return max(self.utilization.values(), default=0.0)
 
     def summary(self) -> str:
         if not self.in_use:
             return "no samples"
         worst = max(self.in_use, key=self.in_use.get)
-        return (f"peak segments_in_use={self.in_use[worst]:.0f} on {worst[0]} shard {worst[1]}, "
+        values = sorted(self.utilization.values())
+        return (f"utilization now min/max {values[0]:.2f}/{values[-1]:.2f} peak {self.peak_utilization:.2f}, "
+                f"peak segments_in_use={self.in_use[worst]:.0f} on {worst[0]} shard {worst[1]}, "
                 f"lowest free_segments={min(self.free.values(), default=float('nan')):.0f}")
+
+    async def sample(self, manager) -> None:
+        for server in await manager.running_servers():
+            try:
+                metrics = await manager.metrics.query(server.ip_addr)
+            except Exception as e:
+                logger.info("Metrics of %s are not available: %s", server.ip_addr, e)
+                continue
+            self.add(server.ip_addr, metrics.lines_by_prefix("scylla_logstor_sm_"))
 
 
 async def monitor_task(manager, workloads: Sequence[LogstorWorkload], stop: asyncio.Event,
@@ -296,13 +353,7 @@ async def monitor_task(manager, workloads: Sequence[LogstorWorkload], stop: asyn
     while not stop.is_set():
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(stop.wait(), interval_s)
-        for server in await manager.running_servers():
-            try:
-                metrics = await manager.metrics.query(server.ip_addr)
-            except Exception as e:
-                logger.info("Metrics of %s are not available: %s", server.ip_addr, e)
-                continue
-            peaks.add(server.ip_addr, metrics.lines_by_prefix("scylla_logstor_sm_"))
+        await peaks.sample(manager)
         logger.info("Progress: %s | %s", " | ".join(wl.progress_line() for wl in workloads), peaks.summary())
 
 

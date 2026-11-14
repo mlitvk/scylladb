@@ -48,7 +48,7 @@ from typing import Awaitable, Callable, Optional, Sequence
 
 from test.cluster.logstor_fuzz.known_issues import KnownIssues
 from test.cluster.logstor_fuzz.params import Profile
-from test.cluster.logstor_fuzz.workload import LogstorWorkload
+from test.cluster.logstor_fuzz.workload import LogstorWorkload, SegmentPeaks
 from test.cluster.strong_consistency.outcomes import (
     ExceptionPolicy,
     first_match,
@@ -93,6 +93,15 @@ class FuzzContext:
     # The rack of each server that is in the cluster.
     rack_of: dict[int, str] = field(default_factory=dict)
     balancing_enabled: bool = True
+    # The use of the store of each shard, which the monitor samples.
+    peaks: SegmentPeaks = field(default_factory=SegmentPeaks)
+
+    def too_full(self) -> Optional[str]:
+        """Returns a reason when a shard is too full for an operation that moves data, or None."""
+        u = self.peaks.max_utilization()
+        if u > self.profile.nemesis.max_shard_utilization:
+            return f"a shard is at {u:.2f} of its store, above {self.profile.nemesis.max_shard_utilization}"
+        return None
 
     @property
     def ks(self) -> str:
@@ -223,6 +232,8 @@ async def _host_ids(ctx: FuzzContext) -> dict[str, ServerInfo]:
 
 
 async def _move(ctx: FuzzContext, rng: random.Random, intranode: bool) -> Optional[str]:
+    if reason := ctx.too_full():
+        return reason
     wl = rng.choice(ctx.workloads)
     servers = await ctx.servers()
     tablets = await get_all_tablet_replicas(ctx.manager, servers[0], wl.ks, wl.table_name)
@@ -269,8 +280,12 @@ async def intranode_move(ctx: FuzzContext, rng: random.Random) -> Optional[str]:
 
 
 async def split_merge(ctx: FuzzContext, rng: random.Random) -> Optional[str]:
+    if reason := ctx.too_full():
+        return reason
     wl = rng.choice(ctx.workloads)
-    count = rng.choice([1, 2, 4, 8, 16, 32])
+    # Not 1: one tablet of a table puts all its data on one shard of a node,
+    # which can fill the shard at the planned utilization.
+    count = rng.choice([2, 4, 8, 16, 32])
     before = await get_tablet_count(ctx.manager, (await ctx.servers())[0], wl.ks, wl.table_name)
     logger.info("Setting min_tablet_count of %s to %d (%d tablets now)", wl.table_name, count, before)
     await ctx.manager.get_cql().run_async(f"ALTER TABLE {wl.fqtn} WITH tablets = {{'min_tablet_count': {count}}}")

@@ -69,6 +69,9 @@ class ValueSize:
     def max(self) -> int:
         return max(b for _, b, _ in self._ranges())
 
+    def mean(self) -> float:
+        return sum((a + b) / 2 * w for a, b, w in self._ranges())
+
     def sample(self, rng: random.Random) -> int:
         ranges = self._ranges()
         a, b, _ = rng.choices(ranges, weights=[w for _, _, w in ranges])[0]
@@ -81,8 +84,19 @@ class WorkloadParams:
     # group on a shard, which the separator and compaction see.
     tables: int = 2
     # The number of keys in each table.  The key space is fixed and the writes
-    # overwrite it, so the live data stays bounded.
-    keys: int = 1000
+    # overwrite it, so the live data stays bounded.  0 derives it from
+    # target_utilization (see keys_for()).
+    keys: int = 0
+    # The fraction of the logstor store of a shard that the live data takes
+    # after the preload, on the nodes that hold a full copy of the data.  The
+    # deletes keep about a tenth of the keys dead during the run, so the run
+    # settles near 0.45.  Logstor compaction works around 0.5, so this keeps
+    # it busy.
+    target_utilization: float = 0.5
+    # Writes each key once before the timed run, so that the run starts at the
+    # target utilization.
+    preload: bool = True
+    preload_concurrency: int = 64
     # "uniform", or "zipf" with the exponent zipf_s.
     key_dist: str = "uniform"
     zipf_s: float = 1.1
@@ -109,8 +123,9 @@ class ClusterParams:
     rf: int = 3
     smp: int = 2
     initial_tablets: int = 8
-    # Per shard.
-    logstor_disk_size_in_mb: int = 64
+    # Per shard.  A small store makes the writes fill the free space of a shard
+    # in tens of seconds, so compaction and the separator run all the time.
+    logstor_disk_size_in_mb: int = 16
     logstor_file_size_in_mb: int = 4
 
 
@@ -125,6 +140,11 @@ class NemesisParams:
     op_timeout_s: float = 600.0
     # The run fails as a hang when no write of a table is acknowledged for this long.
     stall_timeout_s: float = 90.0
+    # An operation that moves data between shards (a tablet move, a resize) does
+    # not run when a shard holds more live data than this fraction of its store,
+    # so that the operations cannot fill a shard (see the known issue
+    # logstor-full-store-hang).
+    max_shard_utilization: float = 0.65
 
 
 @dataclass(frozen=True)
@@ -172,6 +192,15 @@ PROFILES: dict[str, Profile] = {
         )),
     ),
 }
+
+# The operations profile with a skewed load: the keys of a zipf distribution,
+# so that a few hot keys take most of the writes and the reads.  The hot keys
+# make most of the dead records, in a few tablets, while the cold keys stay
+# live, which is the case that the separator and compaction must handle.
+PROFILES["operations_skewed"] = dataclasses.replace(
+    PROFILES["operations"], name="operations_skewed",
+    workload=WorkloadParams(key_dist="zipf", zipf_s=1.1),
+)
 
 
 def _convert(value: str, current: Any, name: str) -> Any:
@@ -225,33 +254,45 @@ def load_profile(name: str, env: dict[str, str] | None = None) -> Profile:
     unknown = {k for k in env if k.startswith(ENV_PREFIX)} - used - NON_PARAMETER_ENV
     if unknown:
         raise ValueError(f"unknown logstor fuzz parameters: {sorted(unknown)}")
+    if workload.keys == 0:
+        workload = dataclasses.replace(workload, keys=keys_for(workload, cluster))
     profile = dataclasses.replace(profile, workload=workload, cluster=cluster, nemesis=nemesis, checks=checks,
                                   duration_s=duration_s, seed=seed, include_known=include_known)
     validate(profile)
     return profile
 
 
-# The serialized size of a value above its payload: the value header, and an
-# allowance for the record header and the column mapping.
-VALUE_OVERHEAD = 512
+# The bytes of a record above the payload of its value: the value header of the
+# workload (26 B) and the logstor record (the header, the key and the mutation
+# framing, about 330 B for this one-column schema on master in Nov 2026).
+# Calibrated against scylla_logstor_sm_live_record_bytes after a preload.
+RECORD_OVERHEAD = 356
 
-# The tablets of a table are not spread evenly over the shards, so the bound
-# takes a shard to hold this many times its even share.
-SKEW = 2
-
-# The live data of a shard must stay under this fraction of its store.  The
-# writes overwrite the keys, so the store also holds the dead records until
-# compaction frees them.
-MAX_LIVE_FRACTION = 0.25
+# A profile may not plan for more live data than this fraction of the store of
+# a shard: above it, an uneven spread of the tablets can fill a shard.
+MAX_UTILIZATION = 0.6
 
 
-def live_bytes_per_shard(profile: Profile) -> float:
-    """Returns an upper bound of the live data of one shard."""
+def record_bytes(w: WorkloadParams) -> float:
+    """Returns the mean size of a record of the workload in the logstor store."""
+    return ValueSize(w.value_size).mean() + RECORD_OVERHEAD
+
+
+def keys_for(w: WorkloadParams, c: ClusterParams) -> int:
+    """Returns the keys of a table that give target_utilization.
+
+    Each rack holds one replica of each tablet (rf equals the number of
+    racks), so a node that is alone in its rack holds all the data once, over
+    its smp shards.  The size is for such a node, which is the fullest one.
+    """
+    store = c.logstor_disk_size_in_mb * 2**20 * c.smp
+    return int(store * w.target_utilization / (w.tables * record_bytes(w)))
+
+
+def utilization_estimate(profile: Profile) -> float:
+    """Returns the planned live data of a shard of a full-copy node, as a fraction of its store."""
     w, c = profile.workload, profile.cluster
-    # The fewest nodes that the operations leave: one in each rack.
-    nodes = min(sum(c.nodes_per_rack), len(c.nodes_per_rack))
-    per_value = ValueSize(w.value_size).max() + VALUE_OVERHEAD
-    return w.tables * w.keys * per_value * c.rf / (nodes * c.smp) * SKEW
+    return w.tables * w.keys * record_bytes(w) / (c.logstor_disk_size_in_mb * 2**20 * c.smp)
 
 
 def validate(profile: Profile) -> None:
@@ -268,11 +309,14 @@ def validate(profile: Profile) -> None:
     if w.key_dist not in ("uniform", "zipf"):
         raise ValueError(f"unknown key_dist {w.key_dist!r}")
     ValueSize(w.value_size)
-    store = c.logstor_disk_size_in_mb * 1024 * 1024
-    live = live_bytes_per_shard(profile)
-    if live > store * MAX_LIVE_FRACTION:
-        raise ValueError(f"the live data of a shard can reach {live / 2**20:.1f} MB, which is more than "
-                         f"{MAX_LIVE_FRACTION} of the {c.logstor_disk_size_in_mb} MB store of a shard; "
+    if w.keys < w.writers:
+        raise ValueError(f"keys={w.keys} is fewer than writers={w.writers}")
+    if c.rf != len(c.nodes_per_rack):
+        raise ValueError(f"the store sizing needs rf ({c.rf}) equal to the number of racks ({len(c.nodes_per_rack)})")
+    utilization = utilization_estimate(profile)
+    if utilization > MAX_UTILIZATION:
+        raise ValueError(f"the live data of a shard is planned at {utilization:.2f} of its "
+                         f"{c.logstor_disk_size_in_mb} MB store, above {MAX_UTILIZATION}; "
                          f"use fewer keys or smaller values, or a larger store")
     if max(c.nodes_per_rack) > c.max_nodes_per_rack:
         raise ValueError(f"nodes_per_rack={c.nodes_per_rack} is above max_nodes_per_rack={c.max_nodes_per_rack}")
