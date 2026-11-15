@@ -1545,9 +1545,13 @@ void segment_manager_impl::raise_active_segment_floor(segment_sequence seq) noex
 // Takes the segments of `group` out of the group after an erase removed the records of the group
 // from the index. Compaction of the group must be disabled. Each segment ends in one of these
 // states:
-// - A segment with no live record is taken out of the group, its first block is zeroed, and it is
-//   freed. The zeroing is not needed for correctness, see zero_first_blocks().
-// - A segment with no live record and another reference is an internal error.
+// - A segment with no live record and no other reference is taken out of the group, its first
+//   block is zeroed, and it is freed. The zeroing is not needed for correctness, see
+//   zero_first_blocks().
+// - A segment with no live record and another reference, for example from the snapshot of a
+//   stale stream of a tablet migration, is only taken out of the group, and its last reference
+//   frees it. The erase does not zero such a segment, because the reader of the reference can
+//   still read it.
 // - A segment with live records stays in the group for compaction. An erase of part of the range
 //   of the group leaves such segments.
 // - A segment with live records in a stopped group is an internal error, because the erase removed
@@ -1575,11 +1579,6 @@ future<> segment_manager_impl::free_erased_segments(logstor_group& group, group_
             continue;
         }
 
-        // Belonging to the group is the only reference the segment may have left.
-        if (desc.ref_count != 1) {
-            on_internal_error(logstor_logger, format("Discarding segment {} with non-zero reference count", seg_id));
-        }
-
         segments.push_back(seg_id);
         co_await coroutine::maybe_yield();
     }
@@ -1587,13 +1586,25 @@ future<> segment_manager_impl::free_erased_segments(logstor_group& group, group_
     logstor_logger.debug("Freeing {} segments of table {} after an erase", segments.size(), group.table_id());
 
     // Removing a segment, zero_first_blocks() and freeing a segment cannot fail, so every segment
-    // taken out of the group is also freed.
+    // taken out of the group is also freed, here or by its last reference.
+    //
+    // Belonging to the group is one reference. The loop reads the reference count after the
+    // removal, and not in the loop above, because another reference can be taken or released while
+    // the erase yields. A segment out of its group with no reference gets no new reference.
+    utils::chunked_vector<log_segment_id> unreferenced;
+    unreferenced.reserve(segments.size());
     for (auto seg_id : segments) {
-        ss.remove_segment(get_segment_descriptor(seg_id));
+        auto& desc = get_segment_descriptor(seg_id);
+        ss.remove_segment(desc);
+        if (desc.ref_count == 0) {
+            unreferenced.push_back(seg_id);
+        } else {
+            logstor_logger.debug("Leaving {} to its other references", seg_id);
+        }
         co_await coroutine::maybe_yield();
     }
-    co_await zero_first_blocks(segments);
-    for (auto seg_id : segments) {
+    co_await zero_first_blocks(unreferenced);
+    for (auto seg_id : unreferenced) {
         free_segment(seg_id);
         co_await coroutine::maybe_yield();
     }
