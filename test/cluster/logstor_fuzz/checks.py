@@ -11,8 +11,17 @@ replica lost: the other replicas hide the loss.  The checks here also read each
 replica on its own, with ``MUTATION_FRAGMENTS()``, which reads only the data
 of the node that gets the query.  The checks run in this order:
 
-  1. A scan at CL=ALL checks each key with the model.  The scan also does a
-     read repair of each key whose replicas differ.
+  0. A wait until each node sends the hints that it holds.  A write that
+     missed a replica, for example a write while the replica was down, leaves
+     a hint on the coordinator, and a later replay of the hint changes the
+     replica.  The coordinator writes the hint only when the write times out,
+     which can be after the first dump.  Without the wait, a replay between
+     the dumps of step 2 and step 4 looks like a change of the replica over
+     the restart.
+  1. A scan at CL=ALL checks each key with the model.  The scan does a read
+     repair only of a range whose replicas return different data.  A key that
+     all replicas delete returns no row, so the scan does not repair a
+     replica that holds an older delete of the key.
   2. A dump of each replica checks that a quorum of the replicas of each key
      holds the newest acknowledged write or a newer one, that a node that is
      not a replica does not hold the key, and that the cache of a node holds
@@ -40,6 +49,7 @@ result, with the segment of each record.
 
 from __future__ import annotations
 
+import asyncio
 import bisect
 import json
 import logging
@@ -55,7 +65,7 @@ from cassandra.query import SimpleStatement
 from test.cluster.logstor_fuzz.known_issues import KnownIssues
 from test.cluster.logstor_fuzz.model import Kind, Status
 from test.cluster.logstor_fuzz.operations import start_node
-from test.cluster.logstor_fuzz.results import FuzzFailure
+from test.cluster.logstor_fuzz.results import FuzzFailure, HangError
 from test.cluster.logstor_fuzz.workload import CorruptValue, LogstorWorkload
 from test.cluster.util import reconnect_driver
 from test.pylib.tablets import get_all_tablet_replicas
@@ -396,8 +406,51 @@ async def scan_all(cql, wl: LogstorWorkload, errors: CheckErrors, what: str) -> 
     logger.info("%s: scanned %s at CL=ALL, %d rows", what, wl.fqtn, len(rows))
 
 
+# The writes that reached their consistency level on a coordinator and still
+# wait for the answer of another replica.
+_BACKGROUND_WRITES = "scylla_storage_proxy_coordinator_background_writes{"
+
+
+async def wait_for_hints(manager, servers, limit_s: float) -> None:
+    """Waits until each of ``servers`` sends its hints to the other nodes, and raises HangError after ``limit_s``.
+
+    A coordinator writes a hint for a replica that did not answer a write only
+    when the write times out, which can be long after the end of the workload.
+    So the wait first waits until no node has a write that waits for a replica.
+    Then the wait makes a sync point on each node, which covers the hints that
+    the node holds for all other nodes, and waits until each node sends them.
+    """
+    start = time.monotonic()
+
+    def time_left(what: str) -> float:
+        left = limit_s - (time.monotonic() - start)
+        if left <= 0:
+            raise HangError(f"{what} in {limit_s:.0f}s")
+        return left
+
+    for s in servers:
+        while (await manager.metrics.query(s.ip_addr)).get(_BACKGROUND_WRITES):
+            time_left(f"{s.ip_addr} did not end its writes")
+            await asyncio.sleep(1)
+    writes_end = time.monotonic() - start
+
+    for s in servers:
+        sync_point = await manager.api.client.post_json("/hinted_handoff/sync_point", host=s.ip_addr)
+        while True:
+            left = time_left(f"{s.ip_addr} did not send its hints")
+            status = await manager.api.client.get_json("/hinted_handoff/sync_point", host=s.ip_addr,
+                                                       params={"id": sync_point, "timeout": str(max(1, int(left)))})
+            if status == "DONE":
+                break
+            if status != "IN_PROGRESS":
+                raise FuzzFailure("error", f"{s.ip_addr}: unexpected state of a hint sync point: {status!r}")
+    logger.info("All nodes ended their writes in %.1fs and sent their hints in %.1fs", writes_end,
+                time.monotonic() - start)
+
+
 async def final_checks(manager, cql, workloads: Sequence[LogstorWorkload], write_quorum: int,
-                       replica_check: bool, final_restart: str, known: KnownIssues, node_start_s: float):
+                       replica_check: bool, final_restart: str, known: KnownIssues, node_start_s: float,
+                       hints_s: float):
     """Runs the checks of the module docstring, and returns the driver session to use after them.
 
     Raises AssertionError with the list of the failed checks.
@@ -405,6 +458,7 @@ async def final_checks(manager, cql, workloads: Sequence[LogstorWorkload], write
     servers = await manager.running_servers()
     for s in servers:
         await manager.api.disable_tablet_balancing(s.ip_addr)
+    await wait_for_hints(manager, servers, hints_s)
 
     errors = CheckErrors("final checks")
     for wl in workloads:

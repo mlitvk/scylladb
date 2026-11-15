@@ -203,10 +203,10 @@ async def run_profile(manager: ScyllaClusterManager, profile: Profile, tmp_path,
                 raise FuzzFailure("no_progress", f"{wl.table_name}: {e}") from e
 
         write_quorum = {"ONE": 1, "QUORUM": c.rf // 2 + 1, "ALL": c.rf}[w.write_cl]
-        async with time_limit("the checks after the run", limits.checks_s):
+        async with time_limit("the checks after the run", limits.checks_s + limits.hints_s):
             cql = await final_checks(manager, manager.get_cql(), workloads, write_quorum,
                                      profile.checks.replica_check, profile.checks.final_restart, known,
-                                     limits.node_start_s)
+                                     limits.node_start_s, limits.hints_s)
 
         if profile.checks.porcupine:
             for wl in workloads:
