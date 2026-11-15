@@ -181,6 +181,11 @@ class TimeLimits:
     stop_s: float = 120.0
     # The checks after the run, with the restart of all nodes.
     checks_s: float = 300.0
+    # The wait at the start of the checks until each node sends its hints.
+    # It includes the write timeout of the test cluster (60 s in a dev
+    # build, 90 s in a debug build), because a coordinator writes a hint
+    # only when a write times out.
+    hints_s: float = 120.0
     # The start of one node, until it serves CQL.
     node_start_s: float = 60.0
     # The operations of the nemesis, by the kind of the operation (see
