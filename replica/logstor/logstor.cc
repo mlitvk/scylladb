@@ -7,6 +7,8 @@
  */
 #include "replica/logstor/logstor.hh"
 #include <seastar/core/coroutine.hh>
+#include <seastar/coroutine/as_future.hh>
+#include <seastar/coroutine/exception.hh>
 #include <seastar/coroutine/try_future.hh>
 #include <seastar/util/defer.hh>
 #include <seastar/util/log.hh>
@@ -18,6 +20,8 @@
 #include "replica/logstor/record_value.hh"
 #include "replica/logstor/segment_manager.hh"
 #include "replica/logstor/types.hh"
+#include "utils/error_injection.hh"
+#include "utils/exceptions.hh"
 #include "utils/managed_bytes.hh"
 #include <random>
 
@@ -136,12 +140,16 @@ future<> logstor::flush_to_separator() {
 
 future<> logstor::erase(table_id table, primary_index& index, dht::token_range range, logstor_group* stopped_group) {
     auto gate_holder = _async_gate.hold();
+    // Step 1 of segment_manager::erase(). The fence stays until the erase returns, which is after
+    // the switch of the active segment, so a write that waited lands above the sequence of the
+    // erase.
+    auto fence = index.fence_writes(range);
     if (!raw_token_bounds::of(range)) {
         // The range holds no token, so the erase has nothing to do. The early return also skips the
         // flush below, which seals the mixed buffer of the shard.
         co_return;
     }
-    // The flush puts every write that came before the erase into a separator buffer. The flush
+    // The flush puts every write that came before the fence into a separator buffer. The flush
     // seals the mixed buffer of the whole shard, so the erase skips it when a stopped group covers
     // the range, because the gate of a stopped group closed only after each write to the group and
     // its separator task were done, see write_target::alive_holder.
@@ -172,16 +180,34 @@ future<> logstor::write(const frozen_mutation& m, const schema& s, write_target 
     }
 }
 
+future<> primary_index::wait_for_writes_unfenced(dht::token token, db::timeout_clock::time_point timeout) {
+    auto waited = co_await coroutine::as_future(_writes_unfenced.wait(timeout, [this, token] { return !writes_fenced(token); }));
+    if (waited.failed()) {
+        auto ep = waited.get_exception();
+        if (try_catch<seastar::condition_variable_timed_out>(ep)) {
+            co_await coroutine::return_exception(seastar::timed_out_error());
+        }
+        co_await coroutine::return_exception_ptr(std::move(ep));
+    }
+    // Holds a write that found no fence, before it goes on, so that a test can take a fence again.
+    co_await utils::get_local_injector().inject("logstor_write_wait_after_unfenced", utils::wait_for_message(std::chrono::seconds{60}));
+}
+
 future<> logstor::do_write(const schema& s, dht::decorated_key dk, api::timestamp_type ts, record_value value,
         write_target target, db::timeout_clock::time_point timeout) {
-    // Every exit before the index insert is a failed write: a closed gate, a failure to buffer or
-    // persist the record, an allocation failure. The write() overloads count a failure that happens
-    // before this coroutine starts.
+    // Every exit before the index insert is a failed write: a closed gate, a fence timeout, a
+    // failure to buffer or persist the record, an allocation failure. The write() overloads count a
+    // failure that happens before this coroutine starts.
     auto count_failure = defer([this] noexcept { ++_stats.write_failures; });
     auto gate_holder = _async_gate.hold();
 
     auto& cg = *target.cg;
     primary_index_key key(dk);
+    auto& index = cg.logstor_index();
+    const auto token = dk.token();
+
+    // The code uses `s` only before the first suspension, because the caller can pass a temporary
+    // to write().
     auto writer = log_record_writer(log_record{
         .header = {
             .key = std::move(dk),
@@ -191,10 +217,19 @@ future<> logstor::do_write(const schema& s, dht::decorated_key dk, api::timestam
         .value = std::move(value),
     });
 
+    // This loop waits for the write fence of an erase, see logstor::erase(). Nothing between the
+    // last check and the write buffer yields, so a write that passed the check before the fence was
+    // taken is in the write buffer when the erase drains it. The check runs again after each wait,
+    // because another erase can take its fence while the write wakes. The waiting write holds the
+    // gate of logstor, so a stop() during a long erase also waits for the erase.
+    while (index.writes_fenced(token)) [[unlikely]] {
+        co_await coroutine::try_future(index.wait_for_writes_unfenced(token, timeout));
+    }
+
     auto [location, op] = co_await coroutine::try_future(
             _write_buffer.write(std::move(writer), timeout, std::move(target)));
 
-    cg.logstor_index().insert(key, index_entry{
+    index.insert(key, index_entry{
         .location = location,
         .timestamp = ts,
     });

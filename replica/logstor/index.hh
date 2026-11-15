@@ -7,9 +7,12 @@
  */
 #pragma once
 
+#include "db/timeout_clock.hh"
 #include "dht/i_partitioner.hh"
+#include <algorithm>
 #include <functional>
 #include <limits>
+#include <seastar/core/condition-variable.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 #include <optional>
@@ -20,6 +23,7 @@
 #include "utils/double-decker.hh"
 #include "utils/on_internal_error.hh"
 #include "utils/phased_barrier.hh"
+#include "utils/small_vector.hh"
 #include <utility>
 #include <variant>
 #include <seastar/util/bool_class.hh>
@@ -215,6 +219,23 @@ class primary_index final {
     // Serializes the erases of the index with each other and with the removal of the index's groups
     // from the compaction manager, see segment_manager::erase().
     seastar::semaphore _erase_sem{1};
+
+    // The held write fences are step 1 of segment_manager::erase(). While a fence over a range is
+    // held, a write of a key in the range waits in logstor::do_write(). The list can hold more than
+    // one fence, because an erase takes its fence before the erases are serialized, so a truncate
+    // and a cleanup can hold fences at the same time.
+    struct write_fence_entry {
+        uint64_t id;
+        dht::token_range range;
+    };
+    utils::small_vector<write_fence_entry, 1> _write_fences;
+    uint64_t _next_write_fence_id = 0;
+    seastar::condition_variable _writes_unfenced;
+
+    void remove_write_fence(uint64_t id) noexcept {
+        _write_fences.erase(std::ranges::find(_write_fences, id, &write_fence_entry::id));
+        _writes_unfenced.broadcast();
+    }
 
     // Non-owning pointer to the cache tracker, which is null when the cache is not set up.
     cache_tracker* _cache_tracker = nullptr;
@@ -459,6 +480,52 @@ public:
 
     // Waits until the read guards that exist now are destroyed. A guard made later does not delay
     // the wait.
+    // Holds a write fence, see fence_writes().
+    class write_fence {
+        primary_index* _index = nullptr;
+        uint64_t _id = 0;
+        friend class primary_index;
+        write_fence(primary_index& index, uint64_t id) noexcept : _index(&index), _id(id) {}
+    public:
+        write_fence(write_fence&& o) noexcept : _index(std::exchange(o._index, nullptr)), _id(o._id) {}
+        write_fence& operator=(write_fence&&) = delete;
+        ~write_fence() {
+            if (_index) {
+                _index->remove_write_fence(_id);
+            }
+        }
+    };
+
+    // Fences the writes of keys in `range` while the returned holder lives. A write that arrives
+    // meanwhile waits, and then continues as a new write. The fence is on the index of the table, so
+    // it covers every group of the table in the range. Copies that the separator and compaction make
+    // are not writes in this sense.
+    write_fence fence_writes(dht::token_range range) {
+        _write_fences.push_back(write_fence_entry{.id = _next_write_fence_id, .range = std::move(range)});
+        return write_fence(*this, _next_write_fence_id++);
+    }
+
+    // Returns whether a held fence covers `token`. It costs one branch while no fence is held.
+    bool writes_fenced(dht::token token) const noexcept {
+        if (_write_fences.empty()) [[likely]] {
+            return false;
+        }
+        return std::ranges::any_of(_write_fences, [&token] (const write_fence_entry& f) {
+            return f.range.contains(token, dht::token_comparator());
+        });
+    }
+
+    // Returns whether one held fence covers all of `range`.
+    bool writes_fenced(const dht::token_range& range) const noexcept {
+        return std::ranges::any_of(_write_fences, [&range] (const write_fence_entry& f) {
+            return f.range.contains(range, dht::token_comparator());
+        });
+    }
+
+    // Waits until no write fence covers `token`. When `timeout` passes first, it fails with
+    // timed_out_error, the error of a write timeout.
+    future<> wait_for_writes_unfenced(dht::token token, db::timeout_clock::time_point timeout);
+
     future<> await_read_guards() {
         return _reads_phaser.advance_and_await();
     }

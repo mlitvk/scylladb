@@ -352,7 +352,8 @@ public:
         _repair_sstable_classifier = std::move(repair_sstable_classifier);
     }
 
-    // Erases the logstor records of the group, so that a restart does not bring them back.
+    // Erases the logstor records of the group, so that a restart does not bring them back. Writes to
+    // the range of the group wait until the erase ends.
     future<> erase_logstor();
 
     // Flushes the separator buffers of the group. The table must use logstor.
