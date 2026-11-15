@@ -27,6 +27,11 @@ of the node that gets the query.  The checks run in this order:
 Each check reads all the columns of a row, and requires each column to hold
 the value of the write of ``v``.
 
+A full dump reads the table in pages.  When compaction or the separator moves
+the record of a key at a page boundary, the dump of the key is incomplete or
+shows two log sources.  The dump reads each such key again with a single-key
+dump, which fits in one page.
+
 When the first dump of a replica has no record of a key that another replica
 holds, a single-key dump of that replica tells whether the full dump missed a
 record that the node has.  The failure details of a later difference show the
@@ -63,6 +68,9 @@ MAX_REPORTED = 20
 
 # The number of keys that the single-key dumps check after the first dump.
 MAX_PROBES = 10
+
+# The largest number of cut keys that one full dump of a node reads again.
+MAX_REDUMPS = 100
 
 
 @dataclass(frozen=True)
@@ -150,11 +158,10 @@ def _state_of_source(wl: LogstorWorkload, pk: int, rows: list, errors: CheckErro
 _DUMP_COLUMNS = "pk, mutation_source, mutation_fragment_kind, metadata, value"
 
 
-async def dump_replica(cql, host, wl: LogstorWorkload, errors: CheckErrors, pk: Optional[int] = None) -> ReplicaDump:
-    """Returns the state of each key that one node holds for the table of ``wl``.
+async def _query_dump(cql, host, wl: LogstorWorkload, pk: Optional[int] = None) -> dict[int, dict[str, list]]:
+    """Returns the rows of a ``MUTATION_FRAGMENTS()`` query on one node, by key and by mutation source.
 
-    With ``pk``, the dump reads only that key.  Also checks that the cached
-    state of a key equals the state in the log.
+    With ``pk``, the query reads only that key.
     """
     where_key = "" if pk is None else f" WHERE pk = {pk}"
     stmt = SimpleStatement(f"SELECT {_DUMP_COLUMNS} FROM MUTATION_FRAGMENTS({wl.fqtn}){where_key}", fetch_size=1000)
@@ -162,10 +169,66 @@ async def dump_replica(cql, host, wl: LogstorWorkload, errors: CheckErrors, pk: 
     by_key: dict[int, dict[str, list]] = {}
     for r in rows:
         by_key.setdefault(r.pk, {}).setdefault(r.mutation_source, []).append(r)
+    return by_key
+
+
+def _is_complete(rows: list) -> bool:
+    """Returns whether the rows of one mutation source start at the partition start and stop at the partition end."""
+    return rows[0].mutation_fragment_kind == "partition start" and rows[-1].mutation_fragment_kind == "partition end"
+
+
+def _is_cut(sources: dict[str, list]) -> bool:
+    """Returns whether the sources of one key show a cut at a page boundary.
+
+    A CQL page of a dump can stop inside a key, and the next page continues
+    after the name of the last source.  When compaction or the separator moves
+    the record between the two pages, the log source of the key has a new name.
+    So the next page skips the new source, which leaves a source with no
+    partition end, or reads the new source in full, which gives two log sources.
+    """
+    log_sources = sum(1 for s in sources if s.startswith("logstor-log:"))
+    return log_sources != 1 or not all(_is_complete(rows) for rows in sources.values())
+
+
+async def _redump_cut_keys(cql, host, wl: LogstorWorkload, errors: CheckErrors, by_key: dict[int, dict[str, list]]) -> None:
+    """Dumps again, one key at a time, the keys of a full dump that a page boundary cut, and puts the result in ``by_key``.
+
+    A single-key dump fits in one page, so a moved record cannot cut it.  The
+    workload has stopped, so the state of the key is the same as at the full
+    dump.  A key that the single-key dump does not find leaves ``by_key``.
+    """
+    cut = [pk for pk, sources in by_key.items() if _is_cut(sources)]
+    for pk in cut[:MAX_REDUMPS]:
+        single = await _query_dump(cql, host, wl, pk)
+        if pk in single:
+            by_key[pk] = single[pk]
+        else:
+            del by_key[pk]
+    if cut:
+        errors.note(f"{host.address} {wl.table_name}: a page boundary of the full dump cut {len(cut)} keys, the first "
+                    f"{min(len(cut), MAX_REDUMPS)} were dumped again one at a time: {cut[:MAX_REPORTED]}")
+
+
+async def dump_replica(cql, host, wl: LogstorWorkload, errors: CheckErrors, pk: Optional[int] = None) -> ReplicaDump:
+    """Returns the state of each key that one node holds for the table of ``wl``.
+
+    With ``pk``, the dump reads only that key.  Without it, the dump reads
+    again, one at a time, the keys that a page boundary cut.  Also checks that
+    the dump of each source of a key is complete, and that the cached state of
+    a key equals the state in the log.
+    """
+    by_key = await _query_dump(cql, host, wl, pk)
+    if pk is None:
+        await _redump_cut_keys(cql, host, wl, errors, by_key)
 
     states = ReplicaDump()
     for pk, sources in by_key.items():
         where = f"{host.address} {wl.table_name}"
+        incomplete = sorted(s for s, rows in sources.items() if not _is_complete(rows))
+        if incomplete:
+            errors.add(f"{where} key={pk}: the dump of {incomplete} does not start at the partition start "
+                       f"and stop at the partition end")
+            continue
         log_sources = [s for s in sources if s.startswith("logstor-log:")]
         if len(log_sources) != 1:
             errors.add(f"{where} key={pk}: expected one log source, found {sorted(sources)}")
