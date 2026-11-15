@@ -4196,6 +4196,59 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_erase_drops_a_running_switch_below_its_seq
     require_recovery_matches(ls, schema->id(), cg.logstor_index());
 }
 
+// An erase that fails after its erased range is durable still raises the floor of the active
+// segment before it returns. Otherwise the next write lands in the active segment, at or below the
+// sequence of the erase, and the next recovery drops it.
+SEASTAR_THREAD_TEST_CASE(test_logstor_write_after_a_failed_erase_lands_above_its_sequence) {
+    auto schema = make_kv_schema();
+    started_logstor store;
+    auto& ls = store.ls();
+
+    test_logstor_group cg(schema, ls);
+    auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+
+    utils::get_local_injector().enable("logstor_erase_fail_after_save", true);
+    BOOST_REQUIRE_THROW(ls.erase(schema->id(), cg.logstor_index(), dht::token_range()).get(), std::runtime_error);
+
+    ls.write(make_kv_mutation(schema, "pk0", "v0"), write_target(&cg, {}), db::no_timeout).get();
+    ls.flush_to_separator().get();
+    BOOST_REQUIRE_EQUAL(cg.logstor_index().get_usage().key_count, 1u);
+    require_recovery_matches(ls, schema->id(), cg.logstor_index());
+}
+
+// An erase whose save fails erases nothing, and still raises the floor of the active segment
+// before it returns, because a failed sync of the directory can leave the erased range in the file.
+SEASTAR_THREAD_TEST_CASE(test_logstor_write_after_an_erase_with_a_failed_save_lands_above_its_sequence) {
+    if constexpr (!std::is_same_v<utils::error_injection_type, utils::error_injection<true>>) {
+        return;
+    }
+    auto schema = make_kv_schema();
+    started_logstor store;
+    auto& ls = store.ls();
+
+    test_logstor_group cg(schema, ls);
+    auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+
+    auto location_of = [&] (const mutation& m) {
+        return *lookup_location(cg.logstor_index(), make_index_key(*schema, m.decorated_key()), *schema);
+    };
+    const auto before = make_kv_mutation(schema, "pk0", "v0");
+    ls.write(before, write_target(&cg, {}), db::no_timeout).get();
+    ls.flush_to_separator().get();
+    const auto before_location = location_of(before);
+
+    utils::get_local_injector().enable("logstor_erased_ranges_save_fail", true);
+    BOOST_REQUIRE_THROW(ls.erase(schema->id(), cg.logstor_index(), dht::token_range()).get(), std::runtime_error);
+    BOOST_REQUIRE_EQUAL(cg.logstor_index().get_usage().key_count, 1u);
+
+    const auto after = make_kv_mutation(schema, "pk1", "v0");
+    ls.write(after, write_target(&cg, {}), db::no_timeout).get();
+    ls.flush_to_separator().get();
+    BOOST_REQUIRE(location_of(after).segment != before_location.segment);
+    BOOST_REQUIRE_EQUAL(cg.logstor_index().get_usage().key_count, 2u);
+    require_recovery_matches(ls, schema->id(), cg.logstor_index());
+}
+
 // The erase finds the groups of the table in the range itself, so it drains the separator buffer
 // of every one of them. A record left in the buffer of a group that the erase did not drain would
 // be written out later, in a segment above the sequence of the erase, and the next recovery would
