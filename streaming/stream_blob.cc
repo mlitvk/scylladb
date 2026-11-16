@@ -593,8 +593,11 @@ tablet_stream_files(netw::messaging_service& ms, std::list<stream_blob_info> sou
         co_return ops_total_size;
     }
 
-    blogger.debug("fstream[{}] Master started sending n={}, sources={}, targets={}",
-            ops_id, sources.size(), sources, targets);
+    // The log lines of the whole stream give the number of files and not their names, because a
+    // stream can have thousands of files, and one line with all of the names can be a very large
+    // allocation. The log lines of each file give the name of that file.
+    blogger.debug("fstream[{}] Master started sending files_nr={} targets={}",
+            ops_id, sources.size(), targets);
 
     struct sink_and_source {
         locator::host_id node;
@@ -636,8 +639,8 @@ tablet_stream_files(netw::messaging_service& ms, std::list<stream_blob_info> sou
             meta.sstable_meta = info.sstable_meta;
             fstream = co_await info.source(stream_options);
         } catch (...) {
-            blogger.warn("fstream[{}] Master failed sources={} targets={} error={}",
-                ops_id, sources, targets, std::current_exception());
+            blogger.warn("fstream[{}] Master failed to open file={} targets={} error={}",
+                ops_id, filename, targets, std::current_exception());
             throw;
         }
 
@@ -811,12 +814,12 @@ tablet_stream_files(netw::messaging_service& ms, std::list<stream_blob_info> sou
     }
     co_await utils::get_local_injector().inject("tablet_stream_files_end_wait", utils::wait_for_message(std::chrono::minutes(5)));
     if (error) {
-        blogger.warn("fstream[{}] Master failed sending files_nr={} files={} targets={} send_size={} bw={} error={}",
-                ops_id, sources.size(), sources, targets, ops_total_size, get_bw(ops_total_size, ops_start_time), error);
+        blogger.warn("fstream[{}] Master failed sending files_nr={} targets={} send_size={} bw={} error={}",
+                ops_id, sources.size(), targets, ops_total_size, get_bw(ops_total_size, ops_start_time), error);
         std::rethrow_exception(sender_error ? sender_error : error);
     } else {
-        blogger.debug("fstream[{}] Master finished sending files_nr={} files={} targets={} send_size={} bw={}",
-                ops_id, sources.size(), sources, targets, ops_total_size, get_bw(ops_total_size, ops_start_time));
+        blogger.debug("fstream[{}] Master finished sending files_nr={} targets={} send_size={} bw={}",
+                ops_id, sources.size(), targets, ops_total_size, get_bw(ops_total_size, ops_start_time));
     }
     co_return ops_total_size;
 }
@@ -934,8 +937,8 @@ future<stream_files_response> tablet_stream_files_handler(replica::database& db,
         // Release the table - we don't need to access it anymore and the files are held by the snapshot.
         table_stream_op = {};
 
-        blogger.debug("stream_sstables[{}] Started sending sstable_nr={} files_nr={} files={} range={}",
-                req.ops_id, sstable_nr, files.size(), files, req.range);
+        blogger.debug("stream_sstables[{}] Started sending sstable_nr={} files_nr={} range={}",
+                req.ops_id, sstable_nr, files.size(), req.range);
     }
     if (files.empty()) {
         if (sstable_nr > 0) {
