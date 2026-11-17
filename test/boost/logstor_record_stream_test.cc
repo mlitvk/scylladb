@@ -38,7 +38,7 @@
 #include "replica/logstor/ondisk.hh"
 #include "replica/logstor/record_stream.hh"
 #include "replica/logstor/record_value.hh"
-#include "replica/logstor/segment_io.hh"
+#include "replica/logstor/segment_scanner.hh"
 #include "replica/logstor/write_buffer.hh"
 #include "schema/schema_builder.hh"
 #include "serializer.hh"

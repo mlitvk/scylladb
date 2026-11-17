@@ -10,7 +10,7 @@ target_sources(replica
     exceptions.cc
     dirty_memory_manager.cc
     logstor/ondisk.cc
-    logstor/segment_io.cc
+    logstor/segment_scanner.cc
     logstor/record_stream.cc
     logstor/segment_file.cc
     logstor/cache.cc

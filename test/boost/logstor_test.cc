@@ -41,7 +41,7 @@
 #include <seastar/testing/thread_test_case.hh>
 
 #include "replica/logstor/segment_file.hh"
-#include "replica/logstor/segment_io.hh"
+#include "replica/logstor/segment_scanner.hh"
 #include "replica/database.hh"
 #include "schema/schema_builder.hh"
 #include "schema/schema_registry.hh"
