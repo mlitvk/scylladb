@@ -171,6 +171,39 @@ compaction reclaims them.
 A write counts in the live record bytes of a group only after the separator moves it into a segment
 of the group.
 
+## Tablet Streaming
+
+A tablet migration moves the live records of the tablet, not its segments, so the stream carries
+about the live record bytes of the tablet whatever the dead records in its segments. The code is in
+`replica/logstor/record_stream.{hh,cc}`.
+
+The node that sends the tablet flushes the separator, so that the segments of the compaction groups
+of the tablet hold every write that completed, and makes a record stream source for each group that
+has live records (`table::make_logstor_record_sources()`). A source reads the segments of its group
+and sends, for each segment, a chunk of the records that the index still points at. It keeps
+compaction of the group disabled until its stream ends, so the segments it reads stay in the group
+and their records do not move. A write that comes during the stream goes to a segment that the
+source does not read, and the write-both stage of the migration sends it to the new replica.
+
+Each chunk of the stream is a chunk of a full segment, as in [Chunks](#chunks), sealed at
+`record_alignment` rather than `block_alignment`, so it has no padding to a block. The chunk header
+names the table and gives the size of the records and their CRC. The `segment_seq` of a chunk has no
+meaning on the wire. A chunk is at most 128 KiB, the largest segment size.
+
+The node that receives the tablet gives the bytes to a record stream sink on the shard of the tablet
+(`table::make_logstor_record_sink()`). The sink checks each chunk with its CRCs and packs the records
+into full segments of its own size, as compaction does. When it writes a segment, it adds the records
+to the index and the segment to the compaction group of the records. A record that is older than the
+record of its key in the index, because a write of the write-both stage came first, stays in the
+segment as dead space. Only whole segments reach the disk: when a stream fails, the sink drops the
+records in its buffer, and the segments it wrote are sealed and indexed in their group. A migration
+that is rolled back erases them with the rest of the tablet.
+
+A shard receives at most `tablet_streaming_write_concurrency_per_shard` streams at once, because each
+sink holds a write buffer for its life. The `stream_records_sent`, `stream_records_received` and
+`stream_records_superseded` metrics count the records of the streams, and `stream_bytes_written` the
+bytes that the sinks write.
+
 ## Measuring Performance
 
 Two tests measure the cost of a logstor operation on one node, at two levels.
@@ -247,7 +280,7 @@ A record frame holds one record and has these parts, in this order:
 
 The value of a record is encoded and decoded by `encode_record_value()` and `decode_record_value()`
 in [replica/logstor/record_value.hh](../../replica/logstor/record_value.hh). All other code copies
-the value as bytes, for example compaction, the separator and segment streaming.
+the value as bytes, for example compaction, the separator and tablet streaming.
 
 For each record, the index holds a `record_location`, which points at the start of the record frame
 and gives the frame size, so one read at that location returns the whole record. The position of a
