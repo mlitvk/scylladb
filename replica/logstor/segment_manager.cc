@@ -8,7 +8,7 @@
 #include "replica/logstor/segment_manager.hh"
 #include "replica/logstor/segment_file.hh"
 #include "replica/logstor/ondisk.hh"
-#include "replica/logstor/segment_io.hh"
+#include "replica/logstor/segment_scanner.hh"
 #include "exceptions/exceptions.hh"
 #include "replica/compaction_group.hh"
 #include "backlog_controller.hh"

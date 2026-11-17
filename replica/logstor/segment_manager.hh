@@ -20,7 +20,7 @@
 #include <seastar/util/bool_class.hh>
 #include "bytes_fwd.hh"
 #include "mutation_writer/token_group_based_splitting_writer.hh"
-#include "replica/logstor/segment_io.hh"
+#include "replica/logstor/segment_scanner.hh"
 #include "replica/logstor/write_buffer.hh"
 #include "replica/logstor/compaction.hh"
 #include "replica/logstor/record_stream.hh"

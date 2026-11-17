@@ -6,7 +6,7 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
-#include "replica/logstor/segment_io.hh"
+#include "replica/logstor/segment_scanner.hh"
 
 #include <exception>
 

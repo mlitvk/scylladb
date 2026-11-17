@@ -21,7 +21,7 @@
 #include <seastar/util/noncopyable_function.hh>
 
 #include "replica/logstor/compaction.hh"
-#include "replica/logstor/segment_io.hh"
+#include "replica/logstor/segment_scanner.hh"
 #include "replica/logstor/write_buffer.hh"
 #include "utils/chunked_vector.hh"
 
