@@ -76,6 +76,17 @@ struct segment_stats {
     bool operator==(const segment_stats&) const noexcept = default;
 };
 
+// The statistics of all the sets of a shard, which are the sum of the statistics of the sets, and
+// the count of the segments that left a set.
+struct shard_segment_totals : segment_stats {
+    // The segments that left a set since the start, also the segments that a merge moves to another
+    // set. The count only increases.
+    // The other changes of a set add a segment or free records, which cannot decrease a count of the
+    // segments under a utilization. Thus, when two samples show the same removals, each such count
+    // can only have increased between them.
+    uint64_t removed_segments{0};
+};
+
 // Exports the utilization histogram as a Prometheus histogram. The buckets of a Prometheus
 // histogram are cumulative. The label of a bucket is the upper limit of its utilization range.
 // Prometheus counts a value equal to the limit in the bucket. utilization_bucket_of() puts such a

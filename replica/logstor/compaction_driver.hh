@@ -52,6 +52,8 @@ public:
         uint64_t available_segments;
         const utilization_histogram& utilization;
         uint64_t dead_segments;
+        // See shard_segment_totals::removed_segments.
+        uint64_t removed_segments;
     };
 
     // The services that the driver needs from the compaction manager.
@@ -177,9 +179,14 @@ private:
     // many candidates a batch needs and can take. The dead segments count apart, because they do
     // not wait for a minimum batch, and the estimate does not show when they die in the lowest
     // bucket.
+    // The removed segments make equal inputs mean that no segment crossed the threshold or died.
+    // Without a removal, the writes can only increase the counts. A removal can decrease them, and
+    // then other segments can bring them back to the same values. Also, a merge that moves the
+    // segments of two groups into one group does not change the counts, but it can make a batch.
     struct ranking_inputs {
         double under_threshold;
         uint64_t dead;
+        uint64_t removed_segments;
         size_t min_batch;
         size_t batch_cap;
 

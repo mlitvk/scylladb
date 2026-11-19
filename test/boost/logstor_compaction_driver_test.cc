@@ -95,6 +95,7 @@ public:
     uint64_t available_segments = segment_count;
     utilization_histogram utilization{};
     uint64_t dead_segments = 0;
+    uint64_t removed_segments = 0;
     // The calls of sample(). The driver calls it once in each controller tick, and once at the start
     // of each ranking.
     mutable size_t ticks = 0;
@@ -150,6 +151,7 @@ public:
             .available_segments = available_segments,
             .utilization = utilization,
             .dead_segments = dead_segments,
+            .removed_segments = removed_segments,
         };
     }
 
@@ -348,6 +350,26 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_wakes_when_the_dead_coun
     BOOST_REQUIRE(wait_until([&] { return host.ranking_limits.size() == 3; }));
     set_dead_segments(8);
     BOOST_REQUIRE(wait_until([&] { return host.jobs.size() == 2; }));
+}
+
+// A merge moves the segments of two groups into one group, which can then have a batch, and the
+// counts of the shard do not change. The segments that the merge removes from the first group wake
+// the driver.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_wakes_when_a_segment_leaves_a_set) {
+    fake_host host;
+    fake_group a;
+    host.rankings = {{}, {candidate_of(a, rich)}};
+    host.utilization[0] = 8;
+    compaction_driver driver(host, make_config());
+    start(driver);
+    auto stop_driver = seastar::defer([&] noexcept { stop(driver, host); });
+
+    BOOST_REQUIRE(wait_until([&] { return host.ranking_limits.size() == 1; }));
+    wait_for_ticks(host, 2);
+    BOOST_REQUIRE_EQUAL(host.ranking_limits.size(), 1u);
+
+    host.removed_segments = 4;
+    BOOST_REQUIRE(wait_until([&] { return host.jobs.size() == 1; }));
 }
 
 // The end of a job, and notify_group_idle(), wake a driver that found nothing to compact.

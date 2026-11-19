@@ -387,7 +387,7 @@ class segment_manager_impl {
     stats _stats;
     // The statistics of the segments that the groups of this shard own, with their distribution by
     // utilization. Each segment_set of the shard adds its changes to them, see segment_set.
-    segment_stats _segment_stats;
+    shard_segment_totals _segment_stats;
     seastar::metrics::metric_groups _metrics;
 
     static constexpr size_t segment_pool_size = 128;
@@ -587,11 +587,11 @@ public:
         return _cfg.sparse_files ? get_segment_bytes_in_use() : get_disk_usage();
     }
 
-    segment_stats& shard_segment_stats() noexcept {
+    shard_segment_totals& shard_segment_stats() noexcept {
         return _segment_stats;
     }
 
-    const segment_stats& shard_segment_stats() const noexcept {
+    const shard_segment_totals& shard_segment_stats() const noexcept {
         return _segment_stats;
     }
 
@@ -718,6 +718,7 @@ compaction_driver::shard_sample compaction_manager_impl::sample() const noexcept
         .available_segments = _sm.available_segment_count(write_source::normal_write),
         .utilization = _sm._segment_stats.utilization,
         .dead_segments = _sm._segment_stats.dead_segments,
+        .removed_segments = _sm._segment_stats.removed_segments,
     };
 }
 
@@ -2352,11 +2353,11 @@ uint64_t segment_manager::get_segment_size() const noexcept {
     return _impl->get_segment_size();
 }
 
-segment_stats& segment_manager::shard_segment_stats() noexcept {
+shard_segment_totals& segment_manager::shard_segment_stats() noexcept {
     return _impl->shard_segment_stats();
 }
 
-const segment_stats& segment_manager::shard_segment_stats() const noexcept {
+const shard_segment_totals& segment_manager::shard_segment_stats() const noexcept {
     return _impl->shard_segment_stats();
 }
 

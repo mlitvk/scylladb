@@ -2870,7 +2870,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_set_stats) {
     // The sets link the descriptors intrusively. Thus, the descriptors must not move, and all the
     // sets must be destroyed before the descriptors.
     std::deque<segment_descriptor> descs;
-    segment_stats shard;
+    shard_segment_totals shard;
     segment_set segments{segment_size, &shard};
     segment_set other{segment_size, &shard};
 
@@ -2957,6 +2957,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_set_stats) {
     BOOST_REQUIRE_EQUAL(other.stats().dead_segments, 1);
     check_shard();
     BOOST_REQUIRE_EQUAL(shard.segment_count, 2);
+    // The merge removed both segments from their set.
+    BOOST_REQUIRE_EQUAL(shard.removed_segments, 2);
 
     // A removal takes the segment and its bytes out of the set and out of the shard statistics.
     other.remove_segment(sparse);
@@ -2964,11 +2966,13 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_set_stats) {
     BOOST_REQUIRE_EQUAL(bucket_of(other, 0), 0);
     BOOST_REQUIRE_EQUAL(other.stats().dead_segments, 0);
     check_shard();
+    BOOST_REQUIRE_EQUAL(shard.removed_segments, 3);
 
     other.clear();
     check_stats(other, 0, 0);
     check_shard();
     BOOST_REQUIRE(shard == segment_stats{});
+    BOOST_REQUIRE_EQUAL(shard.removed_segments, 4);
 }
 
 // The metric exports the utilization histogram as a Prometheus histogram. The buckets of a

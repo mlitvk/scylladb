@@ -137,6 +137,7 @@ compaction_driver::ranking_inputs compaction_driver::make_ranking_inputs(const s
     return ranking_inputs{
         .under_threshold = reclaimable_backlog(shard.utilization, _rate_controller.utilization_threshold()).candidate_segments,
         .dead = shard.dead_segments,
+        .removed_segments = shard.removed_segments,
         .min_batch = _rate_controller.min_batch(),
         .batch_cap = _limits.batch_cap,
     };
