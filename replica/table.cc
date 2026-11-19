@@ -1322,6 +1322,10 @@ logstor::compaction_manager& compaction_group_logstor_state::logstor_compaction_
     return _cg->get_logstor_compaction_manager();
 }
 
+future<> compaction_group::flush_to_separator() {
+    return _t._logstor->flush_to_separator();
+}
+
 future<> compaction_group::flush_separator() {
     return _logstor_state->flush_separator();
 }
@@ -1819,11 +1823,9 @@ future<utils::chunked_vector<sstables::shared_sstable>> table::take_sstable_set_
 }
 
 future<utils::chunked_vector<logstor::segment_snapshot>> table::take_logstor_snapshot(dht::token_range tr) {
-    co_await _logstor->flush_to_separator();
-
     utils::chunked_vector<logstor::segment_snapshot> snp;
     for (auto& sg : storage_groups_for_token_range(tr)) {
-        co_await sg->flush_separator();
+        co_await sg->flush();
 
         auto deletion_guard = co_await get_sstable_list_permit();
 
@@ -4828,7 +4830,11 @@ future<> compaction_group::flush_memtables(std::optional<db::replay_position> po
 }
 
 future<> compaction_group::flush() noexcept {
-    return _logstor_state ? flush_separator() : flush_memtables();
+    if (!_logstor_state) {
+        co_return co_await flush_memtables();
+    }
+    co_await flush_to_separator();
+    co_await flush_separator();
 }
 
 future<> storage_group::flush_memtables() noexcept {
@@ -4837,7 +4843,11 @@ future<> storage_group::flush_memtables() noexcept {
     }
 }
 
-future<> storage_group::flush_separator() noexcept {
+future<> storage_group::flush() noexcept {
+    if (!_main_cg->_t.uses_logstor()) {
+        co_return co_await flush_memtables();
+    }
+    co_await _main_cg->flush_to_separator();
     for (auto& cg : compaction_groups_immediate()) {
         co_await cg->flush_separator();
     }
@@ -4871,10 +4881,6 @@ size_t storage_group::memtable_count() const {
     return count;
 }
 
-future<> table::flush() {
-    return uses_logstor() ? flush_separator() : flush_memtables();
-}
-
 future<> table::flush_memtables(std::optional<db::replay_position> pos) {
     // There is nothing to flush if the table was stopped.
     if (_pending_flushes_phaser.is_closed()) {
@@ -4885,7 +4891,10 @@ future<> table::flush_memtables(std::optional<db::replay_position> pos) {
     co_await parallel_foreach_compaction_group([pos](auto& cg) { return cg.flush_memtables(pos); });
 }
 
-future<> table::flush_separator() {
+future<> table::flush() {
+    if (!uses_logstor()) {
+        co_return co_await flush_memtables();
+    }
     // table::stop() closes the phaser only after it stopped all compaction groups, and
     // compaction_group::stop() flushes the separator buffers of its group, so there is nothing to
     // flush. The check is also necessary because start() throws on a closed phaser.
