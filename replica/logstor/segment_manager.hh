@@ -162,6 +162,10 @@ public:
     future<> rebuild_index_from_disk(index_resolver);
 
     future<> start();
+    // Tells the segment manager that the stop of logstor started. A separator flush that fails
+    // after this call is not tried again, so no wait of the stop can wait for a flush that keeps
+    // failing. stop() calls it too.
+    void begin_stop() noexcept;
     future<> stop();
 
     future<> write(write_buffer& wb);

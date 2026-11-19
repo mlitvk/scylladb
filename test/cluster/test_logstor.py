@@ -162,6 +162,11 @@ async def test_recovery_basic(manager: ScyllaClusterManager, fail_separator_flus
     4. Starts the server again
     5. Verifies all data is correctly recovered
     6. Performs additional writes and reads to verify system continues functioning
+
+    With fail_separator_flush, each attempt of a separator flush fails, so the records stay in
+    their mixed segments while the flush tries again, and recovery must separate them. A graceful
+    stop flushes the tables first and waits for a failing flush, as for a memtable flush, so this
+    variant kills the server.
     """
     cmdline = ['--logger-log-level', 'logstor=trace']
     servers = await manager.servers_add(1, cmdline=cmdline)
@@ -200,7 +205,10 @@ async def test_recovery_basic(manager: ScyllaClusterManager, fail_separator_flus
             assert rows[0].v == expected_v
 
         # restart the server
-        await manager.server_stop_gracefully(servers[0].server_id)
+        if fail_separator_flush:
+            await manager.server_stop(servers[0].server_id, convict=False)
+        else:
+            await manager.server_stop_gracefully(servers[0].server_id)
         await manager.server_start(servers[0].server_id)
         cql, _ = await manager.get_ready_cql(servers)
 
@@ -1203,6 +1211,75 @@ async def test_tablet_split_and_merge(manager: ScyllaClusterManager):
         await wait_for(tablet_merge_finished, time.time() + 60)
 
         await check()
+
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
+async def test_tablet_merge_waits_for_a_failing_separator_flush(manager: ScyllaClusterManager):
+    """
+    A tablet merge stops the compaction groups of the merged tablets and then moves their segments
+    to the group of the new tablet. The stop of a group flushes its separator buffers. If the stop
+    went on after a failed flush, the records of the buffers would stay in mixed segments, in no
+    group, and a later migration of the tablet would lose them.
+
+    This test:
+    1. Splits the table into two tablets, and writes rows whose records stay in the separator
+       buffers of the two tablets
+    2. Makes each attempt of a separator flush fail, and starts a merge of the two tablets
+    3. Verifies that the merge on the replica waits while the flush fails
+    4. Lets the flush succeed, and verifies that the merge completes, that no segment is kept, and
+       that each row is readable
+    """
+    flush_failure = 'fail_flush_separator_buffer'
+    cmdline = ['--logger-log-level', 'logstor=debug', '--logger-log-level', 'table=debug', '--smp', '1']
+    cfg = {'tablet_load_stats_refresh_interval_in_seconds': 1}
+    server = await manager.server_add(config=cfg, cmdline=cmdline)
+    cql = manager.get_cql()
+    log = await manager.server_open_log(server.server_id)
+
+    async def get_metric(name: str) -> int:
+        metrics = await manager.metrics.query(server.ip_addr)
+        value = metrics.get(name)
+        assert value is not None
+        return int(value)
+
+    async def wait_for_tablet_count(ks: str, count: int):
+        async def tablet_count_reached():
+            return True if await get_tablet_count(manager, server, ks, 'test') == count else None
+        await wait_for(tablet_count_reached, time.time() + 60)
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'initial': 1}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v text) WITH storage_engine = 'logstor'")
+
+        await cql.run_async(f"ALTER TABLE {ks}.test WITH tablets = {{'min_tablet_count': 2}}")
+        await wait_for_tablet_count(ks, 2)
+
+        expected = {pk: f"value_{pk}" for pk in range(40)}
+        insert = cql.prepare(f"INSERT INTO {ks}.test (pk, v) VALUES (?, ?)")
+        await asyncio.gather(*[cql.run_async(insert, [pk, v]) for pk, v in expected.items()])
+
+        # The injection makes the merge completion fiber log each time it has no more work.
+        await manager.api.enable_injection(server.ip_addr, 'replica_merge_completion_wait', one_shot=False)
+        await manager.api.enable_injection(server.ip_addr, flush_failure, one_shot=False)
+        failures_before = await get_metric("scylla_logstor_sm_separator_flush_failures")
+
+        mark = await log.mark()
+        await cql.run_async(f"ALTER TABLE {ks}.test WITH tablets = {{'min_tablet_count': 1}}")
+
+        # The stop of each merged group flushes its separator buffers, and the flush fails.
+        async def flush_failed_again():
+            failures = await get_metric("scylla_logstor_sm_separator_flush_failures")
+            return True if failures >= failures_before + 2 else None
+        await wait_for_tablet_count(ks, 1)
+        await wait_for(flush_failed_again, time.time() + 60)
+        assert not await log.grep('Merge completion fiber finished', from_mark=mark)
+
+        await manager.api.disable_injection(server.ip_addr, flush_failure)
+        await log.wait_for('Merge completion fiber finished', from_mark=mark, timeout=60)
+
+        assert await get_metric("scylla_logstor_sm_kept_segments") == 0
+        for pk, v in expected.items():
+            rows = await cql.run_async(f"SELECT v FROM {ks}.test WHERE pk = {pk}")
+            assert len(rows) == 1, f"Key {pk} not found after the merge"
+            assert rows[0].v == v
 
 async def test_tablet_migration(manager: ScyllaClusterManager):
     """

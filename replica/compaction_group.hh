@@ -289,6 +289,8 @@ public:
     void trigger_logstor_compaction();
     // Returns true when the user turned off automatic compaction of the table.
     bool is_auto_compaction_disabled_by_user() const noexcept;
+    // Returns true after table::stop() of the table of the group started.
+    bool table_stopped() const noexcept;
     bool compaction_disabled() const;
     future<unsigned> estimate_pending_compactions() const;
 

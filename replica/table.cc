@@ -1275,6 +1275,7 @@ public:
 
     ::table_id table_id() const noexcept override;
     bool automatic_compaction_disabled() const noexcept override;
+    bool table_stopped() const noexcept override;
 
     logstor::primary_index& logstor_index() noexcept override;
     const logstor::primary_index& logstor_index() const noexcept override;
@@ -1318,6 +1319,10 @@ const logstor::primary_index& compaction_group_logstor_state::logstor_index() co
 
 bool compaction_group_logstor_state::automatic_compaction_disabled() const noexcept {
     return _cg->is_auto_compaction_disabled_by_user();
+}
+
+bool compaction_group_logstor_state::table_stopped() const noexcept {
+    return _cg->table_stopped();
 }
 
 logstor::compaction_manager& compaction_group_logstor_state::logstor_compaction_manager() noexcept {
@@ -3133,6 +3138,10 @@ bool compaction_group::is_auto_compaction_disabled_by_user() const noexcept {
     return _t.is_auto_compaction_disabled_by_user();
 }
 
+bool compaction_group::table_stopped() const noexcept {
+    return _t.async_gate().is_closed();
+}
+
 void table::trigger_offstrategy_compaction() {
     // Run in background.
     // This is safe since the the compaction task is tracked
@@ -3755,7 +3764,15 @@ future<> compaction_group::stop(sstring reason) noexcept {
     }
 
     if (flush_future.failed()) {
-        co_await seastar::coroutine::return_exception_ptr(flush_future.get_exception());
+        auto ex = flush_future.get_exception();
+        if (!_t.uses_logstor() || !table_stopped()) {
+            co_await seastar::coroutine::return_exception_ptr(std::move(ex));
+        }
+        // A failed separator flush is tried again until the table stops, so this failure comes from
+        // the stop of the table. The records stay readable in their kept segments. After a drop of
+        // the table the records are dead, and after a shutdown recovery separates them.
+        tlogger.warn("Cannot flush the logstor separator of {}.{} at stop, its records stay in kept segments: {}",
+                _t.schema()->ks_name(), _t.schema()->cf_name(), ex);
     }
 }
 

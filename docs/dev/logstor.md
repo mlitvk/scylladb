@@ -61,6 +61,11 @@ Only step 4 writes to the disk - all other steps only update in-memory metadata.
 1. When a record is written to the active segment, it is also written to its compaction group's separator buffer. The separator buffer holds a reference to the original segment.
 2. The separator buffer is flushed when it's full, or requested to flush for other reason. It is written into a new segment in the compaction group, and it updates the location of the records from the original mixed segments to the new segments in the compaction group.
 3. After the separator buffer is flushed and all records from the original segment are moved, it releases the reference of the segment. When there are no more reference to the segment it is freed.
+4. A flush that fails is tried again until it succeeds, with the policy of a memtable flush. The buffer keeps its records between the attempts, and the index still points at the records in the mixed segments.
+   - An allocation failure gets about half an hour of tries, and an error of the "no space" class (`ENOSPC`, `EDQUOT`, `EPERM`, `EACCES`) is tried again without a limit. Any other error aborts the node, and recovery separates the records at the next start. A failed take of the new segment is the exception: it is tried again without a limit also at an error of another kind, because the error of a take has no fixed type.
+   - Only the stop of the table or of logstor ends the tries. The mixed segments of the records are then not freed until the node restarts.
+   - So a flush of a table, a tablet migration, a tablet cleanup, a tablet merge and a truncate wait while a flush fails, and a flush that returns without an error means that each record is in a segment of its compaction group. The drop of a table waits too, because it truncates the table before it stops the table, and so does a graceful shutdown, because it flushes each table before it stops the tables.
+   - While the flush of a group tries again and the other buffer of the group is full, the separator stops for all the groups of the shard, because the shard has one separator fiber.
 
 **Compaction:**
 1. The amount of live data is tracked for each segment in its (in-memory) segment_descriptor. The segment descriptors are stored in a histogram by live data. This histogram is called a `segment_set` and each compaction group owns one.

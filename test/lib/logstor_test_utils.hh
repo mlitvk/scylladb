@@ -11,8 +11,10 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -20,6 +22,7 @@
 #include <fmt/format.h>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/scheduling.hh>
+#include <seastar/core/metrics_api.hh>
 #include <seastar/coroutine/as_future.hh>
 
 #include "db/cache_tracker.hh"
@@ -49,6 +52,26 @@ struct noop_space_accounting_subscriber final : replica::logstor::space_accounti
 };
 
 inline noop_space_accounting_subscriber noop_space_accounting{};
+
+// Returns the value of the counter or gauge `name` in the metric group `group` of this shard.
+inline double read_metric(std::string_view group, std::string_view name) {
+    const auto& family = seastar::metrics::impl::get_value_map().at(sstring(fmt::format("{}_{}", group, name)));
+    std::optional<double> value;
+    for (const auto& [labels, metric] : family) {
+        // The unregistration of a metric has two stages, so the family can hold a null metric.
+        if (metric) {
+            BOOST_REQUIRE(!value);
+            value = (*metric)().d();
+        }
+    }
+    BOOST_REQUIRE(value);
+    return *value;
+}
+
+// Returns the value of the counter or gauge `name` of the segment manager of this shard.
+inline double read_segment_manager_metric(std::string_view name) {
+    return read_metric("logstor_sm", name);
+}
 
 // Returns the location of the record of a key with its read guard, or nullopt when the index does
 // not have the key. It looks the key up the way a read that bypasses the cache does.
@@ -124,6 +147,7 @@ class test_logstor_group final : public replica::logstor::logstor_group {
     std::unique_ptr<replica::logstor::primary_index> _owned_index;
     replica::logstor::primary_index& _index;
     replica::logstor::compaction_manager& _cm;
+    bool _table_stopped{false};
 public:
     test_logstor_group(schema_ptr schema, replica::logstor::logstor& ls, bool cache_enabled = false)
         : logstor_group(ls.get_segment_manager().get_segment_size(), &ls.get_segment_manager().shard_segment_stats())
@@ -150,6 +174,15 @@ public:
 
     ::table_id table_id() const noexcept override {
         return _table_id;
+    }
+
+    bool table_stopped() const noexcept override {
+        return _table_stopped;
+    }
+
+    // Makes the group answer as the group of a table whose stop started.
+    void set_table_stopped() noexcept {
+        _table_stopped = true;
     }
 
     replica::logstor::primary_index& logstor_index() noexcept override {
