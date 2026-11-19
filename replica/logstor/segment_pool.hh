@@ -173,9 +173,9 @@ public:
     // Starts the refill in the background.
     void start(scheduling_group sg);
 
-    // Stops the refill after the allocation that the refill does at this time. Call this after all
-    // the consumers stop. A call to take() after stop() starts, or a wait that remains when the
-    // refill stops, is a bug in the caller, and it fails and does not wait forever.
+    // Stops the refill after the allocation that the refill does at this time.
+    // The caller must stop all the consumers first. A take() after stop() starts, or a wait that
+    // remains when the refill stops, is an internal error, and it fails and does not wait forever.
     future<> stop();
 
     // Takes a segment, or waits for one that this source can take. If the caller gives `as` and

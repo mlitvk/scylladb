@@ -2366,6 +2366,9 @@ future<> segment_manager_impl::adopt_streamed_segment(recovery_catalog& catalog,
 }
 
 future<std::unique_ptr<segment_stream_sink>> segment_manager_impl::create_segment_output_stream(recovery_catalog& catalog) {
+    // stop() closes the gate before it stops the segment pool, and a take from a stopped pool is an
+    // internal error.
+    auto holder = _async_gate.hold();
     auto seg = co_await take_segment(write_source::streaming);
     co_return std::make_unique<segment_stream_sink_impl>(*this, catalog, std::move(seg));
 }
