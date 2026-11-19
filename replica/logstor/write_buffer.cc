@@ -199,9 +199,8 @@ void write_buffer::reset() {
 }
 
 future<> write_buffer::close() {
-    if (!_write_gate.is_closed()) {
-        co_await _write_gate.close();
-    }
+    // Not a coroutine, so that the close needs no allocation and does not fail.
+    return _write_gate.is_closed() ? make_ready_future<>() : _write_gate.close();
 }
 
 bool write_buffer::is_closed() const noexcept {
@@ -234,6 +233,18 @@ future<record_location_with_holder> write_buffer::write(Writer writer, write_tar
         }
     }
 
+    return track_write(append_result);
+}
+
+template <log_record_writer_concept Writer>
+future<record_location_with_holder> write_buffer::write_record(const Writer& writer) {
+    if (with_record_copy()) {
+        on_internal_error(logstor_logger, "A mixed write buffer must take the writer of a record");
+    }
+    return track_write(_raw.append(writer));
+}
+
+future<record_location_with_holder> write_buffer::track_write(raw_write_buffer::append_result append_result) {
     // hold the write buffer until the write is complete, and pass the holder to the
     // caller for follow-up operations that should continue holding the buffer, such
     // as index updates.
@@ -273,6 +284,8 @@ std::vector<write_buffer::record_in_buffer> write_buffer::take_separator_records
 
 template future<record_location_with_holder> write_buffer::write<log_record_writer>(log_record_writer, write_target);
 template future<record_location_with_holder> write_buffer::write<log_record_bytes_writer>(log_record_bytes_writer, write_target);
+template future<record_location_with_holder> write_buffer::write_record<log_record_writer>(const log_record_writer&);
+template future<record_location_with_holder> write_buffer::write_record<log_record_bytes_writer>(const log_record_bytes_writer&);
 
 // write_buffer_pool
 

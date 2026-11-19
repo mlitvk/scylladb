@@ -377,25 +377,30 @@ static constexpr size_t max_scan_buffer_size = 128 * 1024;
 
 // One lasting cause can keep many segments, so the warning of a kept segment has a rate limit.
 static thread_local logger::rate_limit kept_segment_rate_limit{std::chrono::seconds(10)};
-// One lasting cause fails the flushes of many groups, and each flush logs each failed attempt.
-static thread_local logger::rate_limit separator_flush_retry_rate_limit{std::chrono::seconds(10)};
+// One lasting cause fails the flushes and the tasks of many groups, and each of them logs each
+// failed attempt.
+static thread_local logger::rate_limit separator_retry_rate_limit{std::chrono::seconds(10)};
 
-// The retry policy of one separator flush, which is the policy of a memtable flush in
-// table::seal_active_memtable(): std::bad_alloc gets a fixed number of tries, an error of the
-// "no space" class is tried again without a limit, and any other error aborts the node, because
+// The retry policy of one separator operation: one flush of a separator buffer, one separator
+// task, or the writes of one separator task to one compaction group. It is the policy of a memtable
+// flush in table::seal_active_memtable(): std::bad_alloc gets a fixed number of tries, an error of
+// the "no space" class is tried again without a limit, and any other error aborts the node, because
 // the records are on disk in their source segments and recovery separates them.
-// One object serves all the steps of one flush, so the steps share the tries and the backoff.
+// One object serves all the steps of one operation, so the steps share the tries and the backoff.
 //
 // The policy differs from the memtable flush in two points:
-// - It checks for a stop before it looks at the error. A stop reaches a separator flush as an error
+// - It checks for a stop before it looks at the error. A stop reaches the separator as an error
 //   of a type that the policy does not know, which would abort the node.
 // - It tries a failed segment take again also at an error that aborts the node for the other steps,
 //   because the error of a take has no fixed type.
-class separator_flush_retry {
-    // A flush that fails with std::bad_alloc gets about half an hour, at one try each 10 seconds.
+class separator_retry {
+    // An operation that fails with std::bad_alloc gets about half an hour, at one try each 10
+    // seconds.
     static constexpr int max_tries = 30 * 60 / 10;
 
-    table_id _table;
+    // The log messages name the operation, and its table if it has one table.
+    std::string_view _operation;
+    std::optional<table_id> _table;
     noncopyable_function<bool ()> _stopped;
     uint64_t& _failed_attempts;
     exponential_backoff_retry _backoff{std::chrono::milliseconds(100), std::chrono::seconds(10)};
@@ -407,10 +412,11 @@ class separator_flush_retry {
     future<bool> after_failure(std::exception_ptr& ex, other_error) noexcept;
 
 public:
-    // `stopped` returns true when the flush must not be tried again, because nothing needs its
+    // `stopped` returns true when the operation must not be tried again, because nothing needs its
     // records in a segment of their group. `failed_attempts` counts each failed attempt.
-    separator_flush_retry(table_id table, noncopyable_function<bool ()> stopped, uint64_t& failed_attempts)
-        : _table(table)
+    separator_retry(std::string_view operation, std::optional<table_id> table, noncopyable_function<bool ()> stopped, uint64_t& failed_attempts)
+        : _operation(operation)
+        , _table(table)
         , _stopped(std::move(stopped))
         , _failed_attempts(failed_attempts)
     {}
@@ -429,12 +435,17 @@ public:
     }
 };
 
-future<bool> separator_flush_retry::after_failure(std::exception_ptr& ex, other_error other) noexcept {
+future<bool> separator_retry::after_failure(std::exception_ptr& ex, other_error other) noexcept {
     ++_failed_attempts;
 
+    // The logger formats the subject, and it does not throw when the allocation of the text fails.
+    const auto subject = seastar::value_of([this] {
+        return _table ? fmt::format("{} of table {}", _operation, *_table) : fmt::format("{}", _operation);
+    });
+
     if (_stopped()) {
-        logstor_logger.warn("Separator flush of table {} failed: {}. It is not tried again, because the table or logstor stops",
-                _table, ex);
+        logstor_logger.warn("Separator {} failed: {}. It is not tried again, because its table or its compaction group stopped, or logstor stops",
+                subject, ex);
         return make_ready_future<bool>(false);
     }
 
@@ -452,12 +463,12 @@ future<bool> separator_flush_retry::after_failure(std::exception_ptr& ex, other_
         _tries_left = 0;
     }
     if (_tries_left <= 0) {
-        logstor_logger.error("Separator flush of table {} failed: {}. Aborting, at {}", _table, ex, current_backtrace());
+        logstor_logger.error("Separator {} failed: {}. Aborting, at {}", subject, ex, current_backtrace());
         std::abort();
     }
 
-    logstor_logger.log(log_level::warn, separator_flush_retry_rate_limit,
-            "Separator flush of table {} failed: {}. It is tried again in {} ms", _table, ex, _backoff.sleep_time().count());
+    logstor_logger.log(log_level::warn, separator_retry_rate_limit,
+            "Separator {} failed: {}. It is tried again in {} ms", subject, ex, _backoff.sleep_time().count());
     try {
         return _backoff.retry().then([] {
             return true;
@@ -798,7 +809,14 @@ private:
     }
     future<> run_separator_fiber();
 
-    future<> write_to_separator(std::vector<write_buffer::record_in_buffer>&, segment_position chunk_position, segment_ref, segment_sequence);
+    // Makes one pass over the records that the task still has, and moves each of them to the
+    // separator buffer of its compaction group. The writes to one group try a failed write again
+    // with the policy of separator_retry, and they give up the records of the group that are left
+    // when the table of the group stopped, the separator of the group closed, or logstor stops.
+    // Clears `complete` if it gives up a record.
+    // Fails only for a failure that no group owns, before the writes to the groups start or in the
+    // loop over the groups. The caller can then call it again.
+    future<> write_task_records(separator_task&, bool& complete);
 
     // The segment info of the first chunk of the segment, or nothing if its headers are not valid.
     future<std::optional<segment_info>> read_segment_info(log_segment_id);
@@ -1054,7 +1072,7 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
         sm::make_counter("separator_flush_failures", _compaction_mgr.get_stats().separator_flush_failures,
                        sm::description("Counts the failed attempts of separator flushes. A failed attempt is tried again until the table or logstor stops.")),
         sm::make_counter("separator_task_failures", _stats.separator_task_failures,
-                       sm::description("Counts number of logstor separator task failures.")),
+                       sm::description("Counts the failed attempts of separator tasks to move records to the separator buffers of their compaction groups. A failed attempt is tried again until the table of the records or logstor stops.")),
         sm::make_gauge("separator_buffers_in_use", [this] { return _separator_buffer_pool.used_buffer_count(); },
                        sm::description("Counts number of write buffers currently held by the separator, one per compaction group that has records to separate plus one per flush in flight.")),
         sm::make_gauge("separator_buffers_allocated", [this] { return _separator_buffer_pool.allocated_buffer_count(); },
@@ -1162,6 +1180,18 @@ future<> segment_manager_impl::stop() {
     logstor_logger.info("Segment manager stopped");
 }
 
+// Returns true when the separator must not try again to write a record to the group, because
+// nothing needs the record in a segment of the group.
+static bool takes_no_separator_writes(const logstor_group& cg) noexcept {
+    return cg.table_stopped() || !cg.separator_writes_enabled();
+}
+
+// Takes the record out of the task. The task then does not write the record, and the record no
+// longer holds its compaction group.
+static void drop_from_task(write_buffer::record_in_buffer& record) noexcept {
+    record.target = {};
+}
+
 future<> segment_manager_impl::run_separator_fiber() {
     while (true) {
         separator_task task;
@@ -1172,11 +1202,50 @@ future<> segment_manager_impl::run_separator_fiber() {
         }
 
         try {
-            co_await write_to_separator(task.records, task.chunk_position, task.keep_guard.ref(), task.seq_num);
-            task.keep_guard.release();
+            // A test holds the task here. The injection does not share messages, so a message
+            // releases only one task. The task goes on when the wait fails.
+            (co_await coroutine::as_future(futurize_invoke([] {
+                return utils::get_local_injector().inject("logstor_separator_task_wait",
+                        utils::wait_for_message(std::chrono::seconds{60}), false);
+            }))).ignore_ready_future();
+
+            // This loop is the one place that runs a failed pass of the task again, and this
+            // coroutine owns the task. So each failure of a pass reaches the retry, also a failed
+            // allocation of the frame of the pass, which futurize_invoke() turns into a failed
+            // future.
+            // The retry is for a failure that no group owns, before the writes to the groups start
+            // or in the loop over the groups. The writes to one group have a retry of their own.
+            separator_retry retry("task", std::nullopt, [this, &task] {
+                return _stopping || std::ranges::all_of(task.records, [] (const write_buffer::record_in_buffer& record) {
+                    return !record.target.cg || takes_no_separator_writes(*record.target.cg);
+                });
+            }, _stats.separator_task_failures);
+            bool complete = true;
+            while (true) {
+                auto pass = co_await coroutine::as_future(futurize_invoke([&] {
+                    return write_task_records(task, complete);
+                }));
+                if (!pass.failed()) {
+                    break;
+                }
+                auto ex = pass.get_exception();
+                if (!co_await retry.after_failed_step(ex)) {
+                    std::ranges::for_each(task.records, drop_from_task);
+                    complete = false;
+                    break;
+                }
+            }
+
+            // If the task gave up a record, the index still points at the record in the segment of
+            // the task, so the guard keeps the segment.
+            if (complete) {
+                task.keep_guard.release();
+            }
         } catch (...) {
-            ++_stats.separator_task_failures;
-            logstor_logger.debug("Separator task failed: {:t}", std::current_exception());
+            // The loop above handles each failure of a pass, so no exception comes here. If one
+            // does, the task cannot go on, and to drop the task would leave live records in a mixed
+            // segment while the flushes report success. After the abort, recovery separates them.
+            on_fatal_internal_error(logstor_logger, fmt::format("Separator task failed outside its retry: {}", std::current_exception()));
         }
     }
 }
@@ -2042,8 +2111,7 @@ void separator_index_update::operator()(record_location new_location, seastar::g
     index->update_record_location(key, prev_location, new_location);
 }
 
-future<> segment_manager_impl::write_to_separator(std::vector<write_buffer::record_in_buffer>& records, segment_position chunk_position,
-        segment_ref seg_ref, segment_sequence segment_seq_num) {
+future<> segment_manager_impl::write_task_records(separator_task& task, bool& complete) {
     static constexpr size_t separator_group_write_concurrency = 4;
 
     struct separator_group_records {
@@ -2051,12 +2119,20 @@ future<> segment_manager_impl::write_to_separator(std::vector<write_buffer::reco
         std::vector<write_buffer::record_in_buffer*> records;
     };
 
-    std::vector<separator_group_records> groups;
-    groups.reserve(records.size());
-    absl::flat_hash_map<logstor_group*, size_t> group_index;
-    group_index.reserve(records.size());
+    utils::get_local_injector().inject("logstor_fail_separator_task", [] {
+        throw std::bad_alloc();
+    });
 
-    for (auto& record : records) {
+    std::vector<separator_group_records> groups;
+    groups.reserve(task.records.size());
+    absl::flat_hash_map<logstor_group*, size_t> group_index;
+    group_index.reserve(task.records.size());
+
+    for (auto& record : task.records) {
+        // A pass before this one wrote the record or gave it up.
+        if (!record.target.cg) {
+            continue;
+        }
         auto [it, inserted] = group_index.emplace(record.target.cg, groups.size());
         if (inserted) {
             groups.push_back(separator_group_records{
@@ -2068,15 +2144,39 @@ future<> segment_manager_impl::write_to_separator(std::vector<write_buffer::reco
     }
 
     co_await seastar::max_concurrent_for_each(groups, separator_group_write_concurrency,
-            [chunk_position, seg_ref, segment_seq_num] (separator_group_records& group) -> future<> {
-        for (auto* record : group.records) {
-            separator_index_update update {
-                .index = &group.cg->logstor_index(),
-                .key = record->writer.record().header.index_key(),
-                .prev_location = record->location(chunk_position),
-            };
+            [this, &task, &complete] (separator_group_records& group) -> future<> {
+        separator_retry retry("task", group.cg->table_id(), [this, cg = group.cg] {
+            return _stopping || takes_no_separator_writes(*cg);
+        }, _stats.separator_task_failures);
 
-            co_await group.cg->write_to_separator(std::move(record->writer), seg_ref, segment_seq_num, std::move(update));
+        for (auto record = group.records.begin(); record != group.records.end(); ) {
+            // A failed write leaves the record with the task, so the next attempt writes the same
+            // record.
+            auto write = co_await coroutine::as_future(futurize_invoke([&] {
+                return group.cg->write_to_separator((*record)->writer, task.keep_guard.ref(), task.seq_num,
+                    separator_index_update {
+                        .index = &group.cg->logstor_index(),
+                        .key = (*record)->writer.record().header.index_key(),
+                        .prev_location = (*record)->location(task.chunk_position),
+                    });
+            }));
+            if (!write.failed()) {
+                // The record is in a separator buffer of its group, so the gate of the group does
+                // not wait for this task any more.
+                drop_from_task(**record);
+                ++record;
+                continue;
+            }
+
+            auto ex = write.get_exception();
+            if (!co_await retry.after_failed_step(ex)) {
+                // The index still points at these records in the segment of the task. Their table
+                // or their group stops, so the records are dead after it, or recovery separates
+                // them at the next start.
+                std::for_each(record, group.records.end(), [] (write_buffer::record_in_buffer* r) { drop_from_task(*r); });
+                complete = false;
+                co_return;
+            }
         }
     });
 }
@@ -2095,7 +2195,7 @@ future<> compaction_manager_impl::flush_separator_buffer(separator_buffer& buf, 
     // owns what an attempt needs from the attempt before it. So each failure of an attempt reaches
     // the retry, also a failed allocation of the frame of the attempt, which futurize_invoke()
     // turns into a failed future.
-    separator_flush_retry retry(cg.table_id(), [this, &cg] {
+    separator_retry retry("flush", cg.table_id(), [this, &cg] {
         return cg.table_stopped() || _sm.stopping();
     }, _stats.separator_flush_failures);
     std::exception_ptr failure;
@@ -2499,6 +2599,19 @@ future<> segment_manager_impl::separate_recovered_segments() {
     logstor_logger.info("Separated the records of {} recovered segments", recovered.to_separate.size());
 }
 
+// Writes a record of a recovered segment to the separator of its group. The write does not take
+// the writer, so this coroutine keeps the writer until the write completes.
+static future<> write_recovered_record(logstor_group& cg, const chunk_record& record, segment_ref seg_ref) {
+    const auto writer = log_record_bytes_writer(record.header, record.bytes);
+    co_await cg.write_to_separator(writer, std::move(seg_ref), std::nullopt,
+        separator_index_update {
+            .index = &cg.logstor_index(),
+            .key = record.header.index_key(),
+            .prev_location = record.location,
+        }
+    );
+}
+
 future<> segment_manager_impl::separate_segment_records(recovery_catalog& catalog, log_segment_id seg_id, recovery_stats& stats) {
     keep_on_release_guard keep_guard(make_segment_ref(seg_id));
     co_await for_each_record(seg_id, [seg_ref = keep_guard.ref(), &catalog, &stats] (const chunk_record& record) {
@@ -2518,15 +2631,7 @@ future<> segment_manager_impl::separate_segment_records(recovery_catalog& catalo
             index->erase(key, record.location);
             return make_ready_future<>();
         }
-        auto writer = log_record_bytes_writer(header, record.bytes);
-
-        return cg->write_to_separator(std::move(writer), seg_ref, std::nullopt,
-            separator_index_update {
-                .index = &cg->logstor_index(),
-                .key = key,
-                .prev_location = record.location,
-            }
-        );
+        return write_recovered_record(*cg, record, seg_ref);
     });
     keep_guard.release();
 }
@@ -2851,8 +2956,13 @@ void logstor_group::switch_active_separator_buffer() {
 
 future<> logstor_group::allocate_active_separator_buffer() {
     auto buf = co_await logstor_compaction_manager().allocate_separator_buffer();
-    co_await utils::get_local_injector().inject("logstor_separator_buffer_allocated",
-            utils::wait_for_message(std::chrono::seconds{60}));
+    // Nothing may fail from here until the group keeps the buffer or closes it, because the pool
+    // takes back only a closed buffer. So the wait of the injection does not fail this function,
+    // and write_buffer::close() needs no allocation.
+    (co_await coroutine::as_future(futurize_invoke([] {
+        return utils::get_local_injector().inject("logstor_separator_buffer_allocated",
+                utils::wait_for_message(std::chrono::seconds{60}));
+    }))).ignore_ready_future();
     if (_separator_enabled && !_active_buffer.allocated()) {
         _active_buffer.buf = std::move(buf);
         co_return;
@@ -2865,7 +2975,17 @@ future<> logstor_group::allocate_active_separator_buffer() {
 }
 
 template <log_record_writer_concept Writer>
-future<> logstor_group::write_to_separator(Writer writer, segment_ref seg_ref, std::optional<segment_sequence> segment_seq_num, separator_index_update after_written) {
+future<> logstor_group::write_to_separator(const Writer& writer, segment_ref seg_ref, std::optional<segment_sequence> segment_seq_num, separator_index_update after_written) {
+    // Fails the writes to the groups of the table that the parameter names, or to each group when
+    // it names no table.
+    co_await utils::get_local_injector().inject("logstor_fail_separator_write", [this] (auto& handler) -> future<> {
+        const auto table = handler.template get<std::string_view>("table");
+        if (!table || *table == fmt::to_string(table_id())) {
+            throw std::bad_alloc();
+        }
+        return make_ready_future<>();
+    });
+
     while (!_active_buffer.can_fit(writer)) {
         if (!_separator_enabled) {
             break;
@@ -2905,11 +3025,11 @@ future<> logstor_group::write_to_separator(Writer writer, segment_ref seg_ref, s
                 "logstor separator write to a closed compaction group of table {}", table_id()));
     }
 
-    _active_buffer.write(std::move(seg_ref), segment_seq_num, std::move(writer), std::move(after_written));
+    _active_buffer.write(std::move(seg_ref), segment_seq_num, writer, std::move(after_written));
 }
 
-template future<> logstor_group::write_to_separator(log_record_writer, segment_ref, std::optional<segment_sequence>, separator_index_update);
-template future<> logstor_group::write_to_separator(log_record_bytes_writer, segment_ref, std::optional<segment_sequence>, separator_index_update);
+template future<> logstor_group::write_to_separator(const log_record_writer&, segment_ref, std::optional<segment_sequence>, separator_index_update);
+template future<> logstor_group::write_to_separator(const log_record_bytes_writer&, segment_ref, std::optional<segment_sequence>, separator_index_update);
 
 future<> logstor_group::flush_separator(std::optional<segment_sequence> seq_num) {
     auto calls_holder = _separator_flush_calls.try_hold();

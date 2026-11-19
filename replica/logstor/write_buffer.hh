@@ -334,6 +334,11 @@ public:
     template <log_record_writer_concept Writer>
     future<record_location_with_holder> write(Writer writer, write_target target = {});
 
+    // Writes a record to the buffer of a full segment, and returns what write() returns.
+    // Does not take the writer, so the caller can write the record again when this fails.
+    template <log_record_writer_concept Writer>
+    future<record_location_with_holder> write_record(const Writer& writer);
+
     // Complete all tracked writes with their locations once the buffer's chunk is written at chunk_position.
     // A call that failed can run again with the same position, and it completes the writes one time.
     future<> complete_writes(segment_position chunk_position);
@@ -352,6 +357,9 @@ private:
 
     std::vector<record_in_buffer> take_separator_records();
 
+    // Returns the future of the location of a record that `_raw` took, with a holder of the buffer.
+    future<record_location_with_holder> track_write(raw_write_buffer::append_result);
+
     friend class buffered_writer;
     friend class segment_manager_impl;
     friend struct separator_buffer;
@@ -362,6 +370,8 @@ extern template raw_write_buffer::append_result raw_write_buffer::append<log_rec
 
 extern template future<record_location_with_holder> write_buffer::write<log_record_writer>(log_record_writer, write_target);
 extern template future<record_location_with_holder> write_buffer::write<log_record_bytes_writer>(log_record_bytes_writer, write_target);
+extern template future<record_location_with_holder> write_buffer::write_record<log_record_writer>(const log_record_writer&);
+extern template future<record_location_with_holder> write_buffer::write_record<log_record_bytes_writer>(const log_record_bytes_writer&);
 
 class write_buffer_pool;
 
