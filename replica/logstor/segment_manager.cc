@@ -391,6 +391,16 @@ struct separator_task {
     utils::phased_barrier::operation write_op;
 };
 
+// A chunk that write_full_segment_chunk() wrote to a full segment, until publish_full_segment()
+// gives the segment to its compaction group.
+struct unpublished_full_segment {
+    seg_ptr segment;
+    segment_position chunk_position{};
+    // The publish makes the index point into the segment, so the guard keeps the segment unless
+    // the publish adds the segment to its group.
+    segment_keep_guard keep_guard;
+};
+
 // The largest read buffer of a segment scan. It is the largest segment size today
 // (segment_descriptor_hist_options), so a scan reads a segment in one buffer.
 static constexpr size_t max_scan_buffer_size = 128 * 1024;
@@ -504,7 +514,19 @@ public:
     future<> stop();
 
     future<> write(write_buffer&);
+    // Writes the records of `wb` to a new full segment of `cg`: takes a segment, and then runs
+    // write_full_segment_chunk() and publish_full_segment(). If the chunk write fails, it aborts
+    // the writes of `wb`.
     future<> write_full_segment(write_buffer&, logstor_group&, write_source, abort_source* = nullptr);
+    // Seals `wb` for the segment and appends the chunk of `wb` to the segment.
+    // If it fails, the segment is freed, and `wb` keeps its records and its pending writes.
+    // The caller must give a segment from get_segment() that has no chunk.
+    future<unpublished_full_segment> write_full_segment_chunk(write_buffer&, logstor_group&, write_source, seg_ptr);
+    // Completes the writes of `wb` at the chunk position, so that the index points at the records
+    // in the segment, then stops the segment and adds the segment to `cg`.
+    // A call that failed can run again with the same arguments, because a step that is complete
+    // does nothing the second time.
+    future<> publish_full_segment(write_buffer&, logstor_group&, unpublished_full_segment&);
 
     future<log_record> read(record_location) noexcept;
 
@@ -1170,13 +1192,24 @@ future<> segment_manager_impl::write(write_buffer& wb) {
 }
 
 future<> segment_manager_impl::write_full_segment(write_buffer& wb, logstor_group& cg, write_source source, abort_source* as) {
+    auto seg = co_await get_segment(source, as);
+    auto chunk_write = co_await coroutine::as_future(write_full_segment_chunk(wb, cg, source, std::move(seg)));
+    if (chunk_write.failed()) {
+        auto ex = chunk_write.get_exception();
+        co_await wb.abort_writes(ex);
+        co_await coroutine::return_exception_ptr(std::move(ex));
+    }
+    auto unpublished = chunk_write.get();
+    co_await publish_full_segment(wb, cg, unpublished);
+}
+
+future<unpublished_full_segment> segment_manager_impl::write_full_segment_chunk(write_buffer& wb, logstor_group& cg, write_source source, seg_ptr seg) {
     const auto chunk_size = wb.chunk_size(block_alignment);
 
     if (chunk_size > _cfg.segment_size) {
         throw std::runtime_error(fmt::format("Chunk size {} exceeds segment size {}", chunk_size, _cfg.segment_size));
     }
 
-    auto seg = co_await get_segment(source, as);
     logstor_logger.trace("Write full segment {} seq {} from {}", seg->id(), seg->seq_num(), write_source_to_string(source));
 
     wb.seal(seg->seq_num(), cg.table_id(), block_alignment);
@@ -1184,27 +1217,33 @@ future<> segment_manager_impl::write_full_segment(write_buffer& wb, logstor_grou
 
     auto append_result = co_await coroutine::as_future(seg->append(chunk));
     if (append_result.failed()) {
-        auto ex = append_result.get_exception();
         ++_stats.write_failures;
-        co_await wb.abort_writes(ex);
-        co_await coroutine::return_exception_ptr(std::move(ex));
+        co_await coroutine::return_exception_ptr(append_result.get_exception());
     }
     auto pos = append_result.get();
 
     _stats.bytes_written[static_cast<size_t>(source)] += chunk.size();
     _stats.data_bytes_written[static_cast<size_t>(source)] += wb.record_bytes();
 
-    // The index already points into this segment, so if the group cannot take the segment, the
-    // guard keeps the segment.
+    // The publish makes the index point into this segment, so if the group cannot take the
+    // segment, the guard keeps the segment.
     segment_keep_guard keep_guard(seg->ref());
 
-    co_await wb.complete_writes(pos);
-    co_await seg->stop();
+    co_return unpublished_full_segment{
+        .segment = std::move(seg),
+        .chunk_position = pos,
+        .keep_guard = std::move(keep_guard),
+    };
+}
+
+future<> segment_manager_impl::publish_full_segment(write_buffer& wb, logstor_group& cg, unpublished_full_segment& unpublished) {
+    co_await wb.complete_writes(unpublished.chunk_position);
+    co_await unpublished.segment->stop();
 
     // add the segment after all index updates are completed.
-    auto& desc = get_segment_descriptor(seg->id());
+    auto& desc = get_segment_descriptor(unpublished.segment->id());
     cg.add_logstor_segment(desc);
-    keep_guard.cancel();
+    unpublished.keep_guard.cancel();
 }
 
 void segment_manager_impl::on_add_record(record_location location) noexcept {
