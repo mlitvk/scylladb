@@ -66,6 +66,7 @@ Only step 4 writes to the disk - all other steps only update in-memory metadata.
    - Only the stop of the table or of logstor ends the tries. The mixed segments of the records are then not freed until the node restarts.
    - So a flush of a table, a tablet migration, a tablet cleanup, a tablet merge and a truncate wait while a flush fails, and a flush that returns without an error means that each record is in a segment of its compaction group. The drop of a table waits too, because it truncates the table before it stops the table, and so does a graceful shutdown, because it flushes each table before it stops the tables.
    - While the flush of a group tries again and the other buffer of the group is full, the separator stops for all the groups of the shard, because the shard has one separator fiber.
+5. The copy of a record to the separator buffer of its group (step 1) has the same policy. A failed write to a group is tried again, for each compaction group by itself, so the records of the other groups of the same mixed chunk go on. When the table of a record stops or its group closes, the separator gives up the record and does not release the reference of the mixed segment, so that segment is not freed until the node restarts.
 
 **Compaction:**
 1. The amount of live data is tracked for each segment in its (in-memory) segment_descriptor. The segment descriptors are stored in a histogram by live data. This histogram is called a `segment_set` and each compaction group owns one.

@@ -3031,9 +3031,13 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_separator_writers_of_a_group_share_one_buf
     injector.enable(allocated);
     auto disable = seastar::defer([&injector, allocated] noexcept { injector.disable(allocated); });
 
-    auto separate = [&] (const sstring& pk) {
-        auto record = make_log_record(schema, pk, value);
-        auto key = record.header.index_key();
+    // The write does not take the writer, so the writers live until the writes complete.
+    const auto writers = std::array<log_record_writer, 2>{
+        log_record_writer(make_log_record(schema, keys[0], value)),
+        log_record_writer(make_log_record(schema, keys[1], value)),
+    };
+    auto separate = [&] (const log_record_writer& writer) {
+        auto key = writer.header().index_key();
         auto entry = lookup_location(cg.logstor_index(), key, *schema);
         BOOST_REQUIRE(entry);
         auto update = separator_index_update{
@@ -3041,16 +3045,15 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_separator_writers_of_a_group_share_one_buf
             .key = key,
             .prev_location = *entry,
         };
-        return cg.write_to_separator(log_record_writer(std::move(record)), snapshot.front().seg_ref,
-                std::nullopt, std::move(update));
+        return cg.write_to_separator(writer, snapshot.front().seg_ref, std::nullopt, std::move(update));
     };
 
-    auto first = separate(keys[0]);
+    auto first = separate(writers[0]);
     BOOST_REQUIRE(eventually_true([&] { return injector.waiters(allocated) == 1; }));
 
     // The pool has a buffer for each group and a reserve, so a second allocation would get a buffer
     // at once and wait at the injection too.
-    auto second = separate(keys[1]);
+    auto second = separate(writers[1]);
     for (int i = 0; i < 10; ++i) {
         seastar::thread::yield();
     }
@@ -3150,27 +3153,36 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_separator_close_waits_for_a_flush_that_sta
 
 namespace {
 
-// Checks that the flush wrote the record of `m` to the one segment of the group, that the index
-// points at the record there, and that the flush kept no segment.
-void require_separated(logstor& ls, test_logstor_group& cg, schema_ptr schema, const mutation& m) {
+// Checks that the flush wrote the records of `mutations` to the one segment of the group, that the
+// index points at each record there, that the segment holds no other live record, and that the
+// separator kept no segment.
+void require_separated(logstor& ls, test_logstor_group& cg, schema_ptr schema, std::span<const mutation> mutations) {
     BOOST_REQUIRE(!cg.separator_has_data());
     BOOST_REQUIRE_EQUAL(cg.separator_held_segment_count(), 0u);
     BOOST_REQUIRE_EQUAL(read_segment_manager_metric("kept_segments"), 0u);
 
     auto snapshot = ls.get_segment_manager().make_snapshot(cg).get();
     BOOST_REQUIRE_EQUAL(snapshot.size(), 1u);
-    auto entry = lookup_location(cg.logstor_index(), make_index_key(*schema, m.decorated_key()), *schema);
-    BOOST_REQUIRE(entry);
-    BOOST_REQUIRE_EQUAL(entry->segment.value, snapshot.front().segment_id.value);
+    BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_at(0).record_count, mutations.size());
+    for (const auto& m : mutations) {
+        auto entry = lookup_location(cg.logstor_index(), make_index_key(*schema, m.decorated_key()), *schema);
+        BOOST_REQUIRE(entry);
+        BOOST_REQUIRE_EQUAL(entry->segment.value, snapshot.front().segment_id.value);
 
-    auto read = read_mutation(ls, schema, cg.logstor_index(), m.decorated_key(), schema->full_slice()).get();
-    BOOST_REQUIRE(read);
-    assert_that(*read).is_equal_to(m);
+        auto read = read_mutation(ls, schema, cg.logstor_index(), m.decorated_key(), schema->full_slice()).get();
+        BOOST_REQUIRE(read);
+        assert_that(*read).is_equal_to(m);
+    }
 }
 
-// Checks that a separator flush whose step fails one time at the injection `failure` tries the step
-// again and succeeds.
-void test_separator_flush_tries_a_failed_step_again(std::string_view failure) {
+void require_separated(logstor& ls, test_logstor_group& cg, schema_ptr schema, const mutation& m) {
+    require_separated(ls, cg, schema, std::span(&m, 1));
+}
+
+// Checks that the separator tries a step again that fails one time at the injection `failure`, in
+// the separator task or in the flush, and that each record is then in the segment of the group one
+// time.
+void test_separator_tries_a_failed_step_again(std::string_view failure) {
     auto schema = make_kv_schema();
     tmpdir dir;
 
@@ -3187,16 +3199,39 @@ void test_separator_flush_tries_a_failed_step_again(std::string_view failure) {
     injector.enable(failure, true /* one shot */);
     auto disable = seastar::defer([&injector, failure] noexcept { injector.disable(failure); });
 
-    auto m = make_kv_mutation(schema, "pk0", "separator-value");
-    ls.write(m, write_target(&cg, {}), db::no_timeout).get();
+    // The writes start before the first of them completes, so one separator task has the records.
+    std::vector<mutation> mutations;
+    std::vector<future<>> writes;
+    for (auto pk : {"pk0", "pk1", "pk2"}) {
+        mutations.push_back(make_kv_mutation(schema, pk, "separator-value"));
+        writes.push_back(ls.write(mutations.back(), write_target(&cg, {}), db::no_timeout));
+    }
+    when_all_succeed(writes.begin(), writes.end()).get();
     ls.flush_to_separator().get();
     cg.flush_separator().get();
 
     // The one-shot injection is off after it failed one attempt.
     BOOST_REQUIRE(!injector.is_enabled(failure));
-    require_separated(ls, cg, schema, m);
+    require_separated(ls, cg, schema, mutations);
 }
 
+}
+
+// The task fails before it writes a record to a group, so it runs again with all its records.
+SEASTAR_THREAD_TEST_CASE(test_logstor_separator_task_tries_a_failed_start_again) {
+    if constexpr (!std::is_same_v<utils::error_injection_type, utils::error_injection<true>>) {
+        return;
+    }
+    test_separator_tries_a_failed_step_again("logstor_fail_separator_task");
+}
+
+// The write of one record to its group fails. The record stays with the task, and the task writes
+// it again and then the records after it.
+SEASTAR_THREAD_TEST_CASE(test_logstor_separator_task_tries_a_failed_write_again) {
+    if constexpr (!std::is_same_v<utils::error_injection_type, utils::error_injection<true>>) {
+        return;
+    }
+    test_separator_tries_a_failed_step_again("logstor_fail_separator_write");
 }
 
 // A failed chunk write frees its segment, and the next attempt seals the buffer again for a new
@@ -3205,7 +3240,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_separator_flush_tries_a_failed_chunk_write
     if constexpr (!std::is_same_v<utils::error_injection_type, utils::error_injection<true>>) {
         return;
     }
-    test_separator_flush_tries_a_failed_step_again("fail_flush_separator_buffer");
+    test_separator_tries_a_failed_step_again("fail_flush_separator_buffer");
 }
 
 // The injection fails the publish after the index points at the records in the new segment, so the
@@ -3214,7 +3249,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_separator_flush_tries_a_failed_publish_aga
     if constexpr (!std::is_same_v<utils::error_injection_type, utils::error_injection<true>>) {
         return;
     }
-    test_separator_flush_tries_a_failed_step_again("logstor_fail_segment_add");
+    test_separator_tries_a_failed_step_again("logstor_fail_segment_add");
 }
 
 // Checks that a separator flush that keeps failing waits, and that it succeeds when the cause of the
@@ -3416,6 +3451,101 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_separator_flush_retry_of_the_publish_ends_
         return;
     }
     test_separator_flush_retry_ends_when_the_table_stops("logstor_fail_segment_add", 2);
+}
+
+// Checks that the stop of a table ends the retry of a separator task for the records of that table
+// only. The task has a record of each of two tables, and the writes to the first table fail. The
+// record of the second table goes to its group while the task tries again. When the first table
+// stops, the task gives up the record of that table and ends, and it keeps its segment, because the
+// index still points at that record there.
+SEASTAR_THREAD_TEST_CASE(test_logstor_separator_task_retry_ends_for_the_table_that_stops) {
+    if constexpr (!std::is_same_v<utils::error_injection_type, utils::error_injection<true>>) {
+        return;
+    }
+
+    auto stopping_schema = make_kv_schema();
+    auto other_schema = schema_builder(1, "ks", "other_cf")
+            .with_column("pk", utf8_type, column_kind::partition_key)
+            .with_column("v", utf8_type)
+            .build();
+    BOOST_REQUIRE(stopping_schema->id() != other_schema->id());
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    test_recovery_catalog no_tables;
+    ls.do_recovery(no_tables).get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group stopping(stopping_schema, ls);
+    test_logstor_group other(other_schema, ls);
+
+    constexpr std::string_view failure = "logstor_fail_separator_write";
+    auto& injector = utils::get_local_injector();
+    injector.enable(failure, false, {{"table", fmt::to_string(stopping.table_id())}});
+    auto disable = seastar::defer([&injector, failure] noexcept { injector.disable(failure); });
+
+    // The writes start before the first of them completes, so one separator task has both records.
+    auto stopping_record = make_kv_mutation(stopping_schema, "pk0", "stopping-value");
+    auto other_record = make_kv_mutation(other_schema, "pk0", "other-value");
+    auto stopping_write = ls.write(stopping_record, write_target(&stopping, {}), db::no_timeout);
+    auto other_write = ls.write(other_record, write_target(&other, {}), db::no_timeout);
+    stopping_write.get();
+    other_write.get();
+
+    auto separated = ls.flush_to_separator();
+    BOOST_REQUIRE(eventually_true([&] { return other.separator_has_data() && injector.enter_count(failure) >= 3; }));
+    BOOST_REQUIRE(!separated.available());
+    BOOST_REQUIRE(!stopping.separator_has_data());
+
+    other.flush_separator().get();
+    require_separated(ls, other, other_schema, other_record);
+
+    stopping.set_table_stopped();
+    separated.get();
+    BOOST_REQUIRE(!stopping.separator_has_data());
+    BOOST_REQUIRE_EQUAL(stopping.logstor_segments().segment_count(), 0u);
+    BOOST_REQUIRE_EQUAL(read_segment_manager_metric("kept_segments"), 1u);
+    auto read = read_mutation(ls, stopping_schema, stopping.logstor_index(), stopping_record.decorated_key(), stopping_schema->full_slice()).get();
+    BOOST_REQUIRE(read);
+    assert_that(*read).is_equal_to(stopping_record);
+}
+
+// Checks that the stop of logstor ends the retry of a separator task, so that the stop does not
+// wait for a task that keeps failing. The task keeps its segment, and recovery separates the record
+// at the next start.
+SEASTAR_THREAD_TEST_CASE(test_logstor_separator_task_retry_ends_when_logstor_stops) {
+    if constexpr (!std::is_same_v<utils::error_injection_type, utils::error_injection<true>>) {
+        return;
+    }
+
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    test_recovery_catalog no_tables;
+    ls.do_recovery(no_tables).get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+
+    constexpr std::string_view failure = "logstor_fail_separator_write";
+    auto& injector = utils::get_local_injector();
+    injector.enable(failure);
+    auto disable = seastar::defer([&injector, failure] noexcept { injector.disable(failure); });
+
+    ls.write(make_kv_mutation(schema, "pk0", "separator-value"), write_target(&cg, {}), db::no_timeout).get();
+    auto separated = ls.flush_to_separator();
+    BOOST_REQUIRE(eventually_true([&] { return injector.enter_count(failure) >= 2; }));
+    BOOST_REQUIRE(!separated.available());
+
+    ls.stop().get();
+    separated.get();
+    BOOST_REQUIRE(!cg.separator_has_data());
+    BOOST_REQUIRE_EQUAL(read_segment_manager_metric("kept_segments"), 1u);
 }
 
 // Checks that the stop of logstor ends the retry of a separator flush, so that the stop does not

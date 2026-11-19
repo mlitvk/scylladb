@@ -338,11 +338,20 @@ struct separator_buffer {
 
     ~separator_buffer();
 
+    // Writes the record to the buffer. The index update `after_written` runs when the flush of the
+    // buffer wrote the record to a segment.
+    // If the write throws, the caller can write the record again. A write that throws can leave
+    // the guard of the source segment and a copy of the record in the buffer. Both are harmless:
+    // the flush cancels the guard, and only one copy of a record gets an index update that
+    // changes the index, because each update applies only while the index points at the source.
     template <log_record_writer_concept Writer>
-    void write(segment_ref seg_ref, std::optional<segment_sequence> segment_seq_num, Writer writer, separator_index_update after_written) {
+    void write(segment_ref seg_ref, std::optional<segment_sequence> segment_seq_num, const Writer& writer, separator_index_update after_written) {
         // The separator buffer holds a reference to the source segment until its updates are durable.
         if (held_segments.empty() || held_segments.back().ref().id() != seg_ref.id()) {
-            held_segments.push_back(segment_keep_guard(std::move(seg_ref)));
+            // The room comes first, and it holds an empty guard. A guard of the segment that goes
+            // away in a failed push_back() would keep the segment for good.
+            held_segments.emplace_back();
+            held_segments.back() = segment_keep_guard(std::move(seg_ref));
         }
 
         if (segment_seq_num && (!min_seq_num || *segment_seq_num < *min_seq_num)) {
@@ -350,7 +359,7 @@ struct separator_buffer {
         }
 
         pending_updates.push_back(
-            buf->write(std::move(writer)).then_unpack(std::move(after_written))
+            buf->write_record(writer).then_unpack(std::move(after_written))
         );
     }
 
@@ -521,8 +530,15 @@ public:
         _logstor_segments.clear();
     }
 
+    // Writes the record to the active separator buffer of the group, after it waited for room.
+    // Throws if the separator of the group closed, or if a step fails. The record is then not in
+    // the group, and the caller can write it again.
+    // The caller must keep the writer valid until the future resolves.
     template <log_record_writer_concept Writer>
-    future<> write_to_separator(Writer, segment_ref, std::optional<segment_sequence>, separator_index_update);
+    future<> write_to_separator(const Writer&, segment_ref, std::optional<segment_sequence>, separator_index_update);
+    // A temporary writer does not live until the future resolves.
+    template <log_record_writer_concept Writer>
+    future<> write_to_separator(const Writer&&, segment_ref, std::optional<segment_sequence>, separator_index_update) = delete;
 
     // Flushes each separator buffer of the group that holds a record of a segment with a segment_seq
     // lower than `seq_num`, or each separator buffer that holds a record when `seq_num` is not given.
@@ -535,6 +551,12 @@ public:
     // registered with it, which is what makes the group's buffers flushable.
     void enable_separator_writes() noexcept {
         _separator_enabled = true;
+    }
+
+    // Returns false before the group is registered with the compaction manager and after
+    // close_separator() started. write_to_separator() then throws.
+    bool separator_writes_enabled() const noexcept {
+        return _separator_enabled;
     }
 
     // Stops the separator writes to the group, waits for the flush_separator() calls, discards the
