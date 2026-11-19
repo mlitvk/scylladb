@@ -121,6 +121,7 @@ class test_logstor_group final : public replica::logstor::logstor_group {
     std::unique_ptr<replica::logstor::primary_index> _owned_index;
     replica::logstor::primary_index& _index;
     replica::logstor::compaction_manager& _cm;
+    bool _table_stopped{false};
 public:
     test_logstor_group(schema_ptr schema, replica::logstor::logstor& ls, bool cache_enabled = false)
         : logstor_group(ls.get_segment_manager().get_segment_size(), &ls.get_segment_manager().shard_segment_stats())
@@ -147,6 +148,15 @@ public:
 
     ::table_id table_id() const noexcept override {
         return _table_id;
+    }
+
+    bool table_stopped() const noexcept override {
+        return _table_stopped;
+    }
+
+    // Makes the group answer as the group of a table whose stop started.
+    void set_table_stopped() noexcept {
+        _table_stopped = true;
     }
 
     replica::logstor::primary_index& logstor_index() noexcept override {

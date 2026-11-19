@@ -97,6 +97,8 @@ future<> logstor::stop() {
     }
     logstor_logger.info("Stopping logstor");
 
+    // The waits below can wait for a separator flush, which must not try again after a failure.
+    _segment_manager.begin_stop();
     co_await _async_gate.close();
     co_await _flush_to_separator_action.join();
     co_await _write_buffer.stop();

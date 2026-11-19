@@ -384,6 +384,14 @@ struct separator_buffer {
     // before this.
     future<> release();
 
+    // Returns true if the buffer has no write buffer, or if its write buffer is closed.
+    bool closed() const noexcept {
+        return !buf || buf->is_closed();
+    }
+
+    // Does what release() does, for a buffer that is closed. Does not fail.
+    void release_closed() noexcept;
+
     future<> abort(std::exception_ptr);
 
     // Releases the guards of the source segments without keep_on_release(), because the flush wrote
@@ -479,6 +487,13 @@ public:
         return false;
     }
 
+    // Returns true after the stop of the table of the group started. The store then does not need
+    // the records of the group in segments of the group: after a drop the records are dead, and
+    // after a shutdown recovery separates them.
+    virtual bool table_stopped() const noexcept {
+        return false;
+    }
+
     virtual primary_index& logstor_index() noexcept = 0;
     virtual const primary_index& logstor_index() const noexcept = 0;
 
@@ -502,6 +517,9 @@ public:
 
     // Flushes each separator buffer of the group that holds a record of a segment with a segment_seq
     // lower than `seq_num`, or each separator buffer that holds a record when `seq_num` is not given.
+    // A flush that fails is tried again until it succeeds, so the call fails only when the table of
+    // the group stopped or logstor stops. It then reports the first failure after it waited for
+    // each flush.
     // Returns at once when close_separator() started, as a flush of a stopped table does, because the
     // close discards what the buffers still hold.
     future<> flush_separator(std::optional<segment_sequence> seq_num = std::nullopt);
