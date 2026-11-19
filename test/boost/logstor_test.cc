@@ -1197,6 +1197,29 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_abort_writes_reclaims_unflush
     BOOST_REQUIRE(!wb.has_data());
 }
 
+// Checks that complete_writes() can run again with the same position, and that the second call
+// does not complete the writes again. The publish of a full segment runs again from its first step
+// after a failure.
+SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_complete_writes_can_run_again) {
+    auto schema = make_kv_schema();
+
+    write_buffer wb(32 * 1024, segment_kind::full);
+    auto written = wb.write(log_record_writer(make_log_record(schema, "pk0", "v0", api::timestamp_type(1))));
+
+    const segment_position chunk_position{.segment = log_segment_id{3}, .offset = 0};
+    auto completed = wb.complete_writes(chunk_position);
+    {
+        // The write gives the location with a holder of the buffer, and the buffer closes when the
+        // holder goes.
+        auto [location, holder] = written.get();
+        BOOST_REQUIRE(location.segment == chunk_position.segment);
+    }
+    completed.get();
+
+    wb.complete_writes(chunk_position).get();
+    BOOST_REQUIRE(wb.is_closed());
+}
+
 // Checks that a pool builds its buffers at the point of use and keeps only max_cached of them once
 // they are returned, so that a pool whose capacity is rarely reached does not hold the memory for it.
 SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_pool_builds_buffers_on_demand) {

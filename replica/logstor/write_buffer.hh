@@ -330,7 +330,8 @@ public:
     template <log_record_writer_concept Writer>
     future<record_location_with_holder> write(Writer writer, write_target target = {});
 
-    // Complete all tracked writes with their locations once the buffer's chunk is written at chunk_position
+    // Complete all tracked writes with their locations once the buffer's chunk is written at chunk_position.
+    // A call that failed can run again with the same position, and it completes the writes one time.
     future<> complete_writes(segment_position chunk_position);
     future<> abort_writes(std::exception_ptr);
 

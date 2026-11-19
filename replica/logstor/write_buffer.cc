@@ -230,7 +230,11 @@ future<record_location_with_holder> write_buffer::write(Writer writer, write_tar
 }
 
 future<> write_buffer::complete_writes(segment_position chunk_position) {
-    _written.set_value(chunk_position);
+    if (!_written.available()) {
+        _written.set_value(chunk_position);
+    } else if (_written.failed()) {
+        on_internal_error(logstor_logger, "Attempted to complete the writes of a write buffer after they aborted");
+    }
     co_await close();
 }
 
