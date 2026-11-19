@@ -84,9 +84,11 @@ public:
         utils::updateable_value<double> min_utilization_threshold;
         seastar::scheduling_group sg;
         // The longest time that the driver waits when no event wakes it. The timeout covers what
-        // the events do not show: a segment that crosses the threshold inside one bucket of the
-        // utilization histogram, which does not change the backlog estimate.
-        std::chrono::milliseconds wait_timeout = std::chrono::seconds(10);
+        // the events do not show, for example a segment that crosses the threshold inside one bucket
+        // of the utilization histogram, which does not change the backlog estimate.
+        // While the driver waits, the writes can wait for free segments, so the timeout is short,
+        // and an idle shard ranks its groups once a second.
+        std::chrono::milliseconds wait_timeout = std::chrono::seconds(1);
         // The time that the driver waits after a failed step before it starts again. A failure that
         // repeats, for example under memory pressure, then logs at most once in this time.
         std::chrono::milliseconds failure_retry_delay = std::chrono::seconds(1);
