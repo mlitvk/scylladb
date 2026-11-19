@@ -2825,10 +2825,28 @@ void logstor_group::switch_active_separator_buffer() {
         on_internal_error(logstor_logger, "Attempted to switch active separator buffer while flush is in progress");
     }
 
-    std::swap(_active_buffer, _flushing_buffer);
-    ++_separator_generation;
+    // The shared future needs an allocation, so it is made before the flush starts: a flush that
+    // started cannot be taken back.
+    promise<> flush_done;
+    shared_future<> flush(flush_done.get_future());
 
-    _separator_flush = shared_future(logstor_compaction_manager().flush_separator_buffer(_flushing_buffer, *this));
+    std::swap(_active_buffer, _flushing_buffer);
+    try {
+        utils::get_local_injector().inject("logstor_fail_separator_flush_start", [] {
+            throw std::bad_alloc();
+        });
+        logstor_compaction_manager().flush_separator_buffer(_flushing_buffer, *this).forward_to(std::move(flush_done));
+    } catch (...) {
+        // The flush did not start, for example because the allocation of its coroutine frame
+        // failed. Put the buffers back, so that the records are in the active buffer again and the
+        // next flush takes them. Without this, the records wait in the other buffer, which no flush
+        // call looks at, and a later flush call returns although it did not flush them.
+        std::swap(_active_buffer, _flushing_buffer);
+        flush_done.set_value();
+        throw;
+    }
+    ++_separator_generation;
+    _separator_flush = std::move(flush);
 }
 
 future<> logstor_group::allocate_active_separator_buffer() {
