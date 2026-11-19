@@ -161,7 +161,9 @@ private:
     aligned_buffer_type _buffer;
     segment_kind _segment_kind;
     ostream _stream;
-    ostream _header_stream;
+    // The size of the records, which the first seal() sets, so that a second seal() writes the same
+    // size to the header.
+    uint32_t _records_size{0};
 
     // The frame sizes of the appended records summed, their padding excluded.
     size_t _record_bytes{0};
@@ -239,6 +241,8 @@ public:
 
     // Completes the chunk: pads it to `alignment` and writes its header. `table` is set for
     // segment_kind::full.
+    // A sealed buffer can be sealed again with the same alignment, for the write of the chunk to
+    // another segment. Then only the headers change.
     void seal(segment_sequence segment_seq, std::optional<table_id> table, size_t alignment);
 
     // The chunk the buffer was sealed into, which is what is written to a segment.
@@ -317,9 +321,9 @@ public:
         return _raw.chunk_size(alignment);
     }
 
-    void seal(segment_sequence segment_seq, std::optional<table_id> table, size_t alignment) {
-        _raw.seal(segment_seq, table, alignment);
-    }
+    // Seals the chunk, as raw_write_buffer::seal() does. A second seal is valid only before
+    // complete_writes() and abort_writes().
+    void seal(segment_sequence segment_seq, std::optional<table_id> table, size_t alignment);
 
     bytes_view chunk() const { return _raw.chunk(); }
 

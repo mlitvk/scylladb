@@ -42,7 +42,9 @@ raw_write_buffer::raw_write_buffer(size_t buffer_size, segment_kind kind)
 
 void raw_write_buffer::reset() {
     _stream = seastar::simple_memory_output_stream(_buffer.get(), _buffer_size);
-    _header_stream = _stream.write_substream(chunk_header_size());
+    // Leaves the room for the chunk header, which write_header() fills.
+    _stream.skip(chunk_header_size());
+    _records_size = 0;
     _record_bytes = 0;
     _record_count = 0;
     _min_token = std::nullopt;
@@ -114,12 +116,15 @@ void raw_write_buffer::pad_to_alignment(size_t alignment) {
 }
 
 void raw_write_buffer::seal(segment_sequence segment_seq, std::optional<table_id> table, size_t alignment) {
-    if (_sealed) {
-        throw std::runtime_error("Cannot seal write buffer more than once");
+    if (!_sealed) {
+        _records_size = static_cast<uint32_t>(serialized_size() - chunk_header_size());
+        pad_to_alignment(alignment);
+    } else if (serialized_size() % alignment != 0) {
+        // The padding of the first seal is in place, and another alignment would need another padding.
+        on_internal_error(logstor_logger, fmt::format(
+                "Attempted to seal a write buffer of {} bytes again with the alignment {}", serialized_size(), alignment));
     }
-    const auto records_size = static_cast<uint32_t>(serialized_size() - chunk_header_size());
-    pad_to_alignment(alignment);
-    write_header(segment_seq, table, records_size);
+    write_header(segment_seq, table, _records_size);
     _sealed = true;
 }
 
@@ -148,7 +153,10 @@ void raw_write_buffer::write_header(segment_sequence segment_seq, std::optional<
         };
         break;
     }
-    ondisk::write_chunk_header(_header_stream, ch);
+    // Each call writes the header from the start of the buffer, so that a second seal() replaces
+    // the header of the first.
+    ostream header_stream(_buffer.get(), chunk_header_size());
+    ondisk::write_chunk_header(header_stream, ch);
 }
 
 size_t raw_write_buffer::estimate_required_segments(size_t record_bytes, size_t record_count, size_t segment_size, segment_kind kind) {
@@ -198,6 +206,15 @@ future<> write_buffer::close() {
 
 bool write_buffer::is_closed() const noexcept {
     return _write_gate.is_closed();
+}
+
+void write_buffer::seal(segment_sequence segment_seq, std::optional<table_id> table, size_t alignment) {
+    // After the writes complete, the index points at the records in a segment that has the
+    // sequence of the last seal, so the chunk must not get another sequence.
+    if (_written.available()) {
+        on_internal_error(logstor_logger, "Attempted to seal a write buffer after its writes completed or aborted");
+    }
+    _raw.seal(segment_seq, table, alignment);
 }
 
 template <log_record_writer_concept Writer>

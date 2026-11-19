@@ -20,6 +20,7 @@
 #include <vector>
 #include <fmt/format.h>
 #include <seastar/core/byteorder.hh>
+#include <seastar/core/on_internal_error.hh>
 #include <seastar/core/memory.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/util/closeable.hh>
@@ -813,6 +814,60 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_record_and_header_serializati
     BOOST_REQUIRE_EQUAL(full.table, schema->id());
     BOOST_REQUIRE_EQUAL(full.first_token, expected.header.key.token());
     BOOST_REQUIRE_EQUAL(full.last_token, expected.header.key.token());
+}
+
+// Checks that a second seal of a full raw write buffer changes only the chunk header, which gets
+// the new sequence and a valid CRC. A flush that failed seals its buffer again when it writes the
+// chunk to another segment.
+SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_seals_again_for_another_segment) {
+    auto schema = make_kv_schema();
+
+    raw_write_buffer wb(32 * 1024, segment_kind::full);
+    wb.append(log_record_writer(make_log_record(schema, "pk0", "v0", api::timestamp_type(7))));
+    wb.seal(segment_sequence{17}, schema->id(), ondisk::block_alignment);
+    const auto first_view = wb.chunk();
+    const bytes first_chunk(first_view.begin(), first_view.end());
+
+    wb.seal(segment_sequence{18}, schema->id(), ondisk::block_alignment);
+    const auto chunk = wb.chunk();
+    const auto header_size = ondisk::chunk_header_size(segment_kind::full);
+    BOOST_REQUIRE_EQUAL(chunk.size(), first_chunk.size());
+    BOOST_REQUIRE(chunk.substr(header_size) == bytes_view(first_chunk).substr(header_size));
+
+    const auto read_header = [] (bytes_view chunk) {
+        temporary_buffer<char> buf(reinterpret_cast<const char*>(chunk.data()), chunk.size());
+        auto header = read_chunk_header(buf);
+        BOOST_REQUIRE(header);
+        return *header;
+    };
+    const auto first_header = read_header(first_chunk);
+    const auto header = read_header(chunk);
+    BOOST_REQUIRE_EQUAL(first_header.segment.segment_seq.value, 17u);
+    BOOST_REQUIRE_EQUAL(header.segment.segment_seq.value, 18u);
+    BOOST_REQUIRE_EQUAL(header.records_size, first_header.records_size);
+    BOOST_REQUIRE_EQUAL(header.body_crc, first_header.body_crc);
+}
+
+// Checks that a write buffer refuses a seal after its writes completed. The index then points at
+// the records in the segment of the last seal, so the chunk must keep the sequence of that segment.
+SEASTAR_THREAD_TEST_CASE(test_logstor_write_buffer_seal_after_its_writes_completed_is_an_internal_error) {
+    const auto do_abort = set_abort_on_internal_error(false);
+    auto restore_abort = seastar::defer([do_abort] noexcept {
+        set_abort_on_internal_error(do_abort);
+    });
+    auto schema = make_kv_schema();
+
+    write_buffer wb(32 * 1024, segment_kind::full);
+    auto written = wb.write(log_record_writer(make_log_record(schema, "pk0", "v0", api::timestamp_type(1))));
+    wb.seal(segment_sequence{17}, schema->id(), ondisk::block_alignment);
+    wb.seal(segment_sequence{18}, schema->id(), ondisk::block_alignment);
+
+    auto completed = wb.complete_writes(segment_position{.segment = log_segment_id{3}, .offset = 0});
+    {
+        auto [location, holder] = written.get();
+    }
+    completed.get();
+    BOOST_REQUIRE_THROW(wb.seal(segment_sequence{19}, schema->id(), ondisk::block_alignment), std::exception);
 }
 
 namespace {
