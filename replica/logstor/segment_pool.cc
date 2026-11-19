@@ -8,6 +8,7 @@
 
 #include "replica/logstor/segment_pool.hh"
 
+#include <algorithm>
 #include <stdexcept>
 
 #include <seastar/core/coroutine.hh>
@@ -82,10 +83,6 @@ future<bool> segment_allocator::wait_for_free_segment() {
     co_return _stop_waiting;
 }
 
-static std::exception_ptr segment_pool_stopped_error() {
-    return std::make_exception_ptr(std::runtime_error("The segment pool is stopped"));
-}
-
 void segment_pool::start(scheduling_group sg) {
     _refill = with_scheduling_group(sg, [this] {
         return refill();
@@ -97,14 +94,17 @@ future<> segment_pool::stop() {
     _refill_needed.signal();
     _allocator.stop_waiting();
     co_await std::move(_refill);
-    fail_waiters(segment_pool_stopped_error());
+    if (std::ranges::any_of(_waiters, [] (const waiter_list& waiters) { return !waiters.empty(); })) [[unlikely]] {
+        on_internal_error_noexcept(logstor_logger, "A consumer waits for a segment while the segment pool stops");
+        fail_waiters(std::make_exception_ptr(std::runtime_error("The segment pool is stopped")));
+    }
     _segments.clear();
 }
 
 future<seg_ptr> segment_pool::take(write_source src, abort_source* as) noexcept {
     try {
         if (_stopping) [[unlikely]] {
-            return make_exception_future<seg_ptr>(segment_pool_stopped_error());
+            on_internal_error(logstor_logger, "Cannot take a segment from a stopped segment pool");
         }
         const auto t = tier_of(src);
         if (_waiters[static_cast<size_t>(t)].empty() && can_take(t)) {

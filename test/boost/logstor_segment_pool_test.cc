@@ -18,6 +18,7 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/scheduling.hh>
 #include <seastar/core/shared_ptr.hh>
+#include <seastar/testing/on_internal_error.hh>
 #include <seastar/testing/thread_test_case.hh>
 #include <seastar/util/defer.hh>
 
@@ -430,8 +431,9 @@ SEASTAR_THREAD_TEST_CASE(test_segment_pool_failed_refill_fails_the_waiters) {
 }
 
 // Checks that a call to take() after the pool stopped fails at once, and that a consumer that waits
-// when the pool stops fails.
+// when the pool stops fails. Both are internal errors, which do not abort the test here.
 SEASTAR_THREAD_TEST_CASE(test_segment_pool_take_after_stop_fails) {
+    seastar::testing::scoped_no_abort_on_internal_error no_abort;
     test_allocator ta(1);
     segment_pool p({.capacity = 1}, ta.alloc);
     p.start(default_scheduling_group());
