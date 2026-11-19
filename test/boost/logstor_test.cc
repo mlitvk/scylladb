@@ -3255,6 +3255,43 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_separator_flush_waits_while_it_fails) {
     require_separated(ls, cg, schema, m);
 }
 
+// Checks that a separator flush that does not start, for example because the allocation of its
+// coroutine frame fails, leaves the records in the buffer that the next flush takes. The flush call
+// fails, and the next flush call writes the records.
+SEASTAR_THREAD_TEST_CASE(test_logstor_separator_flush_that_does_not_start_leaves_its_records_for_the_next_flush) {
+    if constexpr (!std::is_same_v<utils::error_injection_type, utils::error_injection<true>>) {
+        return;
+    }
+
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    test_recovery_catalog no_tables;
+    ls.do_recovery(no_tables).get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+
+    constexpr std::string_view failure = "logstor_fail_separator_flush_start";
+    auto& injector = utils::get_local_injector();
+    injector.enable(failure, true /* one shot */);
+    auto disable = seastar::defer([&injector, failure] noexcept { injector.disable(failure); });
+
+    auto m = make_kv_mutation(schema, "pk0", "separator-value");
+    ls.write(m, write_target(&cg, {}), db::no_timeout).get();
+    ls.flush_to_separator().get();
+
+    BOOST_REQUIRE_THROW(cg.flush_separator().get(), std::bad_alloc);
+    BOOST_REQUIRE(cg.separator_has_data());
+    BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 0u);
+
+    cg.flush_separator().get();
+    require_separated(ls, cg, schema, m);
+}
+
 // Checks that the retry of a separator flush of one group delays the separator of the other groups,
 // and that the delay ends with the retry. While the flush of a group retries and the other buffer
 // of the group is full, the separator fiber waits for room in the group, so no group gets its
