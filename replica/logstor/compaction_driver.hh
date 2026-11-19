@@ -185,11 +185,9 @@ private:
 
         bool operator==(const ranking_inputs&) const noexcept = default;
     };
-    // The inputs as of the last controller tick.
-    ranking_inputs _ranking_inputs{};
-    // The state before the last ranking that came back empty. A driver that waits for candidates is
-    // woken when the inputs change, and it does not wait when a group became idle during the
-    // ranking. An empty value means that any event wakes the driver.
+    // The state of the shard when the last ranking that came back empty started. A driver that waits
+    // for candidates is woken when the inputs change, and it does not wait when a group became idle
+    // during the ranking. An empty value means that any event wakes the driver.
     struct ranking_start {
         ranking_inputs inputs;
         uint64_t idle_notifications;
@@ -216,6 +214,9 @@ private:
 
     void set_space_floor(double fraction) noexcept;
     void tick_rate_controller() noexcept;
+    // Returns the inputs of the selection from `shard`, under the threshold and the minimum batch of
+    // the last controller tick.
+    ranking_inputs make_ranking_inputs(const shard_sample& shard) const noexcept;
     future<> wait_for_work(wait_reason, std::chrono::milliseconds timeout);
     future<> run();
     // Runs one step of the driver: a wait for work, a ranking, or the start of one job.

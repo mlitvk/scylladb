@@ -95,7 +95,8 @@ public:
     uint64_t available_segments = segment_count;
     utilization_histogram utilization{};
     uint64_t dead_segments = 0;
-    // The calls of sample(). The driver calls it once in each controller tick.
+    // The calls of sample(). The driver calls it once in each controller tick, and once at the start
+    // of each ranking.
     mutable size_t ticks = 0;
 
     bool can_submit_compaction() const noexcept override {
@@ -196,7 +197,8 @@ bool wait_until(std::function<bool()> pred) {
     return true;
 }
 
-// Waits until the controller ticks `n` more times.
+// Waits until sample() is called `n` more times. The caller must make sure that no ranking starts
+// during the wait, so that each call is a controller tick.
 void wait_for_ticks(const fake_host& host, size_t n) {
     const auto target = host.ticks + n;
     BOOST_REQUIRE(wait_until([&] { return host.ticks >= target; }));
@@ -317,6 +319,35 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_wakes_when_a_segment_die
 
     host.dead_segments = 1;
     BOOST_REQUIRE(wait_until([&] { return host.jobs.size() == 1; }));
+}
+
+// A job can free the dead segments that the last tick counted, and the writes can make as many new
+// segments dead before the next tick. That tick reads the same inputs as the last tick, but the
+// ranking after the job saw no dead segment, so the tick wakes the driver.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_wakes_when_the_dead_count_returns_after_a_job) {
+    const compaction_candidate_score dead_batch{.n_in = 8, .n_out = 0, .live_bytes = 0};
+    fake_host host;
+    fake_group a;
+    // The second ranking runs while the first job runs, and the third one after the job.
+    host.rankings = {{candidate_of(a, dead_batch)}, {}, {}, {candidate_of(a, dead_batch)}};
+    auto set_dead_segments = [&] (uint64_t n) {
+        host.dead_segments = n;
+        host.utilization[0] = n;
+    };
+    set_dead_segments(8);
+    compaction_driver driver(host, make_config());
+    start(driver);
+    auto stop_driver = seastar::defer([&] noexcept { stop(driver, host); });
+
+    BOOST_REQUIRE(wait_until([&] { return host.jobs.size() == 1 && host.ranking_limits.size() == 2; }));
+    // The last tick before the job ends counts the 8 dead segments.
+    wait_for_ticks(host, 1);
+
+    set_dead_segments(0);
+    end_job(host, 0);
+    BOOST_REQUIRE(wait_until([&] { return host.ranking_limits.size() == 3; }));
+    set_dead_segments(8);
+    BOOST_REQUIRE(wait_until([&] { return host.jobs.size() == 2; }));
 }
 
 // The end of a job, and notify_group_idle(), wake a driver that found nothing to compact.
