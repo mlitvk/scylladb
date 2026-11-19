@@ -23,6 +23,7 @@
 #include "cache.hh"
 #include "mutation/mutation.hh"
 #include "dht/decorated_key.hh"
+#include "utils/serialized_action.hh"
 
 class frozen_mutation;
 
@@ -60,6 +61,10 @@ class logstor {
     seastar::metrics::metric_groups _metrics;
     stats _stats;
     seastar::gate _async_gate;
+    // Runs do_flush_to_separator() for the calls of flush_to_separator(). The calls that come while
+    // a flush runs share the next flush, so many calls at the same time advance the head of the
+    // write buffer ring at most two times, and not one time for each call.
+    serialized_action _flush_to_separator_action{[this] { return do_flush_to_separator(); }};
 
 public:
 
@@ -90,6 +95,8 @@ public:
     // primary_index::set_cache_enabled().
     std::unique_ptr<primary_index> make_primary_index(bool with_cache_tracker, bool cache_enabled);
 
+    // Waits until each write that was accepted before the call is in the separator buffer of its
+    // group.
     future<> flush_to_separator();
 
     future<> write(const mutation&, write_target target, db::timeout_clock::time_point timeout) noexcept;
@@ -120,6 +127,8 @@ public:
     std::map<sstring, mutation_source> make_mutation_sources_for_dump(schema_ptr, const primary_index&, const dht::decorated_key&, reader_permit);
 
 private:
+    future<> do_flush_to_separator();
+
     future<> do_write(const schema&, dht::decorated_key, api::timestamp_type, record_value,
             write_target target, db::timeout_clock::time_point timeout);
 };
