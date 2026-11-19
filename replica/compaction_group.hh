@@ -108,6 +108,13 @@ class compaction_group : public compaction::compaction_backlog_source {
     db::replay_position _highest_flushed_rp;
     friend class table;
 private:
+    // Waits until each write that logstor accepted before the call is in a separator buffer of its
+    // group. The wait is for the writes of every group of the shard, so a flush of more than one
+    // group calls it one time. The table must use logstor.
+    future<> flush_to_separator();
+    // Flushes the separator buffers of the group. The table must use logstor.
+    future<> flush_separator();
+
     std::unique_ptr<compaction_group_view> make_compacting_view();
     std::unique_ptr<compaction_group_view> make_non_compacting_view();
 
@@ -187,9 +194,9 @@ public:
     future<> clear_memtables();
 
     future<> flush_memtables(std::optional<db::replay_position> = {}) noexcept;
-    // Flushes the memtables of the group, or the separator buffers of the group when the table uses
-    // logstor. Unlike table::flush(), it does not first wait for the writes that are not in a
-    // separator buffer yet.
+    // Flushes the memtables of the group. When the table uses logstor, it instead waits until each
+    // write that logstor accepted before the call is in a separator buffer, and then it flushes the
+    // separator buffers of the group.
     future<> flush() noexcept;
     bool can_flush() const;
     bool needs_flush() const;
@@ -360,9 +367,6 @@ public:
 
     future<> discard_logstor_segments();
 
-    // Flushes the separator buffers of the group. The table must use logstor.
-    future<> flush_separator();
-
     logstor::segment_set& logstor_segments() noexcept;
     const logstor::segment_set& logstor_segments() const noexcept;
 
@@ -466,7 +470,8 @@ public:
     future<utils::chunked_vector<logstor::segment_snapshot>> take_logstor_snapshot() const;
 
     future<> flush_memtables() noexcept;
-    future<> flush_separator() noexcept;
+    // Does what compaction_group::flush() does, for all the compaction groups of the storage group.
+    future<> flush() noexcept;
     bool can_flush() const;
     bool needs_flush() const;
     api::timestamp_type min_memtable_timestamp() const;
