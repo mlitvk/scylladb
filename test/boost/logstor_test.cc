@@ -3548,6 +3548,123 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_separator_task_retry_ends_when_logstor_sto
     BOOST_REQUIRE_EQUAL(read_segment_manager_metric("kept_segments"), 1u);
 }
 
+// Checks a separator flush against a failed allocation at each of its allocation points, one point
+// in each round. The flush call succeeds, or it fails and the next call succeeds. In both cases the
+// record is in a segment of the group, and no segment is kept.
+SEASTAR_THREAD_TEST_CASE(test_logstor_separator_flush_survives_allocation_failures) {
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    test_recovery_catalog no_tables;
+    ls.do_recovery(no_tables).get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+    // Each round adds one segment to the group, and the checks count the segments, so no compaction
+    // may merge them.
+    auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+
+    auto& alloc_injector = memory::local_failure_injector();
+    auto cancel = seastar::defer([&alloc_injector] noexcept { alloc_injector.cancel(); });
+    for (uint64_t round = 0; ; ++round) {
+        auto m = make_kv_mutation(schema, seastar::format("pk{}", round), "separator-value");
+        ls.write(m, write_target(&cg, {}), db::no_timeout).get();
+        ls.flush_to_separator().get();
+
+        alloc_injector.fail_after(round);
+        bool call_failed = false;
+        try {
+            cg.flush_separator().get();
+        } catch (const std::bad_alloc&) {
+            call_failed = true;
+        }
+        const bool injected = alloc_injector.failed();
+        alloc_injector.cancel();
+        testlog.debug("round {}: injected {}, call failed {}", round, injected, call_failed);
+        if (call_failed) {
+            cg.flush_separator().get();
+        }
+
+        BOOST_REQUIRE(!cg.separator_has_data());
+        BOOST_REQUIRE_EQUAL(cg.separator_held_segment_count(), 0u);
+        BOOST_REQUIRE_EQUAL(read_segment_manager_metric("kept_segments"), 0u);
+        BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), round + 1);
+        auto read = read_mutation(ls, schema, cg.logstor_index(), m.decorated_key(), schema->full_slice()).get();
+        BOOST_REQUIRE(read);
+        assert_that(*read).is_equal_to(m);
+
+        if (!injected) {
+            break;
+        }
+    }
+}
+
+// Checks a separator task against a failed allocation at each of its allocation points, one point
+// in each round. The task moves its record to the separator buffer of the group, the separator
+// fiber goes on with the next task, and no segment is kept.
+SEASTAR_THREAD_TEST_CASE(test_logstor_separator_task_survives_allocation_failures) {
+    if constexpr (!std::is_same_v<utils::error_injection_type, utils::error_injection<true>>) {
+        return;
+    }
+
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    test_recovery_catalog no_tables;
+    ls.do_recovery(no_tables).get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+    // Each round adds one segment to the group, and the checks count the segments, so no compaction
+    // may merge them.
+    auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+
+    // The injection holds each task before its first step, so that the failed allocation is one
+    // of the task and not one of the write.
+    constexpr std::string_view task_wait = "logstor_separator_task_wait";
+    auto& injector = utils::get_local_injector();
+    injector.enable(task_wait);
+    auto disable = seastar::defer([&injector, task_wait] noexcept { injector.disable(task_wait); });
+
+    auto& alloc_injector = memory::local_failure_injector();
+    auto cancel = seastar::defer([&alloc_injector] noexcept { alloc_injector.cancel(); });
+    for (uint64_t round = 0; ; ++round) {
+        auto m = make_kv_mutation(schema, seastar::format("pk{}", round), "separator-value");
+        ls.write(m, write_target(&cg, {}), db::no_timeout).get();
+        BOOST_REQUIRE(eventually_true([&] { return injector.waiters(task_wait) == 1; }));
+
+        alloc_injector.fail_after(round);
+        injector.receive_message(task_wait);
+        // This wait makes no allocation, so the failed allocation is one of the task.
+        while (!cg.separator_has_data()) {
+            seastar::thread::yield();
+        }
+        const bool injected = alloc_injector.failed();
+        alloc_injector.cancel();
+        testlog.debug("round {}: injected {}", round, injected);
+
+        ls.flush_to_separator().get();
+        cg.flush_separator().get();
+        BOOST_REQUIRE(!cg.separator_has_data());
+        BOOST_REQUIRE_EQUAL(cg.separator_held_segment_count(), 0u);
+        BOOST_REQUIRE_EQUAL(read_segment_manager_metric("kept_segments"), 0u);
+        BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), round + 1);
+        auto read = read_mutation(ls, schema, cg.logstor_index(), m.decorated_key(), schema->full_slice()).get();
+        BOOST_REQUIRE(read);
+        assert_that(*read).is_equal_to(m);
+
+        if (!injected) {
+            break;
+        }
+    }
+}
+
 // Checks that the stop of logstor ends the retry of a separator flush, so that the stop does not
 // wait for a flush that keeps failing. The flush keeps the segment of its record, and recovery
 // separates the record at the next start.
