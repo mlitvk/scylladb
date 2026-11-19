@@ -196,6 +196,10 @@ public:
 
     future<> await_pending_writes();
 
+    // Returns the number of kept segments. A kept segment is not freed until the node restarts,
+    // because the index can still point at records in it that no compaction group owns.
+    size_t kept_segment_count() const noexcept;
+
     future<utils::chunked_vector<segment_snapshot>> make_snapshot(logstor_group& cg);
 
     // Create an output stream to write a segment (for receiving from remote node)

@@ -81,6 +81,9 @@ struct segment_descriptor : public log_heap_hook<segment_descriptor_hist_options
     // The sequence of the latest use of the segment, which each valid chunk of the segment also
     // has, except between get_segment() and the write of the first chunk. reset() keeps it.
     segment_sequence seq{0};
+    // The segment manager does not free a kept segment when its last reference goes, because the
+    // index can still point at records in the segment that no group owns.
+    bool kept{false};
 
     void reset(size_t segment_size) noexcept {
         free_space = segment_size;

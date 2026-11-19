@@ -2695,6 +2695,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_and_separator_flush) {
     // pool: a group with nothing to separate holds no buffer.
     BOOST_REQUIRE_EQUAL(cg.separator_held_segment_count(), 0u);
     BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 1u);
+    BOOST_REQUIRE_EQUAL(ls.get_segment_manager().kept_segment_count(), 0u);
 
     auto snapshot = ls.get_segment_manager().make_snapshot(cg).get();
     BOOST_REQUIRE_EQUAL(snapshot.size(), 1u);
@@ -2759,6 +2760,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_discarded_group_does_not_free_its_unflushe
     // Nothing of the buffer is left held, which is also what gives it back to the pool.
     BOOST_REQUIRE(!cg.separator_has_data());
     BOOST_REQUIRE_EQUAL(cg.separator_held_segment_count(), 0u);
+    BOOST_REQUIRE_EQUAL(sm.kept_segment_count(), 1u);
 
     // The records were never written out, so the index still points at them where they were, and the
     // segment that holds them was not freed and reused underneath it.
@@ -2802,6 +2804,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_closed_group_takes_no_separator_writes) {
     BOOST_REQUIRE(!cg.separator_has_data());
     BOOST_REQUIRE_EQUAL(cg.separator_held_segment_count(), 0u);
     BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 0u);
+    // The segment of the record is kept, because the index still points at the record there.
+    BOOST_REQUIRE_EQUAL(ls.get_segment_manager().kept_segment_count(), 1u);
 
     // The write itself succeeded and the record is readable where it was written.
     BOOST_REQUIRE(lookup_location(cg.logstor_index(), make_index_key(*schema, key), *schema));
