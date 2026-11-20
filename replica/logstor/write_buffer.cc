@@ -76,11 +76,15 @@ frame_extent chunk_builder::append(const Writer& writer) {
     const size_t frame_offset = serialized_size();
     const size_t frame_size = ondisk::record_frame_size(header_size, value_size);
 
-    auto frame_out = _stream.write_substream(frame_size);
+    // Write the frame through a copy of the stream, and keep the copy only when the frame is
+    // complete, so that an append that throws leaves the chunk as it was.
+    auto out = _stream;
+    auto frame_out = out.write_substream(frame_size);
     writer.write_frame(frame_out);
     if (frame_out.size() != 0) {
         on_internal_error(logstor_logger, fmt::format("Record frame of {} bytes left {} unwritten", frame_size, frame_out.size()));
     }
+    _stream = out;
 
     pad_to_alignment(ondisk::record_alignment);
 

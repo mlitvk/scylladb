@@ -177,7 +177,7 @@ public:
     void reset();
 
     // Appends the record frame of the writer's record. Throws std::runtime_error when the record
-    // does not fit, see can_fit().
+    // does not fit, see can_fit(). An append that throws leaves the builder unchanged.
     template <log_record_writer_concept Writer>
     frame_extent append(const Writer& writer);
 
