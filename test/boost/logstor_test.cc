@@ -105,7 +105,7 @@ log_record make_log_record(schema_ptr schema, sstring pk, sstring value, api::ti
 // The mutation that a record value decodes to, for the tests that compare mutations: the decoder
 // gives a single_row_partition.
 mutation decode_to_mutation(const record_value& v, schema_ptr s, const record_header& h) {
-    auto partition = decode_record_value(v, *s, h);
+    auto partition = decode_record_value(v, *s, h).partition;
     return to_mutation(std::move(s), h.key, std::move(partition));
 }
 
@@ -3862,8 +3862,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_single_key_reader_misses_after_an_eviction
 }
 
 // Returns a mutation of `schema`, which has the columns of the key-value schema and a column c.
-static mutation make_kv_mutation_with_c(schema_ptr schema, sstring pk, sstring v, sstring c) {
-    const auto ts = api::timestamp_type(1);
+static mutation make_kv_mutation_with_c(schema_ptr schema, sstring pk, sstring v, sstring c,
+        api::timestamp_type ts = api::timestamp_type(1)) {
     auto m = make_kv_mutation(schema, std::move(pk), std::move(v), ts);
     const auto& c_def = *schema->get_column_definition("c");
     m.partition().clustered_row(*schema, clustering_key::make_empty()).cells().apply(c_def,
@@ -3911,6 +3911,52 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_cache_hit_under_an_older_schema_keeps_the_
 
     assert_that(env.make_reader(singular_range(m))).produces(m).produces_end_of_stream();
     BOOST_REQUIRE_EQUAL(stats.partition_hits, 3);
+}
+
+// A record of a schema version that is newer than the schema of the table does not fill the cache,
+// because a decode under the schema of the table loses the columns that only the newer version has.
+// A tablet stream from a node that already has the newer version can write such a record.
+SEASTAR_THREAD_TEST_CASE(test_logstor_record_of_a_newer_schema_does_not_fill_the_cache) {
+    reader_test_env env(true);
+    auto new_schema = schema_builder(env.schema).with_column("c", utf8_type).build();
+    auto m = make_kv_mutation_with_c(new_schema, "pk0", "v0", "c0");
+    env.populate(std::span<const mutation>(&m, 1));
+    const auto& stats = env.cache_stats();
+
+    auto old_m = m;
+    old_m.upgrade(env.schema);
+    assert_that(env.make_reader(singular_range(m))).produces(old_m).produces_end_of_stream();
+    BOOST_REQUIRE_EQUAL(stats.partition_insertions, 0);
+
+    env.cg->logstor_index().set_table_schema(new_schema);
+    assert_that(env.make_reader(new_schema, singular_range(m), new_schema->full_slice())).produces(m).produces_end_of_stream();
+    BOOST_REQUIRE_EQUAL(stats.partition_insertions, 1);
+}
+
+// A record that has a cell of a column that the table dropped at or after the time of the cell fills
+// the cache, because the cell is dead under every later schema version too. A cell that is newer
+// than the drop is of a column that a later version added again, so its record does not fill the
+// cache.
+SEASTAR_THREAD_TEST_CASE(test_logstor_record_with_a_cell_of_a_dropped_column) {
+    auto old_schema = schema_builder(make_kv_schema()).with_column("c", utf8_type).build();
+    const auto drop_ts = api::timestamp_type(2);
+    reader_test_env env(true, schema_builder(old_schema).remove_column(to_bytes("c"), drop_ts).build());
+    const auto& stats = env.cache_stats();
+
+    auto keys = make_token_ordered_keys(old_schema, 2);
+    auto older = make_kv_mutation_with_c(old_schema, keys[0], "v0", "c0", drop_ts - 1);
+    auto newer = make_kv_mutation_with_c(old_schema, keys[1], "v1", "c1", drop_ts + 1);
+    env.populate(std::vector<mutation>{older, newer});
+
+    auto expected_older = older;
+    expected_older.upgrade(env.schema);
+    assert_that(env.make_reader(singular_range(older))).produces(expected_older).produces_end_of_stream();
+    BOOST_REQUIRE_EQUAL(stats.partition_insertions, 1);
+
+    auto expected_newer = newer;
+    expected_newer.upgrade(env.schema);
+    assert_that(env.make_reader(singular_range(newer))).produces(expected_newer).produces_end_of_stream();
+    BOOST_REQUIRE_EQUAL(stats.partition_insertions, 1);
 }
 
 // The reader contract over a cached partition: next_partition() before the partition was entered

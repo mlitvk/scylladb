@@ -56,13 +56,20 @@ Only step 4 writes to the disk - all other steps only update in-memory metadata.
 2. Index lookup returns the cached partition, if the cache has it, or the record location
 3. Segment manager reads record from disk
 4. Record is decoded into a partition under the schema of the read. The partition is added to the
-   cache if that schema is the current schema of the table, and it is returned
+   cache if that schema is the current schema of the table and the decode kept every cell of the
+   record, and it is returned
 
 The cache holds each partition under the current schema of the table, or under an older version of
 it until a hit upgrades the partition in place. A read under another version gets an upgraded copy.
 A read from a coordinator whose schema is not up to date is under an older version, and an upgrade
 to an older version removes the columns that only the newer version has, so such a read must not
 change the cache.
+
+A record can also be of a newer version than the table, because a tablet stream copies the records
+of a node that already has the newer version. A decode under the schema of the table then loses the
+cells of the columns that only the newer version has, so `decode_record_value()` marks the partition
+incomplete and the read does not add it to the cache. A cell of a column that the table dropped at or
+after the time of the cell does not count, because the cell is dead under every later version too.
 
 **Separator:**
 1. When a record is written to the active segment, it is also written to its compaction group's separator buffer. The separator buffer holds a reference to the original segment.

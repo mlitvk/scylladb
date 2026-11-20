@@ -879,7 +879,7 @@ public:
     // And what it pays after that: the value is decoded into the partition the read returns.
     void do_decode(unsigned count) {
         for (unsigned i = 0; i < count; ++i) {
-            _sink += decode_record_value(_record->value, *_schema, _record->header).row.has_value();
+            _sink += decode_record_value(_record->value, *_schema, _record->header).partition.row.has_value();
         }
     }
 

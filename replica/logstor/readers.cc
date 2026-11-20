@@ -189,12 +189,12 @@ class logstor_single_key_reader : public logstor_reader_base {
         if (record.header.key.key() != _dk.key()) [[unlikely]] {
             co_await coroutine::return_exception(key_mismatch_error(_dk.key(), record.header.key.key(), where.location));
         }
-        auto partition = decode_record_value(record.value, *_forward_schema, record.header);
-        if (_use_cache) {
-            _index.populate_cache(where.guard, key, where.location, *_forward_schema, _dk.key(), partition);
+        auto decoded = decode_record_value(record.value, *_forward_schema, record.header);
+        if (_use_cache && !decoded.incomplete) {
+            _index.populate_cache(where.guard, key, where.location, *_forward_schema, _dk.key(), decoded.partition);
         }
         tracing::trace(_trace_state, "logstor_single_key_reader: fetched key {}", _dk);
-        begin(std::move(partition));
+        begin(std::move(decoded.partition));
     }
 
 public:
@@ -358,7 +358,7 @@ class logstor_range_reader : public logstor_reader_base {
         partitions.reserve(slots.size());
         for (auto& slot : slots) {
             if (slot.record) {
-                auto partition = decode_record_value(slot.record->value, *_forward_schema, slot.record->header);
+                auto partition = decode_record_value(slot.record->value, *_forward_schema, slot.record->header).partition;
                 slot.partition = make_pending(std::move(slot.record->header.key), std::move(partition));
                 slot.record.reset();
             }

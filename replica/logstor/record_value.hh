@@ -7,6 +7,7 @@
  */
 #pragma once
 
+#include "replica/logstor/single_row_partition.hh"
 #include "replica/logstor/types.hh"
 #include "schema/schema_fwd.hh"
 
@@ -14,8 +15,6 @@ class frozen_mutation;
 class mutation;
 
 namespace replica::logstor {
-
-struct single_row_partition;
 
 // The functions that know what the bytes of a record_value mean. Everything else in logstor
 // treats a value as bytes, so changing the encoding is a change to this file alone.
@@ -38,7 +37,18 @@ record_value encode_record_value(const mutation& m);
 // schema that m was frozen with.
 record_value encode_record_value(const frozen_mutation& m, const schema& s);
 
+// The partition that decode_record_value() returns.
+struct decoded_record_value {
+    single_row_partition partition;
+    // Is true if the partition does not have a cell of the record because the schema of the decode
+    // does not have the column of the cell. A column that the schema dropped at or after the time of
+    // the cell does not count, because the cell is dead under every later schema version too.
+    // An incomplete partition is right for a read under the schema of the decode. It must not go
+    // into the cache, because a later schema version of the table can have the column.
+    bool incomplete = false;
+};
+
 // Decodes the value of a record with header h as a partition of the schema s.
-single_row_partition decode_record_value(const record_value& v, const schema& s, const record_header& h);
+decoded_record_value decode_record_value(const record_value& v, const schema& s, const record_header& h);
 
 } // namespace replica::logstor

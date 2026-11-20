@@ -94,6 +94,80 @@ public:
     }
 };
 
+// Applies a record of another schema version to a partition of the schema `s`, as
+// converting_mutation_partition_applier does, and finds the cells that the conversion loses.
+// The conversion loses a cell when `s` does not have the column of the cell, or has it with a
+// type that cannot read the cell. A cell of a column that `s` dropped at or after the time of the
+// cell does not count, because the cell is dead under `s` and under every later schema version.
+class record_partition_applier final : public mutation_partition_view_virtual_visitor {
+    converting_mutation_partition_applier _applier;
+    const column_mapping& _mapping;
+    const schema& _schema;
+    bool _incomplete = false;
+
+    // Marks the partition incomplete if the conversion loses a cell of `column` whose newest
+    // timestamp is `timestamp`.
+    void check_cell(const column_mapping_entry& column, api::timestamp_type timestamp) {
+        if (const auto* def = _schema.get_column_definition(column.name())) {
+            _incomplete |= !def->type->is_value_compatible_with(*column.type());
+            return;
+        }
+        const auto& dropped = _schema.dropped_columns();
+        auto it = dropped.find(sstring(to_string_view(column.name())));
+        _incomplete |= it == dropped.end() || timestamp > it->second.timestamp;
+    }
+
+    void check_cell(const column_mapping_entry& column, const collection_mutation& cell) {
+        check_cell(column, collection_mutation_view(cell).last_update(*column.type()));
+    }
+
+public:
+    record_partition_applier(const column_mapping& mapping, const schema& s, mutation_partition& p)
+        : _applier(mapping, s, p)
+        , _mapping(mapping)
+        , _schema(s)
+    { }
+
+    bool incomplete() const noexcept {
+        return _incomplete;
+    }
+
+    void accept_partition_tombstone(tombstone t) override {
+        _applier.accept_partition_tombstone(t);
+    }
+
+    void accept_static_cell(column_id id, atomic_cell cell) override {
+        check_cell(_mapping.static_column_at(id), cell.timestamp());
+        _applier.accept_static_cell(id, std::move(cell));
+    }
+
+    void accept_static_cell(column_id id, collection_mutation cell) override {
+        check_cell(_mapping.static_column_at(id), cell);
+        _applier.accept_static_cell(id, cell);
+    }
+
+    stop_iteration accept_row_tombstone(range_tombstone rt) override {
+        _applier.accept_row_tombstone(rt);
+        return stop_iteration::no;
+    }
+
+    stop_iteration accept_row(position_in_partition_view key, row_tombstone deleted_at, row_marker rm, is_dummy dummy,
+            is_continuous continuous) override {
+        _applier.accept_row(key, deleted_at, rm, dummy, continuous);
+        return stop_iteration::no;
+    }
+
+    void accept_row_cell(column_id id, atomic_cell cell) override {
+        check_cell(_mapping.regular_column_at(id), cell.timestamp());
+        _applier.accept_row_cell(id, std::move(cell));
+    }
+
+    void accept_row_cell(column_id id, collection_mutation cell) override {
+        check_cell(_mapping.regular_column_at(id), cell);
+        _applier.accept_row_cell(id, cell);
+    }
+};
+
 // Returns the serialized partition of a frozen mutation.
 ser::mutation_partition_view frozen_partition(const frozen_mutation& m) {
     auto in = ser::as_input_stream(m.representation());
@@ -176,7 +250,7 @@ record_value encode_record_value(const frozen_mutation& m, const schema& s) {
     return record_value(std::move(out));
 }
 
-single_row_partition decode_record_value(const record_value& v, const schema& s, const record_header& h) {
+decoded_record_value decode_record_value(const record_value& v, const schema& s, const record_header& h) {
     if (s.id() != h.table) {
         throw std::runtime_error(format("logstor: record of table {} decoded with the schema of table {} ({}.{})",
                 h.table, s.id(), s.ks_name(), s.cf_name()));
@@ -187,6 +261,7 @@ single_row_partition decode_record_value(const record_value& v, const schema& s,
 
     // Decode into a mutation_partition, then move the row out of it.
     mutation_partition p(s);
+    bool incomplete = false;
     if (reader.schema_version() == s.version()) {
         reader.skip_mapping();
         auto partition_view = mutation_partition_view::from_view(reader.read_partition());
@@ -194,11 +269,15 @@ single_row_partition decode_record_value(const record_value& v, const schema& s,
         partition_view.accept(s, b);
     } else {
         column_mapping cm = reader.read_mapping();
-        converting_mutation_partition_applier applier(cm, s, p);
+        record_partition_applier applier(cm, s, p);
         auto partition_view = mutation_partition_view::from_view(reader.read_partition());
         partition_view.accept(cm, applier);
+        incomplete = applier.incomplete();
     }
-    return to_single_row_partition(std::move(p), s, h.key.key());
+    return decoded_record_value{
+        .partition = to_single_row_partition(std::move(p), s, h.key.key()),
+        .incomplete = incomplete,
+    };
 }
 
 } // namespace replica::logstor
