@@ -67,7 +67,8 @@ void cache_tracker::evict(const primary_index_entry& pie) noexcept {
     });
 }
 
-std::optional<keyed_single_row_partition> cache_tracker::read_partition(const primary_index_entry& pie, const schema& target_schema) {
+std::optional<keyed_single_row_partition> cache_tracker::read_partition(const primary_index_entry& pie, const schema_ptr& table_schema,
+        const schema& target_schema) {
     // The partition is built inside the section and returned out of it by value: an allocation
     // failure re-runs the section's function from the start, and nothing outside it has been
     // touched by then.
@@ -77,12 +78,16 @@ std::optional<keyed_single_row_partition> cache_tracker::read_partition(const pr
         }
         auto& e = *pie._cached_entry;
         get_lru().touch(e);
-        if (e.schema().get() != &target_schema) {
+        if (e.schema()->version() != table_schema->version()) {
             with_allocator(allocator(), [&] {
-                e.upgrade(target_schema.shared_from_this());
+                e.upgrade(table_schema);
             });
         }
-        return keyed_single_row_partition{dht::decorated_key(pie.key().token(), e.key()), e.partition().copy(*e.schema())};
+        dht::decorated_key key(pie.key().token(), e.key());
+        if (target_schema.version() == e.schema()->version()) {
+            return keyed_single_row_partition{std::move(key), e.partition().copy(*e.schema())};
+        }
+        return keyed_single_row_partition{std::move(key), e.partition().upgraded_copy(*e.schema(), target_schema)};
     });
 
     if (cached) {

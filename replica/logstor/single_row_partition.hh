@@ -36,6 +36,16 @@ struct single_row_partition {
         }
         return partition;
     }
+
+    // A copy under the schema `to`, in the current allocator, of a partition of the schema `from`.
+    // The copy does not have the cells of the columns that `to` does not have.
+    single_row_partition upgraded_copy(const schema& from, const schema& to) const {
+        single_row_partition partition{.partition_tombstone = partition_tombstone};
+        if (row) {
+            partition.row.emplace(to, from, *row);
+        }
+        return partition;
+    }
 };
 
 // A cached partition together with its key, as a read of the cache hands it out. The index entry
