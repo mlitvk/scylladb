@@ -47,8 +47,6 @@ struct write_target {
 
 // Writer for log records that handles serialization and size computation
 class log_record_writer {
-    using ostream = seastar::simple_memory_output_stream;
-
     log_record _record;
 
 public:
@@ -65,14 +63,12 @@ public:
     size_t record_size() const { return header_size() + value_size(); }
 
     // Write the record's frame - frame header, record header, value - to an output stream.
-    void write_frame(ostream& out) const;
+    void write_frame(seastar::simple_memory_output_stream& out) const;
 };
 
-// Writer for log records that stores pre-serialized bytes.
-// Used in compaction and separator rewriting to avoid deserialization.
+// Writer for a record whose header and value are already serialized. It writes the bytes as they
+// are, so that a rewrite of a record does not decode it.
 class log_record_bytes_writer {
-    using ostream = seastar::simple_memory_output_stream;
-
     record_header _header;
     bytes_view _header_bytes;
     bytes_view _value_bytes;
@@ -90,7 +86,7 @@ public:
     size_t value_size() const { return _value_bytes.size(); }
     size_t record_size() const { return header_size() + value_size(); }
 
-    void write_frame(ostream& out) const;
+    void write_frame(seastar::simple_memory_output_stream& out) const;
 };
 
 template <typename T>

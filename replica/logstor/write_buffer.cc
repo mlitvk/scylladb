@@ -22,11 +22,11 @@
 
 namespace replica::logstor {
 
-void log_record_writer::write_frame(ostream& out) const {
+void log_record_writer::write_frame(seastar::simple_memory_output_stream& out) const {
     ondisk::write_record_frame(out, _record.header, _record.value);
 }
 
-void log_record_bytes_writer::write_frame(ostream& out) const {
+void log_record_bytes_writer::write_frame(seastar::simple_memory_output_stream& out) const {
     ondisk::write_record_frame(out, log_record_bytes_view{_header_bytes, _value_bytes});
 }
 
