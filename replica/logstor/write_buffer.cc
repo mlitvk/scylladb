@@ -69,7 +69,7 @@ frame_extent chunk_builder::append(const Writer& writer) {
     }
 
     const auto record_size = header_size + value_size;
-    if (!can_fit(record_size)) {
+    if (!fits(record_size)) {
         throw std::runtime_error(fmt::format("Record of size {} does not fit the {} bytes left in the buffer", record_size, _stream.size()));
     }
 
@@ -123,14 +123,14 @@ bytes_view chunk_builder::seal(segment_sequence segment_seq, table_id table) {
     return do_seal(segment_seq, table);
 }
 
-bool chunk_builder::can_fit(size_t record_size) const noexcept {
+bool chunk_builder::has_data() const noexcept {
+    return serialized_size() > chunk_header_size();
+}
+
+bool chunk_builder::fits(size_t record_size) const noexcept {
     // The record with its frame header and the padding that follows the frame.
     const auto frame_size = ondisk::record_frame_header_size + record_size;
     return align_up(frame_size, ondisk::record_alignment) <= _stream.size();
-}
-
-bool chunk_builder::has_data() const noexcept {
-    return serialized_size() > chunk_header_size();
 }
 
 void chunk_builder::pad_to_alignment(size_t alignment) {

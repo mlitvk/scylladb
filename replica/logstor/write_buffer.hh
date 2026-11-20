@@ -192,11 +192,9 @@ public:
     bytes_view seal(segment_sequence segment_seq);
     bytes_view seal(segment_sequence segment_seq, table_id table);
 
-    bool can_fit(size_t record_size) const noexcept;
-
     template <log_record_writer_concept Writer>
     bool can_fit(const Writer& writer) const noexcept {
-        return can_fit(writer.record_size());
+        return fits(writer.record_size());
     }
 
     bool has_data() const noexcept;
@@ -212,11 +210,6 @@ public:
 
     size_t record_bytes() const noexcept { return _record_bytes; }
     size_t record_count() const noexcept { return _record_count; }
-    segment_kind kind() const noexcept { return _segment_kind; }
-
-    size_t max_record_size() const noexcept {
-        return chunk_layout::max_record_size(_buffer_size, _segment_kind);
-    }
 
     // The bytes of an appended record frame, its padding excluded.
     bytes_view frame_bytes(frame_extent frame) const noexcept {
@@ -246,11 +239,11 @@ private:
     std::optional<finished_body> _finished_body;
     bool _sealed{false};
 
+    bool fits(size_t record_size) const noexcept;
+
     void pad_to_alignment(size_t alignment);
 
     bytes_view do_seal(segment_sequence segment_seq, std::optional<table_id> table);
-
-    friend class write_buffer;
 };
 
 // A record of a mixed buffer that the separator rewrites once the buffer is written.
@@ -291,14 +284,12 @@ public:
     future<> close();
     bool is_closed() const noexcept;
 
-    bool can_fit(size_t record_size) const noexcept { return _builder.can_fit(record_size); }
     template <log_record_writer_concept Writer>
     bool can_fit(const Writer& writer) const noexcept { return _builder.can_fit(writer); }
     bool has_data() const noexcept { return _builder.has_data(); }
 
     size_t serialized_size() const noexcept { return _builder.serialized_size(); }
     size_t buffer_size() const noexcept { return _builder.buffer_size(); }
-    size_t max_record_size() const noexcept { return _builder.max_record_size(); }
     size_t record_bytes() const noexcept { return _builder.record_bytes(); }
     size_t record_count() const noexcept { return _builder.record_count(); }
 
