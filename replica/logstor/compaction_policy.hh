@@ -32,8 +32,11 @@ constexpr size_t max_compaction_parallelism = 8;
 // that a tablet split is never queued behind it.
 constexpr size_t split_compaction_buffers = 2;
 
-// The largest number of automatic compactions that can be in flight at once. The dynamic limit is
-// derived per disk by make_compaction_limits(); this is the bound the semaphore is sized for.
+// The largest number of automatic compaction jobs in flight, on every disk. A job frees each of its
+// segments when the live records of the segment are in new segments, before it takes the next new
+// segment, so each job in flight uses at most one segment more than it has freed, and the
+// compaction reserve has a segment for each job. The limit leaves at least split_compaction_buffers
+// of the compaction buffers for a split compaction.
 constexpr size_t max_auto_compaction_parallelism = std::min<size_t>(4, max_compaction_parallelism - split_compaction_buffers);
 
 // The smallest batch worth compacting. A batch reclaims only when its mean utilization is below
@@ -41,7 +44,10 @@ constexpr size_t max_auto_compaction_parallelism = std::min<size_t>(4, max_compa
 // packed.
 constexpr size_t min_segments_per_compaction = 8;
 
-// The largest batch. A larger batch makes a single job rewrite more segments before it ends.
+// The largest batch, on every disk. A job frees its segments while it runs, so the batch cap does
+// not depend on the free space. A larger cap gives the selection more candidates to choose a batch
+// from. The cap also limits the time that one job keeps its group, and the segments that the
+// selection scans, see select_compaction_batch().
 constexpr size_t max_segments_per_compaction = 32;
 static_assert(max_segments_per_compaction >= min_segments_per_compaction);
 
@@ -79,27 +85,6 @@ uint64_t compaction_space_floor(uint64_t segment_count, double fraction) noexcep
 // The largest space floor, as a fraction of the disk. With the default anchor at twice the space
 // floor, it leaves at least half of the disk for data.
 constexpr double max_space_floor_fraction = 0.25;
-
-// The limits of what automatic compaction can take at the same time, derived from the space floor.
-// The defaults are the smallest limits that make_compaction_limits() returns, so that limits that
-// are not computed yet still let compaction run.
-struct compaction_limits {
-    // The number of automatic compaction jobs that can run at the same time.
-    size_t auto_parallelism = 1;
-    // The largest number of input segments that one job can take.
-    size_t batch_cap = min_segments_per_compaction;
-};
-
-// Both limits come from the space floor, so that `auto_parallelism * batch_cap <= space_floor`, and
-// the jobs in flight rewrite no more segments at the same time than the space floor holds. This
-// bounds the work in flight, not the space that the jobs hold, because a job frees each of its
-// segments when the live records of the segment are in new segments, before it takes the next new
-// segment, and so holds one new segment at a time. The batch cap is at most
-// max_segments_per_compaction.
-//
-// When the space floor is less than one batch the relation cannot hold, and the limits are one job
-// of `min_segments_per_compaction` segments, the smallest batch that can reclaim.
-compaction_limits make_compaction_limits(uint64_t space_floor) noexcept;
 
 // The utilization threshold as a function of the free level, in available segments: a
 // piecewise-linear curve through three points.

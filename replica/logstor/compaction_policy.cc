@@ -23,23 +23,6 @@ uint64_t compaction_space_floor(uint64_t segment_count, double fraction) noexcep
     return std::max(static_cast<uint64_t>(fraction * double(segment_count)), minimum);
 }
 
-compaction_limits make_compaction_limits(uint64_t space_floor) noexcept {
-    // Below one batch the relation cannot hold, so the limits are one job of the smallest batch
-    // that can reclaim.
-    const auto budget = std::max<uint64_t>(space_floor, min_segments_per_compaction);
-    // Spend the budget on concurrency first, up to the number of jobs the buffer pool can carry,
-    // then give what is left to the batch. Both directions of the clamp matter: a batch below
-    // min_segments_per_compaction cannot reclaim, and one above max_segments_per_compaction makes a
-    // single job rewrite too many segments.
-    const auto parallelism = std::clamp<uint64_t>(budget / min_segments_per_compaction, 1, max_auto_compaction_parallelism);
-    const auto batch_cap = std::clamp<uint64_t>(budget / parallelism, min_segments_per_compaction, max_segments_per_compaction);
-
-    return {
-        .auto_parallelism = static_cast<size_t>(parallelism),
-        .batch_cap = static_cast<size_t>(batch_cap)
-    };
-}
-
 utilization_threshold_curve make_utilization_threshold_curve(uint64_t segment_count, uint64_t space_floor,
         double threshold, double anchor_fraction, double ceiling_fraction, double min_threshold) noexcept {
     // Returns the fraction of the disk in whole segments. A value that is not a usable fraction

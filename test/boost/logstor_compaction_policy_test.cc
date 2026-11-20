@@ -194,9 +194,9 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_marginal_compaction_admission) {
     BOOST_REQUIRE(!rich.efficiency_at_least(all_dead, compaction_marginal_admission_ratio));
 }
 
-// The jobs in flight rewrite no more segments at the same time than the space floor holds, and each
-// batch must still be large enough to reclaim.
-SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_limits_fit_the_space_floor) {
+// The space floor is a small part of the disk, at least min_space_floor_segments on a disk that is
+// large enough, and it follows the configured fraction up to the maximum.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_space_floor) {
     const auto nan = std::numeric_limits<double>::quiet_NaN();
     for (double fraction : {nan, -0.1, 0.0, 0.001, 0.03, 0.2, max_space_floor_fraction, 1.5}) {
         uint64_t previous_space_floor = 0;
@@ -208,23 +208,13 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_limits_fit_the_space_floor) {
                 BOOST_REQUIRE_GE(space_floor, 1u);
                 BOOST_REQUIRE_LE(space_floor, segment_count / 4);
                 BOOST_REQUIRE_GE(space_floor, previous_space_floor);
-                const auto limits = make_compaction_limits(space_floor);
-                BOOST_REQUIRE_GE(limits.auto_parallelism, 1u);
-                BOOST_REQUIRE_LE(limits.auto_parallelism, max_auto_compaction_parallelism);
-                BOOST_REQUIRE_GE(limits.batch_cap, min_segments_per_compaction);
-                BOOST_REQUIRE_LE(limits.batch_cap, max_segments_per_compaction);
-                if (space_floor >= min_segments_per_compaction) {
-                    BOOST_REQUIRE_LE(limits.auto_parallelism * limits.batch_cap, space_floor);
+                if (segment_count >= 8 * min_space_floor_segments) {
+                    BOOST_REQUIRE_GE(space_floor, min_space_floor_segments);
                 }
             }
             previous_space_floor = space_floor;
         }
     }
-
-    // A large disk runs at the full parallelism and the full batch cap.
-    const auto large = make_compaction_limits(compaction_space_floor(100000, 0.03));
-    BOOST_REQUIRE_EQUAL(large.auto_parallelism, max_auto_compaction_parallelism);
-    BOOST_REQUIRE_EQUAL(large.batch_cap, max_segments_per_compaction);
 
     // A larger fraction gives a larger space floor, up to the maximum.
     BOOST_REQUIRE_LT(compaction_space_floor(100000, 0.03), compaction_space_floor(100000, 0.2));
