@@ -181,89 +181,9 @@ bytes_view chunk_builder::do_seal(segment_sequence segment_seq, std::optional<ta
 template frame_extent chunk_builder::append<log_record_writer>(const log_record_writer&);
 template frame_extent chunk_builder::append<log_record_bytes_writer>(const log_record_bytes_writer&);
 
-// write_buffer
-
-write_buffer::write_buffer(size_t buffer_size, segment_kind kind)
-        : _builder(buffer_size, kind)
-{}
-
-future<> write_buffer::complete_writes(segment_position chunk_position) {
-    _written.set_value(chunk_position);
-    co_await close();
-}
-
-future<> write_buffer::close() {
-    if (!_write_gate.is_closed()) {
-        co_await _write_gate.close();
-    }
-}
-
-bool write_buffer::is_closed() const noexcept {
-    return _write_gate.is_closed();
-}
-
-future<record_location_with_holder> write_buffer::track(frame_extent frame) {
-    auto op = _write_gate.hold();
-
-    return _written.get_shared_future().then(
-            [frame, op = std::move(op)] (segment_position chunk_position) mutable {
-        return std::make_tuple(locate_record(chunk_position, frame), std::move(op));
-    });
-}
-
-future<> write_buffer::abort_writes(std::exception_ptr ex) {
-    if (!_written.available()) {
-        _written.set_exception(std::move(ex));
-    }
-    co_await close();
-}
-
-void write_buffer::reset() {
-    if (!is_closed()) {
-        on_internal_error(logstor_logger, "Cannot reset a write buffer that is not closed");
-    }
-    _builder.reset();
-    _written = {};
-    _write_gate = {};
-}
-
-// mixed_write_buffer
-
-mixed_write_buffer::mixed_write_buffer(size_t buffer_size)
-        : write_buffer(buffer_size, segment_kind::mixed)
-{
-    _separator_records.reserve(buffer_size / 100);
-}
-
-future<record_location_with_holder> mixed_write_buffer::write(log_record_writer writer, write_target target) {
-    const auto frame = builder().append(writer);
-    _separator_records.push_back(separator_record {
-        .writer = std::move(writer),
-        .frame = frame,
-        .target = std::move(target)
-    });
-    return track(frame);
-}
-
-std::vector<separator_record> mixed_write_buffer::take_separator_records() {
-    return std::move(_separator_records);
-}
-
-future<> mixed_write_buffer::abort_writes(std::exception_ptr ex) {
-    // A failed flush has no separator pass to consume the records, and they were never written
-    // anywhere, so drop them, along with the holders of their write targets.
-    _separator_records.clear();
-    return write_buffer::abort_writes(std::move(ex));
-}
-
-void mixed_write_buffer::reset() {
-    write_buffer::reset();
-    _separator_records.clear();
-}
-
 // write_buffer_pool
 
-void write_buffer_returner::operator()(full_write_buffer* wb) noexcept {
+void write_buffer_returner::operator()(rewrite_buffer* wb) noexcept {
     _pool->return_buffer(wb, std::move(_units));
 }
 
@@ -280,7 +200,7 @@ write_buffer_pool::write_buffer_pool(config cfg)
     }
     _free.reserve(_max_cached);
     for (size_t i = 0; i < cfg.preallocate; ++i) {
-        _free.push_back(std::make_unique<full_write_buffer>(_buffer_size));
+        _free.push_back(std::make_unique<rewrite_buffer>(_buffer_size));
         ++_stats.buffers_created;
     }
 }
@@ -302,14 +222,14 @@ future<std::vector<owned_write_buffer>> write_buffer_pool::allocate_many(size_t 
 
     // Take the cached buffers and build the ones that are missing before handing any of them out,
     // so that failing to build one leaves the pool as it was and signals the units back.
-    std::vector<std::unique_ptr<full_write_buffer>> bufs;
+    std::vector<std::unique_ptr<rewrite_buffer>> bufs;
     bufs.reserve(count);
     while (bufs.size() < count) {
         if (!_free.empty()) {
             bufs.push_back(std::move(_free.back()));
             _free.pop_back();
         } else {
-            bufs.push_back(std::make_unique<full_write_buffer>(_buffer_size));
+            bufs.push_back(std::make_unique<rewrite_buffer>(_buffer_size));
             ++_stats.buffers_created;
         }
     }
@@ -323,19 +243,10 @@ future<std::vector<owned_write_buffer>> write_buffer_pool::allocate_many(size_t 
     co_return buffers;
 }
 
-void write_buffer_pool::return_buffer(full_write_buffer* wb, seastar::semaphore_units<> pool_units) noexcept {
+void write_buffer_pool::return_buffer(rewrite_buffer* wb, seastar::semaphore_units<> pool_units) noexcept {
     // Take the buffer back, so that it is destroyed when this returns unless it is kept for reuse.
-    auto buf = std::unique_ptr<full_write_buffer>(wb);
+    auto buf = std::unique_ptr<rewrite_buffer>(wb);
     --_in_use;
-
-    if (!buf->is_closed()) {
-        // reset() below reinstalls the buffer's write gate, which is only valid once the gate was
-        // closed and all the writes it held completed. Closing is asynchronous and there is nothing
-        // left here that can wait for it, so drop the buffer instead.
-        on_internal_error_noexcept(logstor_logger, "Returning a logstor write buffer that was not closed");
-        drop_buffer(std::move(buf), pool_units);
-        return;
-    }
 
     // Hold on to the buffer only as long as the pool is meant to keep one - the units are signalled
     // back either way, so a buffer that is let go here is simply built again when it is needed.
@@ -347,16 +258,11 @@ void write_buffer_pool::return_buffer(full_write_buffer* wb, seastar::semaphore_
         buf->reset();
         _free.push_back(std::move(buf));
     } catch (...) {
+        // The buffer is destroyed when this returns, and the units go back with it, so the pool
+        // builds a new buffer when it needs one.
+        ++_stats.buffers_dropped;
         logstor_logger.error("Failed to return a write buffer, dropping it from the pool: {:t}", std::current_exception());
-        drop_buffer(std::move(buf), pool_units);
     }
-}
-
-void write_buffer_pool::drop_buffer(std::unique_ptr<full_write_buffer> wb, seastar::semaphore_units<>& pool_units) noexcept {
-    ++_stats.buffers_dropped;
-    (void)pool_units.release();
-    // Leaked deliberately - see drop_buffer()'s declaration for why the buffer must not be destroyed.
-    [[maybe_unused]] auto* leaked = wb.release();
 }
 
 void write_buffer_pool::set_capacity(size_t capacity) {
@@ -387,10 +293,7 @@ future<> write_buffer_pool::stop() {
     // Fail pending and future allocations, so that nothing can start using a buffer of a pool that
     // is being stopped.
     _available_sem.broken();
-    // Buffers are expected to be back by now - the callers stop everything that allocates from the
-    // pool before stopping it, and a compaction closes and returns its buffer before it completes.
-    // A buffer that is still out is one an owner never gave back at all; one that came back but
-    // could not be taken in was already accounted for and reported by drop_buffer().
+    // A buffer that is still out here is one that its owner never gave back.
     if (used_buffer_count() != 0) {
         on_internal_error_noexcept(logstor_logger, fmt::format(
                 "Stopping logstor write buffer pool with {} of {} buffers still in use",
@@ -401,7 +304,7 @@ future<> write_buffer_pool::stop() {
 
 // write_buffer_ring
 
-write_buffer_ring::write_buffer_ring(write_buffer_ring_config cfg, seastar::noncopyable_function<future<>(mixed_write_buffer&)> flush_func)
+write_buffer_ring::write_buffer_ring(write_buffer_ring_config cfg, seastar::noncopyable_function<future<>(user_write_buffer&)> flush_func)
         : _flush_sg(cfg.flush_sg)
         , _buffer_size(cfg.buffer_size)
         , _ring_size(cfg.ring_size)
@@ -464,7 +367,7 @@ void write_buffer_ring::on_queued_write_removed(const queued_write& w) noexcept 
 }
 
 void write_buffer_ring::fail_queued_write(queued_write& request, std::exception_ptr ep) noexcept {
-    request.accepted_pr.set_exception(std::move(ep));
+    request.completion.on_failed(std::move(ep));
 }
 
 bool write_buffer_ring::maybe_advance_head() noexcept {
@@ -477,21 +380,20 @@ bool write_buffer_ring::maybe_advance_head() noexcept {
     return true;
 }
 
-// The target is taken by reference and moved from only once the record is in a buffer: a caller
-// whose append does not happen goes on to queue the record, and the write target it queues has to
-// be the one it came with, holders and all.
-std::optional<future<record_location_with_holder>> write_buffer_ring::append_to_head_buffer(log_record_writer& writer, write_target& target) {
+// A caller whose append does not happen queues the record with the write target that it came with,
+// holders and all, so the arguments are moved from only when the record goes into a buffer.
+bool write_buffer_ring::append_to_head_buffer(log_record_writer& writer, write_target& target, index_insert& completion) {
     if (!head_buf().can_fit(writer) && !maybe_advance_head()) {
-        return std::nullopt;
+        return false;
     }
 
     bool was_empty = !head_buf().has_data();
-    auto persisted = head_buf().write(std::move(writer), std::move(target));
+    head_buf().write(std::move(writer), std::move(target), std::move(completion));
     if (was_empty) {
         arm_sync_timer();
         _consumer_progress_cv.signal();
     }
-    return persisted;
+    return true;
 }
 
 bool write_buffer_ring::try_dispatch_next_buffer() {
@@ -533,11 +435,7 @@ future<bool> write_buffer_ring::reclaim_completed_tails() {
         auto f = co_await coroutine::as_future(std::move(completion));
 
         if (f.failed()) {
-            auto ex = f.get_exception();
-            auto abort_f = co_await coroutine::as_future(tail_buf().abort_writes(std::move(ex)));
-            if (abort_f.failed()) {
-                logstor_logger.warn("Failed to abort the writes of a buffer whose flush failed: {}. Ignoring.", abort_f.get_exception());
-            }
+            tail_buf().abort_writes(f.get_exception());
         }
 
         tail_buf().reset();
@@ -566,9 +464,9 @@ future<bool> write_buffer_ring::drain_queued_writes() {
         on_queued_write_removed(request);
         removed_queued_writes = true;
         try {
-            auto persisted = append_to_head_buffer(request.writer, request.target).value();
-            request.accepted_pr.set_value(buffered_write_result{request.persisted_pr.get_future()});
-            std::move(persisted).forward_to(std::move(request.persisted_pr));
+            if (!append_to_head_buffer(request.writer, request.target, request.completion)) {
+                on_internal_error(logstor_logger, "A queued write found no room in a head buffer that fits it");
+            }
         } catch (...) {
             fail_queued_write(request, std::current_exception());
         }
@@ -655,10 +553,9 @@ future<> write_buffer_ring::flush() {
     });
 }
 
-// Not a coroutine, because a record that goes straight into the head buffer waits for nothing, and
-// a coroutine would allocate a frame per write for no use. So the function gives each failure as a
-// failed future, and the try costs nothing on the path that does not throw.
-future<buffered_write_result> write_buffer_ring::write_to_buffer(log_record_writer writer, db::timeout_clock::time_point timeout, write_target target) noexcept {
+// This function is not a coroutine, so that a write that goes straight into the head buffer
+// allocates no coroutine frame.
+void write_buffer_ring::write(log_record_writer writer, index_insert completion, db::timeout_clock::time_point timeout, write_target target) noexcept {
     try {
         auto holder = _async_gate.hold();
 
@@ -668,43 +565,48 @@ future<buffered_write_result> write_buffer_ring::write_to_buffer(log_record_writ
         // separator could put it.
         const size_t max_size = chunk_layout::max_record_size_any_kind(head_buf().buffer_size());
         if (writer.record_size() > max_size) [[unlikely]] {
-            return make_exception_future<buffered_write_result>(std::runtime_error(
-                    fmt::format("Write size {} exceeds the maximum record size {}", writer.record_size(), max_size)));
+            completion.on_failed(std::make_exception_ptr(std::runtime_error(
+                    fmt::format("Write size {} exceeds the maximum record size {}", writer.record_size(), max_size))));
+            return;
         }
         const size_t key_size = writer.header_size() - ondisk::record_header_fixed_size;
         if (key_size > ondisk::max_key_size) [[unlikely]] {
-            return make_exception_future<buffered_write_result>(std::runtime_error(
-                    fmt::format("Partition key size {} exceeds the maximum {}", key_size, ondisk::max_key_size)));
+            completion.on_failed(std::make_exception_ptr(std::runtime_error(
+                    fmt::format("Partition key size {} exceeds the maximum {}", key_size, ondisk::max_key_size))));
+            return;
         }
 
         // fast path - if there are no queued writes and there is space in the current head buffer or the next, advance the
         // head buffer if needed and write to it.
-        if (_queued_writes.empty()) {
-            if (auto persisted = append_to_head_buffer(writer, target)) {
-                return make_ready_future<buffered_write_result>(buffered_write_result{std::move(*persisted)});
-            }
+        if (_queued_writes.empty() && append_to_head_buffer(writer, target, completion)) {
+            return;
         }
 
         // either there are queued writes or there is no space in the head buffer and ring is full - queue the write.
-        return queue_write(std::move(writer), timeout, std::move(target), std::move(holder));
+        queue_write(std::move(writer), std::move(completion), timeout, std::move(target), std::move(holder));
     } catch (...) {
-        return current_exception_as_future<buffered_write_result>();
+        completion.on_failed(std::current_exception());
     }
 }
 
-future<buffered_write_result> write_buffer_ring::queue_write(log_record_writer writer, db::timeout_clock::time_point timeout,
-        write_target target, seastar::gate::holder holder) {
+void write_buffer_ring::queue_write(log_record_writer writer, index_insert completion, db::timeout_clock::time_point timeout,
+        write_target target, seastar::gate::holder holder) noexcept {
     const bool queue_was_empty = _queued_writes.empty();
     const auto write_size = writer.record_size();
-    queued_write request(std::move(writer), std::move(target), std::move(holder), timeout, _next_queued_write_id++, write_size);
-    auto accepted = request.accepted_pr.get_future();
-    _queued_writes.push_back(std::move(request), timeout);
+    queued_write request(std::move(writer), std::move(target), std::move(completion), std::move(holder), timeout, _next_queued_write_id++, write_size);
+    try {
+        // push_back() allocates before it moves the request, so a request that it does not take
+        // still holds its completion.
+        _queued_writes.push_back(std::move(request), timeout);
+    } catch (...) {
+        request.completion.on_failed(std::current_exception());
+        return;
+    }
     _queued_write_bytes += write_size;
     ++_total_queued_writes;
     if (queue_was_empty) {
         _consumer_progress_cv.signal();
     }
-    return accepted;
 }
 
 // Each pass reclaims the flushed buffers at the tail, moves queued writes into the free buffers,
