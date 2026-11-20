@@ -320,6 +320,9 @@ public:
     size_t record_bytes() const noexcept { return _builder.record_bytes(); }
     size_t record_count() const noexcept { return _builder.record_count(); }
 
+    // Returns how many writes are neither complete nor aborted.
+    size_t pending_write_count() const noexcept { return _entries.size(); }
+
 protected:
     write_buffer(size_t buffer_size, segment_kind kind)
         : _builder(buffer_size, kind)
@@ -693,6 +696,7 @@ class write_buffer_ring {
     seastar::expiring_fifo<queued_write, on_queued_write_expiry, db::timeout_clock> _queued_writes;
     size_t _queued_write_bytes{0};
     uint64_t _total_queued_writes{0};
+    uint64_t _failed_writes{0};
 
     seastar::timer<db::timeout_clock> _head_flush_timer;
     bool _head_deadline_expired = false;
@@ -737,6 +741,7 @@ class write_buffer_ring {
     future<bool> drain_queued_writes();
 
     void on_queued_write_removed(const queued_write&) noexcept;
+    void fail_write(index_insert&, std::exception_ptr) noexcept;
     void fail_queued_write(queued_write&, std::exception_ptr) noexcept;
     void on_queued_writes_changed() noexcept;
 
@@ -763,6 +768,10 @@ public:
     size_t queued_write_count() const noexcept { return _queued_writes.size(); }
     size_t queued_write_bytes() const noexcept { return _queued_write_bytes; }
     uint64_t total_queued_writes() const noexcept { return _total_queued_writes; }
+
+    // Returns how many writes the ring failed: refused, timed out on the queue, or in a buffer whose
+    // flush failed.
+    uint64_t failed_write_count() const noexcept { return _failed_writes; }
 
     // Returns the memory of the ring buffers. The queued writes are not counted, because the limits
     // on open requests already hold their memory, and their memory is freed when the flushes continue.

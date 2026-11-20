@@ -7,8 +7,6 @@
  */
 #include "replica/logstor/logstor.hh"
 #include <seastar/core/coroutine.hh>
-#include <seastar/coroutine/try_future.hh>
-#include <seastar/util/defer.hh>
 #include <seastar/util/log.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/metrics.hh>
@@ -72,7 +70,7 @@ logstor::logstor(logstor_config config, ::cache_tracker& shared_cache_tracker)
                        sm::description("Bytes of the records that wait in the write buffer queue for room in a buffer.")),
         sm::make_counter("total_queued_writes", [this] { return _write_buffer.total_queued_writes(); },
                        sm::description("Counts the writes that waited in the write buffer queue for room in a buffer.")),
-        sm::make_counter("write_failures", [this] { return _stats.write_failures; },
+        sm::make_counter("write_failures", [this] { return _stats.write_failures + _write_buffer.failed_write_count(); },
                        sm::description("Number of writes that failed to be persisted.")),
     });
 }
@@ -143,6 +141,7 @@ future<> logstor::write(const mutation& m, write_target target, db::timeout_cloc
         return do_write(*m.schema(), m.decorated_key(), record_timestamp(m), encode_record_value(m),
                 std::move(target), timeout);
     } catch (...) {
+        ++_stats.write_failures;
         return current_exception_as_future();
     }
 }
@@ -153,13 +152,15 @@ future<> logstor::write(const frozen_mutation& m, const schema& s, write_target 
         return do_write(s, m.decorated_key(s), record_timestamp(m), encode_record_value(m, s),
                 std::move(target), timeout);
     } catch (...) {
+        ++_stats.write_failures;
         return current_exception_as_future();
     }
 }
 
 future<> logstor::do_write(const schema& s, dht::decorated_key dk, api::timestamp_type ts, record_value value,
         write_target target, db::timeout_clock::time_point timeout) {
-    auto count_failure = defer([this] noexcept { ++_stats.write_failures; });
+    // The ring completes every write that it takes before its stop() returns, so the gate only has
+    // to turn away the writes that come after stop() began.
     auto gate_holder = _async_gate.hold();
 
     index_insert completion{
@@ -167,7 +168,6 @@ future<> logstor::do_write(const schema& s, dht::decorated_key dk, api::timestam
         .key = primary_index_key(dk),
         .timestamp = ts,
     };
-    auto written = completion.done.get_future();
     auto writer = log_record_writer(log_record{
         .header = {
             .key = std::move(dk),
@@ -176,11 +176,12 @@ future<> logstor::do_write(const schema& s, dht::decorated_key dk, api::timestam
         },
         .value = std::move(value),
     });
+    auto written = completion.done.get_future();
 
-    // The ring inserts the record into the index once it is in a segment, before it resolves `written`.
+    // The ring inserts the record into the index once it is in a segment, before it resolves
+    // `written`, and counts the writes that it fails.
     _write_buffer.write(std::move(writer), std::move(completion), timeout, std::move(target));
-    co_await coroutine::try_future(std::move(written));
-    count_failure.cancel();
+    return written;
 }
 
 }
