@@ -410,7 +410,7 @@ write_buffer_ring::write_buffer_ring(write_buffer_ring_config cfg, seastar::nonc
         , _ring()
         , _in_flight(cfg.ring_size)
         , _queued_writes(on_queued_write_expiry{this})
-        , _head_flush_timer([this] { on_head_flush_timer(); }) {
+        , _sync_timer([this] { on_sync_timer(); }) {
 
     if (_ring_size < 2) {
         on_internal_error(logstor_logger, fmt::format("write_buffer_ring ring_size must be >= 2 (got {})", _ring_size));
@@ -430,29 +430,29 @@ bool write_buffer_ring::has_pending_buffers() const noexcept {
     return _tail < _head || head_buf().has_data();
 }
 
-bool write_buffer_ring::should_rotate_head_for_flush() const noexcept {
-    return _dispatch_tail == _head && head_buf().has_data() && (_async_gate.is_closed() || _head_deadline_expired);
+bool write_buffer_ring::should_advance_head() const noexcept {
+    return _dispatch_tail == _head && head_buf().has_data() && (_async_gate.is_closed() || _sync_deadline_expired);
 }
 
-void write_buffer_ring::arm_head_flush_timer() {
-    if (_head_deadline_expired || _head_flush_timer.armed()) {
+void write_buffer_ring::arm_sync_timer() {
+    if (_sync_deadline_expired || _sync_timer.armed()) {
         return;
     }
     if (_sync_period <= std::chrono::milliseconds(0)) {
-        on_head_flush_timer();
+        on_sync_timer();
         return;
     }
-    _head_flush_timer.arm(db::timeout_clock::now() + _sync_period);
+    _sync_timer.arm(db::timeout_clock::now() + _sync_period);
 }
 
-void write_buffer_ring::on_head_flush_timer() noexcept {
-    _head_deadline_expired = true;
+void write_buffer_ring::on_sync_timer() noexcept {
+    _sync_deadline_expired = true;
     _consumer_progress_cv.signal();
 }
 
-void write_buffer_ring::cancel_head_flush_timer() noexcept {
-    _head_flush_timer.cancel();
-    _head_deadline_expired = false;
+void write_buffer_ring::cancel_sync_timer() noexcept {
+    _sync_timer.cancel();
+    _sync_deadline_expired = false;
 }
 
 void write_buffer_ring::on_queued_writes_changed() noexcept {
@@ -471,7 +471,7 @@ bool write_buffer_ring::maybe_advance_head() noexcept {
     if (ring_full() || !head_buf().has_data()) {
         return false;
     }
-    cancel_head_flush_timer();
+    cancel_sync_timer();
     ++_head;
     _consumer_progress_cv.signal();
     return true;
@@ -488,7 +488,7 @@ std::optional<future<record_location_with_holder>> write_buffer_ring::append_to_
     bool was_empty = !head_buf().has_data();
     auto persisted = head_buf().write(std::move(writer), std::move(target));
     if (was_empty) {
-        arm_head_flush_timer();
+        arm_sync_timer();
         _consumer_progress_cv.signal();
     }
     return persisted;
@@ -536,7 +536,7 @@ future<bool> write_buffer_ring::reclaim_completed_tails() {
             auto ex = f.get_exception();
             auto abort_f = co_await coroutine::as_future(tail_buf().abort_writes(std::move(ex)));
             if (abort_f.failed()) {
-                logstor_logger.warn("Failed to abort buffered writes: {}. Ignoring.", abort_f.get_exception());
+                logstor_logger.warn("Failed to abort the writes of a buffer whose flush failed: {}. Ignoring.", abort_f.get_exception());
             }
         }
 
@@ -583,7 +583,7 @@ future<bool> write_buffer_ring::drain_queued_writes() {
 }
 
 future<> write_buffer_ring::start() {
-    logstor_logger.info("Starting write buffer");
+    logstor_logger.info("Starting write buffer ring");
     _consumer = with_scheduling_group(_flush_sg, [this] {
         return consumer_loop();
     });
@@ -594,9 +594,9 @@ future<> write_buffer_ring::stop() {
     if (_async_gate.is_closed()) {
         co_return;
     }
-    logstor_logger.info("Stopping write buffer");
+    logstor_logger.info("Stopping write buffer ring");
 
-    cancel_head_flush_timer();
+    cancel_sync_timer();
 
     // Wake the consumer so it can observe the closing gate and exit.
     auto close_fut = _async_gate.close();
@@ -609,12 +609,12 @@ future<> write_buffer_ring::stop() {
             auto f = co_await coroutine::as_future(std::move(*state.completion));
             state.completion.reset();
             if (f.failed()) {
-                logstor_logger.warn("Buffered write completion failed during stop: {}. Ignoring.", f.get_exception());
+                logstor_logger.warn("A buffer flush failed during stop: {}. Ignoring.", f.get_exception());
             }
         }
     }
 
-    logstor_logger.info("Write buffer stopped");
+    logstor_logger.info("Write buffer ring stopped");
 }
 
 future<> write_buffer_ring::flush() {
@@ -665,51 +665,43 @@ future<> write_buffer_ring::flush() {
     });
 }
 
-// A record that goes straight into the head buffer waits for nothing - it is accepted by returning,
-// and only its place in a segment is still to come - so this is not a coroutine: one that suspends
-// nowhere would allocate a frame per write to do nothing with it. A record that has to be queued
-// waits in queue_write(), which is where the frame belongs.
-//
-// Not being a coroutine, it has to report a failure as a failed future itself, which is what the
-// noexcept says: the caller counts a failed write off the future it gets back, and a throw out of
-// here would go past that accounting. The try costs nothing on the path that does not throw.
+// Not a coroutine, because a record that goes straight into the head buffer waits for nothing, and
+// a coroutine would allocate a frame per write for no use. So the function gives each failure as a
+// failed future, and the try costs nothing on the path that does not throw.
 future<buffered_write_result> write_buffer_ring::write_to_buffer(log_record_writer writer, db::timeout_clock::time_point timeout, write_target target) noexcept {
-  try {
-    auto holder = _async_gate.hold();
+    try {
+        auto holder = _async_gate.hold();
 
-    // The record has to fit the mixed buffer it goes into here and the full segment the separator
-    // later rewrites it into, so it is bounded by whichever of the two takes less: one that only
-    // fits the buffer it is written to first would be accepted here and then never fit anywhere the
-    // separator could put it.
-    const size_t max_size = chunk_builder::max_record_size_any_kind(head_buf().buffer_size());
-    if (writer.record_size() > max_size) [[unlikely]] {
-        return make_exception_future<buffered_write_result>(std::runtime_error(
-                fmt::format("Write size {} exceeds the maximum record size {}", writer.record_size(), max_size)));
-    }
-    const size_t key_size = writer.header_size() - ondisk::record_header_fixed_size;
-    if (key_size > ondisk::max_key_size) [[unlikely]] {
-        return make_exception_future<buffered_write_result>(std::runtime_error(
-                fmt::format("Partition key size {} exceeds the maximum {}", key_size, ondisk::max_key_size)));
-    }
-
-    // fast path - if there are no queued writes and there is space in the current head buffer or the next, advance the
-    // head buffer if needed and write to it.
-    if (_queued_writes.empty()) {
-        if (auto persisted = append_to_head_buffer(writer, target)) {
-            return make_ready_future<buffered_write_result>(buffered_write_result{std::move(*persisted)});
+        // The record has to fit the mixed buffer it goes into here and the full segment the separator
+        // later rewrites it into, so it is bounded by whichever of the two takes less: one that only
+        // fits the buffer it is written to first would be accepted here and then never fit anywhere the
+        // separator could put it.
+        const size_t max_size = chunk_builder::max_record_size_any_kind(head_buf().buffer_size());
+        if (writer.record_size() > max_size) [[unlikely]] {
+            return make_exception_future<buffered_write_result>(std::runtime_error(
+                    fmt::format("Write size {} exceeds the maximum record size {}", writer.record_size(), max_size)));
         }
-    }
+        const size_t key_size = writer.header_size() - ondisk::record_header_fixed_size;
+        if (key_size > ondisk::max_key_size) [[unlikely]] {
+            return make_exception_future<buffered_write_result>(std::runtime_error(
+                    fmt::format("Partition key size {} exceeds the maximum {}", key_size, ondisk::max_key_size)));
+        }
 
-    // either there are queued writes or there is no space in the head buffer and ring is full - queue the write.
-    return queue_write(std::move(writer), timeout, std::move(target), std::move(holder));
-  } catch (...) {
-    return current_exception_as_future<buffered_write_result>();
-  }
+        // fast path - if there are no queued writes and there is space in the current head buffer or the next, advance the
+        // head buffer if needed and write to it.
+        if (_queued_writes.empty()) {
+            if (auto persisted = append_to_head_buffer(writer, target)) {
+                return make_ready_future<buffered_write_result>(buffered_write_result{std::move(*persisted)});
+            }
+        }
+
+        // either there are queued writes or there is no space in the head buffer and ring is full - queue the write.
+        return queue_write(std::move(writer), timeout, std::move(target), std::move(holder));
+    } catch (...) {
+        return current_exception_as_future<buffered_write_result>();
+    }
 }
 
-// The future of the request is what this returns, so there is nothing to wait for here either: the
-// consumer resolves it when it makes room for the record. The request carries the gate holder of the
-// write, which is what has to outlive the wait.
 future<buffered_write_result> write_buffer_ring::queue_write(log_record_writer writer, db::timeout_clock::time_point timeout,
         write_target target, seastar::gate::holder holder) {
     const bool queue_was_empty = _queued_writes.empty();
@@ -725,6 +717,10 @@ future<buffered_write_result> write_buffer_ring::queue_write(log_record_writer w
     return accepted;
 }
 
+// Each pass reclaims the flushed buffers at the tail, moves queued writes into the free buffers,
+// advances the head when its sync deadline ended or the ring stops, and dispatches the buffers
+// behind the head. The loop waits for a signal when a pass makes no progress, and ends when the ring
+// stops and holds no record.
 future<> write_buffer_ring::consumer_loop() {
     try {
         while (true) {
@@ -734,7 +730,7 @@ future<> write_buffer_ring::consumer_loop() {
 
             progressed |= co_await drain_queued_writes();
 
-            if (should_rotate_head_for_flush()) {
+            if (should_advance_head()) {
                 progressed |= maybe_advance_head();
             }
 
@@ -763,7 +759,7 @@ future<> write_buffer_ring::consumer_loop() {
             co_await coroutine::maybe_yield();
         }
     } catch (...) {
-        on_internal_error(logstor_logger, format("write_buffer_ring consumer loop aborted unexpectedly: {:t}", std::current_exception()));
+        on_internal_error(logstor_logger, fmt::format("write_buffer_ring consumer loop aborted unexpectedly: {:t}", std::current_exception()));
     }
 }
 
