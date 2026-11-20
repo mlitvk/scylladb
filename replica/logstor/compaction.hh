@@ -43,18 +43,6 @@ class segment_set;
 struct separator_buffer;
 class logstor_group;
 
-// What the separator owes the index for one record it rewrote: the entry that pointed at the record
-// in the segment it came from has to point at the copy the separator wrote. There is one of these
-// per record, which is why it is a struct rather than a closure - a closure carrying a key does not
-// fit inside a noncopyable_function and would take a heap allocation of its own on every write.
-struct separator_index_update {
-    primary_index* index;
-    primary_index_key key;
-    record_location prev_location;
-
-    void operator()(record_location new_location, seastar::gate::holder) const;
-};
-
 using split_target_group = std::function<logstor_group&(log_segment_id, dht::token first_token, dht::token last_token)>;
 
 // The separator buffer pool is sized for one buffer per compaction group - the one the group writes
@@ -322,7 +310,6 @@ private:
 
 struct separator_buffer {
     owned_write_buffer buf;
-    utils::chunked_vector<future<>> pending_updates;
     // A successful flush cancels the guards of the source segments. Otherwise the guards keep the
     // segments.
     utils::chunked_vector<segment_keep_guard> held_segments;
@@ -339,7 +326,7 @@ struct separator_buffer {
     ~separator_buffer();
 
     template <log_record_writer_concept Writer>
-    void write(segment_ref seg_ref, std::optional<segment_sequence> segment_seq_num, Writer writer, separator_index_update after_written) {
+    void write(segment_ref seg_ref, std::optional<segment_sequence> segment_seq_num, const Writer& writer, index_relocation relocation) {
         // The separator buffer holds a reference to the source segment until its updates are durable.
         if (held_segments.empty() || held_segments.back().ref().id() != seg_ref.id()) {
             held_segments.push_back(segment_keep_guard(std::move(seg_ref)));
@@ -349,9 +336,7 @@ struct separator_buffer {
             min_seq_num = *segment_seq_num;
         }
 
-        pending_updates.push_back(
-            buf->write(std::move(writer)).then_unpack(std::move(after_written))
-        );
+        buf->write(writer, std::move(relocation));
     }
 
     bool allocated() const noexcept {
@@ -371,16 +356,13 @@ struct separator_buffer {
         return buf ? buf->record_bytes() : 0;
     }
 
-    future<> close() {
-        return buf ? buf->close() : make_ready_future<>();
-    }
-
     // Gives the write buffer back to the pool and drops what belonged to it, which releases the
     // source segments it was holding. The buffer is expected to have been flushed, or aborted,
     // before this.
-    future<> release();
+    void release() noexcept;
 
-    future<> abort(std::exception_ptr);
+    // Fails the writes of the buffer with `ex`, for a buffer that is not flushed.
+    void abort(std::exception_ptr ex) noexcept;
 
     // Cancels the guards of the source segments, so that the segments can be freed.
     // The caller must call release_held_segments() only after a flush wrote the records.
@@ -503,7 +485,7 @@ public:
     }
 
     template <log_record_writer_concept Writer>
-    future<> write_to_separator(Writer, segment_ref, std::optional<segment_sequence>, separator_index_update);
+    future<> write_to_separator(Writer, segment_ref, std::optional<segment_sequence>, index_relocation);
 
     // Flushes each separator buffer of the group that holds a record of a segment with a segment_seq
     // lower than `seq_num`, or each separator buffer that holds a record when `seq_num` is not given.

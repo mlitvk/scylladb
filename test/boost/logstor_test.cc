@@ -1001,55 +1001,6 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_failed_compaction_returns_its_buffer_to_th
     assert_that(*read_mutation(ls, schema, cg.logstor_index(), pk1_v0.decorated_key(), schema->full_slice()).get()).is_equal_to(pk1_v0);
 }
 
-// Checks that a compaction whose index updates fail returns its buffer to the pool. This failure
-// surfaces only after the output segment was written, so it lands after flush() handed the pending
-// updates to when_all_succeed() - which moves them out of the vector. That is the path where a
-// teardown still walking that vector would operate on moved-from futures.
-SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_failing_index_update_returns_its_buffer_to_the_pool) {
-    if constexpr (!std::is_same_v<utils::error_injection_type, utils::error_injection<true>>) {
-        return;
-    }
-
-    auto schema = make_kv_schema();
-    tmpdir dir;
-
-    shared_logstor_cache cache;
-    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
-    test_recovery_catalog no_tables;
-    ls.do_recovery(no_tables).get();
-    ls.start().get();
-    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
-
-    test_logstor_group cg(schema, ls);
-    auto setup_guard = std::make_optional(ls.get_compaction_manager().disable_compaction(cg).get());
-
-    auto pk0_v0 = make_kv_mutation(schema, "pk0", "v0", api::timestamp_type(1));
-    auto pk1_v0 = make_kv_mutation(schema, "pk1", "v1", api::timestamp_type(2));
-    auto pk0_v1 = make_kv_mutation(schema, "pk0", "v0-new", api::timestamp_type(3));
-
-    write_and_flush_segment(ls, cg, pk0_v0);
-    write_and_flush_segment(ls, cg, pk1_v0);
-    write_and_flush_segment(ls, cg, pk0_v1);
-
-    utils::get_local_injector().enable("logstor_compaction_fail_index_update", true /* one shot */);
-
-    setup_guard.reset();
-    ls.get_compaction_manager().submit(cg);
-    setup_guard = ls.get_compaction_manager().disable_compaction(cg).get();
-
-    // The records are readable whichever location the index kept for them.
-    assert_that(*read_mutation(ls, schema, cg.logstor_index(), pk0_v1.decorated_key(), schema->full_slice()).get()).is_equal_to(pk0_v1);
-    assert_that(*read_mutation(ls, schema, cg.logstor_index(), pk1_v0.decorated_key(), schema->full_slice()).get()).is_equal_to(pk1_v0);
-
-    // The buffer of the failed compaction is back in the pool, so compaction still runs.
-    setup_guard.reset();
-    ls.get_compaction_manager().submit(cg);
-    auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
-
-    assert_that(*read_mutation(ls, schema, cg.logstor_index(), pk0_v1.decorated_key(), schema->full_slice()).get()).is_equal_to(pk0_v1);
-    assert_that(*read_mutation(ls, schema, cg.logstor_index(), pk1_v0.decorated_key(), schema->full_slice()).get()).is_equal_to(pk1_v0);
-}
-
 // Checks that the segment scan returns mixed-segment record locations that can be used to read back the expected records.
 SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_mixed_chunks_report_readable_record_locations) {
     auto schema = make_kv_schema();
@@ -2066,13 +2017,13 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_separator_writers_of_a_group_share_one_buf
         auto key = record.header.index_key();
         auto entry = lookup_location(cg.logstor_index(), key, *schema);
         BOOST_REQUIRE(entry);
-        auto update = separator_index_update{
+        auto relocation = index_relocation{
             .index = &cg.logstor_index(),
             .key = key,
-            .prev_location = *entry,
+            .old_location = *entry,
         };
         return cg.write_to_separator(log_record_writer(std::move(record)), snapshot.front().seg_ref,
-                std::nullopt, std::move(update));
+                std::nullopt, std::move(relocation));
     };
 
     auto first = separate(keys[0]);

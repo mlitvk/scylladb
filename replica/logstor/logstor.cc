@@ -60,7 +60,7 @@ logstor::logstor(logstor_config config, ::cache_tracker& shared_cache_tracker)
     , _write_buffer(write_buffer_ring_config{
             .buffer_size = _segment_manager.get_segment_size(),
             .flush_sg = config.flush_sg,
-        }, [&sm = _segment_manager] (mixed_write_buffer& buf) { return sm.write(buf); })
+        }, [&sm = _segment_manager] (user_write_buffer& buf) { return sm.write(buf); })
     , _cache_tracker(shared_cache_tracker) {
 
     namespace sm = seastar::metrics;
@@ -162,8 +162,12 @@ future<> logstor::do_write(const schema& s, dht::decorated_key dk, api::timestam
     auto count_failure = defer([this] noexcept { ++_stats.write_failures; });
     auto gate_holder = _async_gate.hold();
 
-    auto& cg = *target.cg;
-    primary_index_key key(dk);
+    index_insert completion{
+        .index = &target.cg->logstor_index(),
+        .key = primary_index_key(dk),
+        .timestamp = ts,
+    };
+    auto written = completion.done.get_future();
     auto writer = log_record_writer(log_record{
         .header = {
             .key = std::move(dk),
@@ -173,13 +177,9 @@ future<> logstor::do_write(const schema& s, dht::decorated_key dk, api::timestam
         .value = std::move(value),
     });
 
-    auto [location, op] = co_await coroutine::try_future(
-            _write_buffer.write(std::move(writer), timeout, std::move(target)));
-
-    cg.logstor_index().insert(key, index_entry{
-        .location = location,
-        .timestamp = ts,
-    });
+    // The ring inserts the record into the index once it is in a segment, before it resolves `written`.
+    _write_buffer.write(std::move(writer), std::move(completion), timeout, std::move(target));
+    co_await coroutine::try_future(std::move(written));
     count_failure.cancel();
 }
 
