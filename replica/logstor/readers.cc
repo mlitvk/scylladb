@@ -60,12 +60,12 @@ protected:
         reader_permit::resource_units memory;
     };
 
-    // The query's schema, _schema, is what the fragments are pushed under. The table's is what the
-    // cache is asked and a record decoded under. They differ for a reversed read, whose query
-    // schema is the reversed one: a table without clustering columns has nothing to reverse, and a
-    // cached partition upgraded to the reversed schema would only be upgraded back by the next
+    // The query's schema, _schema, is what the fragments are pushed under. Its forward version is
+    // what the cache is asked and a record decoded under. The two differ for a reversed read, whose
+    // query schema is the reversed one: a table without clustering columns has nothing to reverse,
+    // and a cached partition upgraded to the reversed schema would only be upgraded back by the next
     // forward read.
-    schema_ptr _table_schema;
+    schema_ptr _forward_schema;
     query::partition_slice _slice;
     // Decided once, from the slice: a slice with bypass_cache neither looks the cache up nor admits
     // what it reads from a segment.
@@ -80,7 +80,7 @@ private:
 protected:
     logstor_reader_base(schema_ptr s, reader_permit p, const query::partition_slice& slice)
         : impl(std::move(s), std::move(p))
-        , _table_schema(slice.is_reversed() ? _schema->get_reversed() : _schema)
+        , _forward_schema(slice.is_reversed() ? _schema->get_reversed() : _schema)
         , _slice(slice)
         , _use_cache(!_slice.options.contains(query::partition_slice::option::bypass_cache))
     { }
@@ -94,7 +94,7 @@ protected:
     size_t waiting_memory_usage(const dht::decorated_key& key, const single_row_partition& partition) const {
         size_t usage = sizeof(pending_partition) + key.key().external_memory_usage();
         if (partition.row) {
-            usage += partition.row->cells().external_memory_usage(*_table_schema, column_kind::regular_column);
+            usage += partition.row->cells().external_memory_usage(*_forward_schema, column_kind::regular_column);
         }
         return usage;
     }
@@ -189,9 +189,9 @@ class logstor_single_key_reader : public logstor_reader_base {
         if (record.header.key.key() != _dk.key()) [[unlikely]] {
             co_await coroutine::return_exception(key_mismatch_error(_dk.key(), record.header.key.key(), where.location));
         }
-        auto partition = decode_record_value(record.value, *_table_schema, record.header);
+        auto partition = decode_record_value(record.value, *_forward_schema, record.header);
         if (_use_cache) {
-            _index.populate_cache(where.guard, key, where.location, _table_schema, _dk.key(), partition);
+            _index.populate_cache(where.guard, key, where.location, _forward_schema, _dk.key(), partition);
         }
         tracing::trace(_trace_state, "logstor_single_key_reader: fetched key {}", _dk);
         begin(std::move(partition));
@@ -219,7 +219,7 @@ public:
 
         try {
             primary_index_key key(_dk);
-            auto found = _index.lookup_for_read(key, *_table_schema, _use_cache);
+            auto found = _index.lookup_for_read(key, *_forward_schema, _use_cache);
             if (!found) {
                 _end_of_stream = true;
                 return make_ready_future<>();
@@ -358,7 +358,7 @@ class logstor_range_reader : public logstor_reader_base {
         partitions.reserve(slots.size());
         for (auto& slot : slots) {
             if (slot.record) {
-                auto partition = decode_record_value(slot.record->value, *_table_schema, slot.record->header);
+                auto partition = decode_record_value(slot.record->value, *_forward_schema, slot.record->header);
                 slot.partition = make_pending(std::move(slot.record->header.key), std::move(partition));
                 slot.record.reset();
             }
@@ -416,7 +416,7 @@ class logstor_range_reader : public logstor_reader_base {
         auto index_batch = _scan.next_batch(max_entries, [&] (const primary_index::scanned_entry& entry) {
             batch_slot slot{.location = entry.entry().location};
             if (_use_cache) {
-                if (auto cached = entry.read_cached(*_table_schema)) {
+                if (auto cached = entry.read_cached(*_forward_schema)) {
                     slot.partition = make_pending(std::move(cached->key), std::move(cached->partition));
                 }
             }
