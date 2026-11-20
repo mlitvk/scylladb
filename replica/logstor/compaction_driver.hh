@@ -139,19 +139,16 @@ private:
     bool _stopping{false};
     driver_stats _stats;
 
-    // compaction_space_floor() for this disk, and the limits derived from it. set_space_floor()
-    // computes them again when the configuration changes.
+    // compaction_space_floor() for this disk. set_space_floor() computes it again when the
+    // configuration changes.
     uint64_t _space_floor{0};
-    compaction_limits _limits{};
     std::optional<utils::observer<double>> _space_floor_observer;
 
     // The future of run(), which starts once and runs for the lifetime of the shard.
     shared_future<> _completion{make_ready_future<>()};
     // The slots of the automatic jobs. The size is max_auto_compaction_parallelism, which leaves
-    // compaction buffers for a split compaction. The driver holds back the difference between the
-    // size and the parallelism that the space floor allows, see make_compaction_limits().
+    // compaction buffers for a split compaction.
     seastar::semaphore _job_slots{max_auto_compaction_parallelism};
-    semaphore_units<> _held_back{consume_units(_job_slots, 0)};
     // The scores of the automatic jobs in flight, for the marginal admission gate.
     std::list<compaction_candidate_score> _jobs_in_flight;
 
@@ -172,15 +169,13 @@ private:
     // Counts the automatic jobs that ended, for the marginal admission gate.
     uint64_t _jobs_ended{0};
     // The inputs of the selection that can give a group a batch. They are the segments under the
-    // threshold, as the backlog estimates them, the dead segments, and the limits that decide how
-    // many candidates a batch needs and can take. The dead segments count apart, because they do
-    // not wait for a minimum batch, and the estimate does not show when they die in the lowest
-    // bucket.
+    // threshold, as the backlog estimates them, the dead segments, and the minimum batch. The dead
+    // segments count apart, because they do not wait for a minimum batch, and the estimate does not
+    // show when they die in the lowest bucket.
     struct ranking_inputs {
         double under_threshold;
         uint64_t dead;
         size_t min_batch;
-        size_t batch_cap;
 
         bool operator==(const ranking_inputs&) const noexcept = default;
     };

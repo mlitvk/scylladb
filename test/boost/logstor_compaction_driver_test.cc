@@ -36,7 +36,7 @@ using namespace std::chrono_literals;
 namespace {
 
 constexpr uint64_t segment_size = 128 * 1024;
-// A space floor of 32 segments: 4 jobs in parallel, of up to 8 segments each.
+// A space floor of 32 segments, and the anchor at 64.
 constexpr uint64_t segment_count = 1024;
 
 // The rich and the poor batch differ much in efficiency, so the gate refuses the poor batch next to
@@ -382,89 +382,24 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_job_runs_under_its_ranki
     BOOST_REQUIRE_EQUAL(used.utilization_threshold, ranked.utilization_threshold);
 }
 
-// A change of the space floor changes the parallelism at once. The jobs in flight continue, and a
-// new job starts only when fewer jobs than the new parallelism run.
-SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_space_floor_update) {
+// A batch that the gate refuses waits for a job to end, and a stop ends the wait.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_stop_ends_the_wait_of_a_refused_batch) {
     fake_host host;
-    fake_group a, b, c, d, e, f;
-    host.rankings = {
-        {candidate_of(a, rich), candidate_of(b, rich), candidate_of(c, rich), candidate_of(d, rich)},
-        {candidate_of(e, rich), candidate_of(f, rich)},
-    };
-    utils::updateable_value_source<double> space_floor(1.0 / 32);
-    auto cfg = make_config();
-    cfg.space_floor = utils::updateable_value<double>(space_floor);
-    compaction_driver driver(host, std::move(cfg));
-    start(driver);
-    auto stop_driver = seastar::defer([&] noexcept { stop(driver, host); });
-
-    BOOST_REQUIRE(wait_until([&] { return host.jobs.size() == 4; }));
-
-    // 16 segments: 2 jobs of up to 8 segments.
-    space_floor.set(1.0 / 64);
-    end_job(host, 0);
-    end_job(host, 1);
-    seastar::sleep(50ms).get();
-    BOOST_REQUIRE_EQUAL(host.jobs.size(), 4u);
-
-    end_job(host, 2);
-    BOOST_REQUIRE(wait_until([&] { return host.jobs.size() == 5; }));
-    BOOST_REQUIRE_EQUAL(host.jobs[4]->group, &e);
-    seastar::sleep(50ms).get();
-    BOOST_REQUIRE_EQUAL(host.jobs.size(), 5u);
-
-    space_floor.set(1.0 / 32);
-    BOOST_REQUIRE(wait_until([&] { return host.jobs.size() == 6; }));
-    BOOST_REQUIRE_EQUAL(host.jobs[5]->group, &f);
-}
-
-// A smaller space floor can leave more jobs in flight than the new parallelism allows, also while a
-// ranking yields. The driver then starts no job and refuses no batch until enough jobs end, and it
-// keeps its ranking. After that, a batch that the gate refuses waits for a job to end, and a stop
-// ends the wait.
-SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_waits_after_the_space_floor_decreases) {
-    fake_host host;
-    fake_group a, b, c, d;
-    host.rankings = {
-        {candidate_of(a, rich), candidate_of(b, rich), candidate_of(c, rich)},
-        {candidate_of(d, poor)},
-    };
-    host.ranking_gate.emplace();
-    utils::updateable_value_source<double> space_floor(1.0 / 32);
-    auto cfg = make_config();
-    cfg.space_floor = utils::updateable_value<double>(space_floor);
-    compaction_driver driver(host, std::move(cfg));
+    fake_group a, b;
+    host.rankings = {{candidate_of(a, rich)}, {candidate_of(b, poor)}};
+    compaction_driver driver(host, make_config());
     start(driver);
     // The test stops the driver at the end, because the stop is part of the test. This stop runs
     // when a check fails before that.
     auto stop_driver = seastar::defer([&] noexcept { stop(driver, host); });
 
-    BOOST_REQUIRE(wait_until([&] { return host.ranking_limits.size() == 1; }));
-    host.open_ranking_gate();
-    host.ranking_gate.emplace();
-    BOOST_REQUIRE(wait_until([&] { return host.ranking_limits.size() == 2; }));
-    BOOST_REQUIRE_EQUAL(host.jobs.size(), 3u);
-
-    // A space floor of 16 segments allows 2 jobs, and 3 jobs run. The driver gives back the slot
-    // that it holds for the ranking.
-    space_floor.set(1.0 / 64);
-    host.open_ranking_gate();
-    seastar::sleep(50ms).get();
-    BOOST_REQUIRE_EQUAL(host.jobs.size(), 3u);
-    BOOST_REQUIRE_EQUAL(driver.stats().batches_refused, 0u);
-
-    // With 1 job in flight, the driver takes the next candidate of its ranking, and the gate refuses
-    // it next to the rich job.
-    end_job(host, 0);
-    end_job(host, 1);
     BOOST_REQUIRE(wait_until([&] { return driver.stats().batches_refused == 1; }));
-    seastar::sleep(50ms).get();
-    BOOST_REQUIRE_EQUAL(host.jobs.size(), 3u);
-    BOOST_REQUIRE_EQUAL(host.ranking_limits.size(), 2u);
+    BOOST_REQUIRE_EQUAL(host.jobs.size(), 1u);
 
     driver.request_stop();
-    end_job(host, 2);
+    end_job(host, 0);
     seastar::with_timeout(lowres_clock::now() + wait_limit, driver.stop()).get();
+    BOOST_REQUIRE_EQUAL(host.jobs.size(), 1u);
 }
 
 // A stop that comes while a ranking runs starts no job from that ranking.
