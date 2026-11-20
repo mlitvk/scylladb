@@ -391,7 +391,10 @@ template <write_completion Completion>
 class mixed_write_buffer final : public write_buffer<Completion> {
     using base = write_buffer<Completion>;
 
+    // The separator takes the vector with each chunk, so write() reserves the record count of the
+    // last chunk for the next one.
     std::vector<separator_record> _separator_records;
+    size_t _last_record_count = 0;
 
 public:
     explicit mixed_write_buffer(size_t buffer_size)
@@ -400,6 +403,9 @@ public:
 
     // Appends the record, see write_buffer::append().
     void write(log_record_writer writer, write_target target, Completion&& completion) {
+        if (_separator_records.capacity() == 0) {
+            _separator_records.reserve(_last_record_count);
+        }
         auto& record = _separator_records.emplace_back(separator_record{
             .writer = std::move(writer),
             .target = std::move(target),
@@ -419,6 +425,7 @@ public:
     // Returns the records of the buffer for the separator, after the chunk of the buffer is
     // written.
     std::vector<separator_record> take_separator_records() {
+        _last_record_count = _separator_records.size();
         return std::move(_separator_records);
     }
 
