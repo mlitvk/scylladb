@@ -753,7 +753,7 @@ public:
     future<> prepare_private_index() {
         // A tracker of its own, so cache-populate's churn doesn't tune the allocating sections the
         // other tests use; region and LRU are shared.
-        auto copy = std::make_unique<primary_index>(tests::logstor::noop_space_accounting, &_cache.logstor_tracker, true);
+        auto copy = std::make_unique<primary_index>(_schema, tests::logstor::noop_space_accounting, &_cache.logstor_tracker, true);
         for (const auto& key : _keys) {
             primary_index_key pk{key};
             auto lookup = index().lookup_for_dump(pk, _schema);
@@ -868,7 +868,7 @@ public:
                 .location = where.location,
                 .timestamp = api::new_timestamp(),
             });
-            if (!_private_index->populate_cache(where.guard, key, where.location, _mutation->schema(), _mutation->key(), *_partition)) [[unlikely]] {
+            if (!_private_index->populate_cache(where.guard, key, where.location, *_mutation->schema(), _mutation->key(), *_partition)) [[unlikely]] {
                 on_internal_error(logstor_logger, "the entry of the prepared partition was not populated");
             }
         }

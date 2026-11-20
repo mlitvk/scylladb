@@ -4113,7 +4113,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_single_key_reader_rejects_a_cached_partiti
     primary_index_key key(ms[0].decorated_key());
     auto where = lookup_guarded_location(index, key, *env.schema);
     BOOST_REQUIRE(where);
-    BOOST_REQUIRE(index.populate_cache(where->guard, key, where->location, ms[1].schema(), ms[1].key(), to_single_row_partition(mutation(ms[1]))));
+    BOOST_REQUIRE(index.populate_cache(where->guard, key, where->location, *ms[1].schema(), ms[1].key(), to_single_row_partition(mutation(ms[1]))));
 
     auto rd = env.make_reader(singular_range(ms[0]));
     auto close_rd = deferred_close(rd);
@@ -4140,6 +4140,58 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_single_key_reader_misses_after_an_eviction
     BOOST_REQUIRE_EQUAL(stats.partition_misses, 2);
     assert_that(env.make_reader(singular_range(m))).produces(m).produces_end_of_stream();
     BOOST_REQUIRE_EQUAL(stats.partition_hits, 2);
+}
+
+// Returns a mutation of `schema`, which has the columns of the key-value schema and a column c.
+static mutation make_kv_mutation_with_c(schema_ptr schema, sstring pk, sstring v, sstring c) {
+    const auto ts = api::timestamp_type(1);
+    auto m = make_kv_mutation(schema, std::move(pk), std::move(v), ts);
+    const auto& c_def = *schema->get_column_definition("c");
+    m.partition().clustered_row(*schema, clustering_key::make_empty()).cells().apply(c_def,
+            atomic_cell::make_live(*c_def.type, ts, serialized(std::move(c))));
+    return m;
+}
+
+// A read under a schema that is older than the schema of the table does not fill the cache, because
+// the read decodes the record without the columns that only the newer schema has. A coordinator
+// whose schema is not up to date sends such a read.
+SEASTAR_THREAD_TEST_CASE(test_logstor_single_key_reader_under_an_older_schema_does_not_fill_the_cache) {
+    auto old_schema = make_kv_schema();
+    reader_test_env env(true, schema_builder(old_schema).with_column("c", utf8_type).build());
+    auto m = make_kv_mutation_with_c(env.schema, "pk0", "v0", "c0");
+    env.populate(std::span<const mutation>(&m, 1));
+    const auto& stats = env.cache_stats();
+
+    auto old_m = m;
+    old_m.upgrade(old_schema);
+    assert_that(env.make_reader(old_schema, singular_range(m), old_schema->full_slice())).produces(old_m).produces_end_of_stream();
+    BOOST_REQUIRE_EQUAL(stats.partition_insertions, 0);
+
+    assert_that(env.make_reader(singular_range(m))).produces(m).produces_end_of_stream();
+    BOOST_REQUIRE_EQUAL(stats.partition_insertions, 1);
+}
+
+// A cache hit under a schema that is older than the schema of the table gives an upgraded copy, and
+// does not remove the columns of the newer schema from the cached partition. The hits of a point
+// read and of a range read are checked.
+SEASTAR_THREAD_TEST_CASE(test_logstor_cache_hit_under_an_older_schema_keeps_the_newer_columns) {
+    auto old_schema = make_kv_schema();
+    reader_test_env env(true, schema_builder(old_schema).with_column("c", utf8_type).build());
+    auto m = make_kv_mutation_with_c(env.schema, "pk0", "v0", "c0");
+    env.populate(std::span<const mutation>(&m, 1));
+    const auto& stats = env.cache_stats();
+
+    assert_that(env.make_reader(singular_range(m))).produces(m).produces_end_of_stream();
+    BOOST_REQUIRE_EQUAL(stats.partition_insertions, 1);
+
+    auto old_m = m;
+    old_m.upgrade(old_schema);
+    assert_that(env.make_reader(old_schema, singular_range(m), old_schema->full_slice())).produces(old_m).produces_end_of_stream();
+    assert_that(env.make_reader(old_schema, query::full_partition_range, old_schema->full_slice())).produces(old_m).produces_end_of_stream();
+    BOOST_REQUIRE_EQUAL(stats.partition_hits, 2);
+
+    assert_that(env.make_reader(singular_range(m))).produces(m).produces_end_of_stream();
+    BOOST_REQUIRE_EQUAL(stats.partition_hits, 3);
 }
 
 // The reader contract over a cached partition: next_partition() before the partition was entered

@@ -86,11 +86,13 @@ public:
     const compaction_manager& get_compaction_manager() const noexcept;
 
     // Makes the primary index of a table.
+    // `table_schema` is the current schema of the table. The table changes it later with
+    // primary_index::set_table_schema().
     // `with_cache_tracker` is true when the node has the cache. It does not change for the life of
     // the index.
     // `cache_enabled` is the caching option of the table. The table can change it later with
     // primary_index::set_cache_enabled().
-    std::unique_ptr<primary_index> make_primary_index(bool with_cache_tracker, bool cache_enabled);
+    std::unique_ptr<primary_index> make_primary_index(schema_ptr table_schema, bool with_cache_tracker, bool cache_enabled);
 
     // Waits until each write that was accepted before the call is in the separator buffer of its
     // group.

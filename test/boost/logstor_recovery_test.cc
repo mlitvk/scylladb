@@ -625,7 +625,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_recovery_reproduces_index_after_compaction
     BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 1u);
 
     null_space_accounting accounting;
-    const auto rebuilt = rebuild_index_from_disk(ls, schema->id(), accounting);
+    const auto rebuilt = rebuild_index_from_disk(ls, schema, accounting);
     require_equal_indexes(cg.logstor_index(), *rebuilt);
 }
 
@@ -678,7 +678,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_recovery_reproduces_index_after_split_comp
     BOOST_REQUIRE_EQUAL(src.logstor_segments().segment_count(), 0u);
 
     null_space_accounting accounting;
-    const auto rebuilt = rebuild_index_from_disk(ls, schema->id(), accounting);
+    const auto rebuilt = rebuild_index_from_disk(ls, schema, accounting);
     require_equal_indexes(index, *rebuilt);
 }
 
@@ -729,7 +729,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_recovery_reproduces_index_under_mixed_work
     auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
 
     null_space_accounting accounting;
-    const auto rebuilt = rebuild_index_from_disk(ls, schema->id(), accounting);
+    const auto rebuilt = rebuild_index_from_disk(ls, schema, accounting);
     require_equal_indexes(cg.logstor_index(), *rebuilt);
 }
 

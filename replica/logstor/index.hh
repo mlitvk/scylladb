@@ -218,6 +218,10 @@ class primary_index final {
     // for the guards that exist.
     mutable utils::phased_barrier _reads_phaser{"logstor_primary_index"};
 
+    // The current schema of the table. A cached partition is of this schema or of an older version,
+    // because the cache takes a partition only under this schema, and a hit upgrades the partition
+    // in place only to this schema.
+    schema_ptr _table_schema;
     // Non-owning pointer to the cache tracker, which is null when the cache is not set up.
     cache_tracker* _cache_tracker = nullptr;
     // The caching option of the table, which controls only lookups and populates. Evicts depend
@@ -270,11 +274,12 @@ class primary_index final {
     }
 
 public:
-    explicit primary_index(space_accounting_subscriber& space_accounting, cache_tracker* ct, bool cache_enabled)
+    primary_index(schema_ptr table_schema, space_accounting_subscriber& space_accounting, cache_tracker* ct, bool cache_enabled)
         : _insert_section(abstract_formatter([] (fmt::format_context& ctx) {
             fmt::format_to(ctx.out(), "logstor_index.insert");
         }))
         , _entries(dht::raw_token_less_comparator{})
+        , _table_schema(std::move(table_schema))
         , _cache_tracker(ct)
         , _cache_enabled(cache_enabled)
         , _space_accounting(space_accounting)
@@ -446,7 +451,7 @@ public:
         logalloc::reclaim_lock lock(_region);
         return find_entry(key).transform([&] (const primary_index_entry& e) -> read_lookup_result {
             if (reads_cache() && uses_cache) {
-                if (auto cached = _cache_tracker->read_partition(e, target_schema)) {
+                if (auto cached = _cache_tracker->read_partition(e, _table_schema, target_schema)) {
                     return std::move(*cached);
                 }
             }
@@ -479,13 +484,15 @@ public:
     }
 
     // Admits `partition`, which the caller read from `location`, to the cache, if the entry of `key`
-    // still holds `location`. Returns false if the index does not read the cache or the entry holds
-    // another location. The caller must hold a read guard from before the lookup that gave `location`.
-    // Without the guard, the segment of `location` can be freed, and a newer record of the key can
-    // get the same location, so that the cache would link the older partition to the newer record.
-    bool populate_cache(const index_read_guard&, const primary_index_key& key, record_location location, const schema_ptr& schema,
+    // still holds `location`.
+    // Returns false if the index does not read the cache, if `schema` is not the current schema of
+    // the table, or if the entry holds another location.
+    // The caller must hold a read guard from before the lookup that gave `location`. Without the
+    // guard, the segment of `location` can be freed, and a newer record of the key can get the same
+    // location, so that the cache would link the older partition to the newer record.
+    bool populate_cache(const index_read_guard&, const primary_index_key& key, record_location location, const schema& schema,
             const partition_key& pk, const single_row_partition& partition) const {
-        if (!reads_cache()) {
+        if (!reads_cache() || schema.version() != _table_schema->version()) {
             return false;
         }
 
@@ -495,7 +502,7 @@ public:
             return false;
         }
         _cache_used = true;
-        _cache_tracker->populate(*e, schema, pk, partition);
+        _cache_tracker->populate(*e, _table_schema, pk, partition);
         return true;
     }
 
@@ -539,7 +546,7 @@ public:
             if (!_index.reads_cache()) {
                 return std::nullopt;
             }
-            return _index._cache_tracker->read_partition(_e, target_schema);
+            return _index._cache_tracker->read_partition(_e, _index._table_schema, target_schema);
         }
     };
 
@@ -653,6 +660,12 @@ public:
 
     token_range_scan scan(const dht::token_range& tr = dht::token_range()) const {
         return token_range_scan(*this, tr);
+    }
+
+    // Makes `schema` the current schema of the table. The caller must not give a schema that is older
+    // than the current one.
+    void set_table_schema(schema_ptr schema) noexcept {
+        _table_schema = std::move(schema);
     }
 
     void set_cache_enabled(bool enabled) noexcept {

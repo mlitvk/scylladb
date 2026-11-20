@@ -126,12 +126,15 @@ public:
     // partition already.
     void populate(const primary_index_entry&, const schema_ptr& schema, const partition_key& key, const single_row_partition& partition);
 
-    // The hit path of a read: touches the LRU, counts a hit or a miss, upgrades the entry in place,
-    // and hands out the partition with its key. A reader turns the partition into fragments without
-    // a mutation in between. The index entry has only the hash of the key, so a point read compares
-    // the key it gets with its own. The schema is taken by reference, because only a hit that
-    // upgrades the entry needs a reference to it. Never yields.
-    std::optional<keyed_single_row_partition> read_partition(const primary_index_entry&, const schema& target_schema);
+    // The hit path of a read: touches the LRU, counts a hit or a miss, and hands out the partition
+    // with its key, under `target_schema`. A reader turns the partition into fragments without a
+    // mutation in between. The index entry has only the hash of the key, so a point read compares
+    // the key it gets with its own. Never yields.
+    // Upgrades the entry in place only to `table_schema`, the current schema of the table, and hands
+    // out an upgraded copy if `target_schema` is another version. An upgrade to an older version
+    // removes the columns that only the newer version has, so it must not change the entry.
+    std::optional<keyed_single_row_partition> read_partition(const primary_index_entry&, const schema_ptr& table_schema,
+            const schema& target_schema);
 
     // For introspection: a snapshot of the cached partition as a mutation, taken without
     // touching the LRU, without counting a hit or a miss and without upgrading the cached

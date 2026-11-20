@@ -55,7 +55,14 @@ Only step 4 writes to the disk - all other steps only update in-memory metadata.
 1. Application requests data for a partition key
 2. Index lookup returns the cached partition, if the cache has it, or the record location
 3. Segment manager reads record from disk
-4. Record is decoded into a partition, which is added to the cache and returned
+4. Record is decoded into a partition under the schema of the read. The partition is added to the
+   cache if that schema is the current schema of the table, and it is returned
+
+The cache holds each partition under the current schema of the table, or under an older version of
+it until a hit upgrades the partition in place. A read under another version gets an upgraded copy.
+A read from a coordinator whose schema is not up to date is under an older version, and an upgrade
+to an older version removes the columns that only the newer version has, so such a read must not
+change the cache.
 
 **Separator:**
 1. When a record is written to the active segment, it is also written to its compaction group's separator buffer. The separator buffer holds a reference to the original segment.
