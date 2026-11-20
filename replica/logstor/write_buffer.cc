@@ -219,6 +219,9 @@ future<> write_buffer::abort_writes(std::exception_ptr ex) {
 }
 
 void write_buffer::reset() {
+    if (!is_closed()) {
+        on_internal_error(logstor_logger, "Cannot reset a write buffer that is not closed");
+    }
     _builder.reset();
     _written = {};
     _write_gate = {};
