@@ -142,42 +142,9 @@ struct buffered_write_result {
 // change after this. seal() then writes the header, which holds the sequence number of
 // the segment that receives the chunk. So a caller can reserve room for the chunk in a
 // segment before it knows that number.
-//
-// This type only serializes a chunk. Tests and write_buffer use it directly.
 class chunk_builder {
 public:
-
-    using ostream = seastar::simple_memory_output_stream;
-
-private:
-
-    using aligned_buffer_type = std::unique_ptr<char[], free_deleter>;
-
-    size_t _buffer_size;
-    aligned_buffer_type _buffer;
-    segment_kind _segment_kind;
-    ostream _stream;
-
-    // The frame sizes of the appended records summed, their padding excluded.
-    size_t _record_bytes{0};
-    size_t _record_count{0};
-    std::optional<dht::token> _min_token;
-    std::optional<dht::token> _max_token;
-
-    // What finish() computes about the chunk body, for the chunk header.
-    struct finished_body {
-        uint32_t records_size;
-        uint32_t body_crc;
-    };
-    // Set by finish().
-    std::optional<finished_body> _finished_body;
-    bool _sealed{false};
-
-public:
-
     chunk_builder(size_t buffer_size, segment_kind kind);
-
-    void reset();
 
     chunk_builder(const chunk_builder&) = delete;
     chunk_builder& operator=(const chunk_builder&) = delete;
@@ -185,12 +152,23 @@ public:
     chunk_builder(chunk_builder&&) noexcept = default;
     chunk_builder& operator=(chunk_builder&&) noexcept = default;
 
-    const char* data() const noexcept { return _buffer.get(); }
+    // Empties the buffer, to build a new chunk in it.
+    void reset();
 
-    // The bytes written to the buffer so far, which after finish() is the whole chunk.
-    size_t serialized_size() const noexcept { return _buffer_size - _stream.size(); }
+    // Appends the record frame of the writer's record. Throws std::runtime_error when the record
+    // does not fit, see can_fit().
+    template <log_record_writer_concept Writer>
+    frame_extent append(const Writer& writer);
 
-    size_t buffer_size() const noexcept { return _buffer_size; }
+    // Ends the appends: pads the chunk to block_alignment and computes the body CRC. Returns the
+    // size of the chunk, which does not change after this, so a caller can reserve room for the
+    // chunk in a segment before it seals the buffer.
+    size_t finish();
+
+    // Completes the chunk: finishes the buffer if finish() was not called, and writes the
+    // header. Returns the chunk, which is what is written to a segment. `table` is set for
+    // segment_kind::full.
+    bytes_view seal(segment_sequence segment_seq, std::optional<table_id> table);
 
     bool can_fit(size_t record_size) const noexcept;
 
@@ -200,6 +178,28 @@ public:
     }
 
     bool has_data() const noexcept;
+
+    // The bytes written to the buffer so far, which after finish() is the whole chunk.
+    size_t serialized_size() const noexcept { return _buffer_size - _stream.size(); }
+
+    size_t buffer_size() const noexcept { return _buffer_size; }
+
+    size_t chunk_header_size() const noexcept {
+        return ondisk::chunk_header_size(_segment_kind);
+    }
+
+    size_t record_bytes() const noexcept { return _record_bytes; }
+    size_t record_count() const noexcept { return _record_count; }
+    segment_kind kind() const noexcept { return _segment_kind; }
+
+    size_t max_record_size() const noexcept {
+        return max_record_size(_buffer_size, _segment_kind);
+    }
+
+    // The bytes of an appended record frame, its padding excluded.
+    bytes_view frame_bytes(frame_extent frame) const noexcept {
+        return bytes_view(reinterpret_cast<const int8_t*>(_buffer.get() + frame.offset), frame.size);
+    }
 
     // The largest record - record header and value, the frame header aside - that fits an
     // empty buffer of this size and kind. The kinds differ in what they carry ahead of their
@@ -218,35 +218,31 @@ public:
                         max_record_size(buffer_size, segment_kind::full));
     }
 
-    size_t max_record_size() const noexcept {
-        return max_record_size(_buffer_size, _segment_kind);
-    }
-
-    size_t record_bytes() const noexcept { return _record_bytes; }
-    size_t record_count() const noexcept { return _record_count; }
-    segment_kind kind() const noexcept { return _segment_kind; }
-
-    template <log_record_writer_concept Writer>
-    frame_extent append(const Writer& writer);
-
     // How many segments of this kind `record_count` records of `record_bytes` bytes take.
     static size_t estimate_required_segments(size_t record_bytes, size_t record_count, size_t segment_size, segment_kind);
 
-    size_t chunk_header_size() const noexcept {
-        return ondisk::chunk_header_size(_segment_kind);
-    }
-
-    // Ends the appends: pads the chunk to block_alignment and computes the body CRC. Returns the
-    // size of the chunk, which does not change after this, so a caller can reserve room for the
-    // chunk in a segment before it seals the buffer.
-    size_t finish();
-
-    // Completes the chunk: finishes the buffer if finish() was not called, and writes the
-    // header. Returns the chunk, which is what is written to a segment. `table` is set for
-    // segment_kind::full.
-    bytes_view seal(segment_sequence segment_seq, std::optional<table_id> table);
-
 private:
+    using ostream = seastar::simple_memory_output_stream;
+
+    size_t _buffer_size;
+    std::unique_ptr<char[], free_deleter> _buffer;
+    segment_kind _segment_kind;
+    ostream _stream;
+
+    // The frame sizes of the appended records summed, their padding excluded.
+    size_t _record_bytes{0};
+    size_t _record_count{0};
+    std::optional<dht::token> _min_token;
+    std::optional<dht::token> _max_token;
+
+    // What finish() computes about the chunk body, for the chunk header.
+    struct finished_body {
+        uint32_t records_size;
+        uint32_t body_crc;
+    };
+    // Set by finish().
+    std::optional<finished_body> _finished_body;
+    bool _sealed{false};
 
     void pad_to_alignment(size_t alignment);
 

@@ -34,7 +34,7 @@ void log_record_bytes_writer::write_frame(seastar::simple_memory_output_stream& 
 
 chunk_builder::chunk_builder(size_t buffer_size, segment_kind kind)
         : _buffer_size(buffer_size)
-        , _buffer(seastar::allocate_aligned_buffer<char>(buffer_size, 4096))
+        , _buffer(seastar::allocate_aligned_buffer<char>(buffer_size, ondisk::block_alignment))
         , _segment_kind(kind)
 {
     reset();
@@ -51,16 +51,6 @@ void chunk_builder::reset() {
     _sealed = false;
 }
 
-bool chunk_builder::can_fit(size_t record_size) const noexcept {
-    // The record with its frame header and the padding that follows the frame.
-    const auto frame_size = ondisk::record_frame_header_size + record_size;
-    return align_up(frame_size, ondisk::record_alignment) <= _stream.size();
-}
-
-bool chunk_builder::has_data() const noexcept {
-    return serialized_size() > chunk_header_size();
-}
-
 template <log_record_writer_concept Writer>
 frame_extent chunk_builder::append(const Writer& writer) {
     const auto& header = writer.header();
@@ -75,7 +65,7 @@ frame_extent chunk_builder::append(const Writer& writer) {
     }
 
     if (_finished_body) {
-        on_internal_error(logstor_logger, "Cannot append a record to a finished write buffer");
+        on_internal_error(logstor_logger, "Cannot append a record to a finished chunk");
     }
 
     const auto record_size = header_size + value_size;
@@ -105,15 +95,6 @@ frame_extent chunk_builder::append(const Writer& writer) {
     };
 }
 
-void chunk_builder::pad_to_alignment(size_t alignment) {
-    auto current_pos = serialized_size();
-    auto next_pos = align_up(current_pos, alignment);
-    auto padding = next_pos - current_pos;
-    if (padding > 0) {
-        _stream.fill('\0', padding);
-    }
-}
-
 size_t chunk_builder::finish() {
     if (_finished_body) {
         return serialized_size();
@@ -130,7 +111,7 @@ size_t chunk_builder::finish() {
 
 bytes_view chunk_builder::seal(segment_sequence segment_seq, std::optional<table_id> table) {
     if (_sealed) {
-        throw std::runtime_error("Cannot seal write buffer more than once");
+        throw std::runtime_error("Cannot seal a chunk more than once");
     }
     finish();
 
@@ -160,6 +141,16 @@ bytes_view chunk_builder::seal(segment_sequence segment_seq, std::optional<table
     return bytes_view(reinterpret_cast<const int8_t*>(_buffer.get()), serialized_size());
 }
 
+bool chunk_builder::can_fit(size_t record_size) const noexcept {
+    // The record with its frame header and the padding that follows the frame.
+    const auto frame_size = ondisk::record_frame_header_size + record_size;
+    return align_up(frame_size, ondisk::record_alignment) <= _stream.size();
+}
+
+bool chunk_builder::has_data() const noexcept {
+    return serialized_size() > chunk_header_size();
+}
+
 size_t chunk_builder::estimate_required_segments(size_t record_bytes, size_t record_count, size_t segment_size, segment_kind kind) {
     if (record_count == 0 || record_bytes == 0) {
         return 0;
@@ -177,6 +168,15 @@ size_t chunk_builder::estimate_required_segments(size_t record_bytes, size_t rec
         records_per_segment = 1;
     }
     return (record_count + records_per_segment - 1) / records_per_segment;
+}
+
+void chunk_builder::pad_to_alignment(size_t alignment) {
+    auto current_pos = serialized_size();
+    auto next_pos = align_up(current_pos, alignment);
+    auto padding = next_pos - current_pos;
+    if (padding > 0) {
+        _stream.fill('\0', padding);
+    }
 }
 
 template frame_extent chunk_builder::append<log_record_writer>(const log_record_writer&);

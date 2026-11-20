@@ -316,13 +316,9 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_chunk_builder_reused_for_another_table_sea
 SEASTAR_THREAD_TEST_CASE(test_logstor_chunk_builder_bytes_writer_writes_the_same_frame) {
     auto schema = make_kv_schema();
     auto writer = log_record_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(5)));
-    auto frame_bytes = [] (const chunk_builder& builder, frame_extent frame) {
-        return bytes_view(reinterpret_cast<const int8_t*>(builder.data()) + frame.offset, frame.size);
-    };
-
     chunk_builder original(32 * 1024, segment_kind::mixed);
     const auto original_frame = original.append(writer);
-    const auto original_bytes = frame_bytes(original, original_frame);
+    const auto original_bytes = original.frame_bytes(original_frame);
 
     seastar::simple_memory_input_stream in(reinterpret_cast<const char*>(original_bytes.data()), original_bytes.size());
     auto parsed = ondisk::try_read_record_frame(in);
@@ -335,7 +331,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_chunk_builder_bytes_writer_writes_the_same
     const auto rewritten_frame = rewritten.append(bytes_writer);
 
     BOOST_REQUIRE_EQUAL(rewritten_frame.size, original_frame.size);
-    BOOST_REQUIRE(frame_bytes(rewritten, rewritten_frame) == original_bytes);
+    BOOST_REQUIRE(rewritten.frame_bytes(rewritten_frame) == original_bytes);
 }
 
 // Checks that a buffer holding records that were never flushed can still be closed and reused
