@@ -419,11 +419,19 @@ public:
     //
     // Each page seeks its ends again under the lock, because the region can compact during the
     // yield. An erase frees and never allocates, so the lock alone is enough.
+    //
+    // The keys of a range were inserted over time, mixed with the keys of other ranges, so the erase
+    // leaves free space in many segments of the region. It requests a background compaction of the
+    // region, so that an allocation under memory pressure does not have to compact the region later.
+    // The request is for all the free space of the region, not only for the erased entries: the
+    // region is not evictable, so its free space is waste, and the reclaim takes the region first
+    // while any of its segments is sparse. The inserts that built the region leave free space too.
     future<> erase(dht::token_range tr) {
         assert_unlocked();
         static constexpr size_t page_size = default_scan_batch_size;
         auto dispose = [this] (primary_index_entry* e) noexcept { dispose_entry(e); };
         std::optional<primary_index_key> next_key;
+        bool erased = false;
         while (true) {
             const bool done = with_allocator(_region.allocator(), [&] {
                 logalloc::reclaim_lock lock(_region);
@@ -439,13 +447,17 @@ public:
                 if (!last_page) {
                     next_key = page_end->key();
                 }
+                erased |= begin != page_end;
                 _entries.erase_and_dispose(begin, page_end, dispose);
                 return last_page;
             });
             if (done) {
-                co_return;
+                break;
             }
             co_await coroutine::maybe_yield();
+        }
+        if (erased) {
+            _region.request_compaction(_region.occupancy().free_space());
         }
     }
 

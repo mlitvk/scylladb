@@ -28,6 +28,7 @@
 #include <variant>
 #include "schema/schema_builder.hh"
 #include "test/lib/log.hh"
+#include "test/lib/lsa_background_reclaim.hh"
 #include "test/lib/logstor_test_utils.hh"
 #include "test/lib/mutation_assertions.hh"
 
@@ -833,6 +834,56 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_cache_survives_lsa_compaction_before_excha
 // then every region of the shard is compacted fully, which moves the cache region too. A full
 // compaction inside the visit of a scan must leave the index region as it is, because the scan
 // holds the lock of the region.
+// A range erase leaves free space in most segments of the index region, and it requests a
+// background compaction of the region. The compaction moves entries that link to cached partitions.
+SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_range_erase_compacts_the_region) {
+    auto stop_background_reclaim = tests::configure_lsa_background_reclaim();
+    auto schema = make_logstor_schema();
+    shared_logstor_cache cache;
+    primary_index index(noop_space_accounting, &cache.logstor_tracker, true);
+
+    constexpr int key_count = 60'000;
+    constexpr int cached_every = 16;
+    const auto location_of = [] (int i) { return make_index_entry(1, uint32_t(i) * 8, 8, 1).location; };
+
+    std::vector<primary_index_key> keys;
+    keys.reserve(key_count);
+    std::map<int, mutation> mutations;
+    for (int i = 0; i < key_count; ++i) {
+        keys.push_back(make_primary_index_key(*schema, format("pk-{:06d}", i)));
+        BOOST_REQUIRE(index.insert(keys[i], make_index_entry(1, uint32_t(i) * 8, 8, 1)).inserted());
+    }
+    for (int i = 0; i < key_count; i += cached_every) {
+        auto m = make_mutation(schema, format("pk-{:06d}", i), format("v{}", i));
+        populate(index, keys[i], m);
+        mutations.emplace(i, std::move(m));
+    }
+    const size_t before = index.get_usage().memory_usage;
+
+    // The first half of the token ring. The insert order is not the token order, so the erased
+    // entries are spread over the whole region.
+    const auto middle = dht::token::from_int64(0);
+    const auto erased = [&] (int i) { return keys[i].token() < middle; };
+    index.erase(dht::token_range::make_ending_with({middle, false})).get();
+
+    BOOST_REQUIRE(tests::wait_for_background_reclaim([&] { return index.get_usage().memory_usage < before * 0.6; }));
+    testlog.info("Index region before the erase: {} bytes, after the requested compaction: {} bytes",
+            before, index.get_usage().memory_usage);
+
+    for (int i = 0; i < key_count; ++i) {
+        if (erased(i)) {
+            BOOST_REQUIRE(!lookup_location(index, keys[i], *schema));
+        } else if (i % cached_every == 0) {
+            assert_that(schema, lookup(index, keys[i], schema)).is_equal_to(mutations.at(i).partition());
+        } else {
+            auto location = lookup_location(index, keys[i], *schema);
+            BOOST_REQUIRE(location);
+            BOOST_REQUIRE(*location == location_of(i));
+        }
+    }
+    index.drain_cache().get();
+}
+
 SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_survives_lsa_compaction) {
     auto schema = make_logstor_schema();
     shared_logstor_cache cache;
