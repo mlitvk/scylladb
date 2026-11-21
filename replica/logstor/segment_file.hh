@@ -40,11 +40,10 @@ extern seastar::logger logstor_logger;
 
 using file_id_t = uint64_t;
 
-// Where a segment is on disk.
-struct segment_location {
+// Where a byte is on disk: a file and an offset in it.
+struct file_position {
     file_id_t file_id;
-    // The offset in the file where the segment starts.
-    uint64_t file_offset;
+    uint64_t offset;
 };
 
 // The layout of the segments in the files of one shard. Each file holds the same count of
@@ -72,11 +71,19 @@ public:
     // retired and not allocated again.
     uint64_t segment_count() const noexcept { return _file_count * _segments_per_file; }
 
-    segment_location location_of(log_segment_id segment_id) const noexcept {
-        return segment_location{
+    // Returns where the segment starts on disk.
+    file_position position_of(log_segment_id segment_id) const noexcept {
+        return file_position{
             .file_id = segment_id.value / _segments_per_file,
-            .file_offset = (segment_id.value % _segments_per_file) * _segment_size,
+            .offset = (segment_id.value % _segments_per_file) * _segment_size,
         };
+    }
+
+    // Returns where the record frame at `location` starts on disk.
+    file_position position_of(record_location location) const noexcept {
+        auto position = position_of(location.segment);
+        position.offset += location.offset;
+        return position;
     }
 
     auto segments_in_file(file_id_t file_id) const noexcept {
