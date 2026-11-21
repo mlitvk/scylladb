@@ -1147,6 +1147,35 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_read_after_stop_fails_the_future) {
     BOOST_REQUIRE_THROW(read_mutation(ls, schema, cg.logstor_index(), m.decorated_key(), schema->full_slice()).get(), gate_closed_exception);
 }
 
+// A short read of a record frame before the end of the file makes the read of the segment read the
+// record frame again, and the read returns the record.
+SEASTAR_THREAD_TEST_CASE(test_logstor_read_after_short_read) {
+    if constexpr (!std::is_same_v<utils::error_injection_type, utils::error_injection<true>>) {
+        return;
+    }
+
+    auto schema = make_kv_schema();
+    tmpdir dir;
+
+    shared_logstor_cache cache;
+    logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
+    test_recovery_catalog no_tables;
+    ls.do_recovery(no_tables).get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    test_logstor_group cg(schema, ls);
+    auto expected = make_kv_mutation(schema, "pk0", "short-read-value");
+    ls.write(expected, write_target(&cg, {}), db::no_timeout).get();
+
+    utils::get_local_injector().enable("logstor_read_short", true /* one shot */);
+    auto actual = read_mutation(ls, schema, cg.logstor_index(), expected.decorated_key(), schema->full_slice()).get();
+    // A one-shot injection is disabled after it fires.
+    BOOST_REQUIRE(!utils::get_local_injector().is_enabled("logstor_read_short"));
+    BOOST_REQUIRE(actual);
+    assert_that(*actual).is_equal_to(expected);
+}
+
 // Checks that a record that does not fit a segment of either kind is rejected by the write path,
 // rather than accepted into a mixed segment that the separator would then not be able to split.
 SEASTAR_THREAD_TEST_CASE(test_logstor_rejects_record_that_does_not_fit_a_segment_of_either_kind) {
