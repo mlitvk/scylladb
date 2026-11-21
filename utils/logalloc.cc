@@ -402,6 +402,14 @@ using clock = std::chrono::steady_clock;
 class background_reclaimer {
     scheduling_group _sg;
     noncopyable_function<void (size_t target)> _reclaim;
+    // Returns true when a region waits for a requested compaction.
+    noncopyable_function<bool ()> _has_compaction_requests;
+    // Compacts one segment of a region that waits for a requested compaction.
+    noncopyable_function<void ()> _compact_requested;
+    // The shares that the scheduling group had when the reclaimer was set up. A requested compaction
+    // runs with at least these shares, because adjust_shares() sets the shares only while free
+    // memory is below the threshold, and a small deficit sets them close to 1.
+    float _configured_shares;
     timer<lowres_clock> _adjust_shares_timer;
     // If engaged, main loop is not running, set_value() to wake it.
     promise<>* _main_loop_wait = nullptr;
@@ -426,7 +434,7 @@ private:
     future<> main_loop() {
         llogger.debug("background_reclaimer::main_loop: entry");
         while (true) {
-            while (!_stopping && !have_work()) {
+            while (!_stopping && !have_work() && !_has_compaction_requests()) {
                 promise<> wait;
                 _main_loop_wait = &wait;
                 llogger.trace("background_reclaimer::main_loop: sleep");
@@ -437,14 +445,27 @@ private:
             if (_stopping) {
                 break;
             }
-            _reclaim(free_memory_threshold - memory::free_memory());
+            // A step of a requested compaction comes first, because it frees a segment without an
+            // eviction, and the reclaim for the threshold then gives that segment to the standard
+            // allocator before it evicts anything. The segments that a requested compaction frees
+            // stay with LSA until a reclaim gives them back, so the reclaim for the threshold runs
+            // in every pass.
+            if (_has_compaction_requests()) {
+                _compact_requested();
+            }
+            if (have_work()) {
+                _reclaim(free_memory_threshold - memory::free_memory());
+            }
             co_await coroutine::maybe_yield();
         }
         llogger.debug("background_reclaimer::main_loop: exit");
     }
     void adjust_shares() {
         if (have_work()) {
-            auto shares = 1 + (1000 * (free_memory_threshold - memory::free_memory())) / free_memory_threshold;
+            float shares = 1 + (1000 * (free_memory_threshold - memory::free_memory())) / free_memory_threshold;
+            if (_has_compaction_requests()) {
+                shares = std::max(shares, _configured_shares);
+            }
             _sg.set_shares(shares);
             llogger.trace("background_reclaimer::adjust_shares: {}", shares);
             if (_main_loop_wait) {
@@ -453,14 +474,25 @@ private:
         }
     }
 public:
-    explicit background_reclaimer(scheduling_group sg, std::chrono::nanoseconds adjust_shares_period, noncopyable_function<void (size_t target)> reclaim)
+    explicit background_reclaimer(scheduling_group sg, std::chrono::nanoseconds adjust_shares_period, noncopyable_function<void (size_t target)> reclaim,
+            noncopyable_function<bool ()> has_compaction_requests, noncopyable_function<void ()> compact_requested)
             : _sg(sg)
             , _reclaim(std::move(reclaim))
+            , _has_compaction_requests(std::move(has_compaction_requests))
+            , _compact_requested(std::move(compact_requested))
+            , _configured_shares(sg.get_shares())
             , _adjust_shares_timer(default_scheduling_group(), [this] { adjust_shares(); })
             , _done(with_scheduling_group(_sg, [this] { return main_loop(); })) {
         if (sg != default_scheduling_group()) {
             _adjust_shares_timer.arm_periodic(adjust_shares_period);
         }
+    }
+    // Wakes the main loop, so that it serves a compaction request.
+    void wake() {
+        if (_sg != default_scheduling_group() && _sg.get_shares() < _configured_shares) {
+            _sg.set_shares(_configured_shares);
+        }
+        main_loop_wake();
     }
     future<> stop() {
         _stopping = true;
@@ -478,12 +510,16 @@ struct tracker_stats {
     reclaim_duration reclaim_time;
     reclaim_duration evict_time;
     reclaim_duration compact_time;
+    uint64_t segments_compacted_on_request = 0;
 };
 
 class tracker::impl {
     std::unique_ptr<logalloc::segment_pool> _segment_pool;
     std::optional<background_reclaimer> _background_reclaimer;
     std::vector<region::impl*> _regions;
+    // The regions that wait for a requested compaction, in the order of the requests. Its capacity
+    // is at least the capacity of _regions, so that request_compaction() does not allocate.
+    std::vector<region::impl*> _compaction_requests;
     seastar::metrics::metric_groups _metrics;
     unsigned _reclaiming_disabled_depth = 0;
     size_t _reclamation_step = 1;
@@ -512,9 +548,9 @@ public:
     ~impl();
     future<> stop() {
         if (_background_reclaimer) {
-            return _background_reclaimer->stop();
-        } else {
-            return make_ready_future<>();
+            co_await _background_reclaimer->stop();
+            // A stopped tracker can be configured again.
+            _background_reclaimer.reset();
         }
     }
     void disable_reclaim() noexcept {
@@ -531,6 +567,13 @@ public:
     }
     void register_region(region::impl*);
     void unregister_region(region::impl*) noexcept;
+    void request_compaction(region::impl*, size_t freed_bytes) noexcept;
+    bool has_compaction_requests() const noexcept {
+        return !_compaction_requests.empty();
+    }
+    // Compacts the sparsest segment of the first region that waits for a requested compaction, or
+    // drops the request when a compaction of the region frees no more memory.
+    void compact_requested() noexcept;
     size_t reclaim(size_t bytes, is_preemptible p);
     // Compacts one segment at a time from sparsest segment to least sparse until work_waiting_on_reactor returns true
     // or there are no more segments to compact.
@@ -556,6 +599,10 @@ public:
         SCYLLA_ASSERT(!_background_reclaimer);
         _background_reclaimer.emplace(sg, adjust_shares_period, [this] (size_t target) {
             reclaim(target, is_preemptible::yes);
+        }, [this] {
+            return has_compaction_requests();
+        }, [this] {
+            compact_requested();
         });
     }
     // const bool&, so interested parties can save a reference and see updates.
@@ -1744,6 +1791,10 @@ private:
     // Used for forcing the result to zero without using conditionals.
     size_t _evictable_space_mask = std::numeric_limits<size_t>::max();
     bool _evictable = false;
+    // True while the region waits for a requested compaction, see region::request_compaction().
+    bool _compaction_requested = false;
+    // The free space that the requested compaction still has to give back.
+    size_t _requested_compaction_bytes = 0;
     region_sanitizer _sanitizer;
     uint64_t _id;
     eviction_fn _eviction_fn;
@@ -2264,6 +2315,27 @@ public:
         return _segment_descs.one_of_largest().occupancy();
     }
 
+    bool compaction_requested() const noexcept {
+        return _compaction_requested;
+    }
+
+    void set_compaction_requested(bool requested) noexcept {
+        _compaction_requested = requested;
+    }
+
+    size_t requested_compaction_bytes() const noexcept {
+        return _requested_compaction_bytes;
+    }
+
+    void add_requested_compaction_bytes(size_t bytes) noexcept {
+        _requested_compaction_bytes += bytes;
+    }
+
+    // Takes the free space that a compaction step gave back from the requested compaction.
+    void on_requested_compaction_step(size_t released) noexcept {
+        _requested_compaction_bytes -= std::min(_requested_compaction_bytes, released);
+    }
+
     // Compacts a single segment, most appropriate for it
     void compact() noexcept {
         compaction_lock _(*this);
@@ -2491,6 +2563,10 @@ void region::merge(region& other) noexcept {
 
 void region::full_compaction() {
     get_impl().full_compaction();
+}
+
+void region::request_compaction(size_t freed_bytes) noexcept {
+    get_impl().get_tracker().get_impl().request_compaction(&get_impl(), freed_bytes);
 }
 
 memory::reclaiming_result region::evict_some() {
@@ -2844,6 +2920,11 @@ void tracker::impl::register_region(region::impl* r) {
         copy.reserve(copy.capacity() * 2);
         _regions = std::move(copy);
     }
+    if (_compaction_requests.capacity() < _regions.capacity()) {
+        auto copy = _compaction_requests;
+        copy.reserve(_regions.capacity());
+        _compaction_requests = std::move(copy);
+    }
     reclaiming_lock _(*this);
     _regions.push_back(r);
     llogger.debug("Registered region @{} with id={}", fmt::ptr(r), r->id());
@@ -2853,6 +2934,64 @@ void tracker::impl::unregister_region(region::impl* r) noexcept {
     reclaiming_lock _(*this);
     llogger.debug("Unregistering region, id={}", r->id());
     _regions.erase(std::remove(_regions.begin(), _regions.end(), r), _regions.end());
+    std::erase(_compaction_requests, r);
+}
+
+void tracker::impl::request_compaction(region::impl* r, size_t freed_bytes) noexcept {
+    if (freed_bytes == 0) {
+        return;
+    }
+    r->add_requested_compaction_bytes(freed_bytes);
+    if (r->compaction_requested()) {
+        return;
+    }
+    r->set_compaction_requested(true);
+    // Does not allocate, see _compaction_requests.
+    _compaction_requests.push_back(r);
+    llogger.debug("Compaction of {} bytes requested for region {}, occupancy={}", freed_bytes, r->id(), r->occupancy());
+    if (_background_reclaimer) {
+        _background_reclaimer->wake();
+    }
+}
+
+void tracker::impl::compact_requested() noexcept {
+    if (_compaction_requests.empty() || _reclaiming_disabled_depth) {
+        return;
+    }
+    auto* r = _compaction_requests.front();
+    auto drop_request = [&] {
+        r->set_compaction_requested(false);
+        r->on_requested_compaction_step(r->requested_compaction_bytes());
+        _compaction_requests.erase(_compaction_requests.begin());
+        llogger.debug("Requested compaction of region {} done, occupancy={}", r->id(), r->occupancy());
+    };
+    if (!r->is_compactible() || r->requested_compaction_bytes() == 0) {
+        drop_request();
+        return;
+    }
+    // The compaction moves the live objects of a segment into other segments before it frees the
+    // segment, so it needs one free segment first. Getting one can reclaim memory, as an allocation
+    // does.
+    try {
+        _segment_pool->ensure_free_segments(1);
+    } catch (const std::bad_alloc&) {
+        // Memory is short, so the reclaim of the next allocation compacts the region if the region is
+        // the best choice. The request has no more to add.
+        drop_request();
+        return;
+    }
+    if (!r->is_compactible()) {
+        drop_request();
+        return;
+    }
+    reclaiming_lock rl(*this);
+    segment_pool::reservation_goal open_emergency_pool(*_segment_pool, 0);
+    reclaim_timer timing_guard("compact_requested", _stats.compact_time, is_preemptible::yes, 0, 0, *this);
+    // compact() takes the sparsest segment, and the compaction gives back its free space.
+    const auto released = r->min_occupancy().free_space();
+    r->compact();
+    r->on_requested_compaction_step(released);
+    ++_stats.segments_compacted_on_request;
 }
 
 static
@@ -2899,6 +3038,9 @@ tracker::impl::impl() : _segment_pool(std::make_unique<logalloc::segment_pool>(*
 
         sm::make_counter("evict_time_ms", [this] { return count_millis(_stats.evict_time); },
                         sm::description("Total time spent in evicting objects, that was not accounted under reclaim_time_ms")),
+
+        sm::make_counter("segments_compacted_on_request", [this] { return _stats.segments_compacted_on_request; },
+                        sm::description("Counts the segments that the background reclaimer compacted for a region::request_compaction() call.")),
 
         sm::make_counter("compact_time_ms", [this] { return count_millis(_stats.compact_time); },
                         sm::description("Total time spent in segment compaction, that was not accounted under reclaim_time_ms")),

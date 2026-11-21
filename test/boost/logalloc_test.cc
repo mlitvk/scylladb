@@ -31,6 +31,7 @@
 #include "utils/managed_ref.hh"
 #include "utils/managed_bytes.hh"
 #include "test/lib/log.hh"
+#include "test/lib/lsa_background_reclaim.hh"
 #ifndef SEASTAR_DEFAULT_ALLOCATOR
 #include "utils/chunked_vector.hh"
 #include "utils/logalloc.hh"
@@ -829,6 +830,142 @@ SEASTAR_THREAD_TEST_CASE(background_reclaim) {
         fmt::print("compacted {} items {} (post)\n", compacted_post, evictable_allocs.size());
         BOOST_REQUIRE_EQUAL(compacted_pre, compacted_post);
     }
+}
+
+static managed_bytes make_test_object(size_t i, size_t size) {
+    bytes b(bytes::initialized_later(), size);
+    std::ranges::fill(b, int8_t(i));
+    return managed_bytes(b);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_requested_compaction_frees_the_holes_of_a_region) {
+    prime_segment_pool(memory::stats().total_memory(), memory::min_free_memory()).get();
+    auto stop_background_reclaim = tests::configure_lsa_background_reclaim();
+
+    region r;
+    std::vector<managed_bytes> objects;
+    auto clean_up = defer([&] () noexcept {
+        with_allocator(r.allocator(), [&] {
+            objects.clear();
+        });
+    });
+
+    // About 64 MiB of objects, and every other object freed, so that each segment keeps half of its
+    // objects and LSA frees no segment by itself.
+    constexpr size_t object_size = 1000;
+    constexpr size_t object_count = 64 * 1024;
+    with_allocator(r.allocator(), [&] {
+        for (size_t i = 0; i < object_count; ++i) {
+            objects.push_back(make_test_object(i, object_size));
+        }
+        for (size_t i = 1; i < object_count; i += 2) {
+            objects[i] = managed_bytes();
+        }
+    });
+    const auto before = r.occupancy();
+    BOOST_REQUIRE_LT(before.used_fraction(), 0.6);
+
+    const auto compacted_before = logalloc::shard_tracker().statistics().segments_compacted;
+    // Two requests while the first one waits add up, and do not queue the region twice.
+    r.request_compaction(before.free_space() / 2);
+    r.request_compaction(before.free_space() - before.free_space() / 2);
+
+    // The background reclaimer compacts the region until it gives back the requested free space, or
+    // until a compaction frees no more memory, which leaves at most 4 segments of free space and no
+    // segment with 15% or more free space.
+    auto done = [&] {
+        const auto occupancy = r.occupancy();
+        return occupancy.total_space() <= occupancy.used_space() / 0.85 + 4 * logalloc::segment_size;
+    };
+    BOOST_REQUIRE(tests::wait_for_background_reclaim(done));
+    const auto after = r.occupancy();
+    testlog.info("Region before the requested compaction: {}, after: {}", before, after);
+    BOOST_REQUIRE_LT(after.total_space(), before.total_space() * 0.6);
+    BOOST_REQUIRE_GT(logalloc::shard_tracker().statistics().segments_compacted, compacted_before);
+
+    for (size_t i = 0; i < object_count; i += 2) {
+        BOOST_REQUIRE(objects[i] == make_test_object(i, object_size));
+    }
+}
+
+SEASTAR_THREAD_TEST_CASE(test_requested_compaction_is_in_proportion_to_the_freed_bytes) {
+    prime_segment_pool(memory::stats().total_memory(), memory::min_free_memory()).get();
+    auto stop_background_reclaim = tests::configure_lsa_background_reclaim();
+
+    region r;
+    std::vector<managed_bytes> objects;
+    auto clean_up = defer([&] () noexcept {
+        with_allocator(r.allocator(), [&] {
+            objects.clear();
+        });
+    });
+    constexpr size_t object_size = 1000;
+    constexpr size_t object_count = 64 * 1024;
+    with_allocator(r.allocator(), [&] {
+        for (size_t i = 0; i < object_count; ++i) {
+            objects.push_back(make_test_object(i, object_size));
+        }
+        for (size_t i = 1; i < object_count; i += 2) {
+            objects[i] = managed_bytes();
+        }
+    });
+    const auto before = r.occupancy();
+
+    // A request for 1/8 of the free space gives back about that much and leaves the rest, although
+    // the region stays compactible.
+    const size_t requested = before.free_space() / 8;
+    r.request_compaction(requested);
+    // The budget counts the free space of each compacted segment, and the region gives back whole
+    // segments, so the two can differ by a segment or two.
+    const size_t slack = 2 * logalloc::segment_size;
+    BOOST_REQUIRE(tests::wait_for_background_reclaim([&] { return before.total_space() - r.occupancy().total_space() + slack >= requested; }));
+    // Let the background reclaimer run more, so that a compaction beyond the request would show.
+    seastar::sleep(100ms).get();
+    const auto released = before.total_space() - r.occupancy().total_space();
+    testlog.info("Requested {} bytes, released {} bytes", requested, released);
+    BOOST_REQUIRE_LE(released, requested + slack);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_requested_compaction_of_a_destroyed_region) {
+    prime_segment_pool(memory::stats().total_memory(), memory::min_free_memory()).get();
+    auto stop_background_reclaim = tests::configure_lsa_background_reclaim();
+
+    // The region goes away before the background reclaimer runs, so the tracker must drop the
+    // request, and the other region must still be served.
+    region kept;
+    std::vector<managed_bytes> objects;
+    auto clean_up = defer([&] () noexcept {
+        with_allocator(kept.allocator(), [&] {
+            objects.clear();
+        });
+    });
+    with_allocator(kept.allocator(), [&] {
+        for (size_t i = 0; i < 16 * 1024; ++i) {
+            objects.push_back(make_test_object(i, 1000));
+        }
+        for (size_t i = 1; i < objects.size(); i += 2) {
+            objects[i] = managed_bytes();
+        }
+    });
+    {
+        region destroyed;
+        std::vector<managed_bytes> destroyed_objects;
+        with_allocator(destroyed.allocator(), [&] {
+            for (size_t i = 0; i < 16 * 1024; ++i) {
+                destroyed_objects.push_back(make_test_object(i, 1000));
+            }
+            for (size_t i = 1; i < destroyed_objects.size(); i += 2) {
+                destroyed_objects[i] = managed_bytes();
+            }
+        });
+        destroyed.request_compaction(destroyed.occupancy().free_space());
+        kept.request_compaction(kept.occupancy().free_space());
+        with_allocator(destroyed.allocator(), [&] {
+            destroyed_objects.clear();
+        });
+    }
+    const auto before = kept.occupancy();
+    BOOST_REQUIRE(tests::wait_for_background_reclaim([&] { return kept.occupancy().total_space() < before.total_space() * 0.6; }));
 }
 
 inline

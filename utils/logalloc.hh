@@ -374,6 +374,26 @@ public:
     // Invalidates references to allocated objects.
     void full_compaction();
 
+    // Asks the tracker to compact this region in the background, one segment at a time, sparsest
+    // segment first, until the compactions give back about `freed_bytes` of free space, or until a
+    // compaction of the region frees no more memory, which is the test that the tracker uses to
+    // choose a region to compact when it reclaims.
+    // Call it after a free of many objects that are spread over the segments of the region, for
+    // example the erase of a key range from a tree, with the bytes that the free gave back to the
+    // region. Without it, the free space stays in the segments until an allocation under memory
+    // pressure compacts the region, synchronously and before it evicts the data of a denser
+    // evictable region. The work of a request is in proportion to `freed_bytes`, so frees that
+    // continue during the compaction, for example the eviction of a cache, cannot keep it running.
+    // The requests that arrive while a request of the region waits add up, so a run of small frees
+    // gets the same compaction as one large free. A request that ends because the region is not
+    // compactible drops its remaining bytes.
+    // The background reclaimer of the tracker serves the requests, in its scheduling group, with at
+    // least the shares that the group had when the tracker was configured, and with a yield after
+    // each segment. A tracker without a background reclaimer keeps the requests until one is
+    // configured.
+    // Invalidates references to allocated objects, as any reclaim does.
+    void request_compaction(size_t freed_bytes) noexcept;
+
     // Runs eviction function once. Mainly for testing.
     memory::reclaiming_result evict_some();
 
