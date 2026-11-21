@@ -1263,6 +1263,8 @@ future<> row_cache::invalidate(external_updater eu, utils::chunked_vector<dht::p
                 _prev_snapshot_pos = {};
                 _prev_snapshot = {};
             });
+            // The bytes that the erased entries gave back to the cache region.
+            size_t freed = 0;
 
             for (auto&& range : ranges) {
                 _prev_snapshot_pos = dht::ring_position_view::for_range_start(range);
@@ -1273,6 +1275,11 @@ future<> row_cache::invalidate(external_updater eu, utils::chunked_vector<dht::p
                         auto cmp = dht::ring_position_comparator(*_schema);
                         auto it = _partitions.lower_bound(*_prev_snapshot_pos, cmp);
                         auto end = _partitions.lower_bound(dht::ring_position_view::for_range_end(range), cmp);
+                        // Nothing else runs in the region during this synchronous step.
+                        const auto used_before = _tracker.region().occupancy().used_space();
+                        auto count_freed = defer([&] () noexcept {
+                            freed += used_before - std::min(used_before, _tracker.region().occupancy().used_space());
+                        });
                         return with_allocator(_tracker.allocator(), [&] {
                             while (it != end) {
                                 if (filter(it->key())) {
@@ -1310,6 +1317,11 @@ future<> row_cache::invalidate(external_updater eu, utils::chunked_vector<dht::p
             }
 
             on_failure.cancel();
+            // The erased entries were allocated over time, mixed with the entries of other ranges and
+            // other tables, so they leave free space in many segments of the cache region. A
+            // background compaction gets that space back before an allocation under memory pressure
+            // has to, and before the reclaim evicts live entries instead.
+            _tracker.region().request_compaction(freed);
         };
     } catch (...) {
         return clear_on_error(std::move(eu), std::current_exception());

@@ -33,6 +33,7 @@
 #include "test/lib/eventually.hh"
 #include "test/lib/memtable_snapshot_source.hh"
 #include "test/lib/log.hh"
+#include "test/lib/lsa_background_reclaim.hh"
 #include "test/lib/reader_concurrency_semaphore.hh"
 #include "test/lib/random_utils.hh"
 #include "test/lib/sstable_utils.hh"
@@ -5713,6 +5714,62 @@ SEASTAR_THREAD_TEST_CASE(test_cache_read_concurrent_to_nonpopulating_reader) {
     assert_that(cache.make_reader(s, semaphore.make_permit(), query::full_partition_range))
         .produces(m)
         .produces_end_of_stream();
+}
+
+// A range invalidation leaves free space in many segments of the cache region, and it requests a
+// background compaction of the region for the bytes that the erased entries gave back.
+SEASTAR_THREAD_TEST_CASE(test_range_invalidation_compacts_the_cache_region) {
+    auto stop_background_reclaim = tests::configure_lsa_background_reclaim();
+    simple_schema s;
+    tests::reader_concurrency_semaphore_wrapper semaphore;
+    cache_tracker tracker;
+    row_cache cache(s.schema(), make_empty_snapshot_source(), tracker, is_continuous::no);
+
+    const sstring value(1000, 'v');
+    const auto keys = s.make_pkeys(20'000);
+    std::vector<mutation> mutations;
+    mutations.reserve(keys.size());
+    for (const auto& key : keys) {
+        mutation m(s.schema(), key);
+        s.add_row(m, s.make_ckey(0), value);
+        mutations.push_back(std::move(m));
+    }
+    // In random order, so that the entries of a token range are spread over the region.
+    std::vector<size_t> order(keys.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::ranges::shuffle(order, tests::random::gen());
+    for (auto i : order) {
+        cache.populate(mutations[i]);
+    }
+    const auto before = tracker.region().occupancy();
+    const auto compacted_before = logalloc::shard_tracker().statistics().segments_compacted;
+
+    // The first half of the token ring.
+    const auto middle = dht::token::from_int64(0);
+    cache.invalidate(row_cache::external_updater([] {}),
+            dht::to_partition_range(dht::token_range::make_ending_with({middle, false}))).get();
+    const auto after_invalidation = tracker.region().occupancy();
+    testlog.info("Cache region before the invalidation: {}, after: {}", before, after_invalidation);
+
+    BOOST_REQUIRE(tests::wait_for_background_reclaim([&] {
+        return tracker.region().occupancy().total_space() < before.total_space() * 0.65;
+    }));
+    testlog.info("Cache region after the requested compaction: {}", tracker.region().occupancy());
+    BOOST_REQUIRE_GT(logalloc::shard_tracker().statistics().segments_compacted, compacted_before);
+
+    size_t kept = 0;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (keys[i].token() < middle) {
+            continue;
+        }
+        ++kept;
+        if (i % 100 == 0) {
+            assert_that(cache.make_reader(s.schema(), semaphore.make_permit(), dht::partition_range::make_singular(keys[i])))
+                .produces(mutations[i])
+                .produces_end_of_stream();
+        }
+    }
+    BOOST_REQUIRE_EQUAL(tracker.partitions(), kept);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
