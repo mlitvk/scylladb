@@ -7,8 +7,11 @@
  */
 #include "replica/logstor/compaction_rate_controller.hh"
 #include <algorithm>
+#include <seastar/util/log.hh>
 
 namespace replica::logstor {
+
+extern seastar::logger logstor_logger;
 
 compaction_backlog reclaimable_backlog(const utilization_histogram& utilization, double threshold) noexcept {
     // A bucket whose upper bound is the threshold counts in full, in spite of rounding.
@@ -36,6 +39,19 @@ void compaction_rate_controller::tick(const sample& s) noexcept {
     _pressure = compaction_space_pressure(s.available_segments, s.curve);
     _threshold = effective_utilization_threshold(s.available_segments, s.curve);
     _backlog = reclaimable_backlog(s.utilization, _threshold);
+}
+
+std::vector<backlog_controller::control_point> compaction_shares_controller::make_control_points(float max_shares) {
+    // The negated comparison also replaces a NaN.
+    if (!(max_shares >= min_shares)) {
+        logstor_logger.warn("logstor_compaction_max_shares {} is below the minimum of {}. The minimum is used",
+                max_shares, min_shares);
+        max_shares = min_shares;
+    }
+    return {
+            {0.0f, min_shares},
+            {1.0f, max_shares},
+    };
 }
 
 } // namespace replica::logstor
