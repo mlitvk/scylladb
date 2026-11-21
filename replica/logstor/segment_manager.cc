@@ -11,12 +11,12 @@
 #include "replica/logstor/segment_io.hh"
 #include "exceptions/exceptions.hh"
 #include "replica/compaction_group.hh"
-#include "backlog_controller.hh"
 #include "replica/logstor/index.hh"
 #include "replica/logstor/logstor.hh"
 #include "replica/logstor/types.hh"
 #include "replica/logstor/compaction.hh"
 #include "replica/logstor/compaction_driver.hh"
+#include "replica/logstor/compaction_rate_controller.hh"
 #include "replica/logstor/compaction_policy.hh"
 #include <absl/container/flat_hash_map.h>
 #include <algorithm>
@@ -58,41 +58,6 @@
 namespace replica::logstor {
 
 using seg_ptr = lw_shared_ptr<segment>;
-
-// Maps the shares demand of the rate controller, in [0, 1], to CPU shares: min_shares at 0, at or
-// above the threshold anchor, and logstor_compaction_max_shares at 1, at the space floor. The
-// function is linear, because the demand already has the shape of the shares ramp, see
-// compaction_rate_controller.
-class compaction_shares_controller : public backlog_controller {
-public:
-    // The shares at or above the threshold anchor. It is the floor that the sstable compaction
-    // controller uses.
-    static constexpr float min_shares = 50.0f;
-
-    compaction_shares_controller(scheduling_group sg, float static_shares, float max_shares,
-            std::chrono::milliseconds interval, std::function<float()> current_backlog)
-        : backlog_controller(std::move(sg), interval, make_control_points(max_shares),
-                std::move(current_backlog), static_shares) {
-    }
-
-    void set_max_shares(float max_shares) {
-        _control_points = make_control_points(max_shares);
-    }
-
-private:
-    static std::vector<control_point> make_control_points(float max_shares) {
-        // The negated comparison also replaces a NaN.
-        if (!(max_shares >= min_shares)) {
-            logstor_logger.warn("logstor_compaction_max_shares {} is below the minimum of {}. The minimum is used",
-                    max_shares, min_shares);
-            max_shares = min_shares;
-        }
-        return {
-                {0.0f, min_shares},
-                {1.0f, max_shares},
-        };
-    }
-};
 
 class compaction_manager_impl : public compaction_manager, private compaction_driver::host {
 public:

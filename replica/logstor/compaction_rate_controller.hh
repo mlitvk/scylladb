@@ -7,11 +7,14 @@
  */
 #pragma once
 
+#include "backlog_controller.hh"
 #include "replica/logstor/compaction_policy.hh"
 #include "replica/logstor/segment_stats.hh"
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <vector>
 
 namespace replica::logstor {
 
@@ -59,6 +62,30 @@ private:
     compaction_backlog _backlog;
     double _pressure = 0;
     double _threshold = 1;
+};
+
+// Maps the shares demand of the rate controller, in [0, 1], to CPU shares: min_shares at 0, at or
+// above the threshold anchor, and logstor_compaction_max_shares at 1, at the space floor. The
+// function is linear, because the demand already has the shape of the shares ramp, see
+// compaction_rate_controller.
+class compaction_shares_controller : public backlog_controller {
+public:
+    // The shares at or above the threshold anchor. It is the floor that the sstable compaction
+    // controller uses.
+    static constexpr float min_shares = 50.0f;
+
+    compaction_shares_controller(scheduling_group sg, float static_shares, float max_shares,
+            std::chrono::milliseconds interval, std::function<float()> current_backlog)
+        : backlog_controller(std::move(sg), interval, make_control_points(max_shares),
+                std::move(current_backlog), static_shares) {
+    }
+
+    void set_max_shares(float max_shares) {
+        _control_points = make_control_points(max_shares);
+    }
+
+private:
+    static std::vector<control_point> make_control_points(float max_shares);
 };
 
 } // namespace replica::logstor
