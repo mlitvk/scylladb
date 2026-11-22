@@ -71,6 +71,11 @@ cells of the columns that only the newer version has, so `decode_record_value()`
 incomplete and the read does not add it to the cache. A cell of a column that the table dropped at or
 after the time of the cell does not count, because the cell is dead under every later version too.
 
+A hit that upgrades a cached partition in place follows the same rule. A DROP COLUMN at a time that
+is older than a cell of the column makes an upgrade lose the cell, although a later ADD COLUMN can
+read the cell again. So the hit evicts such a partition instead, and the read gets the record from
+the disk.
+
 **Separator:**
 1. When a record is written to the active segment, it is also written to its compaction group's separator buffer. The separator buffer holds a reference to the original segment.
 2. The separator buffer is flushed when it's full, or requested to flush for other reason. It is written into a new segment in the compaction group, and it updates the location of the records from the original mixed segments to the new segments in the compaction group.

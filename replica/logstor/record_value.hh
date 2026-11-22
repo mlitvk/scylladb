@@ -40,11 +40,10 @@ record_value encode_record_value(const frozen_mutation& m, const schema& s);
 // The partition that decode_record_value() returns.
 struct decoded_record_value {
     single_row_partition partition;
-    // Is true if the partition does not have a cell of the record because the schema of the decode
-    // does not have the column of the cell. A column that the schema dropped at or after the time of
-    // the cell does not count, because the cell is dead under every later schema version too.
+    // The flag is true if the decode loses a cell of the record that a later schema version can
+    // read, as conversion_loses_readable_cell() defines it.
     // An incomplete partition is right for a read under the schema of the decode. It must not go
-    // into the cache, because a later schema version of the table can have the column.
+    // into the cache, because a later schema version of the table can read the lost cell.
     bool incomplete = false;
 };
 

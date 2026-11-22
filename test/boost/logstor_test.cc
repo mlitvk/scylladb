@@ -4240,6 +4240,38 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_with_a_cell_of_a_dropped_column) {
     BOOST_REQUIRE_EQUAL(stats.partition_insertions, 1);
 }
 
+// A cache hit does not upgrade a cached partition in place when the upgrade loses a cell that is
+// newer than a DROP COLUMN, because a later ADD COLUMN can read the cell again. The hit evicts the
+// partition instead, so that a read after the ADD COLUMN gets the cell from the disk.
+SEASTAR_THREAD_TEST_CASE(test_logstor_cache_hit_evicts_a_partition_that_an_upgrade_loses_a_cell_of) {
+    reader_test_env env(true, schema_builder(make_kv_schema()).with_column("c", utf8_type).build());
+    const auto drop_ts = api::timestamp_type(2);
+    auto m = make_kv_mutation_with_c(env.schema, "pk0", "v0", "c0", drop_ts + 1);
+    env.populate(std::span<const mutation>(&m, 1));
+    const auto& stats = env.cache_stats();
+
+    assert_that(env.make_reader(singular_range(m))).produces(m).produces_end_of_stream();
+    BOOST_REQUIRE_EQUAL(stats.partition_insertions, 1);
+
+    auto dropped_schema = schema_builder(env.schema).remove_column(to_bytes("c"), drop_ts).build();
+    env.cg->logstor_index().set_table_schema(dropped_schema);
+    auto dropped_m = m;
+    dropped_m.upgrade(dropped_schema);
+    assert_that(env.make_reader(dropped_schema, singular_range(m), dropped_schema->full_slice()))
+            .produces(dropped_m).produces_end_of_stream();
+    BOOST_REQUIRE_EQUAL(stats.partition_hits, 0);
+    BOOST_REQUIRE_EQUAL(stats.partition_removals, 1);
+    BOOST_REQUIRE_EQUAL(stats.partition_insertions, 1);
+
+    auto readded_schema = schema_builder(dropped_schema).with_column("c", utf8_type).build();
+    env.cg->logstor_index().set_table_schema(readded_schema);
+    auto readded_m = m;
+    readded_m.upgrade(readded_schema);
+    assert_that(env.make_reader(readded_schema, singular_range(m), readded_schema->full_slice()))
+            .produces(readded_m).produces_end_of_stream();
+    BOOST_REQUIRE_EQUAL(stats.partition_insertions, 2);
+}
+
 // The reader contract over a cached partition: next_partition() before the partition was entered
 // does not skip it, and a forwarding reader produces it in clustering sub-streams.
 SEASTAR_THREAD_TEST_CASE(test_logstor_single_key_reader_partition_navigation_on_a_hit) {

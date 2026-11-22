@@ -95,10 +95,8 @@ public:
 };
 
 // Applies a record of another schema version to a partition of the schema `s`, as
-// converting_mutation_partition_applier does, and finds the cells that the conversion loses.
-// The conversion loses a cell when `s` does not have the column of the cell, or has it with a
-// type that cannot read the cell. A cell of a column that `s` dropped at or after the time of the
-// cell does not count, because the cell is dead under `s` and under every later schema version.
+// converting_mutation_partition_applier does, and finds the cells that the conversion loses, as
+// conversion_loses_readable_cell() defines them.
 class record_partition_applier final : public mutation_partition_view_virtual_visitor {
     converting_mutation_partition_applier _applier;
     const column_mapping& _mapping;
@@ -108,13 +106,7 @@ class record_partition_applier final : public mutation_partition_view_virtual_vi
     // Marks the partition incomplete if the conversion loses a cell of `column` whose newest
     // timestamp is `timestamp`.
     void check_cell(const column_mapping_entry& column, api::timestamp_type timestamp) {
-        if (const auto* def = _schema.get_column_definition(column.name())) {
-            _incomplete |= !def->type->is_value_compatible_with(*column.type());
-            return;
-        }
-        const auto& dropped = _schema.dropped_columns();
-        auto it = dropped.find(sstring(to_string_view(column.name())));
-        _incomplete |= it == dropped.end() || timestamp > it->second.timestamp;
+        _incomplete |= conversion_loses_readable_cell(_schema, column.name(), *column.type(), timestamp);
     }
 
     void check_cell(const column_mapping_entry& column, const collection_mutation& cell) {

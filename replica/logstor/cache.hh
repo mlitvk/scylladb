@@ -133,6 +133,8 @@ public:
     // Upgrades the entry in place only to `table_schema`, the current schema of the table, and hands
     // out an upgraded copy if `target_schema` is another version. An upgrade to an older version
     // removes the columns that only the newer version has, so it must not change the entry.
+    // Evicts the entry and counts a miss if the upgrade to `table_schema` loses a cell that a later
+    // schema version can read, because a later version can add the column of the cell again.
     std::optional<keyed_single_row_partition> read_partition(const primary_index_entry&, const schema_ptr& table_schema,
             const schema& target_schema);
 

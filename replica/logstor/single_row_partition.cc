@@ -18,6 +18,31 @@ namespace replica::logstor {
 
 extern seastar::logger logstor_logger;
 
+bool conversion_loses_readable_cell(const schema& to, const bytes& name, const abstract_type& type, api::timestamp_type newest_timestamp) {
+    if (const auto* def = to.get_column_definition(name)) {
+        return !def->type->is_value_compatible_with(type);
+    }
+    const auto& dropped = to.dropped_columns();
+    auto it = dropped.find(sstring(to_string_view(name)));
+    return it == dropped.end() || newest_timestamp > it->second.timestamp;
+}
+
+bool single_row_partition::upgrade_loses_readable_cells(const schema& from, const schema& to) const {
+    if (!row) {
+        return false;
+    }
+    bool lost = false;
+    row->cells().for_each_cell_until([&] (column_id id, const atomic_cell_or_collection& cell) {
+        const auto& column = from.regular_column_at(id);
+        const auto newest_timestamp = column.is_atomic()
+                ? cell.as_atomic_cell(column).timestamp()
+                : cell.as_collection_mutation().last_update(*column.type);
+        lost = conversion_loses_readable_cell(to, column.name(), *column.type, newest_timestamp);
+        return stop_iteration(lost);
+    });
+    return lost;
+}
+
 void check_partition_shape(const mutation_partition& p, const schema& s, const partition_key& key) {
     if (!p.row_tombstones().empty()) [[unlikely]] {
         on_internal_error(logstor_logger, format("logstor: partition of {} has range tombstones", key.with_schema(s)));

@@ -14,8 +14,17 @@
 #include "schema/schema_fwd.hh"
 
 class mutation;
+class abstract_type;
 
 namespace replica::logstor {
+
+// Returns true if a conversion to the schema `to` loses a cell that a later schema version can
+// read. The cell is of the column `name` of the type `type`, and `newest_timestamp` is the newest
+// timestamp in the cell.
+// The conversion loses a cell when `to` does not have the column of the cell, or has it with a type
+// that cannot read the cell. A cell of a column that `to` dropped at or after `newest_timestamp`
+// does not count, because no later schema version can read the cell either.
+bool conversion_loses_readable_cell(const schema& to, const bytes& name, const abstract_type& type, api::timestamp_type newest_timestamp);
 
 // A logstor partition as the cache holds it, and as a reader pushes it into its buffer as fragments
 // out of the cache or the record decoder. A logstor table has no clustering columns, so its
@@ -46,6 +55,10 @@ struct single_row_partition {
         }
         return partition;
     }
+
+    // Returns true if upgraded_copy() from the schema `from` to the schema `to` loses a cell that a
+    // later schema version can read, as conversion_loses_readable_cell() defines it.
+    bool upgrade_loses_readable_cells(const schema& from, const schema& to) const;
 };
 
 // A cached partition together with its key, as a read of the cache hands it out. The index entry

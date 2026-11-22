@@ -79,6 +79,10 @@ std::optional<keyed_single_row_partition> cache_tracker::read_partition(const pr
         auto& e = *pie._cached_entry;
         get_lru().touch(e);
         if (e.schema()->version() != table_schema->version()) {
+            if (e.partition().upgrade_loses_readable_cells(*e.schema(), *table_schema)) {
+                evict(pie);
+                return std::nullopt;
+            }
             with_allocator(allocator(), [&] {
                 e.upgrade(table_schema);
             });
