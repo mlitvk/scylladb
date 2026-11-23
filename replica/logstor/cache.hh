@@ -129,14 +129,15 @@ public:
     // The hit path of a read: touches the LRU, counts a hit or a miss, upgrades the entry in place,
     // and hands out the partition with its key. A reader turns the partition into fragments without
     // a mutation in between. The index entry has only the hash of the key, so a point read compares
-    // the key it gets with its own. The schema is taken by reference, because only a hit that
+    // the key it gets with its own, and the entry does not hold the index key, so the caller gives
+    // the token of the entry. The schema is taken by reference, because only a hit that
     // upgrades the entry needs a reference to it. Never yields.
-    std::optional<keyed_single_row_partition> read_partition(const primary_index_entry&, const schema& target_schema);
+    std::optional<keyed_single_row_partition> read_partition(const primary_index_entry&, dht::token, const schema& target_schema);
 
     // For introspection: a snapshot of the cached partition as a mutation, taken without
     // touching the LRU, without counting a hit or a miss and without upgrading the cached
     // entry in place - the snapshot is upgraded instead.
-    std::optional<mutation> peek(const primary_index_entry&, schema_ptr);
+    std::optional<mutation> peek(const primary_index_entry&, dht::token, schema_ptr);
 
 private:
     logalloc::region& region() noexcept {

@@ -17,7 +17,6 @@
 #include "utils/abstract_formatter.hh"
 #include "utils/assert.hh"
 #include "utils/bptree.hh"
-#include "utils/double-decker.hh"
 #include "utils/logalloc.hh"
 #include "utils/on_internal_error.hh"
 #include "utils/phased_barrier.hh"
@@ -66,7 +65,8 @@ struct raw_token_bounds {
     }
 };
 
-// One entry in the primary index B+tree.
+// One entry in the primary index B+tree. The tree keeps the index key of the entry in its nodes,
+// so the entry holds only the index value and the link to the cached partition.
 //
 // In addition to the on-disk location (index_entry), each entry can have a
 // cached partition: a cached_partition_entry in the LSA region of the shared
@@ -75,20 +75,13 @@ struct raw_token_bounds {
 // evicts the cached partition, it destroys the cached_partition_entry. This
 // breaks the pair, and _cached_entry becomes empty.
 class primary_index_entry {
-    primary_index_key _key;
     index_entry _e;
     // Non-owning slot pointing into the shared cache region.
     // Empty when no cached partition exists for this key.
     mutable cached_entry_slot _cached_entry;
-    struct {
-        bool _head : 1;
-        bool _tail : 1;
-        bool _train : 1;
-    } _flags{};
 public:
-    primary_index_entry(primary_index_key key, index_entry e)
-        : _key(std::move(key))
-        , _e(std::move(e))
+    explicit primary_index_entry(index_entry e)
+        : _e(std::move(e))
     { }
 
     ~primary_index_entry() {
@@ -98,10 +91,8 @@ public:
     }
 
     primary_index_entry(primary_index_entry&& other) noexcept
-        : _key(std::move(other._key))
-        , _e(std::move(other._e))
+        : _e(std::move(other._e))
         , _cached_entry(std::move(other._cached_entry))
-        , _flags(other._flags)
     {}
 
     primary_index_entry& operator=(primary_index_entry&& other) noexcept {
@@ -111,51 +102,20 @@ public:
         if (_cached_entry) {
             on_fatal_internal_error(logstor_logger, "primary_index_entry move-assignment overwrote a live cached entry");
         }
-        _key = std::move(other._key);
         _e = std::move(other._e);
         _cached_entry = std::move(other._cached_entry);
-        _flags = other._flags;
         return *this;
     }
 
-    bool is_head() const noexcept { return _flags._head; }
-    void set_head(bool v) noexcept { _flags._head = v; }
-    bool is_tail() const noexcept { return _flags._tail; }
-    void set_tail(bool v) noexcept { _flags._tail = v; }
-    bool with_train() const noexcept { return _flags._train; }
-    void set_train(bool v) noexcept { _flags._train = v; }
-
-    const primary_index_key& key() const noexcept { return _key; }
     const index_entry& entry() const noexcept { return _e; }
 
     friend class cache_tracker;
     friend class primary_index;
 };
 
-struct primary_index_key_cmp {
-    std::strong_ordering operator()(const primary_index_key& lhs, const primary_index_key& rhs) const noexcept {
-        return lhs <=> rhs;
-    }
-    std::strong_ordering operator()(int64_t lhs, const primary_index_key& rhs) const noexcept {
-        return dht::tri_compare_raw(lhs, rhs.raw_token().value);
-    }
-    std::strong_ordering operator()(const primary_index_key& lhs, int64_t rhs) const noexcept {
-        return dht::tri_compare_raw(lhs.raw_token().value, rhs);
-    }
-    std::strong_ordering operator()(const primary_index_entry& lhs, const primary_index_entry& rhs) const noexcept {
-        return lhs.key() <=> rhs.key();
-    }
-    std::strong_ordering operator()(const primary_index_entry& lhs, const primary_index_key& rhs) const noexcept {
-        return lhs.key() <=> rhs;
-    }
-    std::strong_ordering operator()(const primary_index_key& lhs, const primary_index_entry& rhs) const noexcept {
-        return lhs <=> rhs.key();
-    }
-    std::strong_ordering operator()(const primary_index_entry& lhs, int64_t rhs) const noexcept {
-        return (*this)(lhs.key(), rhs);
-    }
-    std::strong_ordering operator()(int64_t lhs, const primary_index_entry& rhs) const noexcept {
-        return (*this)(lhs, rhs.key());
+struct primary_index_key_less {
+    bool operator()(const primary_index_key& lhs, const primary_index_key& rhs) const noexcept {
+        return lhs < rhs;
     }
 };
 
@@ -179,7 +139,7 @@ using use_cache = bool_class<class use_cache_tag>;
 struct primary_index_usage {
     // The number of keys that the index holds.
     size_t key_count{0};
-    // The memory of the entries alone, without the nodes of the B+tree.
+    // The memory of the entries alone, without the nodes of the B+tree, which hold the index keys.
     size_t entries_memory_usage{0};
     // The space that the nodes and entries of the B+tree take in the index region.
     size_t memory_usage{0};
@@ -203,9 +163,10 @@ struct primary_index_usage {
 // while the region is reclaim-locked. The tree does not change while a reader holds the lock, so
 // the iterators of the reader stay valid.
 class primary_index final {
-    using tree_type = double_decker<int64_t, primary_index_entry,
-                            dht::raw_token_less_comparator, primary_index_key_cmp,
-                            16, bplus::key_search::linear>;
+    // The tree has one element for each index key. Keys that share a token are separate
+    // elements, so the number of keys of one token has no limit.
+    using tree_type = bplus::tree<primary_index_key, primary_index_entry,
+                            primary_index_key_less, 16, bplus::key_search::linear>;
     using iterator = typename tree_type::iterator;
 
     mutable logalloc::region _region;
@@ -244,7 +205,7 @@ class primary_index final {
     // only while the region is reclaim-locked.
     auto find_entry(this auto& self, const primary_index_key& key) -> std::optional<decltype(*self._entries.begin())> {
         self.assert_locked();
-        auto it = self._entries.find(key, primary_index_key_cmp{});
+        auto it = self._entries.find(key);
         if (it == self._entries.end()) {
             return std::nullopt;
         }
@@ -274,7 +235,7 @@ public:
         : _insert_section(abstract_formatter([] (fmt::format_context& ctx) {
             fmt::format_to(ctx.out(), "logstor_index.insert");
         }))
-        , _entries(dht::raw_token_less_comparator{})
+        , _entries(primary_index_key_less{})
         , _cache_tracker(ct)
         , _cache_enabled(cache_enabled)
         , _space_accounting(space_accounting)
@@ -330,13 +291,13 @@ public:
     template <typename EntryCmp = default_entry_cmp>
     insert_outcome insert(const primary_index_key& key, index_entry new_entry, const EntryCmp& cmp = {}) {
         assert_unlocked();
-        tree_type::bound_hint hint;
+        bool match;
         iterator i;
         uint64_t reclaim_counter;
         {
             logalloc::reclaim_lock lock(_region);
-            i = _entries.lower_bound(key, primary_index_key_cmp{}, hint);
-            if (hint.match) {
+            i = _entries.lower_bound(key, match);
+            if (match) {
                 if (cmp(i->_e, new_entry) > 0) {
                     return {insert_result::superseded, std::make_optional(i->_e)};
                 }
@@ -354,9 +315,9 @@ public:
         _insert_section(_region, [&] {
             with_allocator(_region.allocator(), [&] {
                 if (_region.reclaim_counter() != reclaim_counter) {
-                    i = _entries.lower_bound(key, primary_index_key_cmp{}, hint);
+                    i = _entries.lower_bound(key);
                 }
-                _entries.emplace_before(i, key.raw_token().value, hint, key, new_entry);
+                i.emplace_before(key, primary_index_key_less{}, new_entry);
             });
         });
         ++_key_count;
@@ -385,7 +346,7 @@ public:
             return false;
         }
         with_allocator(_region.allocator(), [&] {
-            iterator(&*e).erase_and_dispose(dht::raw_token_less_comparator{}, [this] (primary_index_entry* erased) noexcept { dispose_entry(erased); });
+            iterator(&*e).erase_and_dispose([this] (primary_index_entry* erased) noexcept { dispose_entry(erased); }, primary_index_key_less{});
         });
         return true;
     }
@@ -404,7 +365,7 @@ public:
                 logalloc::reclaim_lock lock(_region);
                 auto [begin, end] = range_positions(tr);
                 if (next_key) {
-                    begin = _entries.lower_bound(*next_key, primary_index_key_cmp{});
+                    begin = _entries.lower_bound(*next_key);
                 }
 
                 auto page_end = begin;
@@ -412,7 +373,7 @@ public:
 
                 const bool last_page = page_end == end;
                 if (!last_page) {
-                    next_key = page_end->key();
+                    next_key = page_end.key();
                 }
                 _entries.erase_and_dispose(begin, page_end, dispose);
                 return last_page;
@@ -446,7 +407,7 @@ public:
         logalloc::reclaim_lock lock(_region);
         return find_entry(key).transform([&] (const primary_index_entry& e) -> read_lookup_result {
             if (reads_cache() && uses_cache) {
-                if (auto cached = _cache_tracker->read_partition(e, target_schema)) {
+                if (auto cached = _cache_tracker->read_partition(e, key.token(), target_schema)) {
                     return std::move(*cached);
                 }
             }
@@ -468,7 +429,7 @@ public:
         return find_entry(key).transform([&] (const primary_index_entry& e) {
             return dump_lookup_result{
                 .entry = e.entry(),
-                .cached_mutation = _cache_tracker ? _cache_tracker->peek(e, std::move(target_schema)) : std::nullopt,
+                .cached_mutation = _cache_tracker ? _cache_tracker->peek(e, key.token(), std::move(target_schema)) : std::nullopt,
             };
         });
     }
@@ -518,9 +479,11 @@ public:
     // partition through the index that holds the entry.
     class scanned_entry {
         const primary_index& _index;
+        primary_index_key _key;
         const primary_index_entry& _e;
 
-        scanned_entry(const primary_index& index, const primary_index_entry& e) noexcept : _index(index), _e(e) {}
+        scanned_entry(const primary_index& index, const primary_index_key& key, const primary_index_entry& e) noexcept
+            : _index(index), _key(key), _e(e) {}
 
         friend class token_range_scan;
         friend class primary_index;
@@ -528,7 +491,7 @@ public:
         scanned_entry(const scanned_entry&) = delete;
         scanned_entry& operator=(const scanned_entry&) = delete;
 
-        primary_index_key key() const noexcept { return _e.key(); }
+        primary_index_key key() const noexcept { return _key; }
         index_entry entry() const noexcept { return _e.entry(); }
 
         // Returns the cached partition of the entry, with its key. Returns nullopt when the cache
@@ -539,7 +502,7 @@ public:
             if (!_index.reads_cache()) {
                 return std::nullopt;
             }
-            return _index._cache_tracker->read_partition(_e, target_schema);
+            return _index._cache_tracker->read_partition(_e, _key.token(), target_schema);
         }
     };
 
@@ -616,16 +579,16 @@ public:
 
             batch next{
                 .guard = _index->make_read_guard(),
-                .first_token = current->key().token(),
-                .last_token = current->key().token(),
+                .first_token = current.key().token(),
+                .last_token = current.key().token(),
             };
 
             size_t entry_count = 0;
             while (current != end) {
-                auto token = current->key().token();
+                auto token = current.key().token();
                 auto token_end = current;
                 size_t token_entry_count = 0;
-                while (token_end != end && token_end->key().token() == token) {
+                while (token_end != end && token_end.key().token() == token) {
                     ++token_end;
                     ++token_entry_count;
                 }
@@ -635,7 +598,7 @@ public:
 
                 next.last_token = token;
                 for (; current != token_end; ++current) {
-                    visit(scanned_entry(*_index, *current));
+                    visit(scanned_entry(*_index, current.key(), *current));
                 }
                 entry_count += token_entry_count;
             }
@@ -731,8 +694,9 @@ private:
         if (!bounds) {
             return {self._entries.end(), self._entries.end()};
         }
-        return {self._entries.lower_bound(bounds->first, primary_index_key_cmp{}),
-                self._entries.upper_bound(bounds->last, primary_index_key_cmp{})};
+        const primary_index_key first_key(dht::raw_token(bounds->first), key_hash::min());
+        const primary_index_key last_key(dht::raw_token(bounds->last), key_hash::max());
+        return {self._entries.lower_bound(first_key), self._entries.upper_bound(last_key)};
     }
 };
 

@@ -10,6 +10,7 @@
 
 #include <compare>
 #include <cstdint>
+#include <limits>
 
 #include "keys/keys.hh"
 #include "utils/managed_bytes.hh"
@@ -27,6 +28,14 @@ struct key_hash {
 
     bool operator==(const key_hash& other) const noexcept = default;
     auto operator<=>(const key_hash& other) const noexcept = default;
+
+    // The first and the last value in the order of the hashes.
+    static constexpr key_hash min() noexcept {
+        return {0, 0};
+    }
+    static constexpr key_hash max() noexcept {
+        return {std::numeric_limits<uint64_t>::max(), std::numeric_limits<uint64_t>::max()};
+    }
 };
 
 // Process-wide seed for compute_key_hash(), drawn at random when the process starts.

@@ -631,9 +631,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_cache_survives_index_rebalan
 
     BOOST_REQUIRE_EQUAL(cache.shared_tracker.get_stats().partition_insertions, hot_keys.size());
 
-    // Touch all cached entries first, then force same-token bucket growth and
-    // in-bucket compaction. Without cache-pointer rebinding on moves, these
-    // operations can leave cached entries with stale _owner_cached_ptr values.
+    // Touch all cached entries first, then insert and erase keys of the same token, so that the
+    // tree splits and merges nodes around the cached entries.
     for (size_t i = 0; i < hot_keys.size(); ++i) {
         assert_that(schema, lookup(index, hot_keys[i], schema)).is_equal_to(hot_mutations[i].partition());
     }

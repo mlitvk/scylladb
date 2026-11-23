@@ -643,7 +643,7 @@ database::setup_metrics() {
                                        "the segment descriptors and the write buffers. The logstor cache and the queued writes are not included.")),
 
         sm::make_gauge("logstor_index_entries_bytes", [this] { return get_logstor_index_entries_memory_usage(); },
-                       sm::description("Bytes of memory that the logstor primary index entries take, without the nodes and buckets of the B+trees.")),
+                       sm::description("Bytes of memory that the logstor primary index entries take, without the nodes of the B+trees, which hold the index keys.")),
     });
 
     _metrics.add_group("memtables", {

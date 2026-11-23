@@ -67,7 +67,7 @@ void cache_tracker::evict(const primary_index_entry& pie) noexcept {
     });
 }
 
-std::optional<keyed_single_row_partition> cache_tracker::read_partition(const primary_index_entry& pie, const schema& target_schema) {
+std::optional<keyed_single_row_partition> cache_tracker::read_partition(const primary_index_entry& pie, dht::token token, const schema& target_schema) {
     // The partition is built inside the section and returned out of it by value: an allocation
     // failure re-runs the section's function from the start, and nothing outside it has been
     // touched by then.
@@ -82,7 +82,7 @@ std::optional<keyed_single_row_partition> cache_tracker::read_partition(const pr
                 e.upgrade(target_schema.shared_from_this());
             });
         }
-        return keyed_single_row_partition{dht::decorated_key(pie.key().token(), e.key()), e.partition().copy(*e.schema())};
+        return keyed_single_row_partition{dht::decorated_key(token, e.key()), e.partition().copy(*e.schema())};
     });
 
     if (cached) {
@@ -94,13 +94,13 @@ std::optional<keyed_single_row_partition> cache_tracker::read_partition(const pr
     return cached;
 }
 
-std::optional<mutation> cache_tracker::peek(const primary_index_entry& pie, schema_ptr target_schema) {
+std::optional<mutation> cache_tracker::peek(const primary_index_entry& pie, dht::token token, schema_ptr target_schema) {
     auto cached_mut = _read_section(region(), [&] () -> std::optional<mutation> {
         if (!pie._cached_entry) {
             return std::nullopt;
         }
         const auto& e = *pie._cached_entry;
-        dht::decorated_key dk(pie.key().token(), e.key());
+        dht::decorated_key dk(token, e.key());
         return to_mutation(e.schema(), std::move(dk), e.partition().copy(*e.schema()));
     });
 
