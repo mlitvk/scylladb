@@ -672,6 +672,82 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_cache_survives_index_rebalan
     index.drain_cache().get();
 }
 
+// The index holds each key as an element of its own in the tree, so the keys of one token have no
+// limit. The test puts on one token more keys than one LSA object can hold as one array of
+// entries, and a few keys on the tokens before and after it.
+SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_takes_many_keys_of_one_token) {
+    auto schema = make_logstor_schema();
+    primary_index index(noop_space_accounting, nullptr, false);
+
+    constexpr int64_t token = 1000;
+    constexpr int key_count = 10000;
+    const auto location_of = [] (int i) { return make_index_entry(500 + i, uint32_t(i) * 8, 8, 1).location; };
+    const auto token_range = dht::token_range::make_singular(dht::token::from_int64(token));
+
+    auto keys = insert_same_token_keys(index, *schema, token, 0, key_count);
+    auto keys_before = insert_same_token_keys(index, *schema, token - 1, 20000, 3);
+    auto keys_after = insert_same_token_keys(index, *schema, token + 1, 30000, 3);
+    BOOST_REQUIRE_EQUAL(index.get_usage().key_count, size_t(key_count) + 6);
+
+    for (int i = 0; i < key_count; ++i) {
+        BOOST_REQUIRE(lookup_location(index, keys[i], *schema) == location_of(i));
+    }
+    BOOST_REQUIRE(!lookup_location(index, make_fixed_token_key(*schema, token, "absent"), *schema));
+
+    // A scan of the token visits all its keys in index order, and no key of another token.
+    const auto scan_token = [&] {
+        size_t visited = 0;
+        std::optional<primary_index_key> last;
+        auto scan = index.scan(token_range);
+        while (scan.next_batch(64, [&] (const primary_index::scanned_entry& e) {
+            BOOST_REQUIRE_EQUAL(e.key().token(), dht::token::from_int64(token));
+            if (last) {
+                BOOST_REQUIRE((*last <=> e.key()) < 0);
+            }
+            last = e.key();
+            ++visited;
+        })) {
+        }
+        return visited;
+    };
+    BOOST_REQUIRE_EQUAL(scan_token(), size_t(key_count));
+
+    // An overwrite changes the entry of its key only, and an older entry changes nothing.
+    const auto new_location = make_index_entry(9000, 0, 16, 2).location;
+    auto overwritten = index.insert(keys[7], make_index_entry(9000, 0, 16, 2));
+    BOOST_REQUIRE(overwritten.inserted());
+    BOOST_REQUIRE(overwritten.previous_entry && overwritten.previous_entry->location == location_of(7));
+    BOOST_REQUIRE(!index.insert(keys[7], make_index_entry(9001, 0, 16, 1)).inserted());
+    BOOST_REQUIRE(lookup_location(index, keys[7], *schema) == new_location);
+    BOOST_REQUIRE(lookup_location(index, keys[6], *schema) == location_of(6));
+    BOOST_REQUIRE_EQUAL(index.get_usage().key_count, size_t(key_count) + 6);
+
+    // Erases every other key, and compacts the region, which moves the nodes that hold the keys.
+    for (int i = 1; i < key_count; i += 2) {
+        BOOST_REQUIRE(index.erase(keys[i], i == 7 ? new_location : location_of(i)));
+    }
+    logalloc::shard_tracker().full_compaction();
+    for (int i = 0; i < key_count; ++i) {
+        if (i % 2 == 1) {
+            BOOST_REQUIRE(!lookup_location(index, keys[i], *schema));
+        } else {
+            BOOST_REQUIRE(lookup_location(index, keys[i], *schema) == location_of(i));
+        }
+    }
+    BOOST_REQUIRE_EQUAL(scan_token(), size_t(key_count / 2));
+
+    // An erase of the token takes all its keys, and leaves the keys of the tokens next to it.
+    index.erase(token_range).get();
+    BOOST_REQUIRE_EQUAL(scan_token(), 0u);
+    BOOST_REQUIRE_EQUAL(index.get_usage().key_count, 6u);
+    for (const auto& key : keys_before) {
+        BOOST_REQUIRE(lookup_location(index, key, *schema));
+    }
+    for (const auto& key : keys_after) {
+        BOOST_REQUIRE(lookup_location(index, key, *schema));
+    }
+}
+
 // Returns a visit that counts the entries of a batch into `count`, for the scan tests that look
 // only at what a batch covered.
 static auto count_visit(size_t& count) {
