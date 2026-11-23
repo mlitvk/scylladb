@@ -590,6 +590,15 @@ public:
         reference operator*() const noexcept { return _data->value; }
         pointer operator->() const noexcept { return &_data->value; }
 
+        /*
+         * Returns the key of the element, which the leaf keeps.
+         * The iterator must not be the end one.
+         */
+        const Key& key() noexcept {
+            node_ptr leaf = revalidate();
+            return leaf->_keys[_idx - 1].v;
+        }
+
         iterator_base& operator++() noexcept {
             node_ptr leaf = revalidate();
             if (_idx < leaf->_num_keys) {

@@ -243,6 +243,35 @@ BOOST_AUTO_TEST_CASE(test_iterators) {
     }
 }
 
+BOOST_AUTO_TEST_CASE(test_iterator_key) {
+    /* Enough keys for several leaves, erased in part so that nodes merge */
+    test_tree t(int_compare{});
+    const int nr = 64;
+
+    for (int k = 0; k < nr; k++) {
+        t.emplace(k, 100 + k);
+    }
+    for (int k = 0; k < nr; k += 3) {
+        t.erase(k);
+    }
+
+    int k = 1;
+    for (auto i = t.begin(); i != t.end(); i++) {
+        BOOST_REQUIRE(i.key() == k);
+        BOOST_REQUIRE(*i == 100ul + k);
+        k += k % 3 == 2 ? 2 : 1;
+    }
+    BOOST_REQUIRE(k >= nr);
+
+    const test_tree& ct = t;
+    auto ci = ct.find(10);
+    BOOST_REQUIRE(ci.key() == 10);
+
+    /* An iterator made from a value pointer finds its key as well */
+    test_tree::iterator vi(&*t.find(11));
+    BOOST_REQUIRE(vi.key() == 11);
+}
+
 /*
  * Special test that makes sure "self-iterator" works OK.
  * See comment near the bptree::iterator(T* d) constructor
