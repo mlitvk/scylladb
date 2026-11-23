@@ -7,6 +7,8 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
+#include <map>
+#include <random>
 #include <boost/test/unit_test.hpp>
 #include <fmt/core.h>
 
@@ -386,6 +388,110 @@ BOOST_AUTO_TEST_CASE(test_avx_search) {
 
     t.clear();
     check_conversions();
+}
+
+/*
+ * A key that the node keeps as a prefix and a rest, see SplitLessCompare.
+ */
+struct split_key {
+    int64_t prefix;
+    uint32_t rest;
+
+    auto operator<=>(const split_key&) const noexcept = default;
+};
+
+struct split_key_compare {
+    using rest_type = uint32_t;
+
+    bool operator()(const split_key& a, const split_key& b) const noexcept { return a < b; }
+    static int64_t key_prefix(const split_key& k) noexcept { return k.prefix; }
+    static uint32_t key_rest(const split_key& k) noexcept { return k.rest; }
+    static split_key make_key(int64_t prefix, uint32_t rest) noexcept { return split_key{prefix, rest}; }
+    static bool rest_less(uint32_t a, uint32_t b) noexcept { return a < b; }
+};
+
+BOOST_AUTO_TEST_CASE(test_split_key) {
+    /*
+     * The search::both mode checks each simd keys scan against the plain
+     * one, and the std::map tells what the tree must hold.
+     *
+     * There are few prefixes, so many keys share one, and their keys take
+     * several nodes.
+     */
+    using test_tree = tree<split_key, unsigned long, split_key_compare, 4, key_search::both, with_debug::yes>;
+    static_assert(SplitLessCompare<split_key, split_key_compare>);
+
+    const int64_t prefixes[] = { std::numeric_limits<int64_t>::min() + 1, -7, 0, 1, 2, std::numeric_limits<int64_t>::max() };
+    const int nr_prefixes = std::size(prefixes);
+    const int nr_rests = 48;
+
+    test_tree t(split_key_compare{});
+    std::map<split_key, unsigned long> expected;
+    std::minstd_rand rnd(1);
+
+    auto random_key = [&] {
+        return split_key{prefixes[rnd() % nr_prefixes], uint32_t(rnd() % nr_rests)};
+    };
+
+    auto check = [&] {
+        auto i = t.begin();
+        for (auto&& [k, v] : expected) {
+            BOOST_REQUIRE(i != t.end());
+            BOOST_REQUIRE(i.key() == k);
+            BOOST_REQUIRE(*i == v);
+            i++;
+        }
+        BOOST_REQUIRE(i == t.end());
+    };
+
+    for (int step = 0; step < 20000; step++) {
+        split_key k = random_key();
+        auto e = expected.find(k);
+
+        /* Inserts for the first quarter mostly, then erases mostly, and so on */
+        bool insert = (rnd() % 8) < ((step / 2500) % 2 == 0 ? 6u : 2u);
+        if (insert) {
+            auto res = t.emplace(copy_key(k), step);
+            BOOST_REQUIRE(res.second == (e == expected.end()));
+            if (res.second) {
+                expected.emplace(k, step);
+            }
+            BOOST_REQUIRE(res.first.key() == k);
+        } else {
+            auto i = t.find(k);
+            BOOST_REQUIRE((i == t.end()) == (e == expected.end()));
+            if (i != t.end()) {
+                BOOST_REQUIRE(*i == e->second);
+                i.erase(split_key_compare{});
+                expected.erase(e);
+            }
+        }
+
+        k = random_key();
+        auto lb = t.lower_bound(k);
+        auto elb = expected.lower_bound(k);
+        BOOST_REQUIRE((lb == t.end()) == (elb == expected.end()));
+        BOOST_REQUIRE(lb == t.end() || lb.key() == elb->first);
+
+        auto ub = t.upper_bound(k);
+        auto eub = expected.upper_bound(k);
+        BOOST_REQUIRE((ub == t.end()) == (eub == expected.end()));
+        BOOST_REQUIRE(ub == t.end() || ub.key() == eub->first);
+
+        if (step % 500 == 0) {
+            check();
+        }
+    }
+    check();
+
+    /* All keys of one prefix go away, the neighbours stay */
+    auto from = t.lower_bound(split_key{0, 0});
+    auto to = t.upper_bound(split_key{0, std::numeric_limits<uint32_t>::max()});
+    t.erase(from, to);
+    expected.erase(expected.lower_bound(split_key{0, 0}), expected.upper_bound(split_key{0, std::numeric_limits<uint32_t>::max()}));
+    check();
+
+    t.clear();
 }
 
 using test_key = tree_test_key_base;

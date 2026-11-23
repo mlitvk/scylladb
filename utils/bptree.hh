@@ -10,8 +10,11 @@
 
 #include <boost/intrusive/parent_from_member.hpp>
 #include <seastar/util/defer.hh>
+#include <algorithm>
 #include <cassert>
 #include <memory>
+#include <type_traits>
+#include <utility>
 #include <vector>
 #include "utils/assert.hh"
 #include "utils/allocation_strategy.hh"
@@ -291,7 +294,7 @@ private:
             return begin();
         } else if (i <= n._num_keys) {
             const_iterator cur = const_iterator(n._kids[i].d, i);
-            if (upper || _less(n._keys[i - 1].v, k)) {
+            if (upper || _less(n.key_at(i - 1), k)) {
                 cur++;
             } else {
                 match = true;
@@ -363,7 +366,7 @@ public:
         node& n = find_leaf_for(k);
         kid_index i = n.index_for(k, _less);
 
-        if (i >= 1 && !_less(n._keys[i - 1].v, k)) {
+        if (i >= 1 && !_less(n.key_at(i - 1), k)) {
             return const_iterator(n._kids[i].d, i);
         } else {
             return end();
@@ -424,7 +427,7 @@ public:
         node& n = find_leaf_for(k);
         kid_index i = n.index_for(k, _less);
 
-        if (i >= 1 && !_less(n._keys[i - 1].v, k)) {
+        if (i >= 1 && !_less(n.key_at(i - 1), k)) {
             // Direct hit
             return std::pair(iterator(n._kids[i].d, i), false);
         }
@@ -453,7 +456,7 @@ public:
 
         SCYLLA_ASSERT(n._num_keys > 0);
 
-        if (_less(n._keys[i - 1].v, k)) {
+        if (_less(n.key_at(i - 1), k)) {
             return end();
         }
 
@@ -594,9 +597,9 @@ public:
          * Returns the key of the element, which the leaf keeps.
          * The iterator must not be the end one.
          */
-        const Key& key() noexcept {
+        decltype(auto) key() noexcept {
             node_ptr leaf = revalidate();
-            return leaf->_keys[_idx - 1].v;
+            return std::as_const(*leaf).key_at(_idx - 1);
         }
 
         iterator_base& operator++() noexcept {
@@ -940,6 +943,151 @@ struct searcher<K, Key, Less, Size, key_search::both> {
 };
 
 /*
+ * Some keys are an int64 prefix that decides the order of almost any two
+ * keys, and a rest that decides it when the prefixes are equal. A token
+ * with a hash of the partition key is like that.
+ *
+ * If the less-comparator can split the key this way, the node keeps the
+ * prefixes of its keys in one array and the rests in another one. The
+ * intra-node keys scan then uses simd instructions on the prefixes, as
+ * it does for the simple keys above, and it compares the rest only for
+ * the keys with the prefix of the lookup key.
+ *
+ * The comparator must order the keys by prefix first and by rest_less()
+ * second. No key can have utils::simple_key_unused_value for prefix.
+ */
+template <typename Key, typename Less>
+concept SplitLessCompare = requires (Key k, int64_t prefix, typename Less::rest_type rest) {
+    { Less::key_prefix(k) } noexcept -> std::same_as<int64_t>;
+    { Less::key_rest(k) } noexcept -> std::same_as<typename Less::rest_type>;
+    { Less::make_key(prefix, rest) } noexcept -> std::same_as<Key>;
+    { Less::rest_less(rest, rest) } noexcept -> std::same_as<bool>;
+};
+
+/*
+ * The keys of a node are stored in two parts. The heads are placed
+ * before the node's kids and the tails are placed after them, so that
+ * what the keys scan reads is next to the kid it selects.
+ *
+ * In the general case the heads are the keys themselves and there are
+ * no tails.
+ */
+template <typename Key, typename Less, size_t NodeSize>
+struct node_keys {
+    using heads = maybe_key<Key, Less>[NodeSize];
+    struct tails { };
+    using slot = maybe_key<Key, Less>&;
+
+    static slot slot_at(heads& h, tails&, size_t i) noexcept { return h[i]; }
+    static Key& key_at(heads& h, tails&, size_t i) noexcept { return h[i].v; }
+    static const Key& key_at(const heads& h, const tails&, size_t i) noexcept { return h[i].v; }
+
+    template <typename K, key_search Search>
+    static size_t gt(const K& k, const heads& h, const tails&, size_t nr, Less less) noexcept {
+        return searcher<K, Key, Less, NodeSize, Search>::gt(k, h, nr, less);
+    }
+};
+
+/*
+ * For split keys the heads are the prefixes and the tails are the rests.
+ */
+template <typename Key, typename Less, size_t NodeSize>
+requires SplitLessCompare<Key, Less>
+struct node_keys<Key, Less, NodeSize> {
+    using rest_type = typename Less::rest_type;
+
+    static_assert(std::is_trivially_copyable_v<Key> && std::is_trivially_copyable_v<rest_type>);
+    static_assert(NodeSize % 4 == 0, "array_search_gt() needs a capacity that is a multiple of 4");
+
+    struct heads {
+        int64_t prefixes[NodeSize];
+
+        /* An unused prefix must hold the minimal value, see array_search_gt() */
+        heads() noexcept {
+            std::fill_n(prefixes, NodeSize, utils::simple_key_unused_value);
+        }
+    };
+
+    struct tails {
+        rest_type rests[NodeSize];
+
+        tails() noexcept { }
+    };
+
+    /*
+     * Does for one split key what the maybe_key does for a plain one
+     */
+    class slot {
+        int64_t& _prefix;
+        rest_type& _rest;
+
+    public:
+        slot(int64_t& prefix, rest_type& rest) noexcept : _prefix(prefix), _rest(rest) { }
+
+        void reset() noexcept { _prefix = utils::simple_key_unused_value; }
+
+        void emplace(const Key& k) noexcept {
+            _prefix = Less::key_prefix(k);
+            _rest = Less::key_rest(k);
+        }
+
+        void emplace(slot&& other) noexcept {
+            _prefix = other._prefix;
+            _rest = other._rest;
+            other.reset();
+        }
+
+        void emplace(maybe_key<Key, Less>&& other) noexcept {
+            emplace(other.v);
+            other.reset();
+        }
+
+        void replace(const Key& k) noexcept { emplace(k); }
+
+        /*
+         * Moves the key out of the slot. A maybe_key that is emplaced
+         * from a slot gets its key this way.
+         */
+        explicit operator Key() && noexcept {
+            Key k = Less::make_key(_prefix, _rest);
+            reset();
+            return k;
+        }
+    };
+
+    static slot slot_at(heads& h, tails& t, size_t i) noexcept { return slot(h.prefixes[i], t.rests[i]); }
+    static Key key_at(const heads& h, const tails& t, size_t i) noexcept { return Less::make_key(h.prefixes[i], t.rests[i]); }
+
+    template <typename K, key_search Search>
+    requires SplitLessCompare<K, Less>
+    static size_t gt(const K& k, const heads& h, const tails& t, size_t nr, Less less) noexcept {
+        static_assert(Search != key_search::binary, "split keys are searched linearly");
+
+        const int64_t prefix = Less::key_prefix(k);
+        size_t i = utils::array_search_gt(prefix, h.prefixes, NodeSize, nr);
+
+        /*
+         * The keys before i have a prefix that is not greater. Those of
+         * them that have the prefix of k and a greater rest are the last
+         * ones, and they are greater than k.
+         */
+        while (i > 0 && h.prefixes[i - 1] == prefix && Less::rest_less(Less::key_rest(k), t.rests[i - 1])) {
+            i--;
+        }
+
+        if (Search == key_search::both) {
+            size_t j = 0;
+            while (j < nr && !less(k, key_at(h, t, j))) {
+                j++;
+            }
+            SCYLLA_ASSERT(i == j);
+        }
+
+        return i;
+    }
+};
+
+/*
  * A node describes both, inner and leaf nodes.
  */
 template <typename Key, typename T, typename Less, size_t NodeSize, key_search Search, with_debug Debug>
@@ -1013,8 +1161,16 @@ class node final {
      * at index 0 for the non-leaf node.
      */
 
-    maybe_key<Key, Less> _keys[NodeSize];
+    using keys = node_keys<Key, Less, NodeSize>;
+    using key_slot_ref = typename keys::slot;
+
+    typename keys::heads _key_heads;
     node_or_data _kids[NodeSize + 1];
+    [[no_unique_address]] typename keys::tails _key_tails;
+
+    key_slot_ref key_slot(size_t i) noexcept { return keys::slot_at(_key_heads, _key_tails, i); }
+    decltype(auto) key_at(size_t i) noexcept { return keys::key_at(_key_heads, _key_tails, i); }
+    decltype(auto) key_at(size_t i) const noexcept { return keys::key_at(_key_heads, _key_tails, i); }
 
     // Type-aliases for code-reading convenience
     using key_index = size_t;
@@ -1147,7 +1303,7 @@ class node final {
      */
     template <typename K>
     kid_index index_for(const K& k, Less less) const noexcept {
-        return searcher<K, Key, Less, NodeSize, Search>::gt(k, _keys, _num_keys, less);
+        return keys::template gt<K, Search>(k, _key_heads, _key_tails, _num_keys, less);
     }
 
     kid_index index_for(node *n) const noexcept {
@@ -1182,7 +1338,7 @@ class node final {
 
     void shift_right(size_t s) noexcept {
         for (size_t i = _num_keys; i > s; i--) {
-            _keys[i].emplace(std::move(_keys[i - 1]));
+            key_slot(i).emplace(std::move(key_slot(i - 1)));
             _kids[i + 1] = _kids[i];
         }
         _num_keys++;
@@ -1191,7 +1347,7 @@ class node final {
     void shift_left(size_t s) noexcept {
         // The key at s is expected to be .remove()-d !
         for (size_t i = s + 1; i < _num_keys; i++) {
-            _keys[i - 1].emplace(std::move(_keys[i]));
+            key_slot(i - 1).emplace(std::move(key_slot(i)));
             _kids[i] = _kids[i + 1];
         }
         _num_keys--;
@@ -1201,7 +1357,7 @@ class node final {
         size_t toff = to._num_keys;
 
         for (size_t i = 0; i < count; i++) {
-            to._keys[toff + i].emplace(std::move(_keys[foff + i]));
+            to.key_slot(toff + i).emplace(std::move(key_slot(foff + i)));
             to._kids[toff + i + 1] = _kids[foff + i + 1];
         }
         _num_keys = foff;
@@ -1224,7 +1380,7 @@ class node final {
         move_keys_and_kids(off, to, _num_keys - off);
     }
 
-    void grab_from_left(node& from, maybe_key<Key, Less>& sep) noexcept {
+    void grab_from_left(node& from, key_slot_ref sep) noexcept {
         /*
          * Grab one element from the left sibling and return
          * the new separation key for them.
@@ -1250,16 +1406,16 @@ class node final {
         from._num_keys--;
 
         if (is_leaf()) {
-            _keys[0].emplace(std::move(from._keys[i]));
+            key_slot(0).emplace(std::move(from.key_slot(i)));
             _kids[1] = from._kids[i + 1];
             _kids[1].d->reattach(this);
-            sep.replace(copy_key(_keys[0].v));
+            sep.replace(copy_key(key_at(0)));
         } else {
-            _keys[0].emplace(std::move(sep));
+            key_slot(0).emplace(std::move(sep));
             _kids[1] = _kids[0];
             _kids[0] = from._kids[i + 1];
             _kids[0].n->_parent = this;
-            sep.emplace(std::move(from._keys[i]));
+            sep.emplace(std::move(from.key_slot(i)));
         }
     }
 
@@ -1287,7 +1443,7 @@ class node final {
 
         if (!t.is_leaf()) {
             key_index i = t._num_keys;
-            t._keys[i].emplace(std::move(key));
+            t.key_slot(i).emplace(std::move(key));
             t._kids[i + 1] = _kids[0];
             t._kids[i + 1].n->_parent = &t;
             t._num_keys++;
@@ -1296,7 +1452,7 @@ class node final {
         move_keys_and_kids(0, t, _num_keys);
     }
 
-    void grab_from_right(node& from, maybe_key<Key, Less>& sep) noexcept {
+    void grab_from_right(node& from, key_slot_ref sep) noexcept {
         /*
          * Grab one element from the right sibling and return
          * the new separation key for them.
@@ -1318,16 +1474,16 @@ class node final {
         key_index i = _num_keys;
 
         if (is_leaf()) {
-            _keys[i].emplace(std::move(from._keys[0]));
+            key_slot(i).emplace(std::move(from.key_slot(0)));
             _kids[i + 1] = from._kids[1];
             _kids[i + 1].d->reattach(this);
-            sep.replace(copy_key(from._keys[1].v));
+            sep.replace(copy_key(from.key_at(1)));
         } else {
             _kids[i + 1] = from._kids[0];
             _kids[i + 1].n->_parent = this;
-            _keys[i].emplace(std::move(sep));
+            key_slot(i).emplace(std::move(sep));
             from._kids[0] = from._kids[1];
-            sep.emplace(std::move(from._keys[0]));
+            sep.emplace(std::move(from.key_slot(0)));
         }
 
         _num_keys++;
@@ -1352,7 +1508,7 @@ class node final {
     bool left_kid_sorted(const Key& k, Less less) const noexcept {
         if (Debug == with_debug::yes && !is_leaf() && _num_keys > 0) {
             node* x = _kids[0].n;
-            if (x != nullptr && less(k, x->_keys[x->_num_keys - 1].v)) {
+            if (x != nullptr && less(k, x->key_at(x->_num_keys - 1))) {
                 return false;
             }
         }
@@ -1374,7 +1530,7 @@ class node final {
         }
 
         for (key_index i = 0; i < _num_keys; i++) {
-            _keys[i].reset();
+            key_slot(i).reset();
             if (is_leaf()) {
                 ddisp(_kids[i + 1].d);
             } else {
@@ -1411,7 +1567,7 @@ class node final {
     bool try_push_to_sibling(kid_index& idx, Less less) noexcept {
         if (!is_root()) {
             node& p = *_parent;
-            kid_index i = p.index_for(_keys[0].v, less);
+            kid_index i = p.index_for(key_at(0), less);
 
             /*
              * Try to push left or right existing keys to the respective
@@ -1435,14 +1591,14 @@ class node final {
                      * for the new key shifts too
                      */
                     idx--;
-                    left->grab_from_right(*this, p._keys[i - 1]);
+                    left->grab_from_right(*this, p.key_slot(i - 1));
                 }
             }
 
             if (idx < _num_keys && i < p._num_keys) {
                 node* right = p._kids[i + 1].n;
                 if (right->can_push_to()) {
-                    right->grab_from_left(*this, p._keys[i]);
+                    right->grab_from_left(*this, p.key_slot(i));
                 }
             }
         }
@@ -1509,7 +1665,7 @@ class node final {
             } else {
                 nn->do_insert(idx - off, std::move(k), nd, less);
             }
-            sep.emplace(std::move(copy_key(nn->_keys[0].v)));
+            sep.emplace(std::move(copy_key(nn->key_at(0))));
         } else {
             /*
              * Node insertion has one special case -- when the new key
@@ -1549,7 +1705,7 @@ class node final {
                  * datas: -> [A012]   [345]  -> [-123]   [34n5]
                  */
                 move_to(*nn, off + 1);
-                sep.emplace(std::move(_keys[off]));
+                sep.emplace(std::move(key_slot(off)));
                 nn->_kids[0] = _kids[off + 1];
                 nn->_kids[0].n->_parent = nn;
                 _num_keys--;
@@ -1597,7 +1753,7 @@ class node final {
          * what's already there is less than this newcomer, the latter goes
          * one step right.
          */
-        _keys[i].emplace(std::move(k));
+        key_slot(i).emplace(std::move(k));
         _kids[i + 1] = nd;
         if (is_leaf()) {
             nd.d->attach(*this);
@@ -1615,7 +1771,7 @@ class node final {
         node* nr = nodes.pop();
 
         nr->_num_keys = 1;
-        nr->_keys[0].emplace(std::move(sep));
+        nr->key_slot(0).emplace(std::move(sep));
         nr->_kids[0].n = this;
         nr->_kids[1].n = &nn;
         _flags &= ~node::NODE_ROOT;
@@ -1674,7 +1830,7 @@ class node final {
     }
 
     void remove_from(key_index i, Less less) noexcept {
-        _keys[i].reset();
+        key_slot(i).reset();
         shift_left(i);
 
         if (!is_root()) {
@@ -1694,7 +1850,7 @@ class node final {
     }
 
     void merge_kids(node& t, node& n, key_index sep_idx, Less less) noexcept {
-        n.merge_into(t, std::move(_keys[sep_idx].v));
+        n.merge_into(t, std::move(key_at(sep_idx)));
         n.drop();
         remove_from(sep_idx, less);
     }
@@ -1708,7 +1864,7 @@ class node final {
          * it, but since we don't let's be on the safe side.
          */
         SCYLLA_ASSERT(_num_keys > 0);
-        kid_index i = p.index_for(_keys[0].v, less);
+        kid_index i = p.index_for(key_at(0), less);
         SCYLLA_ASSERT(p._kids[i].n == this);
 
         /*
@@ -1743,12 +1899,12 @@ class node final {
         right = i < p._num_keys ? p._kids[i + 1].n : nullptr;
 
         if (left != nullptr && left->can_grab_from()) {
-            grab_from_left(*left, p._keys[i - 1]);
+            grab_from_left(*left, p.key_slot(i - 1));
             return;
         }
 
         if (right != nullptr && right->can_grab_from()) {
-            grab_from_right(*right, p._keys[i]);
+            grab_from_right(*right, p.key_slot(i));
             return;
         }
 
@@ -1791,14 +1947,14 @@ class node final {
          * tree upwards in vain.
          */
         if (strict_separation_key && i == 0 && !is_leftmost()) {
-            const Key& k = _keys[i].v;
+            const Key& k = key_at(i);
             node* p = this;
 
             while (!p->is_root()) {
                 p = p->_parent;
                 kid_index j = p->index_for(k, less);
                 if (j > 0) {
-                    p->_keys[j - 1].replace(copy_key(_keys[1].v));
+                    p->key_slot(j - 1).replace(copy_key(key_at(1)));
                     break;
                 }
             }

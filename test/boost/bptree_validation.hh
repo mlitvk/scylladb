@@ -37,7 +37,7 @@ public:
                 n.is_leaf() ? "leaf" : "node", n.id(), n._num_keys, n._flags);
         if (n.is_leaf()) {
             for (i = 0; i < n._num_keys; i++) {
-                fmt::print(" {}", (int)n._keys[i].v);
+                fmt::print(" {}", (int)n.key_at(i));
             }
             fmt::print("\n");
 
@@ -49,7 +49,7 @@ public:
             print_node(*n._kids[0].n, pfx, indent + 2);
         }
         for (i = 0; i < n._num_keys; i++) {
-            fmt::print("{:<{}c}---{}---\n", pfx, indent, (int)n._keys[i].v);
+            fmt::print("{:<{}c}---{}---\n", pfx, indent, (int)n.key_at(i));
             print_node(*n._kids[i + 1].n, pfx, indent + 2);
         }
     }
@@ -68,7 +68,7 @@ void validator<K, T, L, NS>::validate_node(const tree& t, const node& n, int& pr
     }
 
     for (i = 0; i < n._num_keys; i++) {
-        if (!n._keys[i].v.is_alive()) {
+        if (!n.key_at(i).is_alive()) {
             fmt::print("node {} key {} is not alive\n", n.id(), i);
             throw "key dead";
         }
@@ -76,8 +76,8 @@ void validator<K, T, L, NS>::validate_node(const tree& t, const node& n, int& pr
 
     if (n.is_leaf()) {
         for (i = 0; i < n._num_keys; i++) {
-            if (t._less(n._keys[i].v, K(prev_key))) {
-                fmt::print("node misordered @{} (prev {})\n", (int)n._keys[i].v, prev_key);
+            if (t._less(n.key_at(i), K(prev_key))) {
+                fmt::print("node misordered @{} (prev {})\n", (int)n.key_at(i), prev_key);
                 throw "misorder";
             }
             if (n._kids[i + 1].d->_leaf != &n) {
@@ -85,15 +85,15 @@ void validator<K, T, L, NS>::validate_node(const tree& t, const node& n, int& pr
                 throw "data backlink";
             }
 
-            prev_key = n._keys[i].v;
-            if (!n._kids[i + 1].d->value.match_key(n._keys[i].v)) {
+            prev_key = n.key_at(i);
+            if (!n._kids[i + 1].d->value.match_key(n.key_at(i))) {
                 fmt::print("node value corrupted @{:d}.{:d}\n", n.id(), i);
                 throw "data corruption";
             }
         }
 
         if (n._num_keys > 0) {
-            min_key = (int)n._keys[0].v;
+            min_key = (int)n.key_at(0);
         }
     } else if (n._num_keys > 0) {
         node* k = n._kids[0].n;
@@ -110,18 +110,18 @@ void validator<K, T, L, NS>::validate_node(const tree& t, const node& n, int& pr
                         k->id(), k->_parent ? k->_parent->id() : -1, n.id());
                 throw "mis-parented node";
             }
-            if (t._less(k->_keys[0].v, n._keys[i].v)) {
+            if (t._less(k->key_at(0), n.key_at(i))) {
                 fmt::print("node {:d}.{:d}, separation key {}, kid has {}\n", n.id(), k->id(),
-                        (int)n._keys[i].v, (int)k->_keys[0].v);
+                        (int)n.key_at(i), (int)k->key_at(0));
                 throw "separation key mismatch";
             }
 
             int min = 0;
             validate_node(t, *k, prev_key, min, false);
-            if (t._less(n._keys[i].v, K(min)) || t._less(K(min), n._keys[i].v)) {
+            if (t._less(n.key_at(i), K(min)) || t._less(K(min), n.key_at(i))) {
                 fmt::print("node {:d}.[{:d}]{:d}, separation key {}, min {}\n",
-                        n.id(), i, k->id(), (int)n._keys[i].v, min);
-                if (strict_separation_key || t._less(K(min), n._keys[i].v)) {
+                        n.id(), i, k->id(), (int)n.key_at(i), min);
+                if (strict_separation_key || t._less(K(min), n.key_at(i))) {
                     throw "separation key screw";
                 }
             }
@@ -182,14 +182,14 @@ void validator<K, T, L, NS>::validate_list(const tree& t) {
             throw "list broken";
         }
 
-        if (r->_num_keys > 0 && t._less(r->_keys[0].v, K(prev))) {
-            fmt::print("list misorder on element {:d}, keys {}..., prev {:d}\n", r->id(), (int)r->_keys[0].v, prev);
+        if (r->_num_keys > 0 && t._less(r->key_at(0), K(prev))) {
+            fmt::print("list misorder on element {:d}, keys {}..., prev {:d}\n", r->id(), (int)r->key_at(0), prev);
             throw "list broken";
         }
 
         if (!r->is_root() && r->_parent != nullptr) {
             const auto p = r->_parent;
-            int i = p->index_for(r->_keys[0].v, t._less);
+            int i = p->index_for(r->key_at(0), t._less);
             if (i > 0) {
                 if (p->_kids[i - 1].n != r->get_prev()) {
                     fmt::print("list misorder on parent check: node {:d}.{:d}, parent prev {:d}, list prev {:d}\n",
@@ -207,7 +207,7 @@ void validator<K, T, L, NS>::validate_list(const tree& t) {
         }
 
         if (r->_num_keys > 0) {
-            prev = (int)r->_keys[r->_num_keys - 1].v;
+            prev = (int)r->key_at(r->_num_keys - 1);
         }
 
         if (r != t._left && r != t._right && (r->_flags & (node::NODE_LEFTMOST | node::NODE_RIGHTMOST))) {
