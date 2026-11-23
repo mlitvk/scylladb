@@ -1863,7 +1863,7 @@ private:
     std::unique_ptr<logstor::logstor> _logstor;
     // The tables of this shard as logstor recovery and the adoption of a streamed segment see them.
     // Set with _logstor.
-    std::unique_ptr<logstor::recovery_catalog> _logstor_catalog;
+    std::unique_ptr<logstor::table_catalog> _logstor_catalog;
 
     // By pointer, so that rehashing does not move keyspaces: tables link to theirs by address.
     flat_hash_map<sstring, std::unique_ptr<keyspace>> _keyspaces;
@@ -2273,7 +2273,7 @@ public:
     void trigger_logstor_compaction(bool major);
     size_t get_logstor_memory_usage() const;
     // Only valid when logstor is used.
-    logstor::recovery_catalog& logstor_catalog() noexcept {
+    logstor::table_catalog& logstor_catalog() noexcept {
         return *_logstor_catalog;
     }
     size_t get_logstor_index_entries_memory_usage() const;

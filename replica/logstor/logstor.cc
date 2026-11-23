@@ -78,7 +78,7 @@ logstor::logstor(logstor_config config, ::cache_tracker& shared_cache_tracker)
     });
 }
 
-future<recovery_summary> logstor::do_recovery(recovery_catalog& catalog) {
+future<recovery_summary> logstor::do_recovery(table_catalog& catalog) {
     return _segment_manager.do_recovery(catalog);
 }
 

@@ -17,11 +17,11 @@ namespace replica::logstor {
 class primary_index;
 class logstor_group;
 
-// A recovery_catalog gives the index of a logstor table, and the compaction group of this shard
+// A table_catalog gives the index of a logstor table, and the compaction group of this shard
 // that owns a token or a token range of the table.
-class recovery_catalog {
+class table_catalog {
 public:
-    virtual ~recovery_catalog() = default;
+    virtual ~table_catalog() = default;
 
     // The index of a table and one of its compaction groups, found with one lookup of the table.
     struct target {

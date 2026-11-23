@@ -1004,7 +1004,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_writes_a_frozen_mutation) {
 
     shared_logstor_cache cache;
     logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
-    test_recovery_catalog no_tables;
+    test_table_catalog no_tables;
     ls.do_recovery(no_tables).get();
     ls.start().get();
     auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
@@ -1075,7 +1075,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_rejects_a_key_over_the_frame_key_siz
 
     shared_logstor_cache cache;
     logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
-    test_recovery_catalog no_tables;
+    test_table_catalog no_tables;
     ls.do_recovery(no_tables).get();
     ls.start().get();
     auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
@@ -1110,7 +1110,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_largest_accepted_record_can_be_separated) 
 
     shared_logstor_cache cache;
     logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
-    test_recovery_catalog no_tables;
+    test_table_catalog no_tables;
     ls.do_recovery(no_tables).get();
     ls.start().get();
     auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
@@ -1141,7 +1141,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_read_after_stop_fails_the_future) {
 
     shared_logstor_cache cache;
     logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
-    test_recovery_catalog no_tables;
+    test_table_catalog no_tables;
     ls.do_recovery(no_tables).get();
     ls.start().get();
 
@@ -1165,7 +1165,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_read_after_short_read) {
 
     shared_logstor_cache cache;
     logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
-    test_recovery_catalog no_tables;
+    test_table_catalog no_tables;
     ls.do_recovery(no_tables).get();
     ls.start().get();
     auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
@@ -1190,7 +1190,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_read_fails_after_two_short_reads) {
 
     shared_logstor_cache cache;
     logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
-    test_recovery_catalog no_tables;
+    test_table_catalog no_tables;
     ls.do_recovery(no_tables).get();
     ls.start().get();
     auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
@@ -1218,7 +1218,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_rejects_record_that_does_not_fit_a_segment
 
     shared_logstor_cache cache;
     logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
-    test_recovery_catalog no_tables;
+    test_table_catalog no_tables;
     ls.do_recovery(no_tables).get();
     ls.start().get();
     auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
@@ -1377,7 +1377,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_failed_compaction_returns_its_buffer_to_th
 
     shared_logstor_cache cache;
     logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
-    test_recovery_catalog no_tables;
+    test_table_catalog no_tables;
     ls.do_recovery(no_tables).get();
     ls.start().get();
     auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
@@ -1448,7 +1448,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_failing_index_update_returns_it
 
     shared_logstor_cache cache;
     logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
-    test_recovery_catalog no_tables;
+    test_table_catalog no_tables;
     ls.do_recovery(no_tables).get();
     ls.start().get();
     auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
@@ -2703,7 +2703,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_write_io_error_signals_disk_error)
 
     shared_logstor_cache cache;
     logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
-    test_recovery_catalog no_tables;
+    test_table_catalog no_tables;
     ls.do_recovery(no_tables).get();
     ls.start().get();
     auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
@@ -2750,7 +2750,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_and_separator_flush) {
 
     shared_logstor_cache cache;
     logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
-    test_recovery_catalog no_tables;
+    test_table_catalog no_tables;
     ls.do_recovery(no_tables).get();
     ls.start().get();
     auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
@@ -2803,7 +2803,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_discarded_group_does_not_free_its_unflushe
 
     shared_logstor_cache cache;
     logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
-    test_recovery_catalog no_tables;
+    test_table_catalog no_tables;
     ls.do_recovery(no_tables).get();
     ls.start().get();
     auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
@@ -2865,7 +2865,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_closed_group_takes_no_separator_writes) {
 
     shared_logstor_cache cache;
     logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
-    test_recovery_catalog no_tables;
+    test_table_catalog no_tables;
     ls.do_recovery(no_tables).get();
     ls.start().get();
     auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
@@ -2907,7 +2907,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_separator_write_to_a_closed_group_closes_i
 
     shared_logstor_cache cache;
     logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
-    test_recovery_catalog no_tables;
+    test_table_catalog no_tables;
     ls.do_recovery(no_tables).get();
     ls.start().get();
     auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
@@ -2950,7 +2950,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_separator_writers_of_a_group_share_one_buf
 
     shared_logstor_cache cache;
     logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
-    test_recovery_catalog no_tables;
+    test_table_catalog no_tables;
     ls.do_recovery(no_tables).get();
     ls.start().get();
     auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
@@ -3030,7 +3030,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_separator_close_waits_for_a_flush_that_sta
 
     shared_logstor_cache cache;
     logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
-    test_recovery_catalog no_tables;
+    test_table_catalog no_tables;
     ls.do_recovery(no_tables).get();
     ls.start().get();
     auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
@@ -3338,7 +3338,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_group_compaction_rewrites_live_records) {
 
     shared_logstor_cache cache;
     logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
-    test_recovery_catalog no_tables;
+    test_table_catalog no_tables;
     ls.do_recovery(no_tables).get();
     ls.start().get();
     auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
@@ -3447,7 +3447,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_disabled_group_does_not_compact_on_submit)
 
     shared_logstor_cache cache;
     logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
-    test_recovery_catalog no_tables;
+    test_table_catalog no_tables;
     ls.do_recovery(no_tables).get();
     ls.start().get();
     auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
@@ -3526,7 +3526,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_split_compaction_splits_segments_between_t
 
     shared_logstor_cache cache;
     logstor ls(make_test_logstor_config(dir.path()), cache.shared_tracker);
-    test_recovery_catalog no_tables;
+    test_table_catalog no_tables;
     ls.do_recovery(no_tables).get();
     ls.start().get();
     auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
@@ -3667,7 +3667,7 @@ struct reader_test_env {
 
     explicit reader_test_env(bool cache_enabled = false, schema_ptr s = make_kv_schema())
             : schema(std::move(s)) {
-        test_recovery_catalog no_tables;
+        test_table_catalog no_tables;
         ls.do_recovery(no_tables).get();
         ls.start().get();
         cg.emplace(schema, ls, cache_enabled);
@@ -4351,7 +4351,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_stops_while_segment_allocation_fails) {
         .file_size = file_size,
         .disk_size = 8 * file_size,
     }), cache.shared_tracker);
-    test_recovery_catalog no_tables;
+    test_table_catalog no_tables;
     ls.do_recovery(no_tables).get();
 
     // The pool is empty when the store starts, so the first allocation of the replenisher fails.
@@ -4391,7 +4391,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_write_fails_when_segment_allocation_fails)
         .file_size = file_size,
         .disk_size = 8 * file_size,
     }), cache.shared_tracker);
-    test_recovery_catalog no_tables;
+    test_table_catalog no_tables;
     ls.do_recovery(no_tables).get();
     ls.start().get();
     auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
@@ -4458,7 +4458,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_uses_free_segments_when_file_format_fails)
         .disk_size = 8 * file_size,
         .format_on_startup = false,
     }), cache.shared_tracker);
-    test_recovery_catalog no_tables;
+    test_table_catalog no_tables;
     ls.do_recovery(no_tables).get();
     ls.start().get();
     auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });

@@ -31,9 +31,9 @@
 #include "replica/logstor/compaction.hh"
 #include "replica/logstor/index.hh"
 #include "replica/logstor/logstor.hh"
-#include "replica/logstor/recovery_catalog.hh"
 #include "replica/logstor/segment_manager.hh"
 #include "replica/logstor/single_row_partition.hh"
+#include "replica/logstor/table_catalog.hh"
 #include "schema/schema_fwd.hh"
 #include "utils/updateable_value.hh"
 
@@ -196,10 +196,10 @@ inline future<mutation_opt> read_mutation(replica::logstor::logstor& ls, schema_
     co_return co_await std::move(m);
 }
 
-// test_recovery_catalog holds the groups that a test adds, each with the token range that the group
+// test_table_catalog holds the groups that a test adds, each with the token range that the group
 // owns. The catalog has a table only if the test added a group of the table, and it gives the index
 // of that group as the index of the table.
-class test_recovery_catalog final : public replica::logstor::recovery_catalog {
+class test_table_catalog final : public replica::logstor::table_catalog {
     struct table_groups {
         replica::logstor::primary_index* index;
         std::vector<std::pair<dht::token_range, replica::logstor::logstor_group*>> groups;
@@ -209,11 +209,11 @@ public:
     void add(replica::logstor::logstor_group& group, dht::token_range range = dht::token_range::make_open_ended_both_sides()) {
         auto& table = _tables[group.table_id()];
         if (table.index && table.index != &group.logstor_index()) {
-            throw std::invalid_argument("test_recovery_catalog: the groups of a table must share one index");
+            throw std::invalid_argument("test_table_catalog: the groups of a table must share one index");
         }
         for (const auto& [other_range, other_group] : table.groups) {
             if (other_range.overlaps(range, dht::token_comparator())) {
-                throw std::invalid_argument(fmt::format("test_recovery_catalog: the range {} overlaps the range {} of another group", range, other_range));
+                throw std::invalid_argument(fmt::format("test_table_catalog: the range {} overlaps the range {} of another group", range, other_range));
             }
         }
         table.index = &group.logstor_index();

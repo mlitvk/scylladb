@@ -71,7 +71,7 @@ public:
     logstor& operator=(const logstor&) = delete;
 
     // Call it once, before start(). The catalog must live until start() returns.
-    future<recovery_summary> do_recovery(recovery_catalog&);
+    future<recovery_summary> do_recovery(table_catalog&);
 
     // Starts the store. Call it once, after do_recovery() succeeded.
     future<> start();

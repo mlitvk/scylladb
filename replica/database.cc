@@ -18,8 +18,8 @@
 #include "locator/token_metadata_fwd.hh"
 #include "replica/logstor/compaction.hh"
 #include "replica/logstor/logstor.hh"
-#include "replica/logstor/recovery_catalog.hh"
 #include "replica/logstor/segment_manager.hh"
+#include "replica/logstor/table_catalog.hh"
 #include "replica/logstor/types.hh"
 #include "utils/log.hh"
 #include "replica/database_fwd.hh"
@@ -992,8 +992,8 @@ database::init_commitlog() {
 
 namespace {
 
-// The recovery catalog of a node: the logstor tables of the database.
-class database_logstor_catalog final : public logstor::recovery_catalog {
+// The table catalog of a node: the logstor tables of the database.
+class database_logstor_catalog final : public logstor::table_catalog {
     database& _db;
 
     lw_shared_ptr<table> logstor_table(table_id id) const {
