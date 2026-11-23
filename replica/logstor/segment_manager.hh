@@ -142,15 +142,14 @@ private:
     const segment_manager_impl& get_impl() const noexcept;
 public:
 
-    explicit segment_manager(segment_manager_config config);
+    // The catalog must live until stop() returns.
+    segment_manager(segment_manager_config config, table_catalog& catalog);
     ~segment_manager();
 
     segment_manager(const segment_manager&) = delete;
     segment_manager& operator=(const segment_manager&) = delete;
 
-    // The catalog must live until start() returns: start() separates through it the records of
-    // the segments that recovery could not give whole to a compaction group.
-    future<recovery_summary> do_recovery(table_catalog&);
+    future<recovery_summary> do_recovery();
 
     // The index a record found on disk goes into, or nullptr to drop the record.
     using index_resolver = std::function<primary_index*(const record_header&)>;
@@ -204,7 +203,7 @@ public:
 
     // Create an output stream to write a segment (for receiving from remote node)
     // Allocates a new local segment and returns an output stream for writing to the segment.
-    future<std::unique_ptr<segment_stream_sink>> create_segment_output_stream(table_catalog&);
+    future<std::unique_ptr<segment_stream_sink>> create_segment_output_stream();
 
     friend class segment_manager_impl;
 

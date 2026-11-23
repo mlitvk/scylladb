@@ -546,6 +546,8 @@ class logstor_bench {
     schema_ptr _schema;
     // Outlives _logstor, which holds a reference to it.
     tests::logstor::shared_logstor_cache _cache;
+    // The catalog has no tables, because the benchmark makes its group after the recovery.
+    tests::logstor::test_table_catalog _catalog;
     std::unique_ptr<logstor> _logstor;
     std::unique_ptr<tests::logstor::test_logstor_group> _group;
     std::vector<dht::decorated_key> _keys;
@@ -612,12 +614,11 @@ public:
             // A perf test uses the curve of a node, because its disk is large enough for the curve.
             .compaction_min_utilization_threshold = default_compaction_min_utilization_threshold,
         });
-        _logstor = std::make_unique<logstor>(std::move(logstor_cfg), _cache.shared_tracker);
+        _logstor = std::make_unique<logstor>(std::move(logstor_cfg), _cache.shared_tracker, _catalog);
     }
 
     future<> start() {
-        tests::logstor::test_table_catalog no_tables;
-        co_await _logstor->do_recovery(no_tables);
+        co_await _logstor->do_recovery();
         co_await _logstor->start();
         // The cache is enabled, and the tests that are not about it bypass it per read instead, so
         // that one dataset serves them all.

@@ -1048,8 +1048,8 @@ database::init_logstor() {
         },
         .flush_sg = _dbcfg.commitlog_scheduling_group,
     };
-    _logstor = std::make_unique<logstor::logstor>(std::move(cfg), _row_cache_tracker);
     _logstor_catalog = std::make_unique<database_logstor_catalog>(*this);
+    _logstor = std::make_unique<logstor::logstor>(std::move(cfg), _row_cache_tracker, *_logstor_catalog);
 
     dblog.info("logstor initialized");
     co_return;
@@ -1061,7 +1061,7 @@ database::recover_logstor() {
         co_return;
     }
 
-    co_await _logstor->do_recovery(*_logstor_catalog);
+    co_await _logstor->do_recovery();
 
     co_await _logstor->start();
 

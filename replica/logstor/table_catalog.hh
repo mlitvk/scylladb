@@ -19,6 +19,12 @@ class logstor_group;
 
 // A table_catalog gives the index of a logstor table, and the compaction group of this shard
 // that owns a token or a token range of the table.
+//
+// The segment manager receives the catalog at construction and uses it until stop() returns.
+// The catalog does not keep a table or a group alive, so the pointers that index() and find()
+// return are valid until the caller suspends.
+// A caller can keep a pointer over a suspension only when no group can stop in that time, which
+// is true during recovery and start().
 class table_catalog {
 public:
     virtual ~table_catalog() = default;

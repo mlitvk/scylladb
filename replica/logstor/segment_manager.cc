@@ -427,6 +427,7 @@ class segment_manager_impl {
     compaction_manager_impl _compaction_mgr;
 
     segment_manager_config _cfg;
+    table_catalog& _catalog;
 
     uint64_t _next_new_segment_id{0};
 
@@ -455,14 +456,9 @@ class segment_manager_impl {
     // The reserve replenisher keeps `_segment_pool` full.
     future<> _reserve_replenisher{make_ready_future<>()};
 
-    // The used segments that recovery could not give whole to a compaction group, and the catalog
-    // to separate their records through. start() separates them, because a separator flush needs
-    // the segment pool, which start() fills.
-    struct recovered_segments {
-        table_catalog* catalog = nullptr;
-        std::vector<log_segment_id> to_separate;
-    };
-    recovered_segments _recovered;
+    // The used segments that recovery could not give whole to a compaction group. start()
+    // separates them, because a separator flush needs the segment pool, which start() fills.
+    std::vector<log_segment_id> _segments_to_separate;
 
     // The stage of the segment manager. do_recovery() must run once on a new segment manager, and
     // start() must run once after the recovery succeeded. A recovery that fails leaves the stage at
@@ -493,12 +489,12 @@ class segment_manager_impl {
 public:
     static constexpr size_t block_alignment = ondisk::block_alignment;
 
-    explicit segment_manager_impl(segment_manager_config);
+    segment_manager_impl(segment_manager_config, table_catalog&);
 
     segment_manager_impl(const segment_manager_impl&) = delete;
     segment_manager_impl& operator=(const segment_manager_impl&) = delete;
 
-    future<recovery_summary> do_recovery(table_catalog&);
+    future<recovery_summary> do_recovery();
 
     future<> start();
     future<> stop();
@@ -560,7 +556,7 @@ public:
     };
 
     // Indexes the records of a segment received from another node, and places the segment.
-    future<> adopt_streamed_segment(table_catalog&, log_segment_id);
+    future<> adopt_streamed_segment(log_segment_id);
 
     using needs_separation = bool_class<class needs_separation_tag>;
 
@@ -568,19 +564,19 @@ public:
     // the segment info of the first chunk of the segment, which the scan of the segment returns.
     // Returns needs_separation::yes when the records of the segment must be separated instead: the
     // segment is mixed, or it is full and fits no single group.
-    needs_separation place_recovered_segment(table_catalog&, log_segment_id, const segment_info& info, recovery_stats&);
+    needs_separation place_recovered_segment(log_segment_id, const segment_info& info, recovery_stats&);
 
-    // Separates the records of the segments that recovery listed in `_recovered`.
+    // Separates the records of the segments that recovery listed in `_segments_to_separate`.
     future<> separate_recovered_segments();
 
     // Writes the live records of the segment through the separator of the group of each record.
-    future<> separate_segment_records(table_catalog&, log_segment_id, recovery_stats&);
+    future<> separate_segment_records(log_segment_id, recovery_stats&);
 
     using index_resolver = segment_manager::index_resolver;
 
     // Returns a resolver that gives the index of the table that a record belongs to, or nullptr
     // if the record does not belong to a table or compaction group of this shard.
-    static index_resolver make_index_resolver(table_catalog&, recovery_stats& stats);
+    index_resolver make_index_resolver(recovery_stats& stats);
 
     struct rebuild_index_result {
         // The segment info of the first chunk of each scanned segment, by segment id. A segment
@@ -660,7 +656,7 @@ public:
     future<utils::chunked_vector<segment_snapshot>> make_snapshot(logstor_group&);
 
     future<seastar::input_stream<char>> create_segment_input_stream(log_segment_id segment_id, const seastar::file_input_stream_options& opts);
-    future<std::unique_ptr<segment_stream_sink>> create_segment_output_stream(table_catalog&);
+    future<std::unique_ptr<segment_stream_sink>> create_segment_output_stream();
 
     uint64_t allocatable_new_segment_count() const noexcept {
         return _next_new_segment_id < _geometry.segment_count() ? _geometry.segment_count() - _next_new_segment_id : 0;
@@ -828,7 +824,7 @@ static file_manager_config make_file_manager_config(const segment_manager_config
     };
 }
 
-segment_manager_impl::segment_manager_impl(segment_manager_config config)
+segment_manager_impl::segment_manager_impl(segment_manager_config config, table_catalog& catalog)
     : _geometry(config.segment_size, config.file_size, config.disk_size)
     , _file_mgr(make_file_manager_config(config, _geometry))
     , _compaction_mgr(*this, compaction_manager_impl::compaction_config{
@@ -843,6 +839,7 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
             .split_compaction_sg = config.split_compaction_sg
         })
     , _cfg(config)
+    , _catalog(catalog)
     , _segment_descs(static_cast<size_t>(_geometry.segment_count()))
     // A compaction job takes one segment from the pool per flush, so the reserve that keeps normal
     // writes from draining the pool is one segment per concurrent job.
@@ -2090,7 +2087,6 @@ future<> compaction_manager_impl::flush_separator_buffer(separator_buffer& buf, 
 // the order of run(), and each step starts from the state that the step before it leaves.
 class segment_manager_impl::recovery {
     segment_manager_impl& _sm;
-    table_catalog& _catalog;
     file_manager::recovery _files;
     recovery_summary _summary;
     recovery_stats _stats;
@@ -2102,9 +2098,8 @@ class segment_manager_impl::recovery {
     file_id_t _used_file_count{0};
 
 public:
-    recovery(segment_manager_impl& sm, table_catalog& catalog)
+    explicit recovery(segment_manager_impl& sm)
         : _sm(sm)
-        , _catalog(catalog)
         , _files(sm._file_mgr.start_recovery())
     {}
 
@@ -2158,7 +2153,7 @@ future<> segment_manager_impl::recovery::open_found_files() {
 
 // Scans every found segment into the indexes of the catalog.
 future<> segment_manager_impl::recovery::index_found_segments() {
-    auto rebuilt = co_await _sm.rebuild_index(_summary.found_segments, _sm.make_index_resolver(_catalog, _stats));
+    auto rebuilt = co_await _sm.rebuild_index(_summary.found_segments, _sm.make_index_resolver(_stats));
     _segment_infos = std::move(rebuilt.segment_infos);
     for (uint64_t seg_idx = 0; seg_idx < _summary.found_segments; ++seg_idx) {
         const auto& info = _segment_infos[seg_idx];
@@ -2197,12 +2192,9 @@ future<> segment_manager_impl::recovery::place_found_segments() {
             on_internal_error(logstor_logger, format("Recovered segment {} holds records but has no segment info", seg_id));
         }
         logstor_logger.trace("Recovering used segment {}", seg_id);
-        if (_sm.place_recovered_segment(_catalog, seg_id, *info, _stats) == needs_separation::yes) {
-            _sm._recovered.to_separate.push_back(seg_id);
+        if (_sm.place_recovered_segment(seg_id, *info, _stats) == needs_separation::yes) {
+            _sm._segments_to_separate.push_back(seg_id);
         }
-    }
-    if (!_sm._recovered.to_separate.empty()) {
-        _sm._recovered.catalog = &_catalog;
     }
     logstor_logger.info("Found {} used segments and {} free segments", _summary.used_segments, _summary.free_segments);
 }
@@ -2219,17 +2211,17 @@ void segment_manager_impl::recovery::resume_segment_sequence() {
     _summary.next_segment_seq = _sm._next_segment_seq;
 }
 
-future<recovery_summary> segment_manager_impl::do_recovery(table_catalog& catalog) {
+future<recovery_summary> segment_manager_impl::do_recovery() {
     check_lifecycle(lifecycle::created, "do_recovery()");
-    recovery r(*this, catalog);
+    recovery r(*this);
     auto summary = co_await r.run();
     _lifecycle = lifecycle::recovered;
     co_return summary;
 }
 
-segment_manager_impl::index_resolver segment_manager_impl::make_index_resolver(table_catalog& catalog, recovery_stats& stats) {
-    return [&catalog, &stats] (const record_header& header) -> primary_index* {
-        auto [index, cg] = catalog.find(header.table, header.key.token());
+segment_manager_impl::index_resolver segment_manager_impl::make_index_resolver(recovery_stats& stats) {
+    return [this, &stats] (const record_header& header) -> primary_index* {
+        auto [index, cg] = _catalog.find(header.table, header.key.token());
         if (!index) {
             return nullptr;
         }
@@ -2324,14 +2316,14 @@ void segment_manager::on_move_record(record_location from, record_location to) n
     get_impl().on_move_record(from, to);
 }
 
-segment_manager_impl::needs_separation segment_manager_impl::place_recovered_segment(table_catalog& catalog, log_segment_id seg_id, const segment_info& info, recovery_stats& stats) {
+segment_manager_impl::needs_separation segment_manager_impl::place_recovered_segment(log_segment_id seg_id, const segment_info& info, recovery_stats& stats) {
     return std::visit(overloaded_functor{
         [&] (const segment_info::mixed&) {
             logstor_logger.debug("Recovering mixed segment {} using separator", seg_id);
             return needs_separation::yes;
         },
         [&] (const segment_info::full& full) {
-            auto [index, cg] = catalog.find(full.table, full.first_token, full.last_token);
+            auto [index, cg] = _catalog.find(full.table, full.first_token, full.last_token);
             if (!index) {
                 // The table is gone, and its records with it.
                 return needs_separation::no;
@@ -2339,7 +2331,7 @@ segment_manager_impl::needs_separation segment_manager_impl::place_recovered_seg
             if (cg) {
                 cg->add_logstor_segment(get_segment_descriptor(seg_id));
                 logstor_logger.debug("Added segment {} with tokens [{},{}] to compaction group of table {}", seg_id, full.first_token, full.last_token,
-                        seastar::value_of([&] { return catalog.table_name(full.table); }));
+                        seastar::value_of([&] { return _catalog.table_name(full.table); }));
                 return needs_separation::no;
             }
             // The range of the segment is in two tablets of this shard, or part of the range
@@ -2353,42 +2345,42 @@ segment_manager_impl::needs_separation segment_manager_impl::place_recovered_seg
             // like the records of a mixed segment.
             ++stats.separated_segments;
             logstor_logger.warn("Segment {} with tokens [{},{}] of table {} fits no compaction group of this shard, separating its records",
-                    seg_id, full.first_token, full.last_token, catalog.table_name(full.table));
+                    seg_id, full.first_token, full.last_token, _catalog.table_name(full.table));
             return needs_separation::yes;
         },
     }, info.v);
 }
 
 future<> segment_manager_impl::separate_recovered_segments() {
-    auto recovered = std::exchange(_recovered, {});
-    if (recovered.to_separate.empty()) {
+    auto segments = std::exchange(_segments_to_separate, {});
+    if (segments.empty()) {
         co_return;
     }
-    logstor_logger.info("Separating the records of {} recovered segments", recovered.to_separate.size());
+    logstor_logger.info("Separating the records of {} recovered segments", segments.size());
     // If a separation throws, start() fails, and the segments that are not separated stay on disk.
     // Nothing frees them, because no group owns them and the failed separation kept its segment.
     // The index still points into them, so no record is lost, and the next recovery lists them
     // again.
     recovery_stats stats;
-    for (auto seg_id : recovered.to_separate) {
-        co_await separate_segment_records(*recovered.catalog, seg_id, stats);
+    for (auto seg_id : segments) {
+        co_await separate_segment_records(seg_id, stats);
     }
     if (stats.dropped_records) {
         logstor_logger.warn("Dropped {} records of recovered segments that belong to no compaction group of this shard", stats.dropped_records);
     }
-    logstor_logger.info("Separated the records of {} recovered segments", recovered.to_separate.size());
+    logstor_logger.info("Separated the records of {} recovered segments", segments.size());
 }
 
-future<> segment_manager_impl::separate_segment_records(table_catalog& catalog, log_segment_id seg_id, recovery_stats& stats) {
+future<> segment_manager_impl::separate_segment_records(log_segment_id seg_id, recovery_stats& stats) {
     segment_keep_guard keep_guard(make_segment_ref(seg_id));
-    co_await for_each_record(seg_id, [seg_ref = keep_guard.ref(), &catalog, &stats] (const chunk_record& record) {
+    co_await for_each_record(seg_id, [this, seg_ref = keep_guard.ref(), &stats] (const chunk_record& record) {
         const auto& header = record.header;
         auto key = header.index_key();
-        auto* index = catalog.index(header.table);
+        auto* index = _catalog.index(header.table);
         if (!index || !index->is_record_live(key, record.location)) {
             return make_ready_future<>();
         }
-        auto* cg = catalog.find(header.table, key.token()).group;
+        auto* cg = _catalog.find(header.table, key.token()).group;
         if (!cg) {
             // The scan indexed the record, so a group of this shard owned the token at
             // that time, but no group owns the token now. The separation drops the record
@@ -2438,8 +2430,8 @@ future<utils::chunked_vector<segment_snapshot>> segment_manager_impl::make_snaps
 
 // segment_manager wrapper
 
-segment_manager::segment_manager(segment_manager_config config)
-    : _impl(std::make_unique<segment_manager_impl>(std::move(config)))
+segment_manager::segment_manager(segment_manager_config config, table_catalog& catalog)
+    : _impl(std::make_unique<segment_manager_impl>(std::move(config), catalog))
 { }
 
 segment_manager::~segment_manager() = default;
@@ -2452,8 +2444,8 @@ const segment_manager_impl& segment_manager::get_impl() const noexcept {
     return *_impl;
 }
 
-future<recovery_summary> segment_manager::do_recovery(table_catalog& catalog) {
-    return _impl->do_recovery(catalog);
+future<recovery_summary> segment_manager::do_recovery() {
+    return _impl->do_recovery();
 }
 
 future<> segment_manager::rebuild_index_from_disk(index_resolver resolve) {
@@ -2589,11 +2581,10 @@ future<seastar::input_stream<char>> segment_manager_impl::create_segment_input_s
 
 class segment_stream_sink_impl : public segment_stream_sink {
     segment_manager_impl& _sm;
-    table_catalog& _catalog;
     seg_ptr _seg;
 public:
-    segment_stream_sink_impl(segment_manager_impl& sm, table_catalog& catalog, seg_ptr seg)
-        : _sm(sm), _catalog(catalog), _seg(std::move(seg))
+    segment_stream_sink_impl(segment_manager_impl& sm, seg_ptr seg)
+        : _sm(sm), _seg(std::move(seg))
     {}
 public:
     log_segment_id segment_id() const noexcept override {
@@ -2606,40 +2597,40 @@ public:
     }
     future<> close() override {
         co_await _seg->stop();
-        co_await _sm.adopt_streamed_segment(_catalog, _seg->id());
+        co_await _sm.adopt_streamed_segment(_seg->id());
     }
     future<> abort() override {
         co_await _seg->stop();
     }
 };
 
-future<> segment_manager_impl::adopt_streamed_segment(table_catalog& catalog, log_segment_id seg_id) {
+future<> segment_manager_impl::adopt_streamed_segment(log_segment_id seg_id) {
     recovery_stats stats;
     const auto info = co_await read_segment_info(seg_id);
     if (!info) {
         // The segment has no valid chunk, so it holds no record.
         co_return;
     }
-    co_await index_segment_records(seg_id, primary_index::default_entry_cmp{}, make_index_resolver(catalog, stats));
-    if (place_recovered_segment(catalog, seg_id, *info, stats) == needs_separation::yes) {
-        co_await separate_segment_records(catalog, seg_id, stats);
+    co_await index_segment_records(seg_id, primary_index::default_entry_cmp{}, make_index_resolver(stats));
+    if (place_recovered_segment(seg_id, *info, stats) == needs_separation::yes) {
+        co_await separate_segment_records(seg_id, stats);
     }
     if (stats.dropped_records) {
         logstor_logger.warn("Dropped {} records of streamed segment {} that belong to no compaction group of this shard", stats.dropped_records, seg_id);
     }
 }
 
-future<std::unique_ptr<segment_stream_sink>> segment_manager_impl::create_segment_output_stream(table_catalog& catalog) {
+future<std::unique_ptr<segment_stream_sink>> segment_manager_impl::create_segment_output_stream() {
     auto seg = co_await get_segment(write_source::streaming);
-    co_return std::make_unique<segment_stream_sink_impl>(*this, catalog, std::move(seg));
+    co_return std::make_unique<segment_stream_sink_impl>(*this, std::move(seg));
 }
 
 future<utils::chunked_vector<segment_snapshot>> segment_manager::make_snapshot(logstor_group& cg) {
     return _impl->make_snapshot(cg);
 }
 
-future<std::unique_ptr<segment_stream_sink>> segment_manager::create_segment_output_stream(table_catalog& catalog) {
-    return _impl->create_segment_output_stream(catalog);
+future<std::unique_ptr<segment_stream_sink>> segment_manager::create_segment_output_stream() {
+    return _impl->create_segment_output_stream();
 }
 
 separator_buffer::~separator_buffer() {

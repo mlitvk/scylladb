@@ -65,13 +65,14 @@ class logstor {
 
 public:
 
-    logstor(logstor_config, ::cache_tracker& shared_cache_tracker);
+    // The catalog must live until stop() returns.
+    logstor(logstor_config, ::cache_tracker& shared_cache_tracker, table_catalog& catalog);
 
     logstor(const logstor&) = delete;
     logstor& operator=(const logstor&) = delete;
 
-    // Call it once, before start(). The catalog must live until start() returns.
-    future<recovery_summary> do_recovery(table_catalog&);
+    // Call it once, before start().
+    future<recovery_summary> do_recovery();
 
     // Starts the store. Call it once, after do_recovery() succeeded.
     future<> start();

@@ -55,8 +55,8 @@ primary_index_key::primary_index_key(const dht::decorated_key& dk)
     : primary_index_key(dht::raw_token(dk.token()), compute_key_hash(dk.key())) {
 }
 
-logstor::logstor(logstor_config config, ::cache_tracker& shared_cache_tracker)
-    : _segment_manager(config.segment_manager_cfg)
+logstor::logstor(logstor_config config, ::cache_tracker& shared_cache_tracker, table_catalog& catalog)
+    : _segment_manager(config.segment_manager_cfg, catalog)
     , _write_buffer(buffered_writer_config{
             .buffer_size = _segment_manager.get_segment_size(),
             .ring_size = config.write_buffer_ring_size,
@@ -78,8 +78,8 @@ logstor::logstor(logstor_config config, ::cache_tracker& shared_cache_tracker)
     });
 }
 
-future<recovery_summary> logstor::do_recovery(table_catalog& catalog) {
-    return _segment_manager.do_recovery(catalog);
+future<recovery_summary> logstor::do_recovery() {
+    return _segment_manager.do_recovery();
 }
 
 future<> logstor::start() {
