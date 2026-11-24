@@ -1865,11 +1865,12 @@ struct compaction_buffer {
     // Rewrite a single live record into this buffer, updating the index atomically.
     // Returns immediately after queuing the write; caller must co_await close()/flush()
     // to ensure all pending updates complete.
-    future<> rewrite_record(primary_index& index, record_location read_location, const record_header& header, log_record_bytes_view record_view) {
+    future<> rewrite_record(primary_index& index, const chunk_record& record) {
         auto* index_ptr = &index;
-        auto key = header.index_key();
+        auto key = record.header.index_key();
+        auto read_location = record.location;
 
-        auto writer = log_record_bytes_writer(header, record_view);
+        auto writer = log_record_bytes_writer(record.header, record.bytes, record.format_version);
 
         if (!buf->can_fit(writer)) {
             co_await flush();
@@ -1947,7 +1948,7 @@ future<> compaction_manager_impl::do_compaction(logstor_group& cg, compaction_ba
                     cb.stats.records_skipped++;
                     return make_ready_future<>();
                 }
-                return cb.rewrite_record(index, record.location, record.header, record.bytes);
+                return cb.rewrite_record(index, record);
             });
             co_await cb.flush();
             co_return cb.stats;
@@ -2057,7 +2058,7 @@ future<> compaction_manager_impl::do_split_compaction(logstor_group& src, mutati
                     return make_ready_future<>();
                 }
                 auto& cb = bufs.bufs[classifier(record.header.key.token())];
-                return cb.rewrite_record(index, record.location, record.header, record.bytes);
+                return cb.rewrite_record(index, record);
             });
             co_await coroutine::parallel_for_each(bufs.bufs, &compaction_buffer::flush);
             co_return bufs.bufs[0].stats + bufs.bufs[1].stats;
@@ -2485,7 +2486,7 @@ future<> segment_manager_impl::separate_segment_records(log_segment_id seg_id, r
             index->erase(key, record.location);
             return make_ready_future<>();
         }
-        auto writer = log_record_bytes_writer(header, record.bytes);
+        auto writer = log_record_bytes_writer(header, record.bytes, record.format_version);
 
         return cg->write_to_separator(std::move(writer), seg_ref, std::nullopt,
             separator_index_update {

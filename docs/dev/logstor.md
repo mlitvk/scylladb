@@ -302,7 +302,11 @@ A record frame holds one record and has these parts, in this order:
 
 The value of a record is encoded and decoded by `encode_record_value()` and `decode_record_value()`
 in [replica/logstor/record_value.hh](../../replica/logstor/record_value.hh). All other code copies
-the value as bytes, for example compaction, the separator and tablet streaming.
+the value as bytes, for example compaction, the separator and tablet streaming. These copies go
+through `log_record_bytes_writer`, which takes the format version of the chunk that holds the record,
+and the copy goes to a chunk of the current version. A tablet stream also copies the records of the
+sender into chunks of the version of the receiver. So a release that reads an older format version
+with another record encoding must convert such a record in that writer.
 
 For each record, the index holds a `record_location`, which points at the start of the record frame
 and gives the frame size, so one read at that location returns the whole record. The position of a

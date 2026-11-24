@@ -64,7 +64,7 @@ future<> record_stream_source::collect_live_records(log_segment_id segment_id) {
                 continue;
             }
             // The records of a segment fit a chunk of the segment size.
-            auto writer = log_record_bytes_writer(record.header, record.bytes);
+            auto writer = log_record_bytes_writer(record.header, record.bytes, record.format_version);
             if (!_buffer.can_fit(writer)) {
                 on_internal_error(logstor_logger, fmt::format("The live records of {} do not fit a chunk of {} bytes",
                         segment_id, _buffer.buffer_size()));
@@ -265,7 +265,7 @@ future<> record_stream_sink::write_record(const chunk_record& record) {
     if (header.table != _table) {
         throw record_stream_error(fmt::format("Record stream of table {} has a record of table {}", _table, header.table));
     }
-    auto writer = log_record_bytes_writer(header, record.bytes);
+    auto writer = log_record_bytes_writer(header, record.bytes, record.format_version);
     // The buffers of a sink have the same size.
     const auto max_record_size = _buffers[0].buffer->max_record_size();
     if (writer.record_size() > max_record_size) {

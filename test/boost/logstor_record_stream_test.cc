@@ -408,12 +408,14 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_parse_chunk_gives_the_records_of_a_chunk) 
     BOOST_REQUIRE(chunk);
     BOOST_REQUIRE(chunk->info().kind() == segment_kind::full);
     BOOST_REQUIRE_EQUAL(std::get<segment_info::full>(chunk->info().v).table, schema->id());
+    BOOST_REQUIRE_EQUAL(chunk->format_version(), ondisk::current_version);
     size_t i = 0;
     for (const auto& record : chunk->records()) {
         BOOST_REQUIRE_LT(i, records.size());
         BOOST_REQUIRE(record.header.index_key() == index_key_of(schema, records[i]));
         BOOST_REQUIRE_EQUAL(record.header.timestamp, records[i].timestamp);
         BOOST_REQUIRE_EQUAL(record.header.table, schema->id());
+        BOOST_REQUIRE_EQUAL(record.format_version, ondisk::current_version);
         ++i;
     }
     BOOST_REQUIRE_EQUAL(i, records.size());

@@ -68,8 +68,9 @@ public:
     void write_frame(ostream& out) const;
 };
 
-// Writer for log records that stores pre-serialized bytes.
-// Used in compaction and separator rewriting to avoid deserialization.
+// Writer for a record that a chunk holds. It copies the serialized record header and record value,
+// so that the copy does not decode the record. Compaction, the separator and the record stream
+// copy records with it into chunks of the current format version.
 class log_record_bytes_writer {
     using ostream = seastar::simple_memory_output_stream;
 
@@ -78,11 +79,19 @@ class log_record_bytes_writer {
     bytes_view _value_bytes;
 
 public:
-    log_record_bytes_writer(record_header header, log_record_bytes_view record_view)
+    // `format_version` is the format version of the chunk that holds the record.
+    // The writer is the one place where a record of an older format version can change to the
+    // current encoding. This release reads only the current version, so the writer copies the bytes
+    // as they are.
+    log_record_bytes_writer(record_header header, log_record_bytes_view record_view, uint8_t format_version)
         : _header(std::move(header))
         , _header_bytes(record_view.header)
         , _value_bytes(record_view.value)
-    {}
+    {
+        static_assert(ondisk::min_read_version == ondisk::current_version,
+                "A release that reads more than one format version must convert here a record of an older version, or show that "
+                "its encoding did not change");
+    }
 
     const record_header& header() const { return _header; }
 

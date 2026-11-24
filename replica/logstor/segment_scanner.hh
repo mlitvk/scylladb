@@ -74,6 +74,8 @@ private:
 // A record of a chunk. The views point into the chunk body.
 struct chunk_record : ondisk::parsed_record_frame {
     record_location location;
+    // The format version of the chunk, which sets the encoding of the record bytes.
+    uint8_t format_version;
 
     log_record to_log_record() const {
         return log_record{header, record_value(bytes.value)};
@@ -126,6 +128,7 @@ private:
 class scanned_chunk {
 public:
     const segment_info& info() const noexcept { return _info; }
+    uint8_t format_version() const noexcept { return _format_version; }
     // False if the body does not match its body CRC or is cut short. Such a chunk has no records:
     // a torn chunk can hold records of an earlier use of the segment that parse cleanly.
     bool body_valid() const noexcept { return _body_valid; }
@@ -134,6 +137,7 @@ public:
 private:
     log_segment_id _segment_id;
     segment_info _info;
+    uint8_t _format_version;
     temporary_buffer<char> _body;
     // Holds the offset of the body in the segment, or in the stream chunk that parse_chunk() read.
     // The record locations are offsets from the same start.
@@ -149,9 +153,11 @@ private:
         return _body_valid ? std::span<const char>(_body.get(), _body.size()) : std::span<const char>();
     }
 
-    scanned_chunk(log_segment_id segment_id, segment_info info, temporary_buffer<char> body, size_t body_position, bool body_valid)
+    scanned_chunk(log_segment_id segment_id, segment_info info, uint8_t format_version, temporary_buffer<char> body, size_t body_position,
+            bool body_valid)
         : _segment_id(segment_id)
         , _info(std::move(info))
+        , _format_version(format_version)
         , _body(std::move(body))
         , _body_position(body_position)
         , _body_valid(body_valid)

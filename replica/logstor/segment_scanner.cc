@@ -24,6 +24,13 @@ extern seastar::logger logstor_logger;
 
 namespace {
 
+// A chunk header as read_chunk_header() reads it. The in-memory header does not hold the format
+// version, because write_chunk_header() always writes the current version.
+struct versioned_chunk_header {
+    ondisk::chunk_header header;
+    uint8_t format_version;
+};
+
 // Returns nullopt if the stream ends before the header, if no chunk starts at the position, if the
 // chunk is from an earlier use of the segment (its segment_seq is not `expected_seq`), or if the
 // header is invalid.
@@ -42,7 +49,7 @@ namespace {
 //
 // The function checks the flags after the CRC, which covers them, so that a flag that a bit flip
 // set ends the scan as other corruption does.
-future<std::optional<ondisk::chunk_header>> read_chunk_header(segment_reader& reader, log_segment_id segment_id,
+future<std::optional<versioned_chunk_header>> read_chunk_header(segment_reader& reader, log_segment_id segment_id,
         std::optional<segment_sequence> expected_seq) {
     const auto position = reader.position();
     auto common = co_await reader.read<ondisk::chunk_header_common>();
@@ -70,7 +77,7 @@ future<std::optional<ondisk::chunk_header>> read_chunk_header(segment_reader& re
         throw std::runtime_error(fmt::format("Chunk at offset {} of {} has flags {:#x} that this release does not define",
                 position, segment_id, unknown));
     }
-    co_return ch;
+    co_return versioned_chunk_header{std::move(*ch), common->version};
 }
 
 // The body of a chunk, and whether it matches the body CRC of the chunk header.
@@ -132,6 +139,7 @@ void chunk_records::iterator::read_next() {
             .offset = static_cast<uint32_t>(record_offset),
             .size = static_cast<uint32_t>(frame_size),
         },
+        _chunk->_format_version,
     };
 
     // The next record frame starts at a multiple of record_alignment.
@@ -146,9 +154,10 @@ future<std::optional<scanned_chunk>> parse_chunk(temporary_buffer<char> chunk) {
     std::optional<scanned_chunk> result;
     if (auto header = co_await read_chunk_header(reader, log_segment_id{}, std::nullopt)) {
         const size_t body_position = reader.position();
-        auto body = co_await read_chunk_body(reader, *header);
+        auto body = co_await read_chunk_body(reader, header->header);
         if (body && body->valid && reader.position() == chunk_size) {
-            result.emplace(scanned_chunk(log_segment_id{}, header->segment, std::move(body->buf), body_position, true));
+            result.emplace(scanned_chunk(log_segment_id{}, header->header.segment, header->format_version, std::move(body->buf),
+                    body_position, true));
         }
     }
     co_await in.close();
@@ -191,7 +200,8 @@ future<std::optional<scanned_chunk>> segment_scanner::read_chunk() {
     if (!header) {
         co_return std::nullopt;
     }
-    const auto& ch = *header;
+    const auto& ch = header->header;
+    const auto format_version = header->format_version;
     _segment_seq = ch.segment.segment_seq;
 
     // A chunk whose body is cut short still gives its segment info. Recovery takes the highest
@@ -215,14 +225,14 @@ future<std::optional<scanned_chunk>> segment_scanner::read_chunk() {
                 "The segment is corrupt; the records of the chunk are lost.", _segment_id, ch.records_size, body_position);
         _state = scan_state::last;
         _last_chunk_failed = false;
-        co_return scanned_chunk(_segment_id, std::move(seg_info), {}, body_position, false);
+        co_return scanned_chunk(_segment_id, std::move(seg_info), format_version, {}, body_position, false);
     }
     auto body = co_await read_chunk_body(_reader, ch);
     if (!body) {
         _state = scan_state::last;
         _last_chunk_failed = true;
         ++_failed_chunks;
-        co_return scanned_chunk(_segment_id, std::move(seg_info), {}, body_position, false);
+        co_return scanned_chunk(_segment_id, std::move(seg_info), format_version, {}, body_position, false);
     }
 
     if (body->valid) {
@@ -234,7 +244,7 @@ future<std::optional<scanned_chunk>> segment_scanner::read_chunk() {
         _last_chunk_failed = true;
         ++_failed_chunks;
     }
-    co_return scanned_chunk(_segment_id, std::move(seg_info), std::move(body->buf), body_position, body->valid);
+    co_return scanned_chunk(_segment_id, std::move(seg_info), format_version, std::move(body->buf), body_position, body->valid);
 }
 
 void segment_scanner::report_failed_chunks() const {
@@ -252,7 +262,7 @@ void segment_scanner::report_failed_chunks() const {
 future<std::optional<segment_info>> read_chunk_info(seastar::input_stream<char>& in, log_segment_id segment_id) {
     segment_reader reader(in);
     auto header = co_await read_chunk_header(reader, segment_id, std::nullopt);
-    co_return header.transform(&ondisk::chunk_header::segment);
+    co_return header.transform([] (versioned_chunk_header& h) { return std::move(h.header.segment); });
 }
 
 }
