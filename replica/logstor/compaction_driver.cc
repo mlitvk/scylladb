@@ -127,8 +127,10 @@ void compaction_driver::tick_rate_controller() noexcept {
         .utilization = shard.utilization,
     });
 
-    // A driver that found nothing to compact wakes up when the inputs of the selection differ from
-    // the inputs of the ranking that found nothing.
+    wake_if_inputs_changed(shard);
+}
+
+void compaction_driver::wake_if_inputs_changed(const shard_sample& shard) noexcept {
     if (_wait == wait_reason::candidates && (!_empty_ranking_start || make_ranking_inputs(shard) != _empty_ranking_start->inputs)) {
         _work_wanted.signal();
     }
@@ -148,6 +150,12 @@ void compaction_driver::notify_group_idle() noexcept {
     if (_wait == wait_reason::candidates) {
         _work_wanted.signal();
     }
+}
+
+void compaction_driver::notify_segment_wait() noexcept {
+    // The writes cannot continue until compaction frees a segment, so a change after the ranking
+    // that found nothing wakes the driver now, and not at the next tick.
+    wake_if_inputs_changed(_host.sample());
 }
 
 future<bool> compaction_driver::wait_for_work(wait_reason reason, std::chrono::milliseconds timeout) {
