@@ -362,6 +362,43 @@ record_stream_source::chunk_reader memory_chunk_reader(temporary_buffer<char> se
     };
 }
 
+// A segment of `size` bytes that holds one chunk of the records, of `kind` and of `table`.
+temporary_buffer<char> make_segment(schema_ptr schema, std::span<const test_record> records, size_t size, segment_kind kind, table_id table) {
+    raw_write_buffer buf(size, kind);
+    for (const auto& r : records) {
+        buf.append(log_record_writer(make_log_record(schema, r, table)));
+    }
+    buf.seal(segment_sequence{1}, table, ondisk::block_alignment);
+    return temporary_buffer<char>(reinterpret_cast<const char*>(buf.chunk().data()), buf.chunk().size());
+}
+
+// A source of the table that reads one segment in memory, as segment 0.
+record_stream_source make_memory_source(schema_ptr schema, const primary_index& index, temporary_buffer<char> segment,
+        record_stream_stats& stats) {
+    utils::chunked_vector<log_segment_id> segments;
+    segments.push_back(log_segment_id{0});
+    return record_stream_source(schema->id(), index, compaction_reenabler(), compaction_reenabler(), std::move(segments),
+            memory_chunk_reader(std::move(segment)), stats);
+}
+
+// A space accounting that ignores the records, for an index that is not in a group.
+struct no_space_accounting final : public space_accounting_subscriber {
+    void on_add_record(record_location) noexcept override {}
+    void on_free_record(record_location) noexcept override {}
+    void on_move_record(record_location, record_location) noexcept override {}
+};
+
+// Adds each record of the segment to the index, as a record of segment 0, so that the records are
+// live.
+void index_records(primary_index& index, const temporary_buffer<char>& segment) {
+    memory_chunk_reader(copy_of(segment))(log_segment_id{0}, [&index] (const scanned_chunk& chunk) {
+        for (const auto& record : chunk.records()) {
+            index.insert(record.header.index_key(), index_entry{.location = record.location, .timestamp = record.header.timestamp});
+        }
+        return make_ready_future<>();
+    }).get();
+}
+
 // A group with one segment that holds records of both sides of a split at token 0, the two groups
 // of the split, and a record stream source of the group, which disables compaction of the group.
 struct split_during_stream {
@@ -1054,8 +1091,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_sink_waits_for_the_buffers_of_anoth
     second->close().get();
 }
 
-// The source sends only the live records of the group, one chunk for each segment that holds live
-// records, and the stream stats count each record that it sends.
+// The source sends only the live records of the group, and packs the live records of several
+// segments into one chunk. The stream stats count each record that the source sends.
 SEASTAR_THREAD_TEST_CASE(test_logstor_record_source_sends_only_live_records) {
     auto schema = make_schema();
     logstor_env env;
@@ -1075,7 +1112,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_source_sends_only_live_records) {
     const auto chunks = read_all(*source);
 
     const auto live = timestamps_of({std::span(first).subspan(10), second, overwritten});
-    BOOST_REQUIRE_EQUAL(chunks.size(), 3);
+    BOOST_REQUIRE_EQUAL(chunks.size(), 1);
     BOOST_REQUIRE(timestamps_in(chunks) == live);
     BOOST_REQUIRE_EQUAL(segment_manager_metric("stream_records_sent"), live.size());
 }
@@ -1250,37 +1287,65 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_source_fails_on_a_segment_that_is_n
 
     record_stream_stats stats;
     auto make_source = [&] (temporary_buffer<char> segment) {
-        utils::chunked_vector<log_segment_id> segments;
-        segments.push_back(log_segment_id{0});
-        return record_stream_source(schema->id(), group.logstor_index(), compaction_reenabler(), compaction_reenabler(),
-                std::move(segments), segment_size, memory_chunk_reader(std::move(segment)), stats);
-    };
-    auto make_segment = [&] (segment_kind kind, table_id table) {
-        raw_write_buffer buf(segment_size, kind);
-        for (const auto& r : records) {
-            buf.append(log_record_writer(make_log_record(schema, r, table)));
-        }
-        buf.seal(segment_sequence{1}, table, ondisk::block_alignment);
-        return temporary_buffer<char>(reinterpret_cast<const char*>(buf.chunk().data()), buf.chunk().size());
+        return make_memory_source(schema, group.logstor_index(), std::move(segment), stats);
     };
 
     temporary_buffer<char> empty(ondisk::block_alignment);
     std::fill_n(empty.get_write(), empty.size(), 0);
     BOOST_REQUIRE_THROW(make_source(std::move(empty)).get().get(), record_stream_error);
 
-    BOOST_REQUIRE_THROW(make_source(make_segment(segment_kind::mixed, schema->id())).get().get(), record_stream_error);
-
-    BOOST_REQUIRE_THROW(make_source(make_segment(segment_kind::full, table_id(utils::UUID_gen::get_time_UUID()))).get().get(),
+    BOOST_REQUIRE_THROW(make_source(make_segment(schema, records, segment_size, segment_kind::mixed, schema->id())).get().get(),
             record_stream_error);
 
-    auto corrupt = make_segment(segment_kind::full, schema->id());
+    const auto other_table = table_id(utils::UUID_gen::get_time_UUID());
+    BOOST_REQUIRE_THROW(make_source(make_segment(schema, records, segment_size, segment_kind::full, other_table)).get().get(),
+            record_stream_error);
+
+    auto corrupt = make_segment(schema, records, segment_size, segment_kind::full, schema->id());
     flip_byte(corrupt, ondisk::chunk_header_size(segment_kind::full) + 10);
     BOOST_REQUIRE_THROW(make_source(std::move(corrupt)).get().get(), record_stream_error);
 
-    auto bad_frame = make_segment(segment_kind::full, schema->id());
+    auto bad_frame = make_segment(schema, records, segment_size, segment_kind::full, schema->id());
     break_record_frame(bad_frame, second_frame_offset(schema, records[0]));
     BOOST_REQUIRE_EXCEPTION(make_source(std::move(bad_frame)).get().get(), std::runtime_error,
             exception_predicate::message_contains("not a valid record frame"));
+}
+
+// A segment of the sender that is larger than a stream chunk gives more than one chunk, and no
+// chunk is larger than max_stream_chunk_size.
+SEASTAR_THREAD_TEST_CASE(test_logstor_record_source_splits_a_segment_that_is_larger_than_a_chunk) {
+    auto schema = make_schema();
+    const auto records = make_records(100, 2000);
+    const auto segment = make_segment(schema, records, 2 * max_stream_chunk_size, segment_kind::full, schema->id());
+    no_space_accounting accounting;
+    primary_index index(accounting, nullptr, false);
+    index_records(index, segment);
+
+    record_stream_stats stats;
+    auto source = make_memory_source(schema, index, copy_of(segment), stats);
+    const auto chunks = read_all(source);
+
+    BOOST_REQUIRE_GT(chunks.size(), 1);
+    for (const auto& chunk : chunks) {
+        BOOST_REQUIRE_LE(chunk.size(), max_stream_chunk_size);
+    }
+    BOOST_REQUIRE(timestamps_in(chunks) == timestamps_of({records}));
+    BOOST_REQUIRE_EQUAL(stats.records_sent, records.size());
+}
+
+// A record of a segment that is larger than a stream chunk can be too large for the stream, and the
+// source fails the stream.
+SEASTAR_THREAD_TEST_CASE(test_logstor_record_source_fails_on_a_record_that_does_not_fit_a_chunk) {
+    auto schema = make_schema();
+    const auto records = make_records(1, max_stream_chunk_size + 1000);
+    const auto segment = make_segment(schema, records, 2 * max_stream_chunk_size, segment_kind::full, schema->id());
+    no_space_accounting accounting;
+    primary_index index(accounting, nullptr, false);
+    index_records(index, segment);
+
+    record_stream_stats stats;
+    auto source = make_memory_source(schema, index, copy_of(segment), stats);
+    BOOST_REQUIRE_THROW(source.get().get(), record_stream_error);
 }
 
 // A source and a sink move the live records of a group whose segments are half dead into fewer

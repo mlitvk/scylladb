@@ -31,9 +31,11 @@ namespace replica::logstor {
 
 class table_catalog;
 
-// A chunk of a stream is at most this long, because it holds the records of one segment of the
-// sender, and no segment is larger than this.
-inline constexpr size_t max_stream_chunk_size = segment_descriptor_hist_options.max_size;
+// A chunk of a stream is at most this long. The limit is part of the stream protocol and does not
+// follow the segment size of the sender or of the receiver, so that nodes with other segment sizes
+// can stream to each other. The limit is the default segment size, so a record that a full segment
+// of that size holds fits a stream chunk.
+inline constexpr size_t max_stream_chunk_size = 128 * 1024;
 
 // The sink and the source throw this error when a record stream is not valid, for example when a
 // chunk does not parse, a record is not of the table of the stream, the stream ends inside a chunk,
@@ -54,9 +56,10 @@ struct record_stream_stats {
     uint64_t records_superseded{0};
 };
 
-// The sender of a record stream. It gives one chunk for each segment in its list that has live
-// records, and then an empty buffer. A record is live if the index points at it when the source
-// reads its segment.
+// The sender of a record stream. It packs the live records of the segments in its list into chunks
+// of at most max_stream_chunk_size, and then gives an empty buffer. A record is live if the index
+// points at it when the source reads its segment.
+// A record that does not fit a stream chunk fails the stream.
 //
 // The source owns a guard that keeps compaction of the group disabled for its life, so the
 // segments in the list stay in the group and their records do not move.
@@ -77,8 +80,8 @@ public:
     using chunk_reader = noncopyable_function<future<>(log_segment_id, noncopyable_function<future<>(const scanned_chunk&)>)>;
 
     record_stream_source(table_id table, const primary_index& index, compaction_reenabler compaction_guard,
-            compaction_reenabler merge_target_guard, utils::chunked_vector<log_segment_id> segments, size_t segment_size,
-            chunk_reader read_chunks, record_stream_stats& stats);
+            compaction_reenabler merge_target_guard, utils::chunked_vector<log_segment_id> segments, chunk_reader read_chunks,
+            record_stream_stats& stats);
 
     future<temporary_buffer<char>> get() override;
 
@@ -91,10 +94,15 @@ private:
     size_t _next_segment = 0;
     chunk_reader _read_chunks;
     record_stream_stats& _stats;
+    // Holds the chunk that takes the next live record.
     raw_write_buffer _buffer;
+    // Holds the sealed chunks that get() did not give yet. The live records of one segment can
+    // fill more than one chunk.
+    std::deque<temporary_buffer<char>> _chunks;
 
     future<> collect_live_records(log_segment_id segment_id);
-    temporary_buffer<char> take_chunk();
+    void add_record(log_segment_id segment_id, const chunk_record& record);
+    void seal_chunk();
 };
 
 // Cuts the bytes of a stream into chunks. The bytes arrive in buffers of any size, so a chunk can

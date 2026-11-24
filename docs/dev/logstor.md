@@ -184,10 +184,10 @@ about the live record bytes of the tablet whatever the dead records in its segme
 The node that sends the tablet flushes the separator, so that the segments of the compaction groups
 of the tablet hold every write that completed, and makes a record stream source for each group that
 has live records (`table::make_logstor_record_sources()`). A source reads the segments of its group
-and sends, for each segment, a chunk of the records that the index still points at. It keeps
-compaction of the group disabled until its stream ends, so the segments it reads stay in the group
-and their records do not move. A write that comes during the stream goes to a segment that the
-source does not read, and the write-both stage of the migration sends it to the new replica. A split
+and sends the records that the index still points at, packed into stream chunks. It keeps compaction
+of the group disabled until its stream ends, so the segments that it reads stay in the group and
+their records do not move. A write that comes during the stream goes to a segment that the source
+does not read, and the write-both stage of the migration sends it to the new replica. A split
 compaction of the group waits until the stream ends, because the table can prepare a split of the
 tablet while the tablet streams.
 
@@ -201,7 +201,11 @@ not send yet.
 Each chunk of the stream is a chunk of a full segment, as in [Chunks](#chunks), sealed at
 `record_alignment` rather than `block_alignment`, so it has no padding to a block. The chunk header
 names the table and gives the size of the records and their CRC. The `segment_seq` of a chunk has no
-meaning on the wire. A chunk is at most 128 KiB, the largest segment size.
+meaning on the wire. A chunk is at most `max_stream_chunk_size` (128 KiB). This limit is part of the
+stream protocol and does not follow the segment size of the sender or of the receiver, so nodes with
+other segment sizes can stream to each other. The chunks do not follow the segments of the sender,
+so the live records of several segments can share a chunk, and the live records of a segment that is
+larger than a chunk fill more than one chunk. A record that does not fit a chunk fails the stream.
 
 The node that receives the tablet gives the bytes to a record stream sink on the shard of the tablet
 (`table::make_logstor_record_sink()`). The sink checks each chunk with its CRCs and packs the

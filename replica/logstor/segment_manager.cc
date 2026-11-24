@@ -2532,7 +2532,7 @@ future<std::unique_ptr<record_stream_source>> segment_manager_impl::make_record_
     }
 
     co_return std::make_unique<record_stream_source>(group.table_id(), group.logstor_index(), std::move(compaction_guard),
-            std::move(merge_target_guard), std::move(segments), _cfg.segment_size,
+            std::move(merge_target_guard), std::move(segments),
             [this] (log_segment_id segment_id, noncopyable_function<future<>(const scanned_chunk&)> fn) {
                 return read_chunks(segment_id, std::move(fn));
             },

@@ -26,8 +26,8 @@
 namespace replica::logstor {
 
 record_stream_source::record_stream_source(table_id table, const primary_index& index, compaction_reenabler compaction_guard,
-        compaction_reenabler merge_target_guard, utils::chunked_vector<log_segment_id> segments, size_t segment_size,
-        chunk_reader read_chunks, record_stream_stats& stats)
+        compaction_reenabler merge_target_guard, utils::chunked_vector<log_segment_id> segments, chunk_reader read_chunks,
+        record_stream_stats& stats)
     : _table(table)
     , _index(index)
     , _compaction_guard(std::move(compaction_guard))
@@ -35,19 +35,24 @@ record_stream_source::record_stream_source(table_id table, const primary_index& 
     , _segments(std::move(segments))
     , _read_chunks(std::move(read_chunks))
     , _stats(stats)
-    , _buffer(segment_size, segment_kind::full)
+    , _buffer(max_stream_chunk_size, segment_kind::full)
 {}
 
 future<temporary_buffer<char>> record_stream_source::get() {
     co_await utils::get_local_injector().inject("logstor_record_source_wait", utils::wait_for_message(std::chrono::minutes(5)));
-    // An empty buffer ends the stream, so a segment without live records gives no buffer.
-    while (_next_segment < _segments.size()) {
+    while (_chunks.empty() && _next_segment < _segments.size()) {
         co_await collect_live_records(_segments[_next_segment++]);
-        if (_buffer.has_data()) {
-            co_return take_chunk();
-        }
     }
-    co_return temporary_buffer<char>();
+    if (_chunks.empty() && _buffer.has_data()) {
+        seal_chunk();
+    }
+    // An empty buffer ends the stream, so the source gives only a chunk with records.
+    if (_chunks.empty()) {
+        co_return temporary_buffer<char>();
+    }
+    auto chunk = std::move(_chunks.front());
+    _chunks.pop_front();
+    co_return chunk;
 }
 
 future<> record_stream_source::collect_live_records(log_segment_id segment_id) {
@@ -60,16 +65,9 @@ future<> record_stream_source::collect_live_records(log_segment_id segment_id) {
                     _table, segment_id));
         }
         for (const auto& record : chunk.records()) {
-            if (!_index.is_record_live(record.header.index_key(), record.location)) {
-                continue;
+            if (_index.is_record_live(record.header.index_key(), record.location)) {
+                add_record(segment_id, record);
             }
-            // The records of a segment fit a chunk of the segment size.
-            auto writer = log_record_bytes_writer(record.header, record.bytes, record.format_version);
-            if (!_buffer.can_fit(writer)) {
-                on_internal_error(logstor_logger, fmt::format("The live records of {} do not fit a chunk of {} bytes",
-                        segment_id, _buffer.buffer_size()));
-            }
-            _buffer.append(writer);
         }
         return make_ready_future<>();
     });
@@ -78,14 +76,27 @@ future<> record_stream_source::collect_live_records(log_segment_id segment_id) {
     }
 }
 
-temporary_buffer<char> record_stream_source::take_chunk() {
+void record_stream_source::add_record(log_segment_id segment_id, const chunk_record& record) {
+    auto writer = log_record_bytes_writer(record.header, record.bytes, record.format_version);
+    // A segment of the sender can be larger than a stream chunk, so a record of the segment can be
+    // too large for the stream.
+    if (writer.record_size() > _buffer.max_record_size()) {
+        throw record_stream_error(fmt::format("Record stream of table {} cannot send a record of {} bytes in {}, more than the limit of {} bytes",
+                _table, writer.record_size(), segment_id, _buffer.max_record_size()));
+    }
+    if (!_buffer.can_fit(writer)) {
+        seal_chunk();
+    }
+    _buffer.append(writer);
+}
+
+void record_stream_source::seal_chunk() {
     // The receiver does not read the segment sequence.
     _buffer.seal(segment_sequence{0}, _table, ondisk::record_alignment);
     _stats.records_sent += _buffer.record_count();
     const auto chunk = _buffer.chunk();
-    temporary_buffer<char> buf(reinterpret_cast<const char*>(chunk.data()), chunk.size());
+    _chunks.emplace_back(reinterpret_cast<const char*>(chunk.data()), chunk.size());
     _buffer.reset();
-    return buf;
 }
 
 void stream_chunk_assembler::push(temporary_buffer<char> buf) {
