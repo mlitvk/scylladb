@@ -192,9 +192,9 @@ void start(compaction_driver& driver) {
     driver.start({.segment_count = segment_count});
 }
 
-// Polls `pred` until it holds or `wait_limit` passes.
-bool wait_until(std::function<bool()> pred) {
-    const auto deadline = lowres_clock::now() + wait_limit;
+// Polls `pred` until it holds or `limit` passes.
+bool wait_until(std::function<bool()> pred, std::chrono::milliseconds limit = wait_limit) {
+    const auto deadline = lowres_clock::now() + limit;
     while (!pred()) {
         if (lowres_clock::now() >= deadline) {
             return false;
@@ -377,6 +377,23 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_ranks_once_after_a_job) 
     BOOST_REQUIRE(wait_until([&] { return host.ranking_limits.size() == 3; }));
     wait_for_ticks(host, 2);
     BOOST_REQUIRE_EQUAL(host.ranking_limits.size(), 3u);
+}
+
+// When an event is lost, the timeout still wakes the driver, and the driver starts the job. The
+// driver also logs a warning, which the test does not check.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_wakes_after_the_timeout) {
+    fake_host host;
+    fake_group a;
+    host.rankings = {{}, {candidate_of(a, rich)}};
+    auto cfg = make_config();
+    cfg.wait_timeout = 100ms;
+    compaction_driver driver(host, std::move(cfg));
+    start(driver);
+    auto stop_driver = seastar::defer([&] noexcept { stop(driver, host); });
+
+    // The job starts soon after the timeout. The limit leaves room for a slow machine.
+    BOOST_REQUIRE(wait_until([&] { return host.jobs.size() == 1; }, 2s));
+    BOOST_REQUIRE_EQUAL(host.jobs[0]->group, &a);
 }
 
 // The end of a job, and notify_group_idle(), wake a driver that found nothing to compact.
