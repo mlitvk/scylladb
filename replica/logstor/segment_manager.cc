@@ -191,6 +191,7 @@ public:
 
     const stats& get_stats() const noexcept { return _stats; }
     const compaction_driver& driver() const noexcept { return _driver; }
+    void notify_segment_wait() noexcept { _driver.notify_segment_wait(); }
 
     future<> flush_separator_buffer(separator_buffer&, logstor_group&) override;
     future<owned_write_buffer> allocate_separator_buffer() override;
@@ -741,6 +742,9 @@ private:
     }
 
     future<seg_ptr> get_segment(write_source src, abort_source* as = nullptr) {
+        if (src != write_source::compaction && _segment_pool.available_segment_count(src) == 0) {
+            _compaction_mgr.notify_segment_wait();
+        }
         seg_ptr seg = co_await _segment_pool.get_segment(src, as);
         _replenisher_wakeup.signal();
         auto& desc = get_segment_descriptor(seg->id());

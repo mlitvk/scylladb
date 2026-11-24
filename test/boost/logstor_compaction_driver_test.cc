@@ -11,6 +11,7 @@
 
 #include <boost/test/unit_test.hpp>
 #include <seastar/core/sleep.hh>
+#include <seastar/core/thread.hh>
 #include <seastar/core/with_timeout.hh>
 #include <seastar/testing/thread_test_case.hh>
 #include <seastar/util/defer.hh>
@@ -394,6 +395,36 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_wakes_after_the_timeout)
     // The job starts soon after the timeout. The limit leaves room for a slow machine.
     BOOST_REQUIRE(wait_until([&] { return host.jobs.size() == 1; }, 2s));
     BOOST_REQUIRE_EQUAL(host.jobs[0]->group, &a);
+}
+
+// A write that waits for a segment wakes a driver that found nothing to compact at once, and not
+// at the next tick, but only when a set changed since the ranking.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_wakes_when_a_write_waits_for_a_segment) {
+    fake_host host;
+    fake_group a;
+    host.rankings = {{}, {candidate_of(a, rich)}};
+    compaction_driver driver(host, make_config());
+    start(driver);
+    auto stop_driver = seastar::defer([&] noexcept { stop(driver, host); });
+
+    BOOST_REQUIRE(wait_until([&] { return host.ranking_limits.size() == 1; }));
+    wait_for_ticks(host, 1);
+
+    // The yields let the driver run, and they take much less time than the tick period, so a ranking
+    // after them comes from the call and not from a tick.
+    auto yield_to_driver = [] {
+        for (int i = 0; i < 100; ++i) {
+            seastar::thread::yield();
+        }
+    };
+    driver.notify_segment_wait();
+    yield_to_driver();
+    BOOST_REQUIRE_EQUAL(host.ranking_limits.size(), 1u);
+
+    ++host.set_changes;
+    driver.notify_segment_wait();
+    yield_to_driver();
+    BOOST_REQUIRE_EQUAL(host.jobs.size(), 1u);
 }
 
 // The end of a job, and notify_group_idle(), wake a driver that found nothing to compact.

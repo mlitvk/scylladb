@@ -121,6 +121,9 @@ public:
     // ended, compaction on it was enabled again, or its table turned automatic compaction on
     // again.
     void notify_group_idle() noexcept;
+    // Tells the driver that a write waits for a segment from the pool. A driver that waits for
+    // candidates ranks again when the inputs of the selection changed since its last ranking.
+    void notify_segment_wait() noexcept;
 
     // Returns the part of the range from the minimum to the maximum compaction shares that
     // compaction asks for, in [0, 1].
@@ -157,9 +160,10 @@ private:
     std::list<compaction_candidate_score> _jobs_in_flight;
 
     // The reason the driver waits, and the condition variable that it waits on. A controller tick
-    // signals it when a segment set or the limits change, notify_group_idle() when a group can be
-    // ranked again, and the end of a job when the marginal admission gate waits for one. Nothing
-    // signals a wait after a failure, so only the delay or a stop ends it.
+    // and notify_segment_wait() signal it when a segment set or the limits change,
+    // notify_group_idle() when a group can be ranked again, and the end of a job when the marginal
+    // admission gate waits for one. Nothing signals a wait after a failure, so only the delay or a
+    // stop ends it.
     enum class wait_reason {
         nothing,
         candidates,
@@ -218,6 +222,9 @@ private:
 
     void set_space_floor(double fraction) noexcept;
     void tick_rate_controller() noexcept;
+    // Wakes a driver that found nothing to compact when the inputs of the selection in `shard`
+    // differ from the inputs of the ranking that found nothing.
+    void wake_if_inputs_changed(const shard_sample& shard) noexcept;
     ranking_inputs make_ranking_inputs(const shard_sample& shard) const noexcept;
     // Returns true when the wait ended by the timeout.
     future<bool> wait_for_work(wait_reason, std::chrono::milliseconds timeout);
