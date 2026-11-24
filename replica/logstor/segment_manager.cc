@@ -45,6 +45,7 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/lowres_clock.hh>
+#include <seastar/core/memory.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/util/memory-data-source.hh>
 #include <seastar/util/lazy.hh>
@@ -607,6 +608,20 @@ class segment_manager_impl {
     // Wakes the replenisher. Signal it when a segment goes out of the pool, when a segment becomes
     // free, and when the replenisher must stop.
     seastar::condition_variable _replenisher_wakeup;
+
+    // Returns the wait for the next signal of `_replenisher_wakeup`. The wait with a timeout fails
+    // with condition_variable_timed_out at the timeout.
+    // The replenisher cannot handle a failed allocation of the waiter, and the condition variable
+    // allocates the waiter in a noexcept function. So the allocation is critical, and the
+    // allocation failure injector does not fail it.
+    future<> wait_for_replenisher_wakeup() noexcept {
+        memory::scoped_critical_alloc_section dfg;
+        return _replenisher_wakeup.wait();
+    }
+    future<> wait_for_replenisher_wakeup(timer<>::time_point timeout) noexcept {
+        memory::scoped_critical_alloc_section dfg;
+        return _replenisher_wakeup.wait(timeout);
+    }
 
     write_buffer_pool _compaction_buffer_pool;
     write_buffer_pool _separator_buffer_pool;
@@ -1577,12 +1592,16 @@ future<> segment_manager_impl::switch_active_segment() {
 // progress completes, and no new one starts.
 future<> segment_manager_impl::replenish_reserve() {
     while (true) {
-        co_await _replenisher_wakeup.wait([this] { return _replenisher_stopping || !_segment_pool.full(); });
+        while (!_replenisher_stopping && _segment_pool.full()) {
+            co_await wait_for_replenisher_wakeup();
+        }
         if (_replenisher_stopping) {
             break;
         }
 
-        auto seg_f = co_await coroutine::as_future(allocate_segment());
+        // futurize_invoke() turns a failed allocation of the frame of allocate_segment() into a
+        // failed future, so that the replenisher tries again.
+        auto seg_f = co_await coroutine::as_future(futurize_invoke([this] { return allocate_segment(); }));
         if (seg_f.failed()) {
             auto ex = seg_f.get_exception();
             ++_stats.segment_allocation_failures;
@@ -1590,10 +1609,14 @@ future<> segment_manager_impl::replenish_reserve() {
             logstor_logger.log(log_level::warn, replenish_failure_rate_limit, "Cannot allocate a segment for the segment pool: {:t}. Trying again", ex);
             _segment_pool.fail_waiters(std::move(ex));
             // The timeout is the usual result, so the wait does not throw it.
-            auto wait_f = co_await coroutine::as_future(_replenisher_wakeup.wait(std::chrono::seconds(1), [this] {
-                return _replenisher_stopping;
-            }));
-            wait_f.ignore_ready_future();
+            const auto retry_time = timer<>::clock::now() + std::chrono::seconds(1);
+            while (!_replenisher_stopping) {
+                auto wait_f = co_await coroutine::as_future(wait_for_replenisher_wakeup(retry_time));
+                if (wait_f.failed()) {
+                    wait_f.ignore_ready_future();
+                    break;
+                }
+            }
             continue;
         }
 
@@ -1636,7 +1659,7 @@ future<seg_ptr> segment_manager_impl::allocate_segment() {
         const log_segment_id new_seg_id(_next_new_segment_id);
         const bool allocate_new = _next_new_segment_id < _geometry.segment_count() && (_free_segments.empty() || is_segment_ready(new_seg_id));
         if (allocate_new) {
-            auto seg_f = co_await coroutine::as_future(make_segment(new_seg_id));
+            auto seg_f = co_await coroutine::as_future(futurize_invoke(make_segment, new_seg_id));
             if (!seg_f.failed()) {
                 ++_next_new_segment_id;
                 co_return seg_f.get();
@@ -1653,7 +1676,9 @@ future<seg_ptr> segment_manager_impl::allocate_segment() {
         if (!_free_segments.empty()) {
             auto seg_id = _free_segments.front();
             _free_segments.pop_front();
-            auto seg_f = co_await coroutine::as_future(make_segment(seg_id));
+            // futurize_invoke() turns a failed allocation of the frame of make_segment() into a
+            // failed future, so that the segment goes back to the free list in that case too.
+            auto seg_f = co_await coroutine::as_future(futurize_invoke(make_segment, seg_id));
             if (seg_f.failed()) {
                 _free_segments.push_back(seg_id);
                 co_return coroutine::exception(seg_f.get_exception());
@@ -1663,13 +1688,15 @@ future<seg_ptr> segment_manager_impl::allocate_segment() {
 
         // No free segment. Compaction can free segments later, so wait and try again.
         // The timeout is the usual result, so the wait does not throw it.
-        auto f = co_await coroutine::as_future(_replenisher_wakeup.wait(std::chrono::seconds(5), [this] {
-            return _replenisher_stopping || !_free_segments.empty();
-        }));
-        if (f.failed()) {
-            auto ep = f.get_exception();
-            if (!try_catch<seastar::condition_variable_timed_out>(ep)) {
-                co_await coroutine::return_exception_ptr(std::move(ep));
+        const auto timeout = timer<>::clock::now() + std::chrono::seconds(5);
+        while (!_replenisher_stopping && _free_segments.empty()) {
+            auto f = co_await coroutine::as_future(wait_for_replenisher_wakeup(timeout));
+            if (f.failed()) {
+                auto ep = f.get_exception();
+                if (!try_catch<seastar::condition_variable_timed_out>(ep)) {
+                    co_await coroutine::return_exception_ptr(std::move(ep));
+                }
+                break;
             }
         }
         if (_replenisher_stopping) {
