@@ -126,8 +126,8 @@ void compaction_driver::tick_rate_controller() noexcept {
         .utilization = shard.utilization,
     });
     _ranking_inputs = ranking_inputs{
-        .under_threshold = _rate_controller.backlog().candidate_segments,
-        .dead = shard.dead_segments,
+        .set_changes = shard.set_changes,
+        .utilization_threshold = _rate_controller.utilization_threshold(),
         .min_batch = _rate_controller.min_batch(),
         .batch_cap = _limits.batch_cap,
     };

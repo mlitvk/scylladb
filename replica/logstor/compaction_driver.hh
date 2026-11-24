@@ -51,7 +51,7 @@ public:
     struct shard_sample {
         uint64_t available_segments;
         const utilization_histogram& utilization;
-        uint64_t dead_segments;
+        uint64_t set_changes;
     };
 
     // The services that the driver needs from the compaction manager.
@@ -81,9 +81,9 @@ public:
         utils::updateable_value<double> utilization_threshold;
         utils::updateable_value<double> min_utilization_threshold;
         seastar::scheduling_group sg;
-        // The longest time that the driver waits when no event wakes it. The timeout covers what
-        // the events do not show: a segment that crosses the threshold inside one bucket of the
-        // utilization histogram, which does not change the backlog estimate.
+        // The longest time that the driver waits when no event wakes it. The events show each
+        // change that can give a group a batch, so the timeout only limits the wait after a lost
+        // event, which is a bug.
         std::chrono::milliseconds wait_timeout = std::chrono::seconds(10);
         // The time that the driver waits after a failed step before it starts again. A failure that
         // repeats, for example under memory pressure, then logs at most once in this time.
@@ -157,9 +157,9 @@ private:
     std::list<compaction_candidate_score> _jobs_in_flight;
 
     // The reason the driver waits, and the condition variable that it waits on. A controller tick
-    // signals it when the backlog changes, notify_group_idle() when a group can be ranked again,
-    // and the end of a job when the marginal admission gate waits for one. Nothing signals a wait
-    // after a failure, so only the delay or a stop ends it.
+    // signals it when a segment set or the limits change, notify_group_idle() when a group can be
+    // ranked again, and the end of a job when the marginal admission gate waits for one. Nothing
+    // signals a wait after a failure, so only the delay or a stop ends it.
     enum class wait_reason {
         nothing,
         candidates,
@@ -172,20 +172,20 @@ private:
     uint64_t _idle_notifications{0};
     // Counts the automatic jobs that ended, for the marginal admission gate.
     uint64_t _jobs_ended{0};
-    // The inputs of the selection that can give a group a batch. They are the segments under the
-    // threshold, as the backlog estimates them, the dead segments, and the limits that decide how
-    // many candidates a batch needs and can take. The dead segments count apart, because they do
-    // not wait for a minimum batch, and the estimate does not show when they die in the lowest
-    // bucket.
+    // The inputs of the selection that can give a group a batch: the count of the changes to the
+    // segment sets of the shard, and the limits of the selection. The count includes each change, so
+    // equal inputs show that the segments and the limits are the same as at the last ranking.
     struct ranking_inputs {
-        double under_threshold;
-        uint64_t dead;
+        uint64_t set_changes;
+        double utilization_threshold;
         size_t min_batch;
         size_t batch_cap;
 
         bool operator==(const ranking_inputs&) const noexcept = default;
     };
-    // The inputs as of the last controller tick.
+    // The inputs as of the last controller tick. A ranking saves them as its start state. The count
+    // of the changes only increases, so a count from before the ranking can wake the driver once
+    // more than necessary, but it cannot hide a change.
     ranking_inputs _ranking_inputs{};
     // The state before the last ranking that came back empty. A driver that waits for candidates is
     // woken when the inputs change, and it does not wait when a group became idle during the
