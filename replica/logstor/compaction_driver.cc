@@ -125,18 +125,21 @@ void compaction_driver::tick_rate_controller() noexcept {
         .curve = threshold_curve(),
         .utilization = shard.utilization,
     });
-    _ranking_inputs = ranking_inputs{
+
+    // A driver that found nothing to compact wakes up when the inputs of the selection differ from
+    // the inputs of the ranking that found nothing.
+    if (_wait == wait_reason::candidates && (!_empty_ranking_start || make_ranking_inputs(shard) != _empty_ranking_start->inputs)) {
+        _work_wanted.signal();
+    }
+}
+
+compaction_driver::ranking_inputs compaction_driver::make_ranking_inputs(const shard_sample& shard) const noexcept {
+    return ranking_inputs{
         .set_changes = shard.set_changes,
         .utilization_threshold = _rate_controller.utilization_threshold(),
         .min_batch = _rate_controller.min_batch(),
         .batch_cap = _limits.batch_cap,
     };
-
-    // A driver that found nothing to compact wakes up when the inputs of the selection differ from
-    // the inputs of the ranking that found nothing.
-    if (_wait == wait_reason::candidates && (!_empty_ranking_start || _ranking_inputs != _empty_ranking_start->inputs)) {
-        _work_wanted.signal();
-    }
 }
 
 void compaction_driver::notify_group_idle() noexcept {
@@ -237,7 +240,7 @@ future<bool> compaction_driver::rank(ranking_state& ranking) {
     // change that a tick sees during the ranking, or a group that becomes idle during the ranking,
     // wakes the driver.
     const auto before = ranking_start{
-        .inputs = _ranking_inputs,
+        .inputs = make_ranking_inputs(_host.sample()),
         .idle_notifications = _idle_notifications,
     };
     auto ranked = co_await _host.find_top_compaction_candidates(limits, _limits.auto_parallelism,

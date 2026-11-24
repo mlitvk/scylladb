@@ -95,8 +95,9 @@ public:
     uint64_t available_segments = segment_count;
     utilization_histogram utilization{};
     uint64_t set_changes = 0;
-    // The calls of sample(). The driver calls it once in each controller tick.
-    mutable size_t ticks = 0;
+    // The calls of sample(). The driver calls it in each controller tick, and at the start of each
+    // ranking.
+    mutable size_t samples = 0;
 
     bool can_submit_compaction() const noexcept override {
         return true;
@@ -144,12 +145,19 @@ public:
     }
 
     compaction_driver::shard_sample sample() const noexcept override {
-        ++ticks;
+        ++samples;
         return compaction_driver::shard_sample{
             .available_segments = available_segments,
             .utilization = utilization,
             .set_changes = set_changes,
         };
+    }
+
+    // Returns the number of controller ticks. Each ranking calls sample() and then
+    // find_top_compaction_candidates() with no yield between them, so a ranking adds one sample and
+    // one element of `ranking_limits`.
+    size_t ticks() const noexcept {
+        return samples - ranking_limits.size();
     }
 
     void open_ranking_gate() {
@@ -198,8 +206,8 @@ bool wait_until(std::function<bool()> pred) {
 
 // Waits until the controller ticks `n` more times.
 void wait_for_ticks(const fake_host& host, size_t n) {
-    const auto target = host.ticks + n;
-    BOOST_REQUIRE(wait_until([&] { return host.ticks >= target; }));
+    const auto target = host.ticks() + n;
+    BOOST_REQUIRE(wait_until([&] { return host.ticks() >= target; }));
 }
 
 void end_job(fake_host& host, size_t i) {
@@ -347,6 +355,28 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_wakes_when_segments_die_
     BOOST_REQUIRE(wait_until([&] { return host.ranking_limits.size() >= 3; }));
     set_dead_segments(8);
     BOOST_REQUIRE(wait_until([&] { return host.jobs.size() == 2; }));
+}
+
+// A job changes the sets before it ends, and the ranking after the job starts before the next tick.
+// The ranking saves the inputs of the shard at its start, and not the inputs of the last tick, so
+// the next tick does not wake the driver for a ranking of the same segments.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_ranks_once_after_a_job) {
+    fake_host host;
+    fake_group a;
+    host.rankings = {{candidate_of(a, rich)}};
+    compaction_driver driver(host, make_config());
+    start(driver);
+    auto stop_driver = seastar::defer([&] noexcept { stop(driver, host); });
+
+    // The second ranking runs while the job runs, and finds nothing.
+    BOOST_REQUIRE(wait_until([&] { return host.jobs.size() == 1 && host.ranking_limits.size() == 2; }));
+    wait_for_ticks(host, 1);
+
+    host.set_changes += 8;
+    end_job(host, 0);
+    BOOST_REQUIRE(wait_until([&] { return host.ranking_limits.size() == 3; }));
+    wait_for_ticks(host, 2);
+    BOOST_REQUIRE_EQUAL(host.ranking_limits.size(), 3u);
 }
 
 // The end of a job, and notify_group_idle(), wake a driver that found nothing to compact.
