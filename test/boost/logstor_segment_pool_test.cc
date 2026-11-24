@@ -18,8 +18,10 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/scheduling.hh>
 #include <seastar/core/shared_ptr.hh>
+#include <seastar/core/thread.hh>
 #include <seastar/testing/on_internal_error.hh>
 #include <seastar/testing/thread_test_case.hh>
+#include <seastar/util/alloc_failure_injector.hh>
 #include <seastar/util/defer.hh>
 
 #include "replica/logstor/segment_pool.hh"
@@ -445,4 +447,44 @@ SEASTAR_THREAD_TEST_CASE(test_segment_pool_take_after_stop_fails) {
     p.stop().get();
     BOOST_REQUIRE_THROW(waiting.get(), std::runtime_error);
     BOOST_REQUIRE_THROW(p.take(write_source::normal).get(), std::runtime_error);
+}
+
+// Checks that the refill keeps running when an allocation fails at any point while it runs, and that
+// no segment is lost. The pool holds one of its two segments, and the allocator has no free segment
+// and no new segment, so the refill waits in the allocator for a free segment. Then the test:
+// - frees a segment, which ends that wait, so the refill fills the pool and waits for a take.
+// - takes a segment, which wakes the refill, and the allocator waits for a free segment again.
+// The sweep fails the allocations from a later one in each round, until no allocation fails.
+SEASTAR_THREAD_TEST_CASE(test_segment_pool_refill_survives_allocation_failures) {
+    auto& injector = memory::local_failure_injector();
+    auto let_the_refill_run = [] {
+        for (int i = 0; i < 50; ++i) {
+            seastar::thread::yield();
+        }
+    };
+    for (uint64_t round = 0; ; ++round) {
+        test_pool tp(2, {.capacity = 2});
+        auto freed = tp.take_now(write_source::normal);
+        let_the_refill_run();
+
+        injector.fail_after(round);
+        auto cancel = defer([&injector] noexcept { injector.cancel(); });
+        // free(), take() and yield() do not allocate, so the failures reach only the refill.
+        tp.free(std::move(freed));
+        let_the_refill_run();
+        auto taken = tp.p.take(write_source::normal);
+        let_the_refill_run();
+        const bool injected = injector.failed();
+        injector.cancel();
+
+        // The pool held a segment at the take, also when the refill failed.
+        BOOST_REQUIRE(taken.available());
+        tp.free(taken.get());
+        tp.wait_for_size(2);
+        BOOST_REQUIRE_EQUAL(tp.p.available_segment_count(), 2);
+        if (!injected) {
+            BOOST_TEST_MESSAGE(fmt::format("The sweep ended after {} rounds", round));
+            break;
+        }
+    }
 }

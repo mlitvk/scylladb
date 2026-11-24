@@ -12,7 +12,9 @@
 #include <stdexcept>
 
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/memory.hh>
 #include <seastar/core/on_internal_error.hh>
+#include <seastar/core/timer.hh>
 #include <seastar/core/with_scheduling_group.hh>
 #include <seastar/coroutine/as_future.hh>
 #include <seastar/coroutine/exception.hh>
@@ -26,6 +28,25 @@ namespace replica::logstor {
 
 extern seastar::logger logstor_logger;
 
+namespace {
+
+// Returns the wait for the next signal of `cv`. The condition variable allocates the waiter in a
+// noexcept function, and the refill and the allocator cannot handle a failed allocation of the
+// waiter. So the allocation is critical, and the allocation failure injector does not fail it.
+future<> wait_for_signal(seastar::condition_variable& cv) noexcept {
+    memory::scoped_critical_alloc_section dfg;
+    return cv.wait();
+}
+
+// Returns the same wait as wait_for_signal(cv), which fails with condition_variable_timed_out at
+// `timeout`.
+future<> wait_for_signal(seastar::condition_variable& cv, timer<>::time_point timeout) noexcept {
+    memory::scoped_critical_alloc_section dfg;
+    return cv.wait(timeout);
+}
+
+} // anonymous namespace
+
 // The allocator goes to the next new segment only after the current new segment is allocated, so
 // after a failure the next attempt tries the same segment again. A skipped segment can be the first
 // segment of a file, and then the allocation of the next file fails.
@@ -37,7 +58,7 @@ future<segment_allocator::allocate_result> segment_allocator::allocate() {
         const log_segment_id new_seg_id(_next_new_segment_id);
         const bool allocate_new = new_count() > 0 && (_free_segments.empty() || _opener.is_ready(new_seg_id));
         if (allocate_new) {
-            auto seg_f = co_await coroutine::as_future(_opener.open(new_seg_id));
+            auto seg_f = co_await coroutine::as_future(futurize_invoke([this, new_seg_id] { return _opener.open(new_seg_id); }));
             if (!seg_f.failed()) {
                 ++_next_new_segment_id;
                 co_return seg_f.get();
@@ -51,10 +72,12 @@ future<segment_allocator::allocate_result> segment_allocator::allocate() {
         }
 
         if (!_free_segments.empty()) {
-            // If the allocation fails, the segment goes back to the free list.
+            // If the allocation fails, the segment goes back to the free list. futurize_invoke()
+            // turns a failed allocation of the frame of open() into a failed future, so that the
+            // segment goes back in that case too.
             auto seg_id = _free_segments.front();
             _free_segments.pop_front();
-            auto seg_f = co_await coroutine::as_future(_opener.open(seg_id));
+            auto seg_f = co_await coroutine::as_future(futurize_invoke([this, seg_id] { return _opener.open(seg_id); }));
             if (seg_f.failed()) {
                 _free_segments.push_back(seg_id);
                 co_await coroutine::return_exception_ptr(seg_f.get_exception());
@@ -71,13 +94,15 @@ future<segment_allocator::allocate_result> segment_allocator::allocate() {
 // Waits for a freed segment. The usual result is the timeout, so the wait returns the timeout as a
 // value and does not throw.
 future<bool> segment_allocator::wait_for_free_segment() {
-    auto f = co_await coroutine::as_future(_segment_freed.wait(free_segment_wait_timeout, [this] {
-        return _stop_waiting || !_free_segments.empty();
-    }));
-    if (f.failed()) {
-        auto ep = f.get_exception();
-        if (!try_catch<seastar::condition_variable_timed_out>(ep)) {
-            co_await coroutine::return_exception_ptr(std::move(ep));
+    const auto timeout = timer<>::clock::now() + free_segment_wait_timeout;
+    while (!_stop_waiting && _free_segments.empty()) {
+        auto f = co_await coroutine::as_future(wait_for_signal(_segment_freed, timeout));
+        if (f.failed()) {
+            auto ep = f.get_exception();
+            if (!try_catch<seastar::condition_variable_timed_out>(ep)) {
+                co_await coroutine::return_exception_ptr(std::move(ep));
+            }
+            break;
         }
     }
     co_return _stop_waiting;
@@ -121,12 +146,16 @@ future<seg_ptr> segment_pool::take(write_source src, abort_source* as) noexcept 
 // that it does at that time, and does not start a new one.
 future<> segment_pool::refill() {
     while (true) {
-        co_await _refill_needed.wait([this] { return _stopping || !full(); });
+        while (!_stopping && full()) {
+            co_await wait_for_signal(_refill_needed);
+        }
         if (_stopping) {
             break;
         }
 
-        auto seg_f = co_await coroutine::as_future(_allocator.allocate());
+        // futurize_invoke() turns a failed allocation of the frame of allocate() into a failed
+        // future, so that the refill tries again.
+        auto seg_f = co_await coroutine::as_future(futurize_invoke([this] { return _allocator.allocate(); }));
         if (seg_f.failed()) {
             auto ex = seg_f.get_exception();
             ++_stats.refill_failures;
@@ -135,10 +164,14 @@ future<> segment_pool::refill() {
             fail_waiters(std::move(ex));
             // The usual result of the wait is the timeout, and the loop continues after any result,
             // so ignore it.
-            auto wait_f = co_await coroutine::as_future(_refill_needed.wait(refill_retry_delay, [this] {
-                return _stopping;
-            }));
-            wait_f.ignore_ready_future();
+            const auto retry_time = timer<>::clock::now() + refill_retry_delay;
+            while (!_stopping) {
+                auto wait_f = co_await coroutine::as_future(wait_for_signal(_refill_needed, retry_time));
+                if (wait_f.failed()) {
+                    wait_f.ignore_ready_future();
+                    break;
+                }
+            }
             continue;
         }
 
