@@ -94,7 +94,7 @@ public:
     std::set<const logstor_group*> running;
     uint64_t available_segments = segment_count;
     utilization_histogram utilization{};
-    uint64_t dead_segments = 0;
+    uint64_t set_changes = 0;
     // The calls of sample(). The driver calls it once in each controller tick.
     mutable size_t ticks = 0;
 
@@ -148,7 +148,7 @@ public:
         return compaction_driver::shard_sample{
             .available_segments = available_segments,
             .utilization = utilization,
-            .dead_segments = dead_segments,
+            .set_changes = set_changes,
         };
     }
 
@@ -279,8 +279,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_bar_survives_a_new_ranki
     BOOST_REQUIRE_EQUAL(host.jobs[1]->group, &b);
 }
 
-// A tick that sees the backlog change while a ranking runs wakes the driver after an empty
-// ranking.
+// A tick that sees a set change while a ranking runs wakes the driver after an empty ranking.
 SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_wakes_on_a_change_during_a_ranking) {
     fake_host host;
     fake_group a;
@@ -291,20 +290,21 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_wakes_on_a_change_during
     auto stop_driver = seastar::defer([&] noexcept { stop(driver, host); });
 
     BOOST_REQUIRE(wait_until([&] { return host.ranking_limits.size() == 1; }));
-    host.utilization[0] = 5;
+    ++host.set_changes;
     wait_for_ticks(host, 1);
     host.open_ranking_gate();
 
     BOOST_REQUIRE(wait_until([&] { return host.jobs.size() == 1; }));
 }
 
-// A segment that dies in the lowest bucket does not change the backlog estimate, but it can be
-// compacted at once, so it wakes the driver.
-SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_wakes_when_a_segment_dies) {
+// A free that changes no count of the shard can give a group a batch. For example, at a threshold
+// of 1 each segment is a candidate, and the frees inside one bucket of the histogram can give the
+// candidates a net gain. So each change of a set wakes the driver.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_wakes_when_a_set_changes) {
     fake_host host;
     fake_group a;
     host.rankings = {{}, {candidate_of(a, rich)}};
-    host.utilization[0] = 1;
+    host.utilization[utilization_bucket_count - 1] = 8;
     compaction_driver driver(host, make_config());
     start(driver);
     auto stop_driver = seastar::defer([&] noexcept { stop(driver, host); });
@@ -315,8 +315,38 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_wakes_when_a_segment_die
     BOOST_REQUIRE_EQUAL(host.ranking_limits.size(), 1u);
     BOOST_REQUIRE(host.jobs.empty());
 
-    host.dead_segments = 1;
+    ++host.set_changes;
     BOOST_REQUIRE(wait_until([&] { return host.jobs.size() == 1; }));
+}
+
+// A job can free the dead segments that the last tick counted, and the writes can make as many new
+// segments dead before the next tick. That tick reads the same histogram as the last tick, but each
+// removal and each death changes a set, so the tick wakes the driver.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_wakes_when_segments_die_after_a_job) {
+    const compaction_candidate_score dead_batch{.n_in = 8, .n_out = 0, .live_bytes = 0};
+    fake_host host;
+    fake_group a;
+    // The second ranking runs while the first job runs, and the third one after the job.
+    host.rankings = {{candidate_of(a, dead_batch)}, {}, {}, {candidate_of(a, dead_batch)}};
+    // Adds or removes 8 dead segments, one change for each segment.
+    auto set_dead_segments = [&] (uint64_t n) {
+        host.utilization[0] = n;
+        host.set_changes += 8;
+    };
+    set_dead_segments(8);
+    compaction_driver driver(host, make_config());
+    start(driver);
+    auto stop_driver = seastar::defer([&] noexcept { stop(driver, host); });
+
+    BOOST_REQUIRE(wait_until([&] { return host.jobs.size() == 1 && host.ranking_limits.size() == 2; }));
+    // The last tick before the job ends counts the 8 dead segments.
+    wait_for_ticks(host, 1);
+
+    set_dead_segments(0);
+    end_job(host, 0);
+    BOOST_REQUIRE(wait_until([&] { return host.ranking_limits.size() >= 3; }));
+    set_dead_segments(8);
+    BOOST_REQUIRE(wait_until([&] { return host.jobs.size() == 2; }));
 }
 
 // The end of a job, and notify_group_idle(), wake a driver that found nothing to compact.
@@ -534,9 +564,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_continues_after_a_failur
     BOOST_REQUIRE_EQUAL(host.jobs[0]->group, &a);
 }
 
-// A driver that found nothing to compact wakes up when the minimum batch decreases, also when the
-// backlog estimate and the dead segments do not change. Here the histogram is empty, so the
-// estimate stays 0.
+// A driver that found nothing to compact wakes up when the minimum batch decreases, also when no
+// set changes.
 SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_wakes_when_the_minimum_batch_decreases) {
     fake_host host;
     fake_group a;

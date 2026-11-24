@@ -76,6 +76,41 @@ struct segment_stats {
     bool operator==(const segment_stats&) const noexcept = default;
 };
 
+// The statistics of all the sets of a shard, and the count of the changes to the sets. The
+// statistics are the sum of the statistics of the sets.
+// A set changes them only through this class, so that each change also increments the count.
+class shard_segment_totals {
+    segment_stats _stats;
+    uint64_t _set_changes{0};
+
+public:
+    void add_segment(uint64_t segment_record_bytes, size_t bucket) noexcept {
+        _stats.add_segment(segment_record_bytes, bucket);
+        ++_set_changes;
+    }
+
+    void remove_segment(uint64_t segment_record_bytes, size_t bucket) noexcept {
+        _stats.remove_segment(segment_record_bytes, bucket);
+        ++_set_changes;
+    }
+
+    void free_from_segment(uint64_t freed_record_bytes, uint64_t remaining_record_bytes, size_t old_bucket, size_t new_bucket) noexcept {
+        _stats.free_from_segment(freed_record_bytes, remaining_record_bytes, old_bucket, new_bucket);
+        ++_set_changes;
+    }
+
+    const segment_stats& stats() const noexcept {
+        return _stats;
+    }
+
+    // Returns the count of the changes to the sets of the shard since the start. A change adds a
+    // segment to a set, removes a segment from a set, or frees records in a segment of a set. A
+    // merge adds and removes each segment that it moves.
+    uint64_t set_changes() const noexcept {
+        return _set_changes;
+    }
+};
+
 // Exports the utilization histogram as a Prometheus histogram. The buckets of a Prometheus
 // histogram are cumulative. The label of a bucket is the upper limit of its utilization range.
 // Prometheus counts a value equal to the limit in the bucket. utilization_bucket_of() puts such a

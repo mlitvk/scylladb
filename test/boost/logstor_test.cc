@@ -3151,7 +3151,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_set_stats) {
     // The sets link the descriptors intrusively. Thus, the descriptors must not move, and all the
     // sets must be destroyed before the descriptors.
     std::deque<segment_descriptor> descs;
-    segment_stats shard;
+    shard_segment_totals shard;
     segment_set segments{segment_size, &shard};
     segment_set other{segment_size, &shard};
 
@@ -3180,7 +3180,11 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_set_stats) {
     };
 
     // The shard statistics are the sum of the statistics of the two sets, after all operations.
+    // Each operation also counts in `set_changes`, so that the compaction driver sees it.
+    uint64_t last_set_changes = 0;
     auto check_shard = [&] {
+        BOOST_REQUIRE_GT(shard.set_changes(), last_set_changes);
+        last_set_changes = shard.set_changes();
         segment_stats expected;
         for (const auto* set : {&segments, &other}) {
             expected.segment_count += set->stats().segment_count;
@@ -3190,7 +3194,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_set_stats) {
                 expected.utilization[i] += set->stats().utilization[i];
             }
         }
-        BOOST_REQUIRE(shard == expected);
+        BOOST_REQUIRE(shard.stats() == expected);
     };
 
     auto bucket_of = [&] (const segment_set& set, size_t bucket) {
@@ -3199,7 +3203,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_set_stats) {
 
     // An empty set has zero statistics.
     check_stats(segments, 0, 0);
-    check_shard();
+    BOOST_REQUIRE(shard.stats() == segment_stats{});
+    BOOST_REQUIRE_EQUAL(shard.set_changes(), 0);
 
     // A segment goes into the bucket of its utilization. A segment with a utilization of 1 goes
     // into the last bucket, not into a bucket after the end of the histogram.
@@ -3237,7 +3242,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_set_stats) {
     BOOST_REQUIRE_EQUAL(bucket_of(other, freed_records - 1), 1);
     BOOST_REQUIRE_EQUAL(other.stats().dead_segments, 1);
     check_shard();
-    BOOST_REQUIRE_EQUAL(shard.segment_count, 2);
+    BOOST_REQUIRE_EQUAL(shard.stats().segment_count, 2);
 
     // A removal takes the segment and its bytes out of the set and out of the shard statistics.
     other.remove_segment(sparse);
@@ -3249,7 +3254,9 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_set_stats) {
     other.clear();
     check_stats(other, 0, 0);
     check_shard();
-    BOOST_REQUIRE(shard == segment_stats{});
+    BOOST_REQUIRE(shard.stats() == segment_stats{});
+    // 2 adds, 2 frees, 2 moves of a merge that each add and remove, 1 removal and 1 clear.
+    BOOST_REQUIRE_EQUAL(shard.set_changes(), 10);
 }
 
 // The metric exports the utilization histogram as a Prometheus histogram. The buckets of a
