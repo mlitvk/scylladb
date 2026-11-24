@@ -83,7 +83,7 @@ public:
         seastar::scheduling_group sg;
         // The longest time that the driver waits when no event wakes it. The events show each
         // change that can give a group a batch, so the timeout only limits the wait after a lost
-        // event, which is a bug.
+        // event, which is a bug. The driver warns when it finds a batch after such a wait.
         std::chrono::milliseconds wait_timeout = std::chrono::seconds(10);
         // The time that the driver waits after a failed step before it starts again. A failure that
         // repeats, for example under memory pressure, then logs at most once in this time.
@@ -189,8 +189,14 @@ private:
     struct ranking_start {
         ranking_inputs inputs;
         uint64_t idle_notifications;
+
+        bool operator==(const ranking_start&) const noexcept = default;
     };
     std::optional<ranking_start> _empty_ranking_start;
+    // True when the last wait for candidates ended by the timeout. When the next ranking starts in
+    // the state of the empty ranking and finds a batch, an event did not wake the driver, so the
+    // ranking warns.
+    bool _candidates_wait_timed_out{false};
 
     // The anchor and the ceiling of the threshold curve, as fractions of the disk. 0 selects the
     // default points: the anchor at twice the space floor, and the ceiling one segment above the
@@ -213,7 +219,8 @@ private:
     void set_space_floor(double fraction) noexcept;
     void tick_rate_controller() noexcept;
     ranking_inputs make_ranking_inputs(const shard_sample& shard) const noexcept;
-    future<> wait_for_work(wait_reason, std::chrono::milliseconds timeout);
+    // Returns true when the wait ended by the timeout.
+    future<bool> wait_for_work(wait_reason, std::chrono::milliseconds timeout);
     future<> run();
     // Runs one step of the driver: a wait for work, a ranking, or the start of one job.
     future<> run_step(ranking_state& ranking);

@@ -7,6 +7,7 @@
  */
 #include "replica/logstor/compaction_driver.hh"
 #include "replica/logstor/compaction.hh"
+#include "utils/exceptions.hh"
 #include <algorithm>
 #include <exception>
 #include <optional>
@@ -149,15 +150,17 @@ void compaction_driver::notify_group_idle() noexcept {
     }
 }
 
-future<> compaction_driver::wait_for_work(wait_reason reason, std::chrono::milliseconds timeout) {
+future<bool> compaction_driver::wait_for_work(wait_reason reason, std::chrono::milliseconds timeout) {
     _wait = reason;
     auto f = co_await coroutine::as_future(_work_wanted.wait(timeout));
     _wait = wait_reason::nothing;
-    if (f.failed()) {
-        // The wait ended by a timeout or because request_stop() broke the condition variable, and
-        // the loop checks the conditions again in both cases.
-        f.ignore_ready_future();
+    if (!f.failed()) {
+        co_return false;
     }
+    // The wait ended by a timeout or because request_stop() broke the condition variable, and the
+    // loop checks the conditions again in both cases.
+    auto ep = f.get_exception();
+    co_return try_catch<seastar::condition_variable_timed_out>(ep) != nullptr;
 }
 
 future<> compaction_driver::run() {
@@ -243,6 +246,7 @@ future<bool> compaction_driver::rank(ranking_state& ranking) {
         .inputs = make_ranking_inputs(_host.sample()),
         .idle_notifications = _idle_notifications,
     };
+    const bool after_timeout = std::exchange(_candidates_wait_timed_out, false);
     auto ranked = co_await _host.find_top_compaction_candidates(limits, _limits.auto_parallelism,
             automatic_compaction_allowed);
     if (_stopping) {
@@ -253,6 +257,11 @@ future<bool> compaction_driver::rank(ranking_state& ranking) {
         // compacting, as on a shard with one compaction group while its job runs.
         _empty_ranking_start = before;
         co_return false;
+    }
+    if (after_timeout && _empty_ranking_start == before) {
+        logstor_logger.warn("Automatic compaction found a batch after a wait of {}, while the segments and the limits "
+                "did not change since the last ranking. An event that can give a group a batch did not wake the driver",
+                _cfg.wait_timeout);
     }
 
     // The bar is computed first, because the initializer of `candidates` moves the candidates.
@@ -270,7 +279,7 @@ future<> compaction_driver::wait_for_candidates() {
     if (_empty_ranking_start && _idle_notifications != _empty_ranking_start->idle_notifications) {
         co_return;
     }
-    co_await wait_for_work(wait_reason::candidates, _cfg.wait_timeout);
+    _candidates_wait_timed_out = co_await wait_for_work(wait_reason::candidates, _cfg.wait_timeout);
 }
 
 std::optional<compaction_candidate_score> compaction_driver::admission_bar(const ranking_state& ranking) const {
