@@ -34,6 +34,7 @@
 #include "replica/logstor/index.hh"
 #include "replica/logstor/logstor.hh"
 #include "replica/logstor/ondisk.hh"
+#include "replica/logstor/record_merge.hh"
 #include "replica/logstor/record_value.hh"
 #include "replica/logstor/single_row_partition.hh"
 #include "replica/logstor/write_buffer.hh"
@@ -948,6 +949,145 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_timestamp_requires_a_marker_or_a_to
     }
     BOOST_REQUIRE_THROW(record_timestamp(cells_only), std::runtime_error);
     BOOST_REQUIRE_THROW(record_timestamp(freeze(cells_only)), std::runtime_error);
+}
+
+namespace {
+
+schema_ptr make_two_column_schema() {
+    return schema_builder(1, "ks", "cf_two")
+            .with_column("pk", utf8_type, column_kind::partition_key)
+            .with_column("v", utf8_type)
+            .with_column("w", utf8_type)
+            .build();
+}
+
+// A partition of the key "pk0" with a live row marker and the given cells, all with the timestamp
+// `ts`. Each cell is a column name and a value.
+mutation make_row_mutation(schema_ptr schema, api::timestamp_type ts, std::initializer_list<std::pair<sstring, sstring>> cells) {
+    auto key = partition_key::from_single_value(*schema, serialized(sstring("pk0")));
+    mutation m(schema, dht::decorate_key(*schema, key));
+    auto& row = m.partition().clustered_row(*schema, clustering_key::make_empty());
+    row.apply(row_marker(ts));
+    for (const auto& [column, value] : cells) {
+        const auto& def = *schema->get_column_definition(to_bytes(column));
+        row.cells().apply(def, atomic_cell::make_live(*def.type, ts, serialized(value)));
+    }
+    return m;
+}
+
+// A partition of the key "pk0" that is only a partition tombstone with the timestamp `ts`.
+mutation make_deletion(schema_ptr schema, api::timestamp_type ts) {
+    auto key = partition_key::from_single_value(*schema, serialized(sstring("pk0")));
+    mutation m(schema, dht::decorate_key(*schema, key));
+    m.partition().apply(tombstone(ts, gc_clock::now()));
+    return m;
+}
+
+merge_outcome merge_tied(const mutation& stored, const mutation& incoming) {
+    return merge_tied_records(stored.schema(), stored.decorated_key(),
+            to_single_row_partition(mutation(stored)), to_single_row_partition(mutation(incoming)));
+}
+
+}
+
+// When one of two records with equal timestamps has all the content of the other one, the merge
+// names it and builds no new record. Two equal records count as "the stored record contains the
+// incoming one", so that a write of a record that is already stored writes nothing.
+SEASTAR_THREAD_TEST_CASE(test_logstor_merge_tied_records_finds_the_record_that_contains_the_other) {
+    auto schema = make_two_column_schema();
+    const auto ts = api::timestamp_type(7);
+
+    const auto both = make_row_mutation(schema, ts, {{"v", "a"}, {"w", "b"}});
+    const auto only_v = make_row_mutation(schema, ts, {{"v", "a"}});
+
+    auto same = merge_tied(both, both);
+    BOOST_REQUIRE(same.result == merge_result::stored_contains_incoming);
+    BOOST_REQUIRE(!same.merged);
+
+    auto stored_has_more = merge_tied(both, only_v);
+    BOOST_REQUIRE(stored_has_more.result == merge_result::stored_contains_incoming);
+    BOOST_REQUIRE(!stored_has_more.merged);
+
+    auto incoming_has_more = merge_tied(only_v, both);
+    BOOST_REQUIRE(incoming_has_more.result == merge_result::incoming_contains_stored);
+    BOOST_REQUIRE(!incoming_has_more.merged);
+}
+
+// Two values of one column with one timestamp reconcile by the cell rule, which keeps the larger
+// value in both orders. So the record with the larger value contains the other record.
+SEASTAR_THREAD_TEST_CASE(test_logstor_merge_tied_records_keeps_the_larger_value_of_a_column) {
+    auto schema = make_two_column_schema();
+    const auto ts = api::timestamp_type(7);
+
+    const auto smaller = make_row_mutation(schema, ts, {{"v", "a"}});
+    const auto larger = make_row_mutation(schema, ts, {{"v", "b"}});
+
+    BOOST_REQUIRE(merge_tied(smaller, larger).result == merge_result::incoming_contains_stored);
+    BOOST_REQUIRE(merge_tied(larger, smaller).result == merge_result::stored_contains_incoming);
+}
+
+// When each of two records with equal timestamps has content that the other one does not have, the
+// merge is a new record with the content of both. It does not depend on the order of the two
+// records, it has their timestamp, and it contains each of them.
+SEASTAR_THREAD_TEST_CASE(test_logstor_merge_tied_records_merges_records_that_differ) {
+    auto schema = make_two_column_schema();
+    const auto ts = api::timestamp_type(7);
+
+    const auto only_v = make_row_mutation(schema, ts, {{"v", "a"}});
+    const auto only_w = make_row_mutation(schema, ts, {{"w", "b"}});
+    const auto both = make_row_mutation(schema, ts, {{"v", "a"}, {"w", "b"}});
+
+    auto merged = merge_tied(only_v, only_w);
+    BOOST_REQUIRE(merged.result == merge_result::merged);
+    BOOST_REQUIRE(merged.merged);
+    assert_that(*merged.merged).is_equal_to(both);
+    BOOST_REQUIRE_EQUAL(record_timestamp(*merged.merged), ts);
+
+    auto merged_in_the_other_order = merge_tied(only_w, only_v);
+    BOOST_REQUIRE(merged_in_the_other_order.result == merge_result::merged);
+    assert_that(*merged_in_the_other_order.merged).is_equal_to(both);
+
+    BOOST_REQUIRE(merge_tied(*merged.merged, only_v).result == merge_result::stored_contains_incoming);
+    BOOST_REQUIRE(merge_tied(*merged.merged, only_w).result == merge_result::stored_contains_incoming);
+}
+
+// A deletion and a row with one timestamp merge to a deleted partition in both orders, because a
+// tombstone wins against a cell and a row marker of the same timestamp. The merge keeps the cells
+// that the tombstone covers, so it is equal to neither record, and a second merge with either
+// record changes nothing.
+SEASTAR_THREAD_TEST_CASE(test_logstor_merge_tied_records_of_a_deletion_and_a_row_is_a_deletion) {
+    auto schema = make_two_column_schema();
+    const auto ts = api::timestamp_type(7);
+
+    const auto row = make_row_mutation(schema, ts, {{"v", "a"}});
+    const auto deletion = make_deletion(schema, ts);
+
+    for (const auto& [stored, incoming] : {std::pair(row, deletion), std::pair(deletion, row)}) {
+        auto merged = merge_tied(stored, incoming);
+        BOOST_REQUIRE(merged.result == merge_result::merged);
+        BOOST_REQUIRE_EQUAL(record_timestamp(*merged.merged), ts);
+        BOOST_REQUIRE_EQUAL(merged.merged->live_row_count(), 0u);
+        BOOST_REQUIRE(merge_tied(*merged.merged, row).result == merge_result::stored_contains_incoming);
+        BOOST_REQUIRE(merge_tied(*merged.merged, deletion).result == merge_result::stored_contains_incoming);
+    }
+}
+
+// A stored record of an older schema version merges with a record of the current version, after
+// the decoder converts it to the current schema.
+SEASTAR_THREAD_TEST_CASE(test_logstor_merge_tied_records_of_two_schema_versions) {
+    auto old_schema = make_kv_schema();
+    auto schema = schema_builder(old_schema).with_column("w", utf8_type).build();
+    BOOST_REQUIRE(schema->version() != old_schema->version());
+    const auto ts = api::timestamp_type(7);
+
+    const auto stored = make_kv_mutation(old_schema, "pk0", "a", ts);
+    const auto incoming = make_row_mutation(schema, ts, {{"w", "b"}});
+
+    auto merged = merge_tied_records(schema, incoming.decorated_key(),
+            decode_record_value(encode_record_value(stored), *schema, make_header(stored, ts)),
+            decode_record_value(encode_record_value(incoming), *schema, make_header(incoming, ts)));
+    BOOST_REQUIRE(merged.result == merge_result::merged);
+    assert_that(*merged.merged).is_equal_to(make_row_mutation(schema, ts, {{"v", "a"}, {"w", "b"}}));
 }
 
 // Checks that a frozen mutation written through logstor::write() reads back as the original
