@@ -1176,6 +1176,58 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_source_keeps_compaction_of_the_merg
     BOOST_REQUIRE_LT(merge_target.logstor_segments().segment_count(), 3);
 }
 
+// A tablet merge can remove a group while a source of the group exists, and a new group can then
+// get the address of the removed group. The source sends the records of the removed group, and the
+// destruction of the source does not enable compaction of the new group.
+SEASTAR_THREAD_TEST_CASE(test_logstor_record_source_of_a_removed_group_keeps_compaction_of_a_new_group_disabled) {
+    auto schema = make_schema();
+    logstor_env env;
+    // The merge target owns the index, because the index must stay after the removal of the group.
+    test_logstor_group merge_target(schema, env.ls);
+    // The group is in a std::optional, so that a new group made in its place gets the address of
+    // the removed group.
+    std::optional<test_logstor_group> group(std::in_place, schema, env.ls, merge_target.logstor_index());
+    auto& cm = env.ls.get_compaction_manager();
+
+    const auto first = make_records(10, 100);
+    const auto second = make_records(10, 100, 10);
+    {
+        auto setup_guard = cm.disable_compaction(*group).get();
+        write_segment(env.ls, *group, schema, first);
+        write_segment(env.ls, *group, schema, second);
+    }
+
+    auto source = env.ls.get_segment_manager().make_record_stream_source(*group, merge_target).get();
+    BOOST_REQUIRE(source);
+    // The merge moves the segments to the merge target, and then the group is removed and freed, as
+    // the merge fiber does with an empty merging group.
+    merge_target.logstor_segments().merge(group->logstor_segments()).get();
+    group.reset();
+    group.emplace(schema, env.ls, merge_target.logstor_index());
+
+    // The guard keeps compaction of the new group disabled until the test resets it. The second
+    // segment overwrites the records of the first segment, so compaction can free the first segment.
+    auto new_group_guard = std::make_optional(cm.disable_compaction(*group).get());
+    const auto third = make_records(10, 100, 20);
+    write_segment(env.ls, *group, schema, third);
+    write_segment(env.ls, *group, schema, overwrite(third, 2000));
+    write_segment(env.ls, *group, schema, make_records(10, 100, 30));
+
+    const auto chunks = read_all(*source);
+    BOOST_REQUIRE(timestamps_in(chunks) == timestamps_of({first, second}));
+    source.reset();
+
+    cm.submit(*group);
+    // Waits for a compaction that runs.
+    cm.disable_compaction(*group).get();
+    BOOST_REQUIRE_EQUAL(group->logstor_segments().segment_count(), 3);
+
+    new_group_guard.reset();
+    cm.submit(*group);
+    cm.disable_compaction(*group).get();
+    BOOST_REQUIRE_LT(group->logstor_segments().segment_count(), 3);
+}
+
 // The source fails the stream on a segment that is not a full segment of the table: an empty
 // segment, a mixed segment, a segment of another table, a corrupt segment, and a segment whose CRCs
 // match but whose second record frame does not parse.

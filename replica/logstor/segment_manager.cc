@@ -153,13 +153,20 @@ private:
         // Signalled when compaction of the group is enabled again, and when the compaction manager
         // stops, to wake the split compactions that wait for it.
         seastar::condition_variable compaction_enabled;
+        // This flag is true after remove() or stop() erased the state from `_groups`. The release
+        // of a reenabler then changes only the state, so it does not wake the driver for a group
+        // that is gone, and it does not use the compaction manager after stop().
+        bool removed{false};
 
         bool running() const noexcept {
             return !completion.available();
         }
     };
 
-    using group_compaction_state_map = absl::flat_hash_map<logstor_group*, std::unique_ptr<group_compaction_state>>;
+    // A reenabler keeps the state of its group and not the address of the group, because remove()
+    // can erase a group while compaction of the group is disabled, and a new group can then get the
+    // address of the erased group.
+    using group_compaction_state_map = absl::flat_hash_map<logstor_group*, lw_shared_ptr<group_compaction_state>>;
     group_compaction_state_map _groups;
 
     compaction_driver _driver;
@@ -231,11 +238,12 @@ private:
     future<> do_compaction(logstor_group&, compaction_batch_limits, abort_source&);
     future<> do_split_compaction(logstor_group&, mutation_writer::classify_by_token_group, split_target_group, abort_source&);
 
-    group_compaction_state& get_group_state(logstor_group&);
-    group_compaction_state* find_group_state(logstor_group&) noexcept;
+    lw_shared_ptr<group_compaction_state> get_group_state(logstor_group&);
+    // Returns the state of the group, or null if the group is not registered.
+    lw_shared_ptr<group_compaction_state> find_group_state(logstor_group&) noexcept;
 
-    // Disables compaction of the group until the returned reenabler is destroyed.
-    compaction_reenabler hold_compaction_disabled(logstor_group&, group_compaction_state&);
+    // Disables compaction of the group of `state` until the returned reenabler is destroyed.
+    compaction_reenabler hold_compaction_disabled(lw_shared_ptr<group_compaction_state> state);
 
 };
 
@@ -258,6 +266,9 @@ future<> compaction_manager_impl::stop() {
 
     co_await _shares_controller.shutdown();
 
+    for (auto& [cg, state] : _groups) {
+        state->removed = true;
+    }
     _groups.clear();
 }
 
@@ -809,21 +820,21 @@ compaction_driver::shard_sample compaction_manager_impl::sample() const noexcept
     };
 }
 
-compaction_manager_impl::group_compaction_state& compaction_manager_impl::get_group_state(logstor_group& cg) {
+lw_shared_ptr<compaction_manager_impl::group_compaction_state> compaction_manager_impl::get_group_state(logstor_group& cg) {
     auto it = _groups.find(&cg);
     if (it == _groups.end()) {
         on_internal_error(logstor_logger, format("compaction_state for logstor group {} [{}] does not exist", cg.table_id(), fmt::ptr(&cg)));
     }
-    return *it->second;
+    return it->second;
 }
 
-compaction_manager_impl::group_compaction_state* compaction_manager_impl::find_group_state(logstor_group& cg) noexcept {
+lw_shared_ptr<compaction_manager_impl::group_compaction_state> compaction_manager_impl::find_group_state(logstor_group& cg) noexcept {
     auto it = _groups.find(&cg);
-    return it != _groups.end() ? it->second.get() : nullptr;
+    return it != _groups.end() ? it->second : nullptr;
 }
 
 void compaction_manager_impl::add(logstor_group& cg) {
-    auto [it, inserted] = _groups.try_emplace(&cg, std::make_unique<group_compaction_state>());
+    auto [it, inserted] = _groups.try_emplace(&cg, make_lw_shared<group_compaction_state>());
     if (!inserted) {
         on_internal_error(logstor_logger, format("compaction_state for logstor group {} [{}] already exists", cg.table_id(), fmt::ptr(&cg)));
     }
@@ -1605,7 +1616,7 @@ future<> compaction_manager_impl::submit_group_compaction(logstor_group& cg, std
         std::function<future<>(group_compaction_state&)> op, scheduling_group sg, wait_if_disabled wait) {
     bool waited = false;
     while (can_submit_compaction()) {
-        auto* state = find_group_state(cg);
+        auto state = find_group_state(cg);
         if (!state) {
             co_await coroutine::return_exception(std::runtime_error("logstor group submitted for compaction but it is not registered"));
         }
@@ -1687,6 +1698,7 @@ future<> compaction_manager_impl::remove(logstor_group& cg) {
 
     auto state = std::move(it->second);
     _groups.erase(it);
+    state->removed = true;
 
     auto close_result = co_await coroutine::as_future(cg.close_separator());
     if (close_result.failed()) {
@@ -1702,14 +1714,14 @@ future<> compaction_manager_impl::remove(logstor_group& cg) {
 }
 
 future<compaction_reenabler> compaction_manager_impl::disable_compaction(logstor_group& cg) {
-    auto* state = find_group_state(cg);
+    auto state = find_group_state(cg);
     if (!state) {
         // The group was already removed, so no compaction can run on it anymore and there
         // is nothing to disable. This happens when a group is discarded after it was stopped.
         co_return compaction_reenabler();
     }
 
-    auto reenabler = hold_compaction_disabled(cg, *state);
+    auto reenabler = hold_compaction_disabled(state);
 
     // Wait for any ongoing compaction to finish before disabling
     auto f = co_await coroutine::as_future(state->completion.get_future());
@@ -1719,16 +1731,14 @@ future<compaction_reenabler> compaction_manager_impl::disable_compaction(logstor
 }
 
 compaction_reenabler compaction_manager_impl::disable_compaction_no_wait(logstor_group& cg) {
-    return hold_compaction_disabled(cg, get_group_state(cg));
+    return hold_compaction_disabled(get_group_state(cg));
 }
 
-compaction_reenabler compaction_manager_impl::hold_compaction_disabled(logstor_group& cg, group_compaction_state& state) {
-    ++state.compaction_disabled_counter;
-    return compaction_reenabler([this, &cg] noexcept {
-        // The group can be removed while compaction of it is disabled.
-        auto it = _groups.find(&cg);
-        if (it != _groups.end() && --it->second->compaction_disabled_counter == 0) {
-            it->second->compaction_enabled.broadcast();
+compaction_reenabler compaction_manager_impl::hold_compaction_disabled(lw_shared_ptr<group_compaction_state> state) {
+    ++state->compaction_disabled_counter;
+    return compaction_reenabler([this, state = std::move(state)] noexcept {
+        if (--state->compaction_disabled_counter == 0 && !state->removed) {
+            state->compaction_enabled.broadcast();
             _driver.notify_group_idle();
         }
     });
