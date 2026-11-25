@@ -146,7 +146,7 @@ inline replica::logstor::logstor_config make_test_logstor_config(const std::file
 // A compaction group of a table, which is what the separator and compaction work on. Registers
 // itself with the compaction manager, so it must be destroyed in a seastar thread.
 class test_logstor_group final : public replica::logstor::logstor_group {
-    ::table_id _table_id;
+    schema_ptr _schema;
     std::unique_ptr<replica::logstor::primary_index> _owned_index;
     replica::logstor::primary_index& _index;
     replica::logstor::compaction_manager& _cm;
@@ -157,7 +157,7 @@ class test_logstor_group final : public replica::logstor::logstor_group {
 public:
     test_logstor_group(schema_ptr schema, replica::logstor::logstor& ls, bool cache_enabled = false)
         : logstor_group(ls.get_segment_manager().get_segment_size(), &ls.get_segment_manager().shard_segment_stats())
-        , _table_id(schema->id())
+        , _schema(std::move(schema))
         , _owned_index(ls.make_primary_index(cache_enabled, cache_enabled))
         , _index(*_owned_index)
         , _cm(ls.get_compaction_manager()) {
@@ -168,7 +168,7 @@ public:
     // a table share it. This is what the groups of a split have.
     test_logstor_group(schema_ptr schema, replica::logstor::logstor& ls, replica::logstor::primary_index& index)
         : logstor_group(ls.get_segment_manager().get_segment_size(), &ls.get_segment_manager().shard_segment_stats())
-        , _table_id(schema->id())
+        , _schema(std::move(schema))
         , _index(index)
         , _cm(ls.get_compaction_manager()) {
         _cm.add(*this);
@@ -179,7 +179,11 @@ public:
     }
 
     ::table_id table_id() const noexcept override {
-        return _table_id;
+        return _schema->id();
+    }
+
+    const schema_ptr& schema() const noexcept override {
+        return _schema;
     }
 
     replica::logstor::primary_index& logstor_index() noexcept override {

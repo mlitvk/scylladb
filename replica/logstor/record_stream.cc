@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <compare>
 
 #include <seastar/core/on_internal_error.hh>
 #include <seastar/core/simple-stream.hh>
@@ -260,6 +261,20 @@ future<> record_stream_sink::write_chunk(temporary_buffer<char> bytes) {
     }
 }
 
+namespace {
+
+// Orders a streamed record after a stored record of the same timestamp, so that the streamed record
+// replaces the stored one. The sink does not merge the two records as a write does, so the content
+// that only the stored record has is lost on this replica until a repair.
+struct streamed_record_wins_a_tie {
+    std::strong_ordering operator()(const index_entry& stored, const index_entry& streamed) const noexcept {
+        const auto order = stored.timestamp <=> streamed.timestamp;
+        return order == 0 ? std::strong_ordering::less : order;
+    }
+};
+
+}
+
 future<> record_stream_sink::write_record(const chunk_record& record) {
     const auto& header = record.header;
     if (header.table != _table) {
@@ -283,7 +298,7 @@ future<> record_stream_sink::write_record(const chunk_record& record) {
     gb->index_updates.push_back(gb->buffer->write(std::move(writer)).then_unpack(
             [stats = &_stats, index, key = std::move(key), timestamp = header.timestamp] (record_location location, seastar::gate::holder) {
         ++stats->records_received;
-        if (!index->insert(key, index_entry{.location = location, .timestamp = timestamp}).inserted()) {
+        if (!index->insert(key, index_entry{.location = location, .timestamp = timestamp}, streamed_record_wins_a_tie{}).inserted()) {
             ++stats->records_superseded;
         }
     }));

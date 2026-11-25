@@ -486,6 +486,9 @@ public:
 
     virtual table_id table_id() const noexcept = 0;
 
+    // Returns the current schema of the table of the group.
+    virtual const schema_ptr& schema() const noexcept = 0;
+
     // Returns true when automatic compaction of the table is off, for example after nodetool
     // disableautocompaction. A compaction that is asked for explicitly still runs.
     virtual bool automatic_compaction_disabled() const noexcept {

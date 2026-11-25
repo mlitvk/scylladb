@@ -51,6 +51,24 @@ The `buffered_writer` manages multiple write buffers for user writes, an active 
 
 Only step 4 writes to the disk - all other steps only update in-memory metadata.
 
+**Writes With Equal Timestamps:**
+
+The index keeps the record with the highest timestamp of each key. When a write has the same timestamp as the stored record of its key, the content of the two records decides what the index keeps. The records are compared and merged by the rules that reconcile two versions of a partition in the rest of ScyllaDB (`mutation::apply()`):
+
+| The write against the stored record | Result |
+|---|---|
+| The stored record has all the content of the write | Nothing is written, and the write succeeds |
+| The write has all the content of the stored record, and more | The record of the write replaces the stored record |
+| Each has content that the other one does not have | The merge of the two is written, and it replaces the stored record |
+
+So the value of a key does not depend on the order in which writes with one timestamp arrive, and the replicas converge on such writes without repair. A hint or a retry that arrives again after a repair writes nothing, so it does not undo the repair. The result is not "the later write wins": of two values of one column with one timestamp the larger value stays, and a deletion wins against a row, as in a read that merges the answers of two replicas.
+
+A write looks its key up in the index before it appends its record, which is how it finds a stored record with its timestamp. Such a write reads the stored record from the disk to compare the two. Two writes of one key that are in flight together can both find no stored record. The second one then finds the other record when it updates the index, after its own record is on disk. That record stays on disk with no index entry, as the record of an older write does, and the write continues as the table says.
+
+Known limits:
+- Recovery does not apply this rule. It orders the records of one key with one timestamp by segment sequence and offset. So after a restart, a key with such records can have the value of one of them and not their merge.
+- The receiver of a record stream does not apply this rule. A streamed record replaces a stored record of the same timestamp.
+
 **Read Path:**
 1. Application requests data for a partition key
 2. Index lookup returns the cached partition, if the cache has it, or the record location

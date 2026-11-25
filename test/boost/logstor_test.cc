@@ -4462,3 +4462,418 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_uses_free_segments_when_file_format_fails)
         write_and_flush_segment(ls, cg, make_kv_mutation(schema, seastar::format("pk{}", i), value));
     }
 }
+
+namespace {
+
+// A started logstor over a new test directory, with its cache. The destructor stops the logstor.
+class started_logstor {
+    tmpdir _dir;
+    shared_logstor_cache _cache;
+    test_table_catalog _no_tables;
+    logstor _ls;
+public:
+    started_logstor()
+        : _ls(make_test_logstor_config(_dir.path()), _cache.shared_tracker, _no_tables) {
+        _ls.do_recovery().get();
+        _ls.start().get();
+    }
+
+    ~started_logstor() {
+        _ls.stop().get();
+    }
+
+    logstor& ls() noexcept {
+        return _ls;
+    }
+};
+
+// Waits until a fiber waits on the injection `name`.
+void wait_for_waiter(std::string_view name) {
+    while (utils::get_local_injector().waiters(name) == 0) {
+        seastar::sleep(std::chrono::milliseconds(1)).get();
+    }
+}
+
+// Returns the value of the metric `name` of the store on this shard.
+uint64_t store_metric(std::string_view name) {
+    uint64_t value = 0;
+    for (const auto& [family_name, family] : seastar::metrics::impl::get_value_map()) {
+        for (const auto& [labels, metric] : family) {
+            if (metric && metric->get_id().group_name() == "logstor" && metric->get_id().name() == name) {
+                value += metric->get_function()().ui();
+            }
+        }
+    }
+    return value;
+}
+
+// Requires the counts of the writes that found a stored record with their timestamp.
+void require_tied_writes(uint64_t tied, uint64_t contained, uint64_t merged) {
+    BOOST_REQUIRE_EQUAL(store_metric("tied_writes"), tied);
+    BOOST_REQUIRE_EQUAL(store_metric("tied_writes_contained"), contained);
+    BOOST_REQUIRE_EQUAL(store_metric("tied_writes_merged"), merged);
+    BOOST_REQUIRE_EQUAL(store_metric("write_failures"), 0u);
+}
+
+future<> start_write(logstor& ls, test_logstor_group& cg, const mutation& m) {
+    return ls.write(m, write_target(&cg, {}), db::no_timeout);
+}
+
+void write_and_wait(logstor& ls, test_logstor_group& cg, const mutation& m) {
+    start_write(ls, cg, m).get();
+}
+
+// Requires that a read of the key of `expected` gives `expected`.
+void require_stored(logstor& ls, test_logstor_group& cg, const mutation& expected) {
+    auto actual = read_mutation(ls, expected.schema(), cg.logstor_index(), expected.decorated_key(), expected.schema()->full_slice()).get();
+    BOOST_REQUIRE(actual);
+    assert_that(*actual).is_equal_to(expected);
+}
+
+record_location stored_location(test_logstor_group& cg, const mutation& m) {
+    const auto entry = cg.logstor_index().find(primary_index_key(m.decorated_key()));
+    BOOST_REQUIRE(entry);
+    return entry->location;
+}
+
+// Writes the mutation of the key "pk0" and two other keys, each into a full segment of its own, so
+// that a compaction of the group has three segments to merge and moves the record of "pk0".
+void write_to_segments_that_a_compaction_merges(logstor& ls, test_logstor_group& cg, const mutation& pk0) {
+    auto schema = pk0.schema();
+    const auto ts = record_timestamp(pk0);
+    for (const sstring pk : {"pk1", "pk2"}) {
+        mutation other(schema, dht::decorate_key(*schema, partition_key::from_single_value(*schema, serialized(pk))));
+        other.partition().clustered_row(*schema, clustering_key::make_empty()).apply(row_marker(ts));
+        write_and_flush_segment(ls, cg, other);
+    }
+    write_and_flush_segment(ls, cg, pk0);
+    BOOST_REQUIRE_EQUAL(cg.logstor_segments().segment_count(), 3u);
+}
+
+}
+
+// Two writes of one key with one timestamp, where each has content that the other one does not
+// have, leave their merge, in both orders of arrival. The second write of each order finds the
+// first one in the index, reads it, and stores the merge.
+SEASTAR_THREAD_TEST_CASE(test_logstor_tied_writes_merge_in_both_orders) {
+    auto schema = make_two_column_schema();
+    const auto ts = api::timestamp_type(1);
+    const auto two_cells = make_row_mutation(schema, ts, {{"v", "a"}, {"w", "b"}});
+    const auto larger_v = make_row_mutation(schema, ts, {{"v", "c"}});
+    const auto merge = make_row_mutation(schema, ts, {{"v", "c"}, {"w", "b"}});
+
+    for (const auto& [first, second] : {std::pair(two_cells, larger_v), std::pair(larger_v, two_cells)}) {
+        started_logstor store;
+        auto& ls = store.ls();
+        test_logstor_group cg(schema, ls);
+
+        write_and_wait(ls, cg, first);
+        write_and_wait(ls, cg, second);
+
+        require_stored(ls, cg, merge);
+        require_tied_writes(1, 0, 1);
+    }
+}
+
+// A write whose content is already stored with its timestamp appends nothing, and the store counts
+// it as a write and not as a failure. The copies that the separator and compaction make of the
+// stored record do not change this.
+SEASTAR_THREAD_TEST_CASE(test_logstor_tied_write_of_stored_content_appends_nothing) {
+    auto schema = make_kv_schema();
+    started_logstor store;
+    auto& ls = store.ls();
+    test_logstor_group cg(schema, ls);
+    auto compaction_guard = std::make_optional(ls.get_compaction_manager().disable_compaction(cg).get());
+
+    const auto m = make_kv_mutation(schema, "pk0", "v0", api::timestamp_type(1));
+    write_and_wait(ls, cg, m);
+
+    const auto bytes_written = segment_manager_metric("bytes_written");
+    write_and_wait(ls, cg, m);
+    require_tied_writes(1, 1, 0);
+    BOOST_REQUIRE_EQUAL(segment_manager_metric("bytes_written"), bytes_written);
+
+    // The separator moves the record to a full segment, and a compaction moves it again.
+    ls.flush_to_separator().get();
+    cg.flush_separator().get();
+    write_to_segments_that_a_compaction_merges(ls, cg, make_kv_mutation(schema, "pk0", "v0", api::timestamp_type(1)));
+    require_tied_writes(2, 2, 0);
+    const auto location_before_compaction = stored_location(cg, m);
+    compaction_guard.reset();
+    ls.get_compaction_manager().submit(cg);
+    compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+    BOOST_REQUIRE(stored_location(cg, m) != location_before_compaction);
+
+    const auto bytes_written_after_copies = segment_manager_metric("bytes_written");
+    write_and_wait(ls, cg, m);
+    require_tied_writes(3, 3, 0);
+    BOOST_REQUIRE_EQUAL(segment_manager_metric("bytes_written"), bytes_written_after_copies);
+    require_stored(ls, cg, m);
+}
+
+// Of two values of one column with one timestamp, the larger value stays, and not the value of the
+// later write. This is the rule that a read at QUORUM applies when it merges the answers of two
+// replicas, so a replica gives the same value as such a read.
+SEASTAR_THREAD_TEST_CASE(test_logstor_tied_writes_keep_the_larger_value_and_not_the_later_one) {
+    auto schema = make_kv_schema();
+    started_logstor store;
+    auto& ls = store.ls();
+    test_logstor_group cg(schema, ls);
+
+    const auto larger = make_kv_mutation(schema, "pk0", "v2", api::timestamp_type(1));
+    const auto smaller = make_kv_mutation(schema, "pk0", "v1", api::timestamp_type(1));
+
+    write_and_wait(ls, cg, larger);
+    write_and_wait(ls, cg, smaller);
+
+    require_stored(ls, cg, larger);
+    require_tied_writes(1, 1, 0);
+}
+
+// A deletion and a row with one timestamp leave a deleted partition in both orders of arrival,
+// because a tombstone wins against a row marker and a cell of the same timestamp.
+SEASTAR_THREAD_TEST_CASE(test_logstor_tied_deletion_and_row_leave_a_deletion_in_both_orders) {
+    auto schema = make_two_column_schema();
+    const auto ts = api::timestamp_type(1);
+    const auto row = make_row_mutation(schema, ts, {{"v", "a"}});
+    const auto deletion = make_deletion(schema, ts);
+
+    for (const auto& [first, second] : {std::pair(row, deletion), std::pair(deletion, row)}) {
+        started_logstor store;
+        auto& ls = store.ls();
+        test_logstor_group cg(schema, ls);
+
+        write_and_wait(ls, cg, first);
+        write_and_wait(ls, cg, second);
+
+        auto actual = read_mutation(ls, schema, cg.logstor_index(), row.decorated_key(), schema->full_slice()).get();
+        BOOST_REQUIRE(actual);
+        BOOST_REQUIRE_EQUAL(actual->live_row_count(), 0u);
+        BOOST_REQUIRE(actual->partition().partition_tombstone() == deletion.partition().partition_tombstone());
+        BOOST_REQUIRE_EQUAL(store_metric("tied_writes"), 1u);
+    }
+}
+
+// Two writes of one key with one timestamp that are in flight together both find no stored record
+// before they append. The second one finds the tie when it installs its record. Its record is on
+// disk with no index entry, so it reads the record back and merges it with the stored one.
+SEASTAR_THREAD_TEST_CASE(test_logstor_tied_write_found_at_the_insert_merges) {
+    auto schema = make_two_column_schema();
+    const auto ts = api::timestamp_type(1);
+    started_logstor store;
+    auto& ls = store.ls();
+    test_logstor_group cg(schema, ls);
+
+    const auto only_v = make_row_mutation(schema, ts, {{"v", "a"}});
+    const auto only_w = make_row_mutation(schema, ts, {{"w", "b"}});
+
+    auto first = start_write(ls, cg, only_v);
+    auto second = start_write(ls, cg, only_w);
+    first.get();
+    second.get();
+
+    require_stored(ls, cg, make_row_mutation(schema, ts, {{"v", "a"}, {"w", "b"}}));
+    require_tied_writes(1, 0, 1);
+}
+
+// Two writes of the same content that are in flight together leave one of the two records in the
+// index. The second write finds the tie when it installs its record, and it stores nothing more.
+SEASTAR_THREAD_TEST_CASE(test_logstor_tied_write_found_at_the_insert_with_stored_content) {
+    auto schema = make_kv_schema();
+    started_logstor store;
+    auto& ls = store.ls();
+    test_logstor_group cg(schema, ls);
+
+    const auto m = make_kv_mutation(schema, "pk0", "v0", api::timestamp_type(1));
+
+    auto first = start_write(ls, cg, m);
+    auto second = start_write(ls, cg, m);
+    first.get();
+    second.get();
+
+    require_stored(ls, cg, m);
+    require_tied_writes(1, 1, 0);
+}
+
+// A write that finds the tie at the insert, and whose record contains the stored one, appends its
+// record a second time and installs the second one. It does not install the first one, because
+// the separator can copy the buffer of the first one and free its mixed segment while the write
+// reads the stored record. An index entry at the first location would then point into a free
+// segment, or the free of the segment would find a live record in it.
+// The test parks the write in the read of the stored record, switches the active segment, and
+// starts the separator flushes. The flush of the group moves the stored record and then waits for
+// the read guard of the write, so the write reads the stored record again at its new location.
+SEASTAR_THREAD_TEST_CASE(test_logstor_tied_write_does_not_install_a_record_that_the_separator_can_free) {
+    if constexpr (!std::is_same_v<utils::error_injection_type, utils::error_injection<true>>) {
+        return;
+    }
+
+    auto schema = make_two_column_schema();
+    auto other_schema = make_kv_schema();
+    const auto ts = api::timestamp_type(1);
+    started_logstor store;
+    auto& ls = store.ls();
+    test_logstor_group cg(schema, ls);
+    test_logstor_group other_cg(other_schema, ls);
+    auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+
+    const auto only_v = make_row_mutation(schema, ts, {{"v", "a"}});
+    const auto both = make_row_mutation(schema, ts, {{"v", "a"}, {"w", "b"}});
+
+    auto& injector = utils::get_local_injector();
+    const auto hold_read = "logstor_write_wait_in_tie_read";
+    injector.enable(hold_read, true);
+
+    auto first = start_write(ls, cg, only_v);
+    auto second = start_write(ls, cg, both);
+    first.get();
+    wait_for_waiter(hold_read);
+    const auto mixed_segment = stored_location(cg, only_v).segment;
+
+    // Writes of another table fill the active segment, so that the store switches to a new one and
+    // the segment of the two records can be freed.
+    const sstring filler(16 * 1024, 'x');
+    for (int i = 0; i < 10; ++i) {
+        write_and_wait(ls, other_cg, make_kv_mutation(other_schema, fmt::format("pk{}", i), filler));
+    }
+    const auto segments_freed = segment_manager_metric("segments_freed");
+    ls.flush_to_separator().get();
+    other_cg.flush_separator().get();
+    auto group_flush = cg.flush_separator();
+    while (stored_location(cg, only_v).segment == mixed_segment) {
+        seastar::sleep(std::chrono::milliseconds(1)).get();
+    }
+    BOOST_REQUIRE(!group_flush.available());
+    BOOST_REQUIRE(!second.available());
+
+    injector.receive_message(hold_read);
+    second.get();
+    group_flush.get();
+
+    require_stored(ls, cg, both);
+    require_tied_writes(1, 0, 0);
+    BOOST_REQUIRE(stored_location(cg, both).segment != mixed_segment);
+    BOOST_REQUIRE_GT(segment_manager_metric("segments_freed"), segments_freed);
+
+    // The second record of the write goes through the separator and a read like every record.
+    ls.flush_to_separator().get();
+    cg.flush_separator().get();
+    require_stored(ls, cg, both);
+}
+
+// A compaction moves the stored record while a tied write reads it. The compaction updates the
+// index first and frees the old segment only after the read guard of the write is gone, so the
+// read is safe. The write then finds another location in the index than the one that it read, so
+// it reads the record again there before it stores the merge.
+SEASTAR_THREAD_TEST_CASE(test_logstor_tied_write_reads_again_a_record_that_moved_during_the_read) {
+    if constexpr (!std::is_same_v<utils::error_injection_type, utils::error_injection<true>>) {
+        return;
+    }
+
+    auto schema = make_two_column_schema();
+    const auto ts = api::timestamp_type(1);
+    started_logstor store;
+    auto& ls = store.ls();
+    test_logstor_group cg(schema, ls);
+    auto compaction_guard = std::make_optional(ls.get_compaction_manager().disable_compaction(cg).get());
+
+    const auto only_v = make_row_mutation(schema, ts, {{"v", "a"}});
+    const auto only_w = make_row_mutation(schema, ts, {{"w", "b"}});
+    write_to_segments_that_a_compaction_merges(ls, cg, only_v);
+    const auto location_before = stored_location(cg, only_v);
+
+    auto& injector = utils::get_local_injector();
+    const auto hold_read = "logstor_write_wait_in_tie_read";
+    injector.enable(hold_read, true);
+    auto write = start_write(ls, cg, only_w);
+    wait_for_waiter(hold_read);
+
+    compaction_guard.reset();
+    ls.get_compaction_manager().submit(cg);
+    auto compaction_done = ls.get_compaction_manager().disable_compaction(cg);
+    while (stored_location(cg, only_v) == location_before) {
+        seastar::sleep(std::chrono::milliseconds(1)).get();
+    }
+    BOOST_REQUIRE(!compaction_done.available());
+
+    injector.receive_message(hold_read);
+    write.get();
+    compaction_guard = compaction_done.get();
+
+    require_stored(ls, cg, make_row_mutation(schema, ts, {{"v", "a"}, {"w", "b"}}));
+    require_tied_writes(1, 0, 1);
+}
+
+// A compaction moves the stored record after a tied write decided what to store and before its
+// record is on disk. The write installs its record only over the index value that it compared
+// with, so the install fails, the record stays on disk with no index entry, and the write decides
+// and appends again.
+SEASTAR_THREAD_TEST_CASE(test_logstor_tied_write_appends_again_when_the_stored_record_moved_during_the_append) {
+    if constexpr (!std::is_same_v<utils::error_injection_type, utils::error_injection<true>>) {
+        return;
+    }
+
+    auto schema = make_two_column_schema();
+    const auto ts = api::timestamp_type(1);
+    started_logstor store;
+    auto& ls = store.ls();
+    test_logstor_group cg(schema, ls);
+    auto compaction_guard = std::make_optional(ls.get_compaction_manager().disable_compaction(cg).get());
+
+    const auto only_v = make_row_mutation(schema, ts, {{"v", "a"}});
+    const auto only_w = make_row_mutation(schema, ts, {{"w", "b"}});
+    write_to_segments_that_a_compaction_merges(ls, cg, only_v);
+    const auto location_before = stored_location(cg, only_v);
+
+    auto& injector = utils::get_local_injector();
+    const auto hold_append = "logstor_write_wait_before_append";
+    injector.enable(hold_append, true);
+    auto write = start_write(ls, cg, only_w);
+    wait_for_waiter(hold_append);
+
+    compaction_guard.reset();
+    ls.get_compaction_manager().submit(cg);
+    compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+    BOOST_REQUIRE(stored_location(cg, only_v) != location_before);
+
+    const auto bytes_written = segment_manager_metric("bytes_written");
+    injector.receive_message(hold_append);
+    write.get();
+
+    require_stored(ls, cg, make_row_mutation(schema, ts, {{"v", "a"}, {"w", "b"}}));
+    require_tied_writes(1, 0, 1);
+    // The write appended the merge two times, each time in a chunk of its own.
+    BOOST_REQUIRE_EQUAL(segment_manager_metric("bytes_written") - bytes_written, 2 * ondisk::block_alignment);
+}
+
+// A tied write keeps its write target until it ends, also while it reads the stored record and
+// has no record in a write buffer. So a compaction group cannot stop under the write.
+SEASTAR_THREAD_TEST_CASE(test_logstor_tied_write_holds_its_target_until_it_ends) {
+    if constexpr (!std::is_same_v<utils::error_injection_type, utils::error_injection<true>>) {
+        return;
+    }
+
+    auto schema = make_two_column_schema();
+    const auto ts = api::timestamp_type(1);
+    started_logstor store;
+    auto& ls = store.ls();
+    test_logstor_group cg(schema, ls);
+
+    write_and_wait(ls, cg, make_row_mutation(schema, ts, {{"v", "a"}}));
+
+    auto& injector = utils::get_local_injector();
+    const auto hold_read = "logstor_write_wait_in_tie_read";
+    injector.enable(hold_read, true);
+    seastar::gate group_gate;
+    auto write = ls.write(make_row_mutation(schema, ts, {{"w", "b"}}),
+            write_target{.cg = &cg, .alive_holder = group_gate.hold()}, db::no_timeout);
+    wait_for_waiter(hold_read);
+
+    auto group_stopped = group_gate.close();
+    BOOST_REQUIRE(!group_stopped.available());
+
+    injector.receive_message(hold_read);
+    write.get();
+    group_stopped.get();
+    require_tied_writes(1, 0, 1);
+}

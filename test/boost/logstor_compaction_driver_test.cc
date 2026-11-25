@@ -54,6 +54,9 @@ public:
     ::table_id table_id() const noexcept override {
         return {};
     }
+    const schema_ptr& schema() const noexcept override {
+        std::abort();
+    }
     bool automatic_compaction_disabled() const noexcept override {
         return automatic_compaction_off;
     }

@@ -53,6 +53,12 @@ class logstor {
 
     struct stats {
         uint64_t write_failures{0};
+        // The writes that found a stored record of their key with their timestamp.
+        uint64_t tied_writes{0};
+        // The tied writes that stored nothing, because the stored record had their content.
+        uint64_t tied_writes_contained{0};
+        // The tied writes that stored the merge of their record and the stored record.
+        uint64_t tied_writes_merged{0};
     };
 
     segment_manager _segment_manager;
@@ -129,6 +135,16 @@ private:
 
     future<> do_write(const schema&, dht::decorated_key, api::timestamp_type, record_value,
             write_target target, db::timeout_clock::time_point timeout);
+
+    // Writes `incoming` when the index can hold a record of its key with the same timestamp. The
+    // content of the two records decides what the index keeps:
+    // - If the stored record contains `incoming`, the write stores nothing.
+    // - If `incoming` contains the stored record, the write stores `incoming`.
+    // - If each has content that the other one does not have, the write stores their merge.
+    // So the value of a key does not depend on the order in which records with one timestamp
+    // arrive.
+    // `key` is the index key of `incoming`.
+    future<> write_tied(log_record incoming, primary_index_key key, write_target target, db::timeout_clock::time_point timeout);
 };
 
 } // namespace logstor

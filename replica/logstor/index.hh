@@ -296,6 +296,9 @@ public:
         inserted,
         // The index already holds a newer entry for this key; nothing changed.
         superseded,
+        // The index already holds an entry for this key that the comparator orders as equal to the
+        // new entry; nothing changed.
+        tied,
     };
 
     struct insert_outcome {
@@ -309,7 +312,8 @@ public:
     // Which of two entries of the same key is the newer one. Every write of an existing key asks
     // this, so the default is a stateless functor and the comparator a template parameter: the
     // compare is then inlined, rather than a std::function built per insert to call it through.
-    // Only recovery has a comparator of its own, and it captures state, which entry_cmp_fn is for.
+    // Recovery and the receiver of a segment stream have comparators of their own, which
+    // entry_cmp_fn is for.
     struct default_entry_cmp {
         std::strong_ordering operator()(const index_entry& a, const index_entry& b) const noexcept {
             return a.timestamp <=> b.timestamp;
@@ -319,7 +323,10 @@ public:
     using entry_cmp_fn = std::function<std::strong_ordering(const index_entry&, const index_entry&)>;
 
     // Inserts the entry of a key, or overwrites the entry that the index holds for the key when
-    // `cmp` does not find the new entry older. insert_result::inserted covers both cases.
+    // `cmp` orders it before `new_entry`. insert_result::inserted covers both cases.
+    // Changes nothing when `cmp` orders the two entries as equal, and returns insert_result::tied.
+    // The index cannot tell which of two records with one timestamp to keep, because the content
+    // of the records decides it.
     //
     // An overwrite allocates nothing, so it runs under the lock alone, and it cannot fail. The insert
     // of a new key runs in the allocating section, which can compact the region before it runs its
@@ -337,11 +344,12 @@ public:
             logalloc::reclaim_lock lock(_region);
             i = _entries.lower_bound(key, primary_index_key_cmp{}, hint);
             if (hint.match) {
-                // On equal timestamps the later write wins here, while recovery prefers the record in
-                // the higher-sequence segment; the two can disagree, see
-                // test_logstor_recovery_loses_an_equal_timestamp_overwrite.
-                if (cmp(i->_e, new_entry) > 0) {
+                const std::strong_ordering order = cmp(i->_e, new_entry);
+                if (order > 0) {
                     return {insert_result::superseded, std::make_optional(i->_e)};
+                }
+                if (order == 0) {
+                    return {insert_result::tied, std::make_optional(i->_e)};
                 }
                 // Overwriting with newer data: evict the stale cached partition.
                 evict_cached_partition(*i);

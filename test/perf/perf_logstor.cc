@@ -148,7 +148,12 @@
 //   write-frozen     a whole write of a frozen mutation, which is how a write reaches a replica. Its
 //                    partition is copied into the record value, and no mutation is built. Draws from
 //                    a pool of frozen mutations of up to 1024 keys, which is frozen before the test
-//                    starts, so the freeze, which the coordinator pays, is not in the number
+//                    starts, so the freeze, which the coordinator pays, is not in the number. The
+//                    pool has a timestamp older than the dataset, so the index keeps its records
+//   write-replay     a write of a frozen mutation whose content is already stored with its
+//                    timestamp, as a hint or a retry that arrives a second time. The write reads the
+//                    stored record, compares the two, and appends nothing. Draws from a pool as
+//                    write-frozen does, and the first write of each key of the pool stores it
 //
 // Everything above `raw-read` touches no disk - the two cache tests touch the cache, the rest touch
 // neither it nor the disk. They run `cpu_test_batch` operations per invocation of the measurement
@@ -348,6 +353,7 @@ enum class test_kind {
     segment_read,
     write,
     write_frozen,
+    write_replay,
 };
 
 const std::vector<std::pair<std::string_view, test_kind>> test_kinds = {
@@ -368,6 +374,7 @@ const std::vector<std::pair<std::string_view, test_kind>> test_kinds = {
     {"segment-read", test_kind::segment_read},
     {"write", test_kind::write},
     {"write-frozen", test_kind::write_frozen},
+    {"write-replay", test_kind::write_replay},
 };
 
 std::string_view name_of(test_kind kind) {
@@ -666,17 +673,23 @@ public:
         return _logstor->write(fm, *_schema, write_target{.cg = _group.get()}, db::no_timeout);
     }
 
-    // Freezes the mutations of up to 1024 keys, spread over the dataset, for the write-frozen test.
-    // A frozen mutation keeps its timestamp, and the index does not replace an entry with an older
-    // one. The pool is frozen just before the test, so it is newer than what the tests before it
-    // wrote, and each write of it replaces the entry of its key as the write test does.
-    void freeze_write_pool() {
+    // Freezes the mutations of up to 1024 keys, spread over the dataset, for the write-frozen and
+    // write-replay tests. A frozen mutation keeps its timestamp, so each key of the pool is written
+    // many times with one timestamp, and `timestamp` decides what such a write does:
+    // - With a timestamp older than the records of the dataset, each write appends its record, and
+    //   the index keeps the record that it has. This is the whole write that write-frozen measures.
+    //   A write cannot replace the entry of its key each time, as the write test does, because that
+    //   needs a new timestamp and so a new freeze for each write.
+    // - With a new timestamp, the first write of a key replaces the entry of the key, and each
+    //   later write finds its own content stored with its timestamp. It reads the stored record and
+    //   appends nothing, which write-replay measures.
+    void freeze_write_pool(api::timestamp_type timestamp) {
         constexpr size_t max_pool_size = 1024;
         const auto pool_size = std::min(max_pool_size, _keys.size());
         _frozen_pool.clear();
         _frozen_pool.reserve(pool_size);
         for (size_t i = 0; i < pool_size; ++i) {
-            _frozen_pool.push_back(freeze(make_mutation(_keys[i * _keys.size() / pool_size])));
+            _frozen_pool.push_back(freeze(make_mutation(_keys[i * _keys.size() / pool_size], timestamp)));
         }
     }
 
@@ -971,8 +984,7 @@ private:
         };
     }
 
-    mutation make_mutation(const dht::decorated_key& key) const {
-        const auto ts = api::new_timestamp();
+    mutation make_mutation(const dht::decorated_key& key, api::timestamp_type ts = api::new_timestamp()) const {
         mutation m(_schema, key);
         auto& row = m.partition().clustered_row(*_schema, clustering_key::make_empty());
         row.apply(row_marker(ts));
@@ -1111,7 +1123,11 @@ std::vector<perf_result_with_io> run_test(sharded<logstor_bench>& bench, test_ki
     case test_kind::write:
         return io_test(&logstor_bench::do_write);
     case test_kind::write_frozen:
-        bench.invoke_on_all(&logstor_bench::freeze_write_pool).get();
+        // The records of the dataset have the time of their write as their timestamp.
+        bench.invoke_on_all(&logstor_bench::freeze_write_pool, api::timestamp_type(1)).get();
+        return io_test(&logstor_bench::do_write_frozen);
+    case test_kind::write_replay:
+        bench.invoke_on_all(&logstor_bench::freeze_write_pool, api::new_timestamp()).get();
         return io_test(&logstor_bench::do_write_frozen);
     }
     on_internal_error(logstor_logger, "unknown test kind");

@@ -1274,6 +1274,7 @@ public:
     explicit compaction_group_logstor_state(compaction_group& cg) noexcept;
 
     ::table_id table_id() const noexcept override;
+    const schema_ptr& schema() const noexcept override;
     bool automatic_compaction_disabled() const noexcept override;
 
     logstor::primary_index& logstor_index() noexcept override;
@@ -1306,6 +1307,10 @@ compaction_group_logstor_state::compaction_group_logstor_state(compaction_group&
 
 ::table_id compaction_group_logstor_state::table_id() const noexcept {
     return _cg->schema()->id();
+}
+
+const schema_ptr& compaction_group_logstor_state::schema() const noexcept {
+    return _cg->schema();
 }
 
 logstor::primary_index& compaction_group_logstor_state::logstor_index() noexcept {

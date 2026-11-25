@@ -15,9 +15,12 @@
 #include "keys/keys.hh"
 #include "mutation/frozen_mutation.hh"
 #include "replica/logstor/key_utils.hh"
+#include "replica/logstor/record_merge.hh"
 #include "replica/logstor/record_value.hh"
 #include "replica/logstor/segment_manager.hh"
+#include "replica/logstor/single_row_partition.hh"
 #include "replica/logstor/types.hh"
+#include "utils/error_injection.hh"
 #include "utils/managed_bytes.hh"
 #include <random>
 
@@ -75,6 +78,12 @@ logstor::logstor(logstor_config config, ::cache_tracker& shared_cache_tracker, t
                        sm::description("Counts the writes that waited in the write buffer queue for room in a buffer.")),
         sm::make_counter("write_failures", [this] { return _stats.write_failures; },
                        sm::description("Number of writes that failed to be persisted.")),
+        sm::make_counter("tied_writes", [this] { return _stats.tied_writes; },
+                       sm::description("Counts the writes that found a stored record of the same key with the same timestamp.")),
+        sm::make_counter("tied_writes_contained", [this] { return _stats.tied_writes_contained; },
+                       sm::description("Counts the writes that stored nothing, because the stored record with the same timestamp already had their content.")),
+        sm::make_counter("tied_writes_merged", [this] { return _stats.tied_writes_merged; },
+                       sm::description("Counts the writes that stored the merge of their record and the stored record with the same timestamp.")),
     });
 }
 
@@ -163,25 +172,123 @@ future<> logstor::do_write(const schema& s, dht::decorated_key dk, api::timestam
     auto count_failure = defer([this] noexcept { ++_stats.write_failures; });
     auto gate_holder = _async_gate.hold();
 
-    auto& cg = *target.cg;
-    primary_index_key key(dk);
-    auto writer = log_record_writer(log_record{
+    auto& index = target.cg->logstor_index();
+    const primary_index_key key(dk);
+    log_record record{
         .header = {
             .key = std::move(dk),
             .timestamp = ts,
             .table = s.id(),
         },
         .value = std::move(value),
-    });
+    };
 
-    auto [location, op] = co_await coroutine::try_future(
-            _write_buffer.write(std::move(writer), timeout, std::move(target)));
+    if (const auto stored = index.find(key); !stored || stored->timestamp != ts) [[likely]] {
+        // The write keeps a copy of `target`, because a tie at the insert needs the group after the
+        // write buffer dropped its own copy.
+        auto [location, op] = co_await coroutine::try_future(
+                _write_buffer.write(log_record_writer(std::move(record)), timeout, target));
 
-    cg.logstor_index().insert(key, index_entry{
-        .location = location,
-        .timestamp = ts,
-    });
+        const auto outcome = index.insert(key, index_entry{
+            .location = location,
+            .timestamp = ts,
+        });
+        if (outcome.result != primary_index::insert_result::tied) [[likely]] {
+            count_failure.cancel();
+            co_return;
+        }
+
+        // Another write of the key with the same timestamp got into the index during the append.
+        // The record of this write is on disk with no index entry, and the write buffer has its
+        // value, so the write reads the record back. `op` keeps the mixed segment of the record
+        // allocated during the read, because the separator gets the buffer only after `op` is
+        // released. The index takes no part in this read, and the guard is only what read() asks for.
+        const auto guarded = index.find_guarded(key);
+        record = co_await coroutine::try_future(_segment_manager.read(guarded->guard, location));
+    }
+
+    co_await coroutine::try_future(write_tied(std::move(record), key, std::move(target), timeout));
     count_failure.cancel();
+}
+
+future<> logstor::write_tied(log_record incoming, primary_index_key key, write_target target, db::timeout_clock::time_point timeout) {
+    ++_stats.tied_writes;
+
+    auto& cg = *target.cg;
+    auto& index = cg.logstor_index();
+    const auto ts = incoming.header.timestamp;
+
+    // `compared_with` is the index value of the stored record that the write compared `incoming`
+    // with. `merged` is the result of that comparison. It holds the merge when the write must
+    // store the merge, and it is empty when the write must store `incoming`.
+    std::optional<index_entry> compared_with;
+    std::optional<record_value> merged;
+
+    while (true) {
+        const auto stored = index.find(key);
+        const bool tied = stored && stored->timestamp == ts;
+
+        if (tied && stored != compared_with) {
+            // The guard does not keep the index value in place, so the separator and compaction
+            // can move the stored record during the read. The next round then finds the new
+            // location, which is not equal to `compared_with`, and it reads the record again there.
+            auto guarded = index.find_guarded(key);
+            const auto stored_record = co_await coroutine::try_future(_segment_manager.read(guarded->guard, stored->location));
+            co_await utils::get_local_injector().inject("logstor_write_wait_in_tie_read", utils::wait_for_message(std::chrono::seconds(60)));
+            guarded.reset();
+
+            if (stored_record.header.key.key() != incoming.header.key.key()) [[unlikely]] {
+                co_await coroutine::return_exception(key_mismatch_error(incoming.header.key.key(), stored_record.header.key.key(), stored->location));
+            }
+
+            // The two records can have different schema versions, so the write merges them in
+            // the current schema of the table, as a memtable does with a mutation of another
+            // version.
+            const schema_ptr schema = cg.schema();
+            auto outcome = merge_tied_records(schema, incoming.header.key,
+                    decode_record_value(stored_record.value, *schema, stored_record.header),
+                    decode_record_value(incoming.value, *schema, incoming.header));
+            if (outcome.result == merge_result::stored_contains_incoming) {
+                ++_stats.tied_writes_contained;
+                co_return;
+            }
+            compared_with = stored;
+            merged = outcome.merged.transform([] (const mutation& m) { return encode_record_value(m); });
+            continue;
+        }
+
+        if (!tied) {
+            // An erase removed the stored record, or a record with a newer timestamp replaced it.
+            compared_with.reset();
+            merged.reset();
+        }
+
+        co_await utils::get_local_injector().inject("logstor_write_wait_before_append", utils::wait_for_message(std::chrono::seconds(60)));
+
+        // The write installs a record only in the continuation that gets its location, with `op`
+        // held. When the install fails, the record stays on disk with no index entry, as the record
+        // of a superseded write does, and the next round appends again. A location from an earlier
+        // round is not safe to install, because the separator can copy the record and free its
+        // segment after `op` is released.
+        auto [location, op] = co_await coroutine::try_future(_write_buffer.write(log_record_writer(log_record{
+            .header = incoming.header,
+            .value = merged ? *merged : incoming.value,
+        }), timeout, target));
+
+        const index_entry entry{
+            .location = location,
+            .timestamp = ts,
+        };
+        const bool installed = tied
+                ? index.replace_if(key, *stored, entry)
+                : index.insert(key, entry).result != primary_index::insert_result::tied;
+        if (installed) {
+            if (tied && merged) {
+                ++_stats.tied_writes_merged;
+            }
+            co_return;
+        }
+    }
 }
 
 }

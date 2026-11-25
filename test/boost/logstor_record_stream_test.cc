@@ -687,6 +687,33 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_record_sink_keeps_a_newer_local_record) {
     BOOST_REQUIRE_EQUAL(segment_manager_metric("stream_records_superseded") - superseded_before, 1);
 }
 
+// The sink does not merge a streamed record with a local record of the same timestamp, as a write
+// does. The streamed record replaces the local one, whatever the two records hold.
+SEASTAR_THREAD_TEST_CASE(test_logstor_record_sink_replaces_a_local_record_of_the_same_timestamp) {
+    auto schema = make_schema();
+    logstor_env env;
+    test_logstor_group group(schema, env.ls);
+    env.catalog.add(group);
+
+    const test_record local{.pk = "pk0", .value = "local", .timestamp = 1000};
+    env.ls.write(make_mutation(schema, local), write_target(&group, {}), db::no_timeout).get();
+    const auto superseded_before = segment_manager_metric("stream_records_superseded");
+
+    // "local" is the larger value, so a write of the streamed record would leave the local one.
+    const std::vector<test_record> streamed{{.pk = "pk0", .value = "a streamed value", .timestamp = 1000}};
+    std::vector<temporary_buffer<char>> chunks;
+    chunks.push_back(make_chunk(schema, streamed));
+
+    auto sink = env.ls.get_segment_manager().make_record_stream_sink(schema->id(), {}).get();
+    sink->put(chunks).get();
+    sink->close().get();
+    sink.reset();
+    group.close_gates().get();
+
+    require_reads_back(env.ls, schema, group.logstor_index(), streamed[0]);
+    BOOST_REQUIRE_EQUAL(segment_manager_metric("stream_records_superseded") - superseded_before, 0);
+}
+
 // A corrupt chunk fails put(), and after abort() the group has no segment and no record of the
 // stream.
 SEASTAR_THREAD_TEST_CASE(test_logstor_record_sink_rejects_a_corrupt_chunk) {

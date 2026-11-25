@@ -160,7 +160,9 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_recovery_of_an_empty_directory) {
 }
 
 // The newest record of each key comes back, for two tables: an overwrite with a newer timestamp, and
-// an overwrite with an equal timestamp in the same segment, which the offset orders.
+// an overwrite with an equal timestamp and a larger value in the same segment. The write path keeps
+// the larger of two values with one timestamp, and recovery takes the record at the higher offset,
+// which is the same record here.
 SEASTAR_THREAD_TEST_CASE(test_logstor_recovery_restores_the_newest_records) {
     auto schema_a = make_kv_schema("a");
     auto schema_b = make_kv_schema("b");
@@ -461,9 +463,10 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_recovery_separates_many_full_segments_that
     }
 }
 
-// The segment sequence goes on from the highest one on disk, so a record written after a restart is
-// newer than every record before it: of two records with the same timestamp, the later one wins
-// after the next restart too.
+// The segment sequence goes on from the highest one on disk, so recovery orders a record written
+// after a restart above every record before it. So of two records with the same timestamp,
+// recovery takes the later one after the next restart too. The later record here has the larger
+// value, so the write path keeps it too.
 SEASTAR_THREAD_TEST_CASE(test_logstor_recovery_continues_the_segment_sequence) {
     auto schema = make_kv_schema("cf");
     const auto before_restart = make_kv_mutation(schema, "pk0", "v0", 1);
