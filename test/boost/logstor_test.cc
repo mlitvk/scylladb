@@ -1560,47 +1560,41 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_mixed_chunks_report_readable_
     BOOST_REQUIRE(std::holds_alternative<segment_info::mixed>(maybe_header->v));
 }
 
-// Checks that the segment scan stops at a record whose key_size is corrupt instead of trusting it, and
-// resumes with the next chunk of a mixed segment.
-SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_rejects_corrupt_key_size) {
+// The record frames of a chunk fill its body, so a frame that does not parse in a chunk whose CRCs
+// match is a bug of the writer. The scan fails there, and does not stop as at the end of the
+// chunk's frames, which would lose the records after the frame without notice. The cases are a
+// key_size that makes the first frame end after the end of the chunk, and a value_size of 0 in the
+// second frame.
+SEASTAR_THREAD_TEST_CASE(test_logstor_segment_scan_fails_on_a_record_frame_that_does_not_parse) {
     auto schema = make_kv_schema();
 
-    auto scan_with_corrupt_key_size = [&] (uint16_t key_size) {
-        raw_write_buffer wb0(64 * 1024, segment_kind::mixed);
-        raw_write_buffer wb1(64 * 1024, segment_kind::mixed);
-        wb0.append(log_record_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(31))));
-        wb0.append(log_record_writer(make_log_record(schema, "pk1", "value1", api::timestamp_type(32))));
-        wb1.append(log_record_writer(make_log_record(schema, "pk2", "value2", api::timestamp_type(33))));
-        wb0.seal(segment_sequence{29}, std::nullopt, ondisk::block_alignment);
-        wb1.seal(segment_sequence{29}, std::nullopt, ondisk::block_alignment);
+    raw_write_buffer wb(64 * 1024, segment_kind::mixed);
+    wb.append(log_record_writer(make_log_record(schema, "pk0", "value0", api::timestamp_type(31))));
+    wb.append(log_record_writer(make_log_record(schema, "pk1", "value1", api::timestamp_type(32))));
+    wb.append(log_record_writer(make_log_record(schema, "pk2", "value2", api::timestamp_type(33))));
+    wb.seal(segment_sequence{29}, std::nullopt, ondisk::block_alignment);
+    const auto chunk = copy_chunk(wb.chunk());
+    const auto records = scan_buffer_records(chunk, log_segment_id{5});
+    BOOST_REQUIRE_EQUAL(records.size(), 3u);
 
-        auto serialized0 = copy_chunk(wb0.chunk());
-        auto serialized1 = copy_chunk(wb1.chunk());
-        // The first record_frame_header of the first chunk follows the chunk header; key_size is its first field.
-        seastar::simple_memory_output_stream out(serialized0.get_write() + ondisk::chunk_header_size(segment_kind::mixed), sizeof(uint16_t));
-        ser::serialize(out, key_size);
-        // The corruption is in the records, which is what the body CRC would catch first.
-        reseal_chunk_crcs(serialized0);
+    // Writes `value` at `field_offset` in the frame header of the record at `location`, with
+    // matching CRCs, and checks that the scan fails at that record.
+    auto require_scan_fails = [&] (const record_location& location, size_t field_offset, auto value) {
+        auto corrupt = slice_buffer(chunk, 0, chunk.size());
+        seastar::simple_memory_output_stream out(corrupt.get_write() + location.offset + field_offset, sizeof(value));
+        ser::serialize(out, value);
+        reseal_chunk_crcs(corrupt);
 
-        auto segment = concat_chunks({&serialized0, &serialized1});
-        const auto segment_size = segment.size();
-        auto in = seastar::util::as_input_stream(std::move(segment));
-
-        std::vector<api::timestamp_type> seen;
-        segment_scanner scanner(in, log_segment_id{5}, segment_size);
-        while (auto* chunk = scanner.next_chunk().get()) {
-            for (const auto& record : chunk->records()) {
-                seen.push_back(record.header.timestamp);
-            }
-        }
-        in.close().get();
-        return seen;
+        const auto expected = fmt::format("Cannot read the record at offset {} of segment(5), because its bytes are not a valid record frame",
+                location.offset);
+        BOOST_REQUIRE_EXCEPTION(scan_buffer_records(corrupt, log_segment_id{5}), std::runtime_error, [&] (const std::runtime_error& e) {
+            return std::string_view(e.what()) == expected;
+        });
     };
 
-    // The size check rejects a frame that ends after the end of the chunk.
-    auto seen = scan_with_corrupt_key_size(ondisk::max_key_size);
-    BOOST_REQUIRE_EQUAL(seen.size(), 1u);
-    BOOST_REQUIRE_EQUAL(seen[0], api::timestamp_type(33));
+    // key_size is the first field of the frame header, and value_size is the third.
+    require_scan_fails(records[0].location, 0, uint16_t(ondisk::max_key_size));
+    require_scan_fails(records[1].location, 2 * sizeof(uint16_t), uint32_t(0));
 }
 
 // A record frame with an unknown flag in a chunk whose CRCs match is from another release, so the

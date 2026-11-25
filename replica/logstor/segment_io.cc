@@ -112,8 +112,12 @@ void chunk_records::iterator::read_next() {
     } catch (const std::runtime_error&) {
         std::throw_with_nested(std::runtime_error(fmt::format("Cannot read the record at offset {} of {}", record_offset, segment_id)));
     }
+    // The record frames of a chunk fill its body, and the body CRC matches, so bytes that are not a
+    // record frame mean a bug in the writer. A scan that stopped there would lose the records after
+    // them without notice.
     if (!record) {
-        return;
+        throw std::runtime_error(fmt::format("Cannot read the record at offset {} of {}, because its bytes are not a valid record frame",
+                record_offset, segment_id));
     }
 
     logstor_logger.trace("Found record of size {} bytes in {}",

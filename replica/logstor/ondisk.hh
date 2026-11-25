@@ -334,9 +334,7 @@ inline bool validate_chunk_body(const chunk_header& ch, std::span<const char> bo
 
 inline bool validate_record_frame_header(const record_frame_header& frame_header) noexcept {
     // A record always carries an encoded value, so a zero value_size cannot come from a record
-    // this code wrote. A scan finds a zero value_size in the zero-filled end of a torn chunk, and
-    // this check stops the scan there, so that the scan does not read the end as a run of
-    // zero-length records.
+    // this code wrote.
     return frame_header.value_size != 0;
 }
 
