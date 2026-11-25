@@ -330,6 +330,78 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_space_accounting) {
     BOOST_REQUIRE_EQUAL(accounting.freed_locations.size(), 6u);
 }
 
+// replace_if() replaces the index value of a key only when the index still holds the expected
+// value. A replace frees the old location and adds the new one in the space accounting, and it
+// evicts the cached partition, because the partition belongs to the old record.
+SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_replace_if_replaces_only_the_expected_value) {
+    auto schema = make_logstor_schema();
+    struct : space_accounting_subscriber {
+        std::vector<record_location> added;
+        std::vector<record_location> freed;
+
+        void on_add_record(record_location location) noexcept override {
+            added.push_back(location);
+        }
+        void on_free_record(record_location location) noexcept override {
+            freed.push_back(location);
+        }
+        void on_move_record(record_location, record_location) noexcept override {
+        }
+    } accounting;
+    shared_logstor_cache cache;
+    primary_index index(accounting, &cache.logstor_tracker, true);
+
+    const auto key = make_primary_index_key(*schema, "pk0");
+    const auto other_key = make_primary_index_key(*schema, "pk1");
+    const auto stored = make_index_entry(1, 0, 10, 1);
+    const auto replacement = make_index_entry(2, 0, 12, 1);
+
+    BOOST_REQUIRE(!index.replace_if(key, stored, replacement));
+    BOOST_REQUIRE(!index.find(key));
+
+    BOOST_REQUIRE(index.insert(key, stored).inserted());
+    populate(index, key, make_mutation(schema, "pk0", "v0"));
+    BOOST_REQUIRE(lookup_exists(index, key, schema));
+
+    // The expected value has another location, another timestamp or another key.
+    BOOST_REQUIRE(!index.replace_if(key, make_index_entry(1, 16, 10, 1), replacement));
+    BOOST_REQUIRE(!index.replace_if(key, make_index_entry(1, 0, 10, 2), replacement));
+    BOOST_REQUIRE(!index.replace_if(other_key, stored, replacement));
+    BOOST_REQUIRE(index.find(key) == stored);
+    BOOST_REQUIRE(lookup_exists(index, key, schema));
+    BOOST_REQUIRE(accounting.freed.empty());
+
+    BOOST_REQUIRE(index.replace_if(key, stored, replacement));
+    BOOST_REQUIRE(index.find(key) == replacement);
+    BOOST_REQUIRE(!lookup_exists(index, key, schema));
+    BOOST_REQUIRE(accounting.freed == std::vector{stored.location});
+    BOOST_REQUIRE(accounting.added == (std::vector{stored.location, replacement.location}));
+    BOOST_REQUIRE_EQUAL(index.get_usage().live_record_bytes, replacement.location.size);
+    BOOST_REQUIRE_EQUAL(index.get_usage().key_count, 1u);
+}
+
+// find_guarded() returns the index value of a key with a read guard, and await_read_guards() waits
+// until the guard is destroyed.
+SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_find_guarded_holds_a_read_guard) {
+    auto schema = make_logstor_schema();
+    primary_index index(noop_space_accounting, nullptr, false);
+
+    const auto key = make_primary_index_key(*schema, "pk0");
+    const auto entry = make_index_entry(1, 0, 10, 1);
+
+    BOOST_REQUIRE(!index.find_guarded(key));
+
+    BOOST_REQUIRE(index.insert(key, entry).inserted());
+    auto found = index.find_guarded(key);
+    BOOST_REQUIRE(found);
+    BOOST_REQUIRE(found->entry == entry);
+
+    auto guards_released = index.await_read_guards();
+    BOOST_REQUIRE(!guards_released.available());
+    found.reset();
+    guards_released.get();
+}
+
 // Checks that range erase and clear() account for freed log locations correctly.
 SEASTAR_THREAD_TEST_CASE(test_logstor_primary_index_range_erase_and_clear_space_accounting) {
     auto schema = make_logstor_schema();

@@ -367,6 +367,23 @@ public:
         return {insert_result::inserted, std::nullopt};
     }
 
+    // Replaces the index value of `key` with `new_entry` only if the index still holds `expected` for
+    // the key. Returns false, and changes nothing, if the index holds another value or does not have
+    // the key.
+    // Evicts the cached partition and moves the space accounting, as insert() does when it replaces.
+    bool replace_if(const primary_index_key& key, const index_entry& expected, index_entry new_entry) {
+        logalloc::reclaim_lock lock(_region);
+        auto e = find_entry(key);
+        if (!e || e->_e != expected) {
+            return false;
+        }
+        evict_cached_partition(*e);
+        e->_e = new_entry;
+        space_accounting_on_record_freed(expected.location);
+        space_accounting_on_record_added(new_entry.location);
+        return true;
+    }
+
     bool update_record_location(const primary_index_key& key, record_location old_location, record_location new_location) {
         logalloc::reclaim_lock lock(_region);
         auto e = find_entry_at(key, old_location);
@@ -429,6 +446,28 @@ public:
 
     future<> clear() {
         return erase(dht::token_range());
+    }
+
+    // Returns the index value of `key`, or nullopt if the index does not have the key.
+    // The location comes without a guard, so the caller must not read the record from it.
+    std::optional<index_entry> find(const primary_index_key& key) const {
+        logalloc::reclaim_lock lock(_region);
+        return find_entry(key).transform([] (const primary_index_entry& e) { return e.entry(); });
+    }
+
+    // An index value and the guard that keeps its location readable.
+    struct guarded_entry {
+        index_entry entry;
+        index_read_guard guard;
+    };
+
+    // Returns the index value of `key` with a guard for its location, or nullopt if the index does
+    // not have the key. The lookup does not read the cache.
+    std::optional<guarded_entry> find_guarded(const primary_index_key& key) const {
+        logalloc::reclaim_lock lock(_region);
+        return find_entry(key).transform([this] (const primary_index_entry& e) {
+            return guarded_entry{.entry = e.entry(), .guard = make_read_guard()};
+        });
     }
 
     // A record location and the guard that keeps the location readable.
