@@ -2761,10 +2761,14 @@ future<> segment_manager_impl::adopt_streamed_segment(recovery_catalog& catalog,
         // The segment has no valid chunk, so it holds no record.
         co_return;
     }
-    co_await index_segment_records(seg_id, info->segment_seq, primary_index::default_entry_cmp{}, make_index_resolver(catalog, stats),
-            _erased_ranges);
+    const auto indexed = co_await index_segment_records(seg_id, info->segment_seq, primary_index::default_entry_cmp{},
+            make_index_resolver(catalog, stats), _erased_ranges);
     if (place_recovered_segment(catalog, seg_id, *info, stats) == needs_separation::yes) {
         co_await separate_segment_records(catalog, seg_id, stats);
+    }
+    if (indexed.erased_records) {
+        logstor_logger.warn("Left out {} records of streamed segment {} at sequence {} that an erased range covers",
+                indexed.erased_records, seg_id, info->segment_seq);
     }
     if (stats.dropped_records) {
         logstor_logger.warn("Dropped {} records of streamed segment {} that belong to no compaction group of this shard", stats.dropped_records, seg_id);
