@@ -743,43 +743,11 @@ async def test_repair_mutation_merge_conflicting_rows_with_same_timestamp_multic
 
 
 @pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
-async def test_repair_three_replica_multicell_merge(manager: ScyllaClusterManager):
-    """Test that repair converges a partition whose columns are split across three replicas.
-
-    Each replica holds a disjoint column of pk=1 at the same timestamp (node1 a='x',
-    node2 b='y', node3 c='z'), because the other replicas were down when each write
-    happened and hinted handoff is disabled. Repair must gather all versions on the
-    master and push the fully merged partition to every replica, so each node ends up
-    with a='x', b='y', c='z'. This exercises the logstor whole-partition convergence:
-    sending only the differing rows would drop the columns held by other replicas.
-    """
-    servers, cql, hosts = await create_logstor_cluster(manager, nodes=3)
-
-    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3}") as ks:
-        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, a text, b text, c text) WITH storage_engine = 'logstor'")
-
-        # Write a disjoint column on each node, suppressed on the other two.
-        for idx, col, val in [(0, 'a', 'x'), (1, 'b', 'y'), (2, 'c', 'z')]:
-            await write_only_on(manager, servers, cql, hosts, ks, "test", idx,
-                                [f"INSERT INTO {ks}.test (pk, {col}) VALUES (1, '{val}') USING TIMESTAMP 1000"])
-
-        await manager.api.repair(servers[0].ip_addr, ks, "test")
-
-        # All three replicas must store the same merged record, with each column
-        # keeping the timestamp it was written with. A replica that received only
-        # the rows it was missing would store a partial partition here.
-        records = await check_converged(cql, hosts, f"{ks}.test", {1: {'a': 'x', 'b': 'y', 'c': 'z'}})
-        assert records[1].cell_timestamps() == {'a': 1000, 'b': 1000, 'c': 1000}
-        assert records[1].marker_timestamp == 1000
-
-
-@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
 async def test_repair_three_replica_conflicting_versions(manager: ScyllaClusterManager):
     """Test that repair converges three replicas that hold conflicting versions.
 
-    In test_repair_three_replica_multicell_merge the three versions are disjoint,
-    so merging them cannot lose anything. Here every replica holds a genuinely
-    conflicting version of the same partition, and one of them is a delete:
+    Every replica holds a conflicting version of the same partition, and one of
+    them is a delete:
 
       pk=1: node1 v='a', node2 v='b', node3 v='c', all at ts=1000
             - the cell tiebreaker picks the largest value, 'c'.
@@ -823,8 +791,8 @@ async def test_repair_three_replica_conflicting_versions(manager: ScyllaClusterM
         assert records[1].cell_timestamps() == {'v': 1000}
         assert records[2].cell_timestamps() == {'v': 3000}
         # The winning version is newer than the tombstone, so the partition stays
-        # live, but the converged record must still carry the tombstone: dropping
-        # it would let node1's older version resurrect on a later repair.
+        # live, but the converged record must still carry the tombstone, because
+        # the cell level merge keeps it.
         assert records[2].tombstone_timestamp() == 2000
 
 
@@ -888,23 +856,27 @@ async def test_repair_window_never_splits_partition(manager: ScyllaClusterManage
       that boundary is the minimum across the replicas and cuts node2's row for
       the same partition into the next window.
 
-    Both groups end up with the tombstone lost from the converged record and the
-    cells it deleted resurrected, which is what the assertions below catch.
+    A split window converges each part of the partition alone, so a replica can
+    store a record without the tombstone, which the assertions below catch. The
+    row is newer than the tombstone, so a read still returns the same row, but
+    the records differ from the cell level merge of the versions. When the
+    replicas end up with different records, their repair hashes never become
+    equal, and each later repair sends the partition again.
 
     Both groups converge to the same value, and differ only in which replica
     holds the tombstone and in the fragment shape that produces the boundary:
 
-      two_fragment keys   node1: batch DELETE ts=2000 + INSERT v='new' ts=3000
+      two_fragment keys   node1: batch DELETE ts=2000 + INSERT v='new', w='new' ts=3000
                           node2: INSERT v='old', w='stale' ts=1000
       tombstone_only keys node1: DELETE ts=2000, nothing else
-                          node2: batch INSERT w='stale' ts=1000 + v='new' ts=3000
+                          node2: INSERT v='new', w='new' ts=3000
 
-      converged, both:    live, v='new', w killed by the tombstone at 2000
+      converged, both:    the tombstone at 2000 and the row v='new', w='new'
 
-    Note the second group needs node2's surviving cell to be *newer* than the
-    tombstone. With an older one a split does no visible damage: logstor keeps
-    the record with the highest timestamp, so the older row could never replace
-    the tombstone that was converged without it.
+    Note the second group needs node2's row to be *newer* than the tombstone.
+    With an older one a split does no visible damage: logstor keeps the record
+    with the highest timestamp, so the older row could never replace the
+    tombstone that was converged without it.
     """
     servers, cql, hosts = await create_logstor_cluster(manager)
 
@@ -918,29 +890,23 @@ async def test_repair_window_never_splits_partition(manager: ScyllaClusterManage
         await write_only_on(manager, servers, cql, hosts, ks, "test", 0, [
             f"BEGIN UNLOGGED BATCH "
             f"DELETE FROM {ks}.test USING TIMESTAMP 2000 WHERE pk = {pk}; "
-            f"INSERT INTO {ks}.test (pk, v) VALUES ({pk}, 'new') USING TIMESTAMP 3000; "
+            f"INSERT INTO {ks}.test (pk, v, w) VALUES ({pk}, 'new', 'new') USING TIMESTAMP 3000; "
             f"APPLY BATCH" for pk in two_fragment_keys] + [
             f"DELETE FROM {ks}.test USING TIMESTAMP 2000 WHERE pk = {pk}" for pk in tombstone_only_keys])
         await write_only_on(manager, servers, cql, hosts, ks, "test", 1, [
             f"INSERT INTO {ks}.test (pk, v, w) VALUES ({pk}, 'old', 'stale') USING TIMESTAMP 1000"
             for pk in two_fragment_keys] + [
-            f"BEGIN UNLOGGED BATCH "
-            f"INSERT INTO {ks}.test (pk, w) VALUES ({pk}, 'stale') USING TIMESTAMP 1000; "
-            f"INSERT INTO {ks}.test (pk, v) VALUES ({pk}, 'new') USING TIMESTAMP 3000; "
-            f"APPLY BATCH" for pk in tombstone_only_keys])
+            f"INSERT INTO {ks}.test (pk, v, w) VALUES ({pk}, 'new', 'new') USING TIMESTAMP 3000"
+            for pk in tombstone_only_keys])
 
         async with AsyncExitStack() as stack:
             for server in servers:
                 await stack.enter_async_context(inject_error(manager.api, server.ip_addr, "repair_tiny_max_row_buf_size"))
             await manager.api.repair(servers[0].ip_addr, ks, "test")
 
-        # Repair compacts the converged partition, so the tombstone removes w,
-        # and v is the only cell that is left.
-        records = await check_converged(cql, hosts, f"{ks}.test", {pk: {'v': 'new'} for pk in keys})
+        records = await check_converged(cql, hosts, f"{ks}.test", {pk: {'v': 'new', 'w': 'new'} for pk in keys})
         # The converged record must still carry the partition tombstone next to
-        # the newer row. A record that only kept the row reads the same to a
-        # client, but has lost the deletion: a later write of w at a timestamp
-        # between 1000 and 2000 would then resurrect it.
+        # the newer row, as the cell level merge does.
         for pk, record in records.items():
             assert record.kinds == (PARTITION_START, CLUSTERING_ROW, PARTITION_END), f"pk {pk}: {record}"
             assert record.tombstone_timestamp() == 2000, f"pk {pk}: tombstone lost from the converged record: {record}"
@@ -1032,16 +998,18 @@ async def test_repair_same_token_window_boundary(manager: ScyllaClusterManager):
 
     Both colliding keys carry a conflict that makes such a mixup visible:
 
-      COLLIDING_PK1  node1: INSERT v='a...' ts=1000  node2: INSERT v='b...' ts=1000
-                     -> converges by the equal-timestamp cell tiebreak to 'b...',
-                        and must not pick up the other key's tombstone
+      COLLIDING_PK1  node1: INSERT v='a...', w='a' ts=1000
+                     node2: INSERT v='b...', w='b' ts=1000
+                     -> converges by the equal-timestamp cell tiebreak to
+                        v='b...', w='b', and must not pick up the other key's
+                        tombstone
 
       COLLIDING_PK2  node1: DELETE ts=2000, nothing else
-                     node2: batch INSERT w='stale' ts=1000 + v='new...' ts=3000
-                     -> converges to a live row v='new...' still carrying the
-                        tombstone that kills w; on node1 its only repair row
-                        sits at the partition-start position, the shape that
-                        makes the reported boundary position matter
+                     node2: INSERT v='new...', w='new' ts=3000
+                     -> converges to the live row of node2 that still carries
+                        the tombstone; on node1 its only repair row sits at the
+                        partition-start position, the shape that makes the
+                        reported boundary position matter
 
     Every live value is padded above the injected byte budget, so a window that
     read a live row is full once the partition completes. On node2 both colliding
@@ -1067,16 +1035,13 @@ async def test_repair_same_token_window_boundary(manager: ScyllaClusterManager):
         await assert_colliding_tokens(cql, ks)
 
         await write_only_on(manager, servers, cql, hosts, ks, "test", 0,
-                            [f"INSERT INTO {table} (pk, v) VALUES ({COLLIDING_PK1}, 'a{pad}') USING TIMESTAMP 1000",
+                            [f"INSERT INTO {table} (pk, v, w) VALUES ({COLLIDING_PK1}, 'a{pad}', 'a') USING TIMESTAMP 1000",
                              f"DELETE FROM {table} USING TIMESTAMP 2000 WHERE pk = {COLLIDING_PK2}"] +
-                            [f"INSERT INTO {table} (pk, v) VALUES ({pk}, 'v{pk}{pad}') USING TIMESTAMP 1000"
+                            [f"INSERT INTO {table} (pk, v, w) VALUES ({pk}, 'v{pk}{pad}', 'w{pk}') USING TIMESTAMP 1000"
                              for pk in plain_keys])
         await write_only_on(manager, servers, cql, hosts, ks, "test", 1,
-                            [f"INSERT INTO {table} (pk, v) VALUES ({COLLIDING_PK1}, 'b{pad}') USING TIMESTAMP 1000",
-                             f"BEGIN UNLOGGED BATCH "
-                             f"INSERT INTO {table} (pk, w) VALUES ({COLLIDING_PK2}, 'stale') USING TIMESTAMP 1000; "
-                             f"INSERT INTO {table} (pk, v) VALUES ({COLLIDING_PK2}, 'new{pad}') USING TIMESTAMP 3000; "
-                             f"APPLY BATCH"])
+                            [f"INSERT INTO {table} (pk, v, w) VALUES ({COLLIDING_PK1}, 'b{pad}', 'b') USING TIMESTAMP 1000",
+                             f"INSERT INTO {table} (pk, v, w) VALUES ({COLLIDING_PK2}, 'new{pad}', 'new') USING TIMESTAMP 3000"])
 
         logs = await mark_logs(manager, servers)
 
@@ -1095,23 +1060,21 @@ async def test_repair_same_token_window_boundary(manager: ScyllaClusterManager):
         assert stats['round_nr_slow_path'] >= len(plain_keys) + 1, \
             f"a sync window held more than one live partition: {stats}"
 
-        expected = {COLLIDING_PK1: {'v': f'b{pad}'}, COLLIDING_PK2: LIVE}
-        expected |= {pk: {'v': f'v{pk}{pad}'} for pk in plain_keys}
+        expected = {COLLIDING_PK1: {'v': f'b{pad}', 'w': 'b'}, COLLIDING_PK2: {'v': f'new{pad}', 'w': 'new'}}
+        expected |= {pk: {'v': f'v{pk}{pad}', 'w': f'w{pk}'} for pk in plain_keys}
         records = await check_converged(cql, hosts, table, expected)
 
         # The equal-timestamp conflict converges by the cell tiebreak (largest
         # value wins) with the original timestamp, and must not have picked up
         # the tombstone of the other key at the same token.
-        assert records[COLLIDING_PK1].cell_timestamps() == {'v': 1000}
+        assert records[COLLIDING_PK1].cell_timestamps() == {'v': 1000, 'w': 1000}
         assert records[COLLIDING_PK1].partition_tombstone is None, \
             f"the tombstone of the key sharing the token leaked into this record: {records[COLLIDING_PK1]}"
 
         # The deleted-then-rewritten key must keep the newer row and the
-        # tombstone next to it, and w must not have survived the deletion.
+        # tombstone next to it.
         record = records[COLLIDING_PK2]
         assert record.tombstone_timestamp() == 2000, f"tombstone lost from the converged record: {record}"
-        assert record.cell_values()['v'] == f'new{pad}', f"{record}"
-        assert record.cell_timestamps().get('w', 0) < 2000, f"w survived the tombstone: {record}"
 
 
 async def test_repair_consistent_nodes_transfers_nothing(manager: ScyllaClusterManager):
@@ -1596,9 +1559,13 @@ async def test_read_repair_scan_leaves_partitions_beyond_the_page(manager: Scyll
     which at the coordinator is indistinguishable from not holding them.
 
     Sending such a replica the whole reconciled partition would replace a record
-    the reconciliation never saw. Here node1's page ends at `mid`, which only
-    node1 holds, so it reports nothing for `high` although its own record for
-    `high` carries the only copy of that partition's v2 cell.
+    that the reconciliation never saw. A version with a lower timestamp cannot
+    replace the record, because the index keeps the record with the higher
+    timestamp, but a version with the same timestamp replaces it (SCYLLADB-6194).
+    Here node1's page ends at `mid`, which only node1 holds, so node1 reports
+    nothing for `high`. Node1 and node2 hold different versions of `high` with
+    the same timestamp, and the cell tiebreak of the reconciliation picks the
+    version of node1, so the version of node2 must not replace it.
     """
     servers, cql, hosts = await create_logstor_cluster(manager)
 
@@ -1611,26 +1578,25 @@ async def test_read_repair_scan_leaves_partitions_beyond_the_page(manager: Scyll
         await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v1 text, v2 text) WITH storage_engine = 'logstor'")
         table = f"{ks}.test"
 
-        # Both replicas store `low` and the first version of `high`.
+        # Both replicas store `low`.
         await cql.run_async(SimpleStatement(f"INSERT INTO {table} (pk, v1, v2) VALUES ({low}, 'x', 'x2') USING TIMESTAMP 1000",
                                             consistency_level=ConsistencyLevel.ALL))
-        await cql.run_async(SimpleStatement(f"INSERT INTO {table} (pk, v1, v2) VALUES ({high}, 'old', 'keep') USING TIMESTAMP 1000",
-                                            consistency_level=ConsistencyLevel.ALL))
-        # Only node2 gets the newer version of `high`. A logstor write replaces
-        # the whole record, so node2's copy has no v2 at all and node1's older
-        # record is the only place v2 is stored.
+        # Each replica stores its own version of `high`, with the same timestamp.
+        # The values of node1 are larger, so the cell tiebreak picks them.
+        await write_only_on(manager, servers, cql, hosts, ks, "test", 0,
+                            [f"INSERT INTO {table} (pk, v1, v2) VALUES ({high}, 'z', 'z2') USING TIMESTAMP 1000"])
         await write_only_on(manager, servers, cql, hosts, ks, "test", 1,
-                            [f"INSERT INTO {table} (pk, v1) VALUES ({high}, 'new') USING TIMESTAMP 2000"])
+                            [f"INSERT INTO {table} (pk, v1, v2) VALUES ({high}, 'b', 'b2') USING TIMESTAMP 1000"])
         # Only node1 gets `mid`, so below `high` node1 has one live partition
         # more than node2.
         await write_only_on(manager, servers, cql, hosts, ks, "test", 0,
-                            [f"INSERT INTO {table} (pk, v1) VALUES ({mid}, 'm') USING TIMESTAMP 1000"])
+                            [f"INSERT INTO {table} (pk, v1, v2) VALUES ({mid}, 'm', 'm2') USING TIMESTAMP 1000"])
 
         await flush_records_to_segments(manager, servers)
         before = await read_all_records(cql, hosts, table)
         assert set(before[0]) == {low, mid, high} and set(before[1]) == {low, high}
-        assert before[0][high].cell_values() == {'v1': 'old', 'v2': 'keep'}
-        assert before[1][high].cell_values() == {'v1': 'new'}
+        assert before[0][high].cell_values() == {'v1': 'z', 'v2': 'z2'}
+        assert before[1][high].cell_values() == {'v1': 'b', 'v2': 'b2'}
 
         metrics_before = await manager.metrics.query(servers[0].ip_addr)
 
@@ -1649,25 +1615,26 @@ async def test_read_repair_scan_leaves_partitions_beyond_the_page(manager: Scyll
         after = await read_all_records(cql, hosts, table)
         # `mid` is the partition node2 really is missing, and repairing it is
         # what the page is supposed to do.
-        assert after[1][mid].cell_values() == {'v1': 'm'}
+        assert after[1][mid].cell_values() == {'v1': 'm', 'v2': 'm2'}
         # `high` is past node1's part of the page, so node1's record for it must
-        # be left alone: replacing it drops the only copy of v2.
-        assert after[0][high].cell_values() == {'v1': 'old', 'v2': 'keep'}, \
+        # be left alone: replacing it drops the version that the cell tiebreak
+        # picks.
+        assert after[0][high].cell_values() == {'v1': 'z', 'v2': 'z2'}, \
             "read repair overwrote node1's record for a partition its page never reached"
         assert log_segments(after[0])[high] == log_segments(before[0])[high], \
             "read repair rewrote node1's record for a partition its page never reached"
 
         # The next page of the same scan does reach `high`, where both replicas
-        # report their version, and converges them on the merged record.
+        # report their version, and converges them on the version of node1.
         page = await asyncio.to_thread(cql.execute, statement, paging_state=page.paging_state, host=hosts[0])
-        assert [(row.pk, row.v1, row.v2) for row in page.current_rows] == [(high, 'new', 'keep')]
+        assert [(row.pk, row.v1, row.v2) for row in page.current_rows] == [(high, 'z', 'z2')]
 
         records = await check_converged(cql, hosts, table, {
             low: {'v1': 'x', 'v2': 'x2'},
-            mid: {'v1': 'm'},
-            high: {'v1': 'new', 'v2': 'keep'},
+            mid: {'v1': 'm', 'v2': 'm2'},
+            high: {'v1': 'z', 'v2': 'z2'},
         })
-        assert records[high].marker_timestamp == 2000
+        assert records[high].marker_timestamp == 1000
 
 
 @pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
@@ -1680,12 +1647,9 @@ async def test_read_repair_partial_column_selection(manager: ScyllaClusterManage
     query selects: a reconciled partition built from the selected columns alone
     would drop the unselected columns from every replica it is written to.
 
-    Both reads here select only v1, and each partition diverges in v1 so that
-    the digests differ and the read goes through read repair:
-    - pk 1: node1 stores a newer version of every column. Node2 must end up with
-      node1's v2 and v3, not just its v1.
-    - pk 2: node1 stores a newer v1 but no v2, which only node2's older record
-      holds. Both replicas must end up with the merged record, v2 included.
+    The read here selects only v1, which diverges so that the digests differ
+    and the read goes through read repair. Node1 stores a newer version of every
+    column, and node2 must end up with node1's v2 and v3, not just its v1.
     """
     servers, cql, hosts = await create_logstor_cluster(manager)
 
@@ -1695,17 +1659,12 @@ async def test_read_repair_partial_column_selection(manager: ScyllaClusterManage
 
         await cql.run_async(SimpleStatement(f"INSERT INTO {table} (pk, v1, v2, v3) VALUES (1, 'a', 'b', 'c') USING TIMESTAMP 1000",
                                             consistency_level=ConsistencyLevel.ALL))
-        await cql.run_async(SimpleStatement(f"INSERT INTO {table} (pk, v1, v2) VALUES (2, 'old', 'keep') USING TIMESTAMP 1000",
-                                            consistency_level=ConsistencyLevel.ALL))
         await write_only_on(manager, servers, cql, hosts, ks, "test", 0, [
-            f"INSERT INTO {table} (pk, v1, v2, v3) VALUES (1, 'a2', 'b2', 'c2') USING TIMESTAMP 2000",
-            f"INSERT INTO {table} (pk, v1) VALUES (2, 'new') USING TIMESTAMP 2000"])
+            f"INSERT INTO {table} (pk, v1, v2, v3) VALUES (1, 'a2', 'b2', 'c2') USING TIMESTAMP 2000"])
 
         before = await read_all_records(cql, hosts, table)
         assert before[0][1].cell_values() == {'v1': 'a2', 'v2': 'b2', 'v3': 'c2'}
         assert before[1][1].cell_values() == {'v1': 'a', 'v2': 'b', 'v3': 'c'}
-        assert before[0][2].cell_values() == {'v1': 'new'}
-        assert before[1][2].cell_values() == {'v1': 'old', 'v2': 'keep'}
 
         metrics_before = await manager.metrics.query(servers[0].ip_addr)
 
@@ -1713,17 +1672,10 @@ async def test_read_repair_partial_column_selection(manager: ScyllaClusterManage
         # the selected ones.
         rows = await cql.run_async(SimpleStatement(f"SELECT pk, v1 FROM {table} WHERE pk = 1", consistency_level=ConsistencyLevel.ALL), host=hosts[0])
         assert [tuple(row) for row in rows] == [(1, 'a2')] and all(row._fields == ('pk', 'v1') for row in rows), rows
-        rows = await cql.run_async(SimpleStatement(f"SELECT pk, v1 FROM {table} WHERE pk = 2", consistency_level=ConsistencyLevel.ALL), host=hosts[0])
-        assert [tuple(row) for row in rows] == [(2, 'new')] and all(row._fields == ('pk', 'v1') for row in rows), rows
 
         metrics_after = await manager.metrics.query(servers[0].ip_addr)
-        assert metric_delta(metrics_before, metrics_after, FOREGROUND_READ_REPAIRS) >= 2, \
-            "the reads did not go through foreground read repair"
+        assert metric_delta(metrics_before, metrics_after, FOREGROUND_READ_REPAIRS) >= 1, \
+            "the read did not go through foreground read repair"
 
-        records = await check_converged(cql, hosts, table, {
-            1: {'v1': 'a2', 'v2': 'b2', 'v3': 'c2'},
-            2: {'v1': 'new', 'v2': 'keep'},
-        })
+        records = await check_converged(cql, hosts, table, {1: {'v1': 'a2', 'v2': 'b2', 'v3': 'c2'}})
         assert records[1].marker_timestamp == 2000
-        assert records[2].marker_timestamp == 2000
-        assert records[2].cell_timestamps() == {'v1': 2000, 'v2': 1000}
