@@ -4539,10 +4539,65 @@ public:
     }
 };
 
+#ifdef SCYLLA_ENABLE_ERROR_INJECTION
+// Waits until `ready` returns true, and fails the test when it does not within a minute, so that a
+// regression fails the test and does not hang it.
+void wait_until(std::function<bool()> ready, std::string_view what) {
+    const auto deadline = seastar::lowres_clock::now() + std::chrono::minutes(1);
+    while (!ready()) {
+        BOOST_REQUIRE_MESSAGE(seastar::lowres_clock::now() < deadline, fmt::format("Timed out waiting for {}", what));
+        seastar::sleep(std::chrono::milliseconds(1)).get();
+    }
+}
+
+// Waits until a fiber waits on the injection `name`.
+void wait_for_waiter(std::string_view name) {
+    wait_until([name] { return utils::get_local_injector().waiters(name) > 0; }, fmt::format("a waiter on {}", name));
+}
+#endif
+
 } // anonymous namespace
 
-// A range that holds no token has nothing to erase, so the erase returns before it drains anything
-// and leaves the index as it was.
+// The erased range of an erase covers the range of the erase and nothing else, so the keys outside
+// it stay, on disk and in the rebuilt index alike.
+SEASTAR_THREAD_TEST_CASE(test_logstor_erase_covers_only_its_range) {
+    auto schema = make_kv_schema();
+    started_logstor store;
+    auto& ls = store.ls();
+
+    test_logstor_group cg(schema, ls);
+    auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+
+    // Each key is written twice, first to a segment of the group, and then to the shared mixed
+    // segment.
+    constexpr size_t key_count = 8;
+    const auto keys = make_token_ordered_keys(schema, key_count);
+    std::vector<mutation> ms;
+    for (const auto& key : keys) {
+        ms.push_back(make_kv_mutation(schema, key, "v1", api::timestamp_type(1)));
+    }
+    write_and_flush_segment(ls, cg, ms);
+    for (const auto& key : keys) {
+        ls.write(make_kv_mutation(schema, key, "v2", api::timestamp_type(2)), write_target(&cg, {}), db::no_timeout).get();
+    }
+    ls.flush_to_separator().get();
+    require_recovery_matches(ls, schema->id(), cg.logstor_index());
+
+    // The range is the lower half, with an exclusive start and an inclusive end, as the range of a
+    // tablet has.
+    const auto range = dht::token_range::make({dht::minimum_token(), false}, {ms[key_count / 2 - 1].token(), true});
+    ls.erase(schema->id(), cg.logstor_index(), range).get();
+
+    BOOST_REQUIRE_EQUAL(cg.logstor_index().get_usage().key_count, key_count / 2);
+    for (size_t i = 0; i < key_count; ++i) {
+        const auto found = lookup_location(cg.logstor_index(), make_index_key(*schema, ms[i].decorated_key()), *schema).has_value();
+        BOOST_REQUIRE_EQUAL(found, i >= key_count / 2);
+    }
+    require_recovery_matches(ls, schema->id(), cg.logstor_index());
+}
+
+// A range that holds no token has nothing to erase, so the erase returns before it drains anything,
+// saves no erased range and leaves the index as it was.
 SEASTAR_THREAD_TEST_CASE(test_logstor_erase_of_an_empty_range_does_nothing) {
     auto schema = make_kv_schema();
     started_logstor store;
@@ -4563,9 +4618,168 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_erase_of_an_empty_range_does_nothing) {
     }
 
     BOOST_REQUIRE_EQUAL(cg.logstor_index().get_usage().key_count, 1u);
+    BOOST_REQUIRE(erased_ranges::load(store.dir(), this_shard_id()).get().empty());
     ls.flush_to_separator().get();
     require_recovery_matches(ls, schema->id(), cg.logstor_index());
 }
+
+#ifdef SCYLLA_ENABLE_ERROR_INJECTION
+// A switch of the active segment takes the new segment's sequence first and makes the segment
+// active later. An erase that chooses its sequence between the two does not wait for the switch,
+// so the switch makes a segment at or below the sequence of the erase active. The next write
+// switches away from that segment. Otherwise the write would land at or below the sequence of the
+// erase, and the next recovery would drop it.
+SEASTAR_THREAD_TEST_CASE(test_logstor_write_after_an_erase_skips_a_running_switch_below_its_sequence) {
+    auto schema = make_kv_schema();
+    auto other_schema = make_kv_schema();
+    started_logstor store;
+    auto& ls = store.ls();
+
+    test_logstor_group cg(schema, ls);
+    test_logstor_group other_cg(other_schema, ls);
+    auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+
+    // Writes of another table fill the active segment until one of them needs a new segment. That
+    // switch then waits with the new segment's sequence issued.
+    auto& injector = utils::get_local_injector();
+    const auto hold_switch = "logstor_switch_wait_after_get_segment";
+    injector.enable(hold_switch, true);
+    const sstring filler(16 * 1024, 'x');
+    std::optional<future<>> held_write;
+    for (int i = 0; !held_write; ++i) {
+        auto write = ls.write(make_kv_mutation(other_schema, fmt::format("pk{}", i), filler), write_target(&other_cg, {}), db::no_timeout);
+        while (!write.available() && injector.waiters(hold_switch) == 0) {
+            seastar::sleep(std::chrono::milliseconds(1)).get();
+        }
+        if (write.available()) {
+            write.get();
+        } else {
+            held_write = std::move(write);
+        }
+    }
+
+    // The test calls segment_manager::erase() directly, because logstor::erase() drains the write
+    // path, and the drain waits for the held write. The sequence of the erase is above the sequence
+    // of the held switch, and the erase ends while the switch is still held.
+    ls.get_segment_manager().erase(schema->id(), cg.logstor_index(), dht::token_range()).get();
+    BOOST_REQUIRE_EQUAL(injector.waiters(hold_switch), 1u);
+
+    injector.receive_message(hold_switch);
+    held_write->get();
+
+    auto after = make_kv_mutation(schema, "pk0", "v0");
+    ls.write(after, write_target(&cg, {}), db::no_timeout).get();
+    ls.flush_to_separator().get();
+    require_recovery_matches(ls, schema->id(), cg.logstor_index());
+}
+
+// An erase that fails after its erased range is durable still raises the floor of the active
+// segment before it returns. Otherwise the next write lands in the active segment, at or below the
+// sequence of the erase, and the next recovery drops it.
+SEASTAR_THREAD_TEST_CASE(test_logstor_write_after_a_failed_erase_lands_above_its_sequence) {
+    auto schema = make_kv_schema();
+    started_logstor store;
+    auto& ls = store.ls();
+
+    test_logstor_group cg(schema, ls);
+    auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+
+    utils::get_local_injector().enable("logstor_erase_after_save", true, {{"action", "fail"}});
+    BOOST_REQUIRE_THROW(ls.erase(schema->id(), cg.logstor_index(), dht::token_range()).get(), std::runtime_error);
+
+    ls.write(make_kv_mutation(schema, "pk0", "v0"), write_target(&cg, {}), db::no_timeout).get();
+    ls.flush_to_separator().get();
+    BOOST_REQUIRE_EQUAL(cg.logstor_index().get_usage().key_count, 1u);
+    require_recovery_matches(ls, schema->id(), cg.logstor_index());
+}
+
+// An erase whose save fails erases nothing, and still raises the floor of the active segment
+// before it returns, because a failed sync of the directory can leave the erased range in the file.
+SEASTAR_THREAD_TEST_CASE(test_logstor_write_after_an_erase_with_a_failed_save_lands_above_its_sequence) {
+    auto schema = make_kv_schema();
+    started_logstor store;
+    auto& ls = store.ls();
+
+    test_logstor_group cg(schema, ls);
+    auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+
+    auto location_of = [&] (const mutation& m) {
+        return *lookup_location(cg.logstor_index(), make_index_key(*schema, m.decorated_key()), *schema);
+    };
+    const auto before = make_kv_mutation(schema, "pk0", "v0");
+    ls.write(before, write_target(&cg, {}), db::no_timeout).get();
+    ls.flush_to_separator().get();
+    const auto before_location = location_of(before);
+
+    utils::get_local_injector().enable("logstor_erased_ranges_save_fail", true);
+    BOOST_REQUIRE_THROW(ls.erase(schema->id(), cg.logstor_index(), dht::token_range()).get(), std::runtime_error);
+    BOOST_REQUIRE_EQUAL(cg.logstor_index().get_usage().key_count, 1u);
+
+    const auto after = make_kv_mutation(schema, "pk1", "v0");
+    ls.write(after, write_target(&cg, {}), db::no_timeout).get();
+    ls.flush_to_separator().get();
+    BOOST_REQUIRE(location_of(after).segment != before_location.segment);
+    BOOST_REQUIRE_EQUAL(cg.logstor_index().get_usage().key_count, 2u);
+    require_recovery_matches(ls, schema->id(), cg.logstor_index());
+}
+#endif
+
+// The erase finds the groups of the table in the range itself, so it drains the separator buffer
+// of every one of them. A record left in the buffer of a group that the erase did not drain would
+// be written out later, in a segment above the sequence of the erase, and the next recovery would
+// bring it back.
+SEASTAR_THREAD_TEST_CASE(test_logstor_erase_drains_every_group_of_the_table) {
+    auto schema = make_kv_schema();
+    started_logstor store;
+    auto& ls = store.ls();
+
+    test_logstor_group cg(schema, ls);
+    test_logstor_group other(schema, ls, cg.logstor_index());
+    auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+    auto other_compaction_guard = ls.get_compaction_manager().disable_compaction(other).get();
+
+    // The record is in the separator buffer of the second group, and in no segment of a group.
+    ls.write(make_kv_mutation(schema, "pk0", "v0"), write_target(&other, {}), db::no_timeout).get();
+    ls.flush_to_separator().get();
+
+    ls.erase(schema->id(), cg.logstor_index(), dht::token_range()).get();
+    other.flush_separator().get();
+
+    BOOST_REQUIRE_EQUAL(cg.logstor_index().get_usage().key_count, 0u);
+    require_recovery_matches(ls, schema->id(), cg.logstor_index());
+}
+
+#ifdef SCYLLA_ENABLE_ERROR_INJECTION
+// An erase uses the groups that it found in the registry until it is done. Removing one of them,
+// which stopping a compaction group does before the group is destroyed, waits for the erase.
+SEASTAR_THREAD_TEST_CASE(test_logstor_group_removal_waits_for_an_erase) {
+    auto schema = make_kv_schema();
+    started_logstor store;
+    auto& ls = store.ls();
+
+    test_logstor_group cg(schema, ls);
+    std::optional<test_logstor_group> other(std::in_place, schema, ls, cg.logstor_index());
+    write_and_flush_segment(ls, *other, make_kv_mutation(schema, "pk0", "v0"));
+
+    auto& injector = utils::get_local_injector();
+    const auto hold = "logstor_erase_after_save";
+    injector.enable(hold, true, {{"action", "wait"}});
+    auto erase = ls.erase(schema->id(), cg.logstor_index(), dht::token_range());
+    wait_for_waiter(hold);
+
+    // The group's destructor removes it from the compaction manager, and the removal waits for the
+    // erase semaphore of the index, which the erase holds.
+    auto destroy = seastar::async([&other] { other.reset(); });
+    wait_until([&cg] { return cg.logstor_index().erase_semaphore().waiters() == 1; }, "the removal to wait for the erase");
+    BOOST_REQUIRE(!destroy.available());
+
+    injector.receive_message(hold);
+    erase.get();
+    destroy.get();
+    BOOST_REQUIRE_EQUAL(cg.logstor_index().get_usage().key_count, 0u);
+    require_recovery_matches(ls, schema->id(), cg.logstor_index());
+}
+#endif
 
 namespace {
 

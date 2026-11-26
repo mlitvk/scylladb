@@ -452,12 +452,19 @@ class segment_manager_impl {
     seastar::circular_buffer<log_segment_id> _free_segments;
 
     seg_ptr _active_segment;
+    // A write appends only to an active segment above this floor. An erase raises the floor to its
+    // sequence S, so that the next write to the range of the erase lands above S, see erase().
+    segment_sequence _active_segment_floor{0};
     segment_pool _segment_pool;
     std::optional<shared_future<>> _switch_segment_fut;
     segment_sequence _next_segment_seq{1};
 
-    // The shard keeps its erased ranges here. Recovery loads them before it scans the segments.
+    // The shard keeps its erased ranges here. Recovery loads them before it scans the segments, and
+    // erase() adds to them.
     erased_ranges _erased_ranges;
+    // The erases of every table of the shard share the erased ranges and their file, so the update
+    // and the save of one erase complete before the next begins, see erase().
+    seastar::semaphore _erased_ranges_sem{1};
 
     seastar::gate _async_gate;
     // The reserve replenisher keeps `_segment_pool` full.
@@ -773,6 +780,11 @@ private:
     }
 
     void free_segment(log_segment_id) noexcept;
+
+    future<> save_erased_range(table_id, const dht::token_range&, segment_sequence);
+    future<> erase_index_and_segments(table_id, primary_index&, const dht::token_range&, const std::vector<logstor_group*>& groups,
+            logstor_group* stopped_group);
+    void raise_active_segment_floor(segment_sequence) noexcept;
 
     using group_stopped = bool_class<struct group_stopped_tag>;
     future<> free_erased_segments(logstor_group&, group_stopped);
@@ -1135,7 +1147,9 @@ future<> segment_manager_impl::write(write_buffer& wb) {
     }
 
     while (true) {
-        if (!_active_segment) {
+        // An erase raises the floor and leaves the active segment in place, so a write also
+        // switches from an active segment at or below the floor.
+        if (!_active_segment || _active_segment->seq_num() <= _active_segment_floor) {
             co_await request_segment_switch();
             continue;
         }
@@ -1347,6 +1361,12 @@ future<> segment_manager_impl::request_segment_switch() {
 future<> segment_manager_impl::switch_active_segment() {
     auto new_seg = co_await get_segment(write_source::normal_write);
 
+    // Holds a switch whose new segment has its sequence but is not active yet. The code checks the
+    // injection first, so that a disabled injection adds no suspension point here.
+    if (utils::get_local_injector().is_enabled("logstor_switch_wait_after_get_segment")) [[unlikely]] {
+        co_await utils::get_local_injector().inject("logstor_switch_wait_after_get_segment", utils::wait_for_message(std::chrono::seconds{60}));
+    }
+
     auto old_seg = std::exchange(_active_segment, std::move(new_seg));
 
     if (old_seg) {
@@ -1497,22 +1517,64 @@ void segment_manager_impl::free_segment(log_segment_id segment_id) noexcept {
     _stats.segments_freed++;
 }
 
-// Erases the records of `table` in `range`. The caller must allow no write to the range until the
-// erase ends, and must drain the write path into the separator first, see logstor::erase(). The
-// caller can skip the drain when `range` is inside `stopped_group`, because the gate of a stopped
-// group closed after each write to the group was done (compaction_group::stop()).
+// Fails with an internal error when `found` holds a group that is not in `known`, because such a
+// group joined the registry during the erase of `range`.
+static void check_no_group_joined(table_id table, const dht::token_range& range,
+        const std::vector<logstor_group*>& known, const std::vector<logstor_group*>& found) {
+    for (auto* group : found) {
+        if (!std::ranges::contains(known, group)) {
+            on_internal_error(logstor_logger, fmt::format("A compaction group of table {} with range {} joined during the erase of range {}",
+                    table, group->token_range(), range));
+        }
+    }
+}
+
+// Erases the records of `table` in `range` so that recovery does not bring them back. Freeing a
+// segment leaves its records on disk, so the erase saves an erased range {table, range, S}, and
+// recovery leaves out each record of the range in a segment at a sequence of at most S.
+//
+// The erased range is exact when no copy of a record of the range is above S, and no write that
+// follows the erase is at or below S.
+// The caller must allow no write to the range from before the call until the erase returns. A
+// write that lands before the index erase is erased with the rest, and a write that lands in the
+// active segment after the index erase is at or below S, so the next restart loses it.
+// The caller must also drain the write path into the separator first. A drained write is in the
+// index too, because a write holds the gate of its write buffer until index.insert() returns, and
+// the flush of the buffer closes the gate. The caller can skip the drain when `range` is inside
+// `stopped_group`, because the gate of a stopped group closed after each write to the group was
+// done (compaction_group::stop()).
+//
+// The erase takes these steps:
+// 1. Drain the separator buffers of the groups, so that every record of the range is in a segment
+//    that has a sequence.
+// 2. Disable compaction of the groups, so that nothing copies a record of the range to a new
+//    segment. Split compaction uses the same compaction state, so this stops it too.
+// 3. Choose S, the last sequence issued, and save the erased range. When the save fails, the
+//    erase fails.
+// 4. Erase the index range.
+// 5. Wait for the readers of the erased locations, then free the segments of the groups that
+//    have no live record.
+// 6. Raise the floor of the active segment to S, so that the next write to the range lands above
+//    S. The erase does not wait for a new active segment, and the next write takes it. This step
+//    runs also when a step after step 2 fails, because writes to the range can start again when
+//    the erase returns.
+//
+// The caller must also make sure that no group of `index` that overlaps `range` joins the registry
+// during the erase, for example a child of a tablet split or the group of a tablet that migrates
+// in. The erase does not disable the compaction of such a group, so that compaction can copy a
+// record of the range above S. The erase fails with an internal error when it finds such a group
+// after the flush or at its end.
 //
 // The groups are the registered groups of `index` that overlap `range`, and `stopped_group` when
 // the caller gives one. A stopped group is no longer registered, so the erase cannot find it.
 future<> segment_manager_impl::erase(table_id table, primary_index& index, dht::token_range range, logstor_group* stopped_group) {
     auto holder = _async_gate.hold();
 
-    // The caller drained the write path into the separator, and the erase flushes the separator
-    // buffers of the groups here, so that every record of the range is in a segment of a group. The
-    // flush comes before compaction is disabled, because a flush needs a free segment for each group
-    // and compaction frees segments.
-    // The flush runs before the erase takes the erase semaphore, because the flush can wait for a free
-    // segment, and the removal of a group of the index must not wait for that. Compaction runs
+    // Step 1. The flush comes before compaction is disabled, because a flush needs a free segment
+    // for each group and compaction frees segments. A copy that compaction makes in between is in a
+    // segment of the group at a sequence that the erased range covers.
+    // The flush runs before the erase takes the erase semaphore, because the flush can wait for a
+    // free segment, and the removal of a group of the index must not wait for that. Compaction runs
     // during the flush and frees segments, so the wait ends unless the disk is full of live records.
     // A group can leave the registry during the flush. close_separator() waits for each
     // flush_separator() call that started, so all the calls start with no suspension after
@@ -1526,19 +1588,17 @@ future<> segment_manager_impl::erase(table_id table, primary_index& index, dht::
     auto units = co_await get_units(index.erase_semaphore(), 1);
 
     // The erase finds the groups again after it holds the semaphore, because a group of the flush
-    // can be gone, and a tablet split or a migration can add a group. While the erase holds the
-    // semaphore, no group of the list is removed, see compaction_manager_impl::remove().
-    //
-    // A group that joins after the flush, for example a child of a split that is still running, is
-    // not flushed, so its separator buffers can hold records of the range. A group that joins after
-    // this point is also not in the list. The index erase covers the records of both like the
-    // others, but the segments of a group that is not in the list stay in the group, with no live
-    // record, until compaction frees them.
+    // can be gone. While the erase holds the semaphore, no group of the list is removed, see
+    // compaction_manager_impl::remove().
+    // A group that joined after the flush was not flushed, so its separator buffers can hold
+    // records of the range.
     auto groups = _compaction_mgr.groups_of(index, range);
+    check_no_group_joined(table, range, flushed_groups, groups);
     if (stopped_group && !std::ranges::contains(groups, stopped_group)) {
         groups.push_back(stopped_group);
     }
 
+    // Step 2.
     std::vector<compaction_reenabler> compaction_disabled;
     compaction_disabled.reserve(groups.size());
     co_await coroutine::parallel_for_each(groups, [this, &compaction_disabled] (logstor_group* group) {
@@ -1547,11 +1607,63 @@ future<> segment_manager_impl::erase(table_id table, primary_index& index, dht::
         });
     });
 
+    // Step 3. Every sequence issued so far is below _next_segment_seq, and from here on nothing
+    // issues a sequence for a copy of a record of the range, because the caller allows no write to
+    // the range, and compaction and the separator do not run.
+    //
+    // An erased range that is not durable does not erase anything, so the erase fails. When only
+    // the sync of the directory failed, the file can still hold the erased range until the next save
+    // rewrites the file without it, and a restart before that applies it, so step 6 runs also after
+    // this failure.
+    //
+    // A failed erase can have taken effect, as a failed write can. After a failure in step 4 or 5,
+    // the erased range is durable, but the index can still hold entries of the range. Compaction
+    // runs again below, and it can copy the records of these entries above S, where the erased
+    // range does not cover them. So only a retry completes the erase, and the retry saves a second
+    // erased range, which covers the first one.
+    const auto seq = segment_sequence(_next_segment_seq.value - 1);
+    auto erased = co_await coroutine::as_future(save_erased_range(table, range, seq));
+    if (!erased.failed()) {
+        erased = co_await coroutine::as_future(erase_index_and_segments(table, index, range, groups, stopped_group));
+    }
+
+    // Compaction runs again also after a failure, because the reclaim of space would stop with no
+    // bound if compaction stayed off after a failure.
+    compaction_disabled.clear();
+
+    raise_active_segment_floor(seq);
+    co_await std::move(erased);
+}
+
+// Saves the erased range of an erase of `range` at `seq` in the file, and then adds it to the
+// erased ranges in memory, see erased_ranges::insert_and_save().
+future<> segment_manager_impl::save_erased_range(table_id table, const dht::token_range& range, segment_sequence seq) {
+    auto units = co_await get_units(_erased_ranges_sem, 1);
+    co_await _erased_ranges.insert_and_save(erased_ranges::make(table, range, seq), _cfg.base_dir, _file_mgr.shard());
+    logstor_logger.info("Saved the erased range of table {} range {} at sequence {}", table, range, seq);
+}
+
+// Erases `range` from `index`, waits for the readers of the erased locations, and then frees the
+// segments of `groups` that have no live record left.
+// The caller must disable the compaction of `groups`.
+future<> segment_manager_impl::erase_index_and_segments(table_id table, primary_index& index, const dht::token_range& range,
+        const std::vector<logstor_group*>& groups, logstor_group* stopped_group) {
+    // The injection fails the erase after the save of its erased range when its parameter `action`
+    // is "fail", and holds the erase there until a message comes otherwise.
+    co_await utils::get_local_injector().inject("logstor_erase_after_save", [] (auto& handler) -> future<> {
+        if (handler.get("action") == "fail") {
+            throw std::runtime_error("erase failed after the save by injection");
+        }
+        co_await handler.wait_for_message(std::chrono::steady_clock::now() + std::chrono::seconds{60});
+    });
+
     co_await index.erase(range);
     if (index.has_keys_in(range)) {
         // A write that lands in the range during the erase leaves a key in the range, so this is a
-        // warning and not an error.
-        logstor_logger.warn("Erase of table {} range {} left keys in the range", table, range);
+        // warning and not an error. Such a write can be at or below S, where the erased range covers
+        // it (SCYLLADB-5484).
+        logstor_logger.warn("Erase of table {} range {} left keys that writes added during the erase, and the next restart can lose them",
+                table, range);
     }
     // A reader that took a location of the range before the index erase can still read it, so the
     // readers must finish before the segments are freed, see free_segment().
@@ -1559,6 +1671,16 @@ future<> segment_manager_impl::erase(table_id table, primary_index& index, dht::
     co_await coroutine::parallel_for_each(groups, [this, stopped_group] (logstor_group* group) {
         return free_erased_segments(*group, group_stopped(group == stopped_group));
     });
+    check_no_group_joined(table, range, groups, _compaction_mgr.groups_of(index, range));
+}
+
+// Makes every write that starts from now on land in a segment above `seq`. The function only
+// raises the floor and does not stop the active segment, so it cannot fail. write() switches from
+// an active segment at or below the floor. This also covers a switch that is already running,
+// because such a switch can have taken a sequence at or below `seq` and make that segment active
+// after the floor rises.
+void segment_manager_impl::raise_active_segment_floor(segment_sequence seq) noexcept {
+    _active_segment_floor = std::max(_active_segment_floor, seq);
 }
 
 // Takes the segments of `group` out of the group after an erase removed the records of the group
@@ -1612,7 +1734,8 @@ future<> segment_manager_impl::free_erased_segments(logstor_group& group, group_
 
     logstor_logger.debug("Discarding {} segments", segments.size());
 
-    // Invalidate the first header block so recovery treats the segment as empty.
+    // Invalidate the first header block so recovery treats the segment as empty. The erased range
+    // covers the records either way; this only makes the segment's space count as free at once.
     co_await max_concurrent_for_each(segments, 32, [this] (log_segment_id seg_id) -> future<> {
         logstor_logger.trace("Discard segment {}", seg_id);
         auto [file_id, file_offset] = _geometry.position_of(seg_id);
