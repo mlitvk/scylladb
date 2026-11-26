@@ -17,6 +17,7 @@ import logging
 from test.pylib.tablets import get_tablet_count, get_tablet_replica
 from test.pylib.util import wait_for
 from test.pylib.rest_client import ScyllaMetricsLine
+from test.pylib.log_browsing import ScyllaLogFile
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,11 @@ segment_size = 128 * 1024
 async def count_logstor_data_files(manager: ScyllaClusterManager, server_id: int, shard: int) -> int:
     workdir = await manager.server_get_workdir(server_id)
     return len(list((Path(workdir) / "logstor").glob(f"logstor-{shard}-Data-*.db")))
+
+async def assert_no_dropped_records(server_log: ScyllaLogFile, from_mark: int):
+    """Asserts that each recovery after `from_mark` logged its completion and dropped no record."""
+    matches = await server_log.grep(r"Recovery complete: .*, (\d+) dropped records", from_mark=from_mark)
+    assert matches and all(int(m.group(1)) == 0 for _, m in matches)
 
 async def test_config_option_consistency(manager: ScyllaClusterManager):
     """
@@ -1309,7 +1315,17 @@ async def test_recovery_after_tablet_migration(manager: ScyllaClusterManager):
     After a tablet migrates to another shard, the source shard still holds the tablet's records on
     disk: the originals sit in the mixed segments they were written to, which the separator freed
     without erasing once it had moved them. Recovery must neither fail the node on them nor revive
-    them - they belong to no compaction group of that shard - and it counts what it dropped.
+    them. The erased range that cleanup left behind covers them, so recovery never offers them
+    to the index and counts them as erased records, and the summary of each recovery counts no
+    record that belongs to no compaction group of the shard.
+
+    Then the tablet moves to the source shard and back to the destination shard, with no restart in
+    between, and new writes go to the destination shard. The cleanup of the destination shard
+    erased the whole tablet at a sequence S, and the active segment of that shard was at S, because
+    the restart before it opened the active segment and nothing wrote to the shard since. The
+    cleanup switched the active segment above S, so the new writes land above S and survive the
+    restarts. The new values are small and the first restart kills the node, so the separator does
+    not write a copy of the new writes to a later segment, and only the mixed segment holds them.
     """
     cmdline = ['--logger-log-level', 'logstor=trace', '--smp=2']
     s1 = await manager.server_add(cmdline=cmdline, property_file={"dc": "dc1", "rack": "rack1"})
@@ -1345,8 +1361,91 @@ async def test_recovery_after_tablet_migration(manager: ScyllaClusterManager):
             assert len(rows) == 1, f"Expected 1 row for key {i} after recovery, but got {len(rows)}"
             assert rows[0].v == f"{i}_{value}", f"Wrong value for key {i} after recovery"
 
-        matches = await server_log.grep(r"Recovery complete: .*, (\d+) dropped records", from_mark=log_mark)
+        await assert_no_dropped_records(server_log, log_mark)
+        matches = await server_log.grep(r"Recovery complete: .*, (\d+) erased records", from_mark=log_mark)
         assert sum(int(m.group(1)) for _, m in matches) >= nrows
+        metrics = await manager.metrics.query(s1.ip_addr)
+        assert (metrics.get("scylla_logstor_sm_erased_ranges") or 0) >= 1
+
+        dst_shard = 1 - src_shard
+        await manager.api.move_tablet(s1.ip_addr, ks, "test", h1, dst_shard, h1, src_shard, tablet_token)
+        await manager.api.move_tablet(s1.ip_addr, ks, "test", h1, src_shard, h1, dst_shard, tablet_token)
+        new_rows = nrows // 2
+        # Small values, so that the separator buffer does not fill and write the copies out.
+        for i in range(new_rows):
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, v) VALUES ({i}, 'new_{i}')")
+
+        async def check_rows():
+            for i in range(nrows):
+                rows = await cql.run_async(f"SELECT pk, v FROM {ks}.test WHERE pk = {i}")
+                assert len(rows) == 1, f"Expected 1 row for key {i} after recovery, but got {len(rows)}"
+                expected = f"new_{i}" if i < new_rows else f"{i}_{value}"
+                assert rows[0].v == expected, f"Wrong value for key {i} after recovery: {rows[0].v[:16]}"
+
+        log_mark = await server_log.mark()
+        await manager.server_stop(s1.server_id, convict=False)
+        await manager.server_start(s1.server_id)
+        cql, _ = await manager.get_ready_cql(servers)
+        await check_rows()
+        await assert_no_dropped_records(server_log, log_mark)
+
+        log_mark = await server_log.mark()
+        await manager.server_stop_gracefully(s1.server_id)
+        await manager.server_start(s1.server_id)
+        cql, _ = await manager.get_ready_cql(servers)
+        await check_rows()
+        await assert_no_dropped_records(server_log, log_mark)
+
+async def test_truncate_survives_restarts(manager: ScyllaClusterManager):
+    """
+    Truncate erases all records of the table, but the records stay on disk until their segments
+    are written again, and only the erased range that the truncate saves marks them as erased.
+    The writes after the truncate must stay, and one of them has an older timestamp than the
+    record that it replaces, so it wins only if the erased record is never a candidate. If the
+    recovered sequence counter ignored the erased range, the first restart would give the new
+    writes a sequence that the erased range covers, and the second restart would drop them.
+    """
+    cmdline = ['--logger-log-level', 'logstor=trace', '--smp=1']
+    servers = await manager.servers_add(1, cmdline=cmdline)
+    cql = manager.get_cql()
+
+    async with new_test_keyspace(manager, "WITH tablets={'initial': 2}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v text) WITH storage_engine = 'logstor'")
+
+        value = 'x' * (30 * 1024)
+        for i in range(10):
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, v) VALUES ({i}, 'before_{value}') USING TIMESTAMP 1000")
+        # The flush moves the first rows into the tablets' own segments, and the rows after it
+        # stay in the shared mixed segments.
+        await manager.api.keyspace_flush(servers[0].ip_addr, ks, "test")
+        for i in range(10, 15):
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, v) VALUES ({i}, 'before_{value}') USING TIMESTAMP 1000")
+
+        await cql.run_async(f"TRUNCATE TABLE {ks}.test")
+        assert len(await cql.run_async(f"SELECT pk FROM {ks}.test")) == 0
+
+        expected = {}
+        await cql.run_async(f"INSERT INTO {ks}.test (pk, v) VALUES (0, 'after_{value}') USING TIMESTAMP 5")
+        expected[0] = f'after_{value}'
+        for i in range(20, 25):
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, v) VALUES ({i}, 'after_{value}')")
+            expected[i] = f'after_{value}'
+
+        async def check(when: str):
+            rows = await cql.run_async(f"SELECT pk, v FROM {ks}.test")
+            assert {row.pk: row.v for row in rows} == expected, f"Wrong table content {when}"
+
+        await check("after the truncate")
+        server_log = await manager.server_open_log(servers[0].server_id)
+        for restart in range(1, 3):
+            log_mark = await server_log.mark()
+            await manager.server_stop_gracefully(servers[0].server_id)
+            await manager.server_start(servers[0].server_id)
+            cql, _ = await manager.get_ready_cql(servers)
+            await check(f"after restart {restart}")
+            await assert_no_dropped_records(server_log, log_mark)
+            metrics = await manager.metrics.query(servers[0].ip_addr)
+            assert (metrics.get("scylla_logstor_sm_erased_ranges") or 0) >= 1
 
 @pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
 async def test_tablet_migration_with_compaction(manager: ScyllaClusterManager):
