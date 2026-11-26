@@ -169,7 +169,7 @@ public:
 
     // Reads the record at a location from the index. Keep the guard of the location until the
     // read is complete, so that the segment stays allocated.
-    future<log_record> read(const index_read_guard&, record_location location);
+    future<log_record> read(const index_read_guard&, record_location location) noexcept;
 
     // The column mappings of the schema versions in the segments of this shard.
     column_mapping_registry& column_mappings() noexcept;
