@@ -123,10 +123,16 @@ public:
     enum class component : uint8_t {
         // A data file holds segments and has a file id.
         data,
+        // The erased ranges of the shard, see erased_ranges.
+        erase,
     };
 
     static file_name data(unsigned shard, file_id_t file_id) noexcept {
         return file_name(shard, component::data, file_id, false);
+    }
+
+    static file_name erase(unsigned shard) noexcept {
+        return file_name(shard, component::erase, std::nullopt, false);
     }
 
     // Returns the parsed `name`, or nullopt when `name` is not a logstor file name.
