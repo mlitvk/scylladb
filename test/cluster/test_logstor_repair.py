@@ -1313,7 +1313,8 @@ async def test_repair_does_not_purge_logstor_tombstones(manager: ScyllaClusterMa
 
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 2}") as ks:
         await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v1 text, v2 text)"
-                            " WITH storage_engine = 'logstor' AND tombstone_gc = {'mode': 'immediate'}")
+                            " WITH storage_engine = 'logstor' AND tombstone_gc = {'mode': 'immediate'}"
+                            " AND speculative_retry = 'NONE'")
         table = f"{ks}.test"
         await set_config_on_all(cql, hosts, "enable_tombstone_gc_for_streaming_and_repair", "1")
 
@@ -1347,7 +1348,9 @@ async def test_repair_does_not_purge_logstor_tombstones(manager: ScyllaClusterMa
 
         # Each node must answer a read of the partition out of its own storage
         # with no row. A read at a higher consistency level cannot show a
-        # difference, because its own read repair merges the two versions.
+        # difference, because its own read repair merges the two versions. The
+        # table has no speculative retry, so that the read of a node does not go
+        # to the other node too.
         for host in hosts:
             rows = await read_locally(cql, host, f"SELECT v1, v2 FROM {table} WHERE pk = 1")
             assert list(rows) == [], f"host {host} still returns a live row: {list(rows)}"
