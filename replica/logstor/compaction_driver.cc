@@ -7,6 +7,7 @@
  */
 #include "replica/logstor/compaction_driver.hh"
 #include "replica/logstor/compaction.hh"
+#include "utils/exceptions.hh"
 #include <algorithm>
 #include <exception>
 #include <optional>
@@ -54,6 +55,7 @@ void compaction_driver::start(disk_geometry geometry) {
         set_space_floor(fraction);
     }));
 
+    _last_rate_tick = lowres_clock::now() - compaction_rate_control_period;
     tick_rate_controller();
     _rate_timer.arm_periodic(compaction_rate_control_period);
     _completion = shared_future(with_scheduling_group(_cfg.sg, [this] {
@@ -118,25 +120,54 @@ utilization_threshold_curve compaction_driver::threshold_curve() const noexcept 
 }
 
 void compaction_driver::tick_rate_controller() noexcept {
+    const auto now = lowres_clock::now();
+    const auto dt = std::chrono::duration<double>(now - _last_rate_tick).count();
+    // A period of zero gives no rate. Its counts go to the next tick.
+    if (!(dt > 0)) {
+        return;
+    }
+    _last_rate_tick = now;
+
     const auto shard = _host.sample();
+    const auto allocated = shard.reclaimable_segments_allocated;
 
     _rate_controller.tick({
         .available_segments = shard.available_segments,
         .curve = threshold_curve(),
         .utilization = shard.utilization,
+        .segments_allocated = allocated - _last_segments_allocated,
+        // The bucket keeps one batch, so an idle period saves at most one job.
+        .burst_cap = double(_limits.batch_cap),
+        .dt = dt,
+        .candidates_empty = _no_candidates,
+        .throttled = _throttled_since_tick || _wait == wait_reason::credit,
     });
-    _ranking_inputs = ranking_inputs{
-        .under_threshold = _rate_controller.backlog().candidate_segments,
-        .dead = shard.dead_segments,
+    _last_segments_allocated = allocated;
+    _throttled_since_tick = false;
+
+    // A driver that waits for credit wakes up when the bucket holds what its candidate needs, or
+    // when compaction is disabled.
+    if (_wait == wait_reason::credit) {
+        if (!_host.can_submit_compaction() || _rate_controller.can_afford(_credit_needed)) {
+            _work_wanted.signal();
+        }
+    }
+    wake_if_inputs_changed(shard);
+}
+
+void compaction_driver::wake_if_inputs_changed(const shard_sample& shard) noexcept {
+    if (_wait == wait_reason::candidates && (!_empty_ranking_start || make_ranking_inputs(shard) != _empty_ranking_start->inputs)) {
+        _work_wanted.signal();
+    }
+}
+
+compaction_driver::ranking_inputs compaction_driver::make_ranking_inputs(const shard_sample& shard) const noexcept {
+    return ranking_inputs{
+        .set_changes = shard.set_changes,
+        .utilization_threshold = _rate_controller.utilization_threshold(),
         .min_batch = _rate_controller.min_batch(),
         .batch_cap = _limits.batch_cap,
     };
-
-    // A driver that found nothing to compact wakes up when the inputs of the selection differ from
-    // the inputs of the ranking that found nothing.
-    if (_wait == wait_reason::candidates && (!_empty_ranking_start || _ranking_inputs != _empty_ranking_start->inputs)) {
-        _work_wanted.signal();
-    }
 }
 
 void compaction_driver::notify_group_idle() noexcept {
@@ -146,15 +177,23 @@ void compaction_driver::notify_group_idle() noexcept {
     }
 }
 
-future<> compaction_driver::wait_for_work(wait_reason reason, std::chrono::milliseconds timeout) {
+void compaction_driver::notify_segment_wait() noexcept {
+    // The writes cannot continue until compaction frees a segment, so a change after the ranking
+    // that found nothing wakes the driver now, and not at the next tick.
+    wake_if_inputs_changed(_host.sample());
+}
+
+future<bool> compaction_driver::wait_for_work(wait_reason reason, std::chrono::milliseconds timeout) {
     _wait = reason;
     auto f = co_await coroutine::as_future(_work_wanted.wait(timeout));
     _wait = wait_reason::nothing;
-    if (f.failed()) {
-        // The wait ended by a timeout or because request_stop() broke the condition variable, and
-        // the loop checks the conditions again in both cases.
-        f.ignore_ready_future();
+    if (!f.failed()) {
+        co_return false;
     }
+    // The wait ended by a timeout or because request_stop() broke the condition variable, and the
+    // loop checks the conditions again in both cases.
+    auto ep = f.get_exception();
+    co_return try_catch<seastar::condition_variable_timed_out>(ep) != nullptr;
 }
 
 future<> compaction_driver::run() {
@@ -182,6 +221,7 @@ future<> compaction_driver::run_step(ranking_state& ranking) {
         // Compaction is disabled on the shard. The driver treats this like a shard with nothing to
         // reclaim.
         ranking = {};
+        _no_candidates = true;
         _empty_ranking_start.reset();
         co_await wait_for_work(wait_reason::candidates, _cfg.wait_timeout);
         co_return;
@@ -218,12 +258,32 @@ future<> compaction_driver::run_step(ranking_state& ranking) {
         co_return;
     }
 
+    // The gate comes before the throttle, so that a candidate that the gate refuses does not
+    // wait for credit. The bar cannot increase while the driver waits for credit, because only
+    // the driver starts jobs.
     if (auto bar = admission_bar(ranking); bar && refuse_marginal(c, *bar)) {
         // The driver takes the candidates best first, so no later candidate passes either, and the
         // bar does not change until a job ends. Wait for one job to end, and then rank again.
         ranking = {};
         slot.return_all();
         co_await wait_for_job_end();
+        co_return;
+    }
+
+    // The throttle makes compaction run at the commanded rate, and not as fast as it can when
+    // there is a candidate. It also paces a batch of dead segments, because a job costs more
+    // than its copy.
+    if (!_rate_controller.can_afford(c.score.reclaimed())) {
+        // This candidate is the best, and compaction_admission_credit limits its wait, so keep
+        // it for when the bucket fills. If the limits changed during the wait, the ranking is
+        // out of date, and the driver ranks again.
+        const auto needed = c.score.reclaimed();
+        ranking.candidates.push_back(std::move(c));
+        slot.return_all();
+        co_await wait_for_credit(needed);
+        if (automatic_batch_limits() != ranking.limits) {
+            ranking = {};
+        }
         co_return;
     }
 
@@ -237,9 +297,10 @@ future<bool> compaction_driver::rank(ranking_state& ranking) {
     // change that a tick sees during the ranking, or a group that becomes idle during the ranking,
     // wakes the driver.
     const auto before = ranking_start{
-        .inputs = _ranking_inputs,
+        .inputs = make_ranking_inputs(_host.sample()),
         .idle_notifications = _idle_notifications,
     };
+    const bool after_timeout = std::exchange(_candidates_wait_timed_out, false);
     auto ranked = co_await _host.find_top_compaction_candidates(limits, _limits.auto_parallelism,
             automatic_compaction_allowed);
     if (_stopping) {
@@ -247,11 +308,21 @@ future<bool> compaction_driver::rank(ranking_state& ranking) {
     }
     if (ranked.candidates.empty()) {
         // No group has a batch under the threshold with a net gain, or each such group is
-        // compacting, as on a shard with one compaction group while its job runs.
+        // compacting, as on a shard with one compaction group while its job runs. More CPU cannot
+        // change the first case, so the driver tells the controller which case applies. A split or
+        // a manual compaction does not use the rate, so a group that it holds counts only while an
+        // automatic job runs too.
+        _no_candidates = !ranked.skipped_busy_group || _jobs_in_flight.empty();
         _empty_ranking_start = before;
         co_return false;
     }
+    if (after_timeout && _empty_ranking_start == before) {
+        logstor_logger.warn("Automatic compaction found a batch after a wait of {}, while the segments and the limits "
+                "did not change since the last ranking. An event that can give a group a batch did not wake the driver",
+                _cfg.wait_timeout);
+    }
 
+    _no_candidates = false;
     // The bar is computed first, because the initializer of `candidates` moves the candidates.
     auto bar = best_copying_score(ranked.candidates | std::views::transform(&candidate::score));
     ranking = {
@@ -267,7 +338,7 @@ future<> compaction_driver::wait_for_candidates() {
     if (_empty_ranking_start && _idle_notifications != _empty_ranking_start->idle_notifications) {
         co_return;
     }
-    co_await wait_for_work(wait_reason::candidates, _cfg.wait_timeout);
+    _candidates_wait_timed_out = co_await wait_for_work(wait_reason::candidates, _cfg.wait_timeout);
 }
 
 std::optional<compaction_candidate_score> compaction_driver::admission_bar(const ranking_state& ranking) const {
@@ -278,6 +349,12 @@ std::optional<compaction_candidate_score> compaction_driver::admission_bar(const
     // ranking skips a group that is compacting, so without the jobs in flight, a ranking made while
     // the best group compacts would admit the next best group, even a very poor one.
     return std::max(ranking.bar, best_copying_score(_jobs_in_flight));
+}
+
+future<> compaction_driver::wait_for_credit(size_t needed) {
+    _throttled_since_tick = true;
+    _credit_needed = needed;
+    co_await wait_for_work(wait_reason::credit, _cfg.wait_timeout);
 }
 
 future<> compaction_driver::wait_for_job_end() {
@@ -301,10 +378,32 @@ bool compaction_driver::refuse_marginal(const candidate& c, const compaction_can
 }
 
 void compaction_driver::start_job(candidate c, compaction_batch_limits limits, semaphore_units<> units) {
+    // The job is charged the estimate of what its batch reclaims, because the real count is known
+    // only when the job ends, and the charge holds while the job runs. When the job ends, the
+    // difference to what it reclaimed is settled. At the space floor the throttle is off, so a job
+    // that starts there is not charged.
+    const auto estimate = double(c.score.reclaimed());
+    const bool charged = !_rate_controller.bypassed();
+    if (charged) {
+        _rate_controller.charge_job(estimate);
+    }
+
     auto job = _jobs_in_flight.insert(_jobs_in_flight.end(), c.score);
-    (void)_host.submit_normal_compaction(*c.group, limits).handle_exception([] (std::exception_ptr ep) {
-        logstor_logger.debug("An automatic compaction job failed: {}. Ignored", ep);
-    }).finally([this, job, units = std::move(units)] {
+    (void)_host.submit_normal_compaction(*c.group, limits).then_wrapped(
+            [this, job, estimate, charged, units = std::move(units)] (future<job_result> f) {
+        job_result result;
+        if (f.failed()) {
+            logstor_logger.debug("An automatic compaction job failed: {}. Ignored", f.get_exception());
+        } else {
+            result = f.get();
+        }
+        if (charged) {
+            _rate_controller.settle_job(estimate, double(result.reclaimed()));
+            // A refund can pay for the candidate that waits for credit.
+            if (_wait == wait_reason::credit && _rate_controller.can_afford(_credit_needed)) {
+                _work_wanted.signal();
+            }
+        }
         on_job_end(job);
     });
 }

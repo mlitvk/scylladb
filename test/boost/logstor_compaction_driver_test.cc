@@ -11,6 +11,7 @@
 
 #include <boost/test/unit_test.hpp>
 #include <seastar/core/sleep.hh>
+#include <seastar/core/thread.hh>
 #include <seastar/core/with_timeout.hh>
 #include <seastar/testing/thread_test_case.hh>
 #include <seastar/util/defer.hh>
@@ -43,6 +44,8 @@ constexpr uint64_t segment_count = 1024;
 // the rich one.
 const compaction_candidate_score rich{.n_in = 8, .n_out = 2, .live_bytes = 2 * segment_size};
 const compaction_candidate_score poor{.n_in = 8, .n_out = 7, .live_bytes = 7 * segment_size};
+// Poor, but it reclaims as much as a full admission credit.
+const compaction_candidate_score poor_large{.n_in = 32, .n_out = 24, .live_bytes = 24 * segment_size};
 
 class fake_group final : public logstor_group {
 public:
@@ -73,7 +76,7 @@ protected:
 struct submitted_job {
     logstor_group* group;
     compaction_batch_limits limits;
-    promise<> done;
+    promise<compaction_driver::job_result> done;
     bool ended = false;
 };
 
@@ -94,9 +97,14 @@ public:
     std::set<const logstor_group*> running;
     uint64_t available_segments = segment_count;
     utilization_histogram utilization{};
-    uint64_t dead_segments = 0;
-    // The calls of sample(). The driver calls it once in each controller tick.
-    mutable size_t ticks = 0;
+    uint64_t set_changes = 0;
+    // The calls of sample(). The driver calls it in each controller tick, and at the start of each
+    // ranking.
+    mutable size_t samples = 0;
+    // The allocations that each sample reports. By default there are many, so the credit never
+    // holds a job back, because most tests are not about the throttle.
+    uint64_t allocations_per_sample = 1000;
+    mutable uint64_t segments_allocated = 0;
 
     bool can_submit_compaction() const noexcept override {
         return true;
@@ -127,29 +135,39 @@ public:
             auto gate = ranking_gate->get_future();
             co_await std::move(gate);
         }
-        std::erase_if(candidates, [this] (const compaction_driver::candidate& c) { return running.contains(c.group); });
+        const auto skipped = std::erase_if(candidates, [this] (const compaction_driver::candidate& c) { return running.contains(c.group); });
         std::ranges::reverse(candidates);
-        co_return compaction_driver::ranking{.candidates = std::move(candidates)};
+        co_return compaction_driver::ranking{.candidates = std::move(candidates), .skipped_busy_group = skipped != 0};
     }
 
     bool can_start(const logstor_group* group) const noexcept override {
         return !running.contains(group);
     }
 
-    future<> submit_normal_compaction(logstor_group& group, compaction_batch_limits limits) override {
+    future<compaction_driver::job_result> submit_normal_compaction(logstor_group& group, compaction_batch_limits limits) override {
         running.insert(&group);
-        auto& job = *jobs.emplace_back(std::make_unique<submitted_job>(&group, limits, promise<>()));
-        co_await job.done.get_future();
+        auto& job = *jobs.emplace_back(std::make_unique<submitted_job>(&group, limits, promise<compaction_driver::job_result>()));
+        const auto result = co_await job.done.get_future();
         running.erase(&group);
+        co_return result;
     }
 
     compaction_driver::shard_sample sample() const noexcept override {
-        ++ticks;
+        ++samples;
+        segments_allocated += allocations_per_sample;
         return compaction_driver::shard_sample{
             .available_segments = available_segments,
             .utilization = utilization,
-            .dead_segments = dead_segments,
+            .set_changes = set_changes,
+            .reclaimable_segments_allocated = segments_allocated,
         };
+    }
+
+    // Returns the number of controller ticks. Each ranking calls sample() and then
+    // find_top_compaction_candidates() with no yield between them, so a ranking adds one sample and
+    // one element of `ranking_limits`.
+    size_t ticks() const noexcept {
+        return samples - ranking_limits.size();
     }
 
     void open_ranking_gate() {
@@ -184,9 +202,9 @@ void start(compaction_driver& driver) {
     driver.start({.segment_count = segment_count});
 }
 
-// Polls `pred` until it holds or `wait_limit` passes.
-bool wait_until(std::function<bool()> pred) {
-    const auto deadline = lowres_clock::now() + wait_limit;
+// Polls `pred` until it holds or `limit` passes.
+bool wait_until(std::function<bool()> pred, std::chrono::milliseconds limit = wait_limit) {
+    const auto deadline = lowres_clock::now() + limit;
     while (!pred()) {
         if (lowres_clock::now() >= deadline) {
             return false;
@@ -198,13 +216,13 @@ bool wait_until(std::function<bool()> pred) {
 
 // Waits until the controller ticks `n` more times.
 void wait_for_ticks(const fake_host& host, size_t n) {
-    const auto target = host.ticks + n;
-    BOOST_REQUIRE(wait_until([&] { return host.ticks >= target; }));
+    const auto target = host.ticks() + n;
+    BOOST_REQUIRE(wait_until([&] { return host.ticks() >= target; }));
 }
 
-void end_job(fake_host& host, size_t i) {
+void end_job(fake_host& host, size_t i, compaction_driver::job_result result = {}) {
     host.jobs[i]->ended = true;
-    host.jobs[i]->done.set_value();
+    host.jobs[i]->done.set_value(result);
 }
 
 void stop(compaction_driver& driver, fake_host& host) {
@@ -279,8 +297,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_bar_survives_a_new_ranki
     BOOST_REQUIRE_EQUAL(host.jobs[1]->group, &b);
 }
 
-// A tick that sees the backlog change while a ranking runs wakes the driver after an empty
-// ranking.
+// A tick that sees a set change while a ranking runs wakes the driver after an empty ranking.
 SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_wakes_on_a_change_during_a_ranking) {
     fake_host host;
     fake_group a;
@@ -291,20 +308,21 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_wakes_on_a_change_during
     auto stop_driver = seastar::defer([&] noexcept { stop(driver, host); });
 
     BOOST_REQUIRE(wait_until([&] { return host.ranking_limits.size() == 1; }));
-    host.utilization[0] = 5;
+    ++host.set_changes;
     wait_for_ticks(host, 1);
     host.open_ranking_gate();
 
     BOOST_REQUIRE(wait_until([&] { return host.jobs.size() == 1; }));
 }
 
-// A segment that dies in the lowest bucket does not change the backlog estimate, but it can be
-// compacted at once, so it wakes the driver.
-SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_wakes_when_a_segment_dies) {
+// A free that changes no count of the shard can give a group a batch. For example, at a threshold
+// of 1 each segment is a candidate, and the frees inside one bucket of the histogram can give the
+// candidates a net gain. So each change of a set wakes the driver.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_wakes_when_a_set_changes) {
     fake_host host;
     fake_group a;
     host.rankings = {{}, {candidate_of(a, rich)}};
-    host.utilization[0] = 1;
+    host.utilization[utilization_bucket_count - 1] = 8;
     compaction_driver driver(host, make_config());
     start(driver);
     auto stop_driver = seastar::defer([&] noexcept { stop(driver, host); });
@@ -315,8 +333,107 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_wakes_when_a_segment_die
     BOOST_REQUIRE_EQUAL(host.ranking_limits.size(), 1u);
     BOOST_REQUIRE(host.jobs.empty());
 
-    host.dead_segments = 1;
+    ++host.set_changes;
     BOOST_REQUIRE(wait_until([&] { return host.jobs.size() == 1; }));
+}
+
+// A job can free the dead segments that the last tick counted, and the writes can make as many new
+// segments dead before the next tick. That tick reads the same histogram as the last tick, but each
+// removal and each death changes a set, so the tick wakes the driver.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_wakes_when_segments_die_after_a_job) {
+    const compaction_candidate_score dead_batch{.n_in = 8, .n_out = 0, .live_bytes = 0};
+    fake_host host;
+    fake_group a;
+    // The second ranking runs while the first job runs, and the third one after the job.
+    host.rankings = {{candidate_of(a, dead_batch)}, {}, {}, {candidate_of(a, dead_batch)}};
+    // Adds or removes 8 dead segments, one change for each segment.
+    auto set_dead_segments = [&] (uint64_t n) {
+        host.utilization[0] = n;
+        host.set_changes += 8;
+    };
+    set_dead_segments(8);
+    compaction_driver driver(host, make_config());
+    start(driver);
+    auto stop_driver = seastar::defer([&] noexcept { stop(driver, host); });
+
+    BOOST_REQUIRE(wait_until([&] { return host.jobs.size() == 1 && host.ranking_limits.size() == 2; }));
+    // The last tick before the job ends counts the 8 dead segments.
+    wait_for_ticks(host, 1);
+
+    set_dead_segments(0);
+    end_job(host, 0);
+    BOOST_REQUIRE(wait_until([&] { return host.ranking_limits.size() >= 3; }));
+    set_dead_segments(8);
+    BOOST_REQUIRE(wait_until([&] { return host.jobs.size() == 2; }));
+}
+
+// A job changes the sets before it ends, and the ranking after the job starts before the next tick.
+// The ranking saves the inputs of the shard at its start, and not the inputs of the last tick, so
+// the next tick does not wake the driver for a ranking of the same segments.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_ranks_once_after_a_job) {
+    fake_host host;
+    fake_group a;
+    host.rankings = {{candidate_of(a, rich)}};
+    compaction_driver driver(host, make_config());
+    start(driver);
+    auto stop_driver = seastar::defer([&] noexcept { stop(driver, host); });
+
+    // The second ranking runs while the job runs, and finds nothing.
+    BOOST_REQUIRE(wait_until([&] { return host.jobs.size() == 1 && host.ranking_limits.size() == 2; }));
+    wait_for_ticks(host, 1);
+
+    host.set_changes += 8;
+    end_job(host, 0);
+    BOOST_REQUIRE(wait_until([&] { return host.ranking_limits.size() == 3; }));
+    wait_for_ticks(host, 2);
+    BOOST_REQUIRE_EQUAL(host.ranking_limits.size(), 3u);
+}
+
+// When an event is lost, the timeout still wakes the driver, and the driver starts the job. The
+// driver also logs a warning, which the test does not check.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_wakes_after_the_timeout) {
+    fake_host host;
+    fake_group a;
+    host.rankings = {{}, {candidate_of(a, rich)}};
+    auto cfg = make_config();
+    cfg.wait_timeout = 100ms;
+    compaction_driver driver(host, std::move(cfg));
+    start(driver);
+    auto stop_driver = seastar::defer([&] noexcept { stop(driver, host); });
+
+    // The job starts soon after the timeout. The limit leaves room for a slow machine.
+    BOOST_REQUIRE(wait_until([&] { return host.jobs.size() == 1; }, 2s));
+    BOOST_REQUIRE_EQUAL(host.jobs[0]->group, &a);
+}
+
+// A write that waits for a segment wakes a driver that found nothing to compact at once, and not
+// at the next tick, but only when a set changed since the ranking.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_wakes_when_a_write_waits_for_a_segment) {
+    fake_host host;
+    fake_group a;
+    host.rankings = {{}, {candidate_of(a, rich)}};
+    compaction_driver driver(host, make_config());
+    start(driver);
+    auto stop_driver = seastar::defer([&] noexcept { stop(driver, host); });
+
+    BOOST_REQUIRE(wait_until([&] { return host.ranking_limits.size() == 1; }));
+    wait_for_ticks(host, 1);
+
+    // The yields let the driver run, and they take much less time than the tick period, so a ranking
+    // after them comes from the call and not from a tick.
+    auto yield_to_driver = [] {
+        for (int i = 0; i < 100; ++i) {
+            seastar::thread::yield();
+        }
+    };
+    driver.notify_segment_wait();
+    yield_to_driver();
+    BOOST_REQUIRE_EQUAL(host.ranking_limits.size(), 1u);
+
+    ++host.set_changes;
+    driver.notify_segment_wait();
+    yield_to_driver();
+    BOOST_REQUIRE_EQUAL(host.jobs.size(), 1u);
 }
 
 // The end of a job, and notify_group_idle(), wake a driver that found nothing to compact.
@@ -534,9 +651,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_continues_after_a_failur
     BOOST_REQUIRE_EQUAL(host.jobs[0]->group, &a);
 }
 
-// A driver that found nothing to compact wakes up when the minimum batch decreases, also when the
-// backlog estimate and the dead segments do not change. Here the histogram is empty, so the
-// estimate stays 0.
+// A driver that found nothing to compact wakes up when the minimum batch decreases, also when no
+// set changes.
 SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_wakes_when_the_minimum_batch_decreases) {
     fake_host host;
     fake_group a;
@@ -551,6 +667,77 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_wakes_when_the_minimum_b
 
     BOOST_REQUIRE(wait_until([&] { return host.jobs.size() == 1; }));
     BOOST_REQUIRE_LT(host.ranking_limits[1].min_batch, host.ranking_limits[0].min_batch);
+}
+
+// The gate refuses a poor candidate at once, and the candidate does not first wait for credit.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_refuses_before_waiting_for_credit) {
+    fake_host host;
+    fake_group a, b;
+    // One segment per period. The rich job takes the credit, and the poor batch needs 8 more.
+    host.allocations_per_sample = 1;
+    host.rankings = {{candidate_of(a, rich)}, {candidate_of(b, poor_large)}};
+    compaction_driver driver(host, make_config());
+    start(driver);
+    auto stop_driver = seastar::defer([&] noexcept { stop(driver, host); });
+
+    BOOST_REQUIRE(wait_until([&] { return host.jobs.size() == 1; }));
+    // Without allocations the credit does not grow, so a driver that waits for credit before the
+    // gate never refuses the poor batch.
+    host.allocations_per_sample = 0;
+    BOOST_REQUIRE(wait_until([&] { return driver.stats().batches_refused == 1; }));
+}
+
+// When the limits change while a candidate waits for credit, the driver ranks again, and the job
+// runs under the new limits.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_ranks_again_after_a_credit_wait) {
+    fake_host host;
+    fake_group a;
+    // Without allocations the credit does not grow, so the candidate waits until the limits change.
+    host.allocations_per_sample = 0;
+    host.available_segments = 500;
+    host.rankings = {{candidate_of(a, rich)}, {candidate_of(a, rich)}};
+    compaction_driver driver(host, make_config());
+    start(driver);
+    auto stop_driver = seastar::defer([&] noexcept { stop(driver, host); });
+
+    BOOST_REQUIRE(wait_until([&] { return host.ranking_limits.size() == 1; }));
+    // Between the space floor (32) and the anchor (64): the threshold and the minimum batch move.
+    host.available_segments = 40;
+    BOOST_REQUIRE(wait_until([&] { return driver.automatic_batch_limits() != host.ranking_limits[0]; }));
+    host.allocations_per_sample = 1;
+
+    BOOST_REQUIRE(wait_until([&] { return host.jobs.size() == 1; }));
+    // The ranking after the job started comes back empty.
+    BOOST_REQUIRE_GE(host.ranking_limits.size(), 2u);
+    BOOST_REQUIRE(host.ranking_limits[1] != host.ranking_limits[0]);
+    BOOST_REQUIRE(host.jobs[0]->limits == host.ranking_limits[1]);
+}
+
+// A job in flight holds its charge, so a second job waits until the bucket refills. When a job ends,
+// the difference between what it reclaimed and its charge is settled.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_driver_job_holds_its_charge) {
+    fake_host host;
+    fake_group a, b;
+    // One segment per period: a rich batch, which reclaims 6, waits about 6 periods for credit.
+    host.allocations_per_sample = 1;
+    host.rankings = {{candidate_of(a, rich), candidate_of(b, rich)}};
+    compaction_driver driver(host, make_config());
+    start(driver);
+    auto stop_driver = seastar::defer([&] noexcept { stop(driver, host); });
+
+    BOOST_REQUIRE(wait_until([&] { return host.jobs.size() == 1; }));
+    BOOST_REQUIRE_EQUAL(host.jobs[0]->group, &a);
+    // Without allocations the credit does not grow, so only the refund of the first job can pay
+    // for the second job.
+    host.allocations_per_sample = 0;
+    BOOST_REQUIRE_LT(driver.rate_controller().credit(), double(rich.reclaimed()));
+    wait_for_ticks(host, 3);
+    BOOST_REQUIRE_EQUAL(host.jobs.size(), 1u);
+
+    // The job reclaimed nothing, so its charge comes back and the second job starts.
+    end_job(host, 0);
+    BOOST_REQUIRE(wait_until([&] { return host.jobs.size() == 2; }));
+    BOOST_REQUIRE_EQUAL(host.jobs[1]->group, &b);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

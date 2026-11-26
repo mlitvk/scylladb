@@ -142,7 +142,7 @@ public:
     // `shard_stats` are the shard-wide statistics. All the sets of the shard add their changes to
     // them. Thus, the shard can read its utilization from one field, and it does not have to walk
     // over the groups. Use nullptr for a set that is not part of a shard, for example in a test.
-    explicit segment_set(size_t segment_size, segment_stats* shard_stats = nullptr) noexcept
+    explicit segment_set(size_t segment_size, shard_segment_totals* shard_stats = nullptr) noexcept
         : _segment_size(segment_size)
         , _shard_stats(shard_stats) {
         // The set calculates the live record bytes and the utilization of a segment from its free
@@ -275,7 +275,7 @@ private:
     size_t _segment_size;
     // The statistics of this set, and the shard-wide statistics that get the same changes.
     segment_stats _stats;
-    segment_stats* _shard_stats;
+    shard_segment_totals* _shard_stats;
 
     // Makes room for one more segment, so that the following link() cannot fail. Only useful when
     // nothing can be added to the set in between, since the room is not reserved for a caller.
@@ -490,7 +490,7 @@ class logstor_group {
 protected:
     // `shard_stats` are the shard-wide segment statistics. The set of this group adds its segments
     // to them, see segment_set.
-    explicit logstor_group(size_t segment_size, segment_stats* shard_stats) noexcept
+    explicit logstor_group(size_t segment_size, shard_segment_totals* shard_stats) noexcept
         : _logstor_segments(segment_size, shard_stats) {
     }
 

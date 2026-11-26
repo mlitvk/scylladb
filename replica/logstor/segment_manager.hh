@@ -69,8 +69,8 @@ struct segment_manager_config {
     utils::updateable_value<double> compaction_min_utilization_threshold{default_compaction_min_utilization_threshold};
     seastar::scheduling_group compaction_sg;
     utils::updateable_value<float> compaction_static_shares;
-    // The shares of the compaction scheduling group at the space floor, see
-    // compaction_rate_controller.
+    // The shares of the compaction scheduling group when compaction cannot use its rate or the disk
+    // is at the space floor, see compaction_rate_controller.
     utils::updateable_value<float> compaction_max_shares{2000};
     seastar::scheduling_group separator_sg;
     seastar::scheduling_group split_compaction_sg;
@@ -187,8 +187,8 @@ public:
     // The statistics of the segments that the compaction groups of this shard own, with their
     // distribution by utilization. The segment_set of each group adds its changes to them. A group
     // gives a pointer to them to the constructor of its segment_set.
-    segment_stats& shard_segment_stats() noexcept;
-    const segment_stats& shard_segment_stats() const noexcept;
+    shard_segment_totals& shard_segment_stats() noexcept;
+    const shard_segment_totals& shard_segment_stats() const noexcept;
 
     // Returns the path of the file holding the given segment (for debug/introspection).
     // The path is computed from the segment id, the segment is not looked up, so the file

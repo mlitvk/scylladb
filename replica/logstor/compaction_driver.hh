@@ -45,13 +45,32 @@ public:
         // The candidates are worst first, in the order that
         // top_compaction_candidates::take_sorted() returns them.
         std::vector<candidate> candidates;
+        // A group was not ranked because it is compacting. While an automatic job runs, an empty
+        // ranking then means that the candidates are behind the job, and not that the disk holds
+        // none, which the controller and the driver treat differently.
+        bool skipped_busy_group = false;
     };
 
     // The values that one controller tick reads from the shard.
     struct shard_sample {
         uint64_t available_segments;
         const utilization_histogram& utilization;
-        uint64_t dead_segments;
+        uint64_t set_changes;
+        // The count since the start, which the driver subtracts from the count at the previous
+        // tick. See compaction_rate_controller::sample::segments_allocated.
+        uint64_t reclaimable_segments_allocated;
+    };
+
+    // Holds the segments that one compaction job read (`n_in`) and wrote (`n_out`).
+    struct job_result {
+        size_t n_in = 0;
+        size_t n_out = 0;
+
+        // Returns the segments that the job freed, which is `n_in - n_out`, or 0 if `n_out` is
+        // larger.
+        size_t reclaimed() const noexcept {
+            return n_in > n_out ? n_in - n_out : 0;
+        }
     };
 
     // The services that the driver needs from the compaction manager.
@@ -70,7 +89,8 @@ public:
         // Returns true when the group of a candidate is still registered, idle and enabled. The
         // function only compares `group`, because the group can be gone.
         virtual bool can_start(const logstor_group* group) const noexcept = 0;
-        virtual future<> submit_normal_compaction(logstor_group&, compaction_batch_limits) = 0;
+        // Returns what the job did. A job that finds no batch returns an empty result.
+        virtual future<job_result> submit_normal_compaction(logstor_group&, compaction_batch_limits) = 0;
         virtual shard_sample sample() const noexcept = 0;
     };
 
@@ -81,9 +101,9 @@ public:
         utils::updateable_value<double> utilization_threshold;
         utils::updateable_value<double> min_utilization_threshold;
         seastar::scheduling_group sg;
-        // The longest time that the driver waits when no event wakes it. The timeout covers what
-        // the events do not show: a segment that crosses the threshold inside one bucket of the
-        // utilization histogram, which does not change the backlog estimate.
+        // The longest time that the driver waits when no event wakes it. The events show each
+        // change that can give a group a batch, so the timeout only limits the wait after a lost
+        // event, which is a bug. The driver warns when it finds a batch after such a wait.
         std::chrono::milliseconds wait_timeout = std::chrono::seconds(10);
         // The time that the driver waits after a failed step before it starts again. A failure that
         // repeats, for example under memory pressure, then logs at most once in this time.
@@ -121,10 +141,11 @@ public:
     // ended, compaction on it was enabled again, or its table turned automatic compaction on
     // again.
     void notify_group_idle() noexcept;
+    // Tells the driver that a write waits for a segment from the pool. A driver that waits for
+    // candidates ranks again when the inputs of the selection changed since its last ranking.
+    void notify_segment_wait() noexcept;
 
-    // Returns the part of the range from the minimum to the maximum compaction shares that
-    // compaction asks for, in [0, 1].
-    double shares_demand() const noexcept { return _rate_controller.space_pressure(); }
+    double shares_demand() const noexcept { return _rate_controller.shares_demand(); }
     const compaction_rate_controller& rate_controller() const noexcept { return _rate_controller; }
     // Returns the threshold curve of the current configuration. Every input is live-updatable, so
     // the curve is built where it is used and not cached.
@@ -156,12 +177,17 @@ private:
     // The scores of the automatic jobs in flight, for the marginal admission gate.
     std::list<compaction_candidate_score> _jobs_in_flight;
 
-    // The reason the driver waits, and the condition variable that it waits on. A controller tick
-    // signals it when the backlog changes, notify_group_idle() when a group can be ranked again,
-    // and the end of a job when the marginal admission gate waits for one. Nothing signals a wait
-    // after a failure, so only the delay or a stop ends it.
+    // The reason the driver waits, and the condition variable that it waits on. These events
+    // signal a wait:
+    // - A wait for credit: a controller tick, or the refund of a job that ends.
+    // - A wait for candidates: a tick or notify_segment_wait() when a segment set or the limits
+    //   change, or notify_group_idle() when a group can be ranked again.
+    // - A wait for a job end: the end of a job, for the marginal admission gate.
+    //
+    // Nothing signals a wait after a failure, so only the delay or a stop ends it.
     enum class wait_reason {
         nothing,
+        credit,
         candidates,
         failure,
         job_end,
@@ -172,29 +198,38 @@ private:
     uint64_t _idle_notifications{0};
     // Counts the automatic jobs that ended, for the marginal admission gate.
     uint64_t _jobs_ended{0};
-    // The inputs of the selection that can give a group a batch. They are the segments under the
-    // threshold, as the backlog estimates them, the dead segments, and the limits that decide how
-    // many candidates a batch needs and can take. The dead segments count apart, because they do
-    // not wait for a minimum batch, and the estimate does not show when they die in the lowest
-    // bucket.
+    // True when the last ranking found no batch with a net gain. More CPU cannot change this state,
+    // so the driver gives it to the controller.
+    bool _no_candidates{false};
+    // The inputs of the selection that can give a group a batch: the count of the changes to the
+    // segment sets of the shard, and the limits of the selection. The count includes each change, so
+    // equal inputs show that the segments and the limits are the same as at the last ranking.
     struct ranking_inputs {
-        double under_threshold;
-        uint64_t dead;
+        uint64_t set_changes;
+        double utilization_threshold;
         size_t min_batch;
         size_t batch_cap;
 
         bool operator==(const ranking_inputs&) const noexcept = default;
     };
-    // The inputs as of the last controller tick.
-    ranking_inputs _ranking_inputs{};
-    // The state before the last ranking that came back empty. A driver that waits for candidates is
-    // woken when the inputs change, and it does not wait when a group became idle during the
-    // ranking. An empty value means that any event wakes the driver.
+    // The state of the shard when the last ranking that came back empty started. A driver that waits
+    // for candidates is woken when the inputs change, and it does not wait when a group became idle
+    // during the ranking. An empty value means that any event wakes the driver.
     struct ranking_start {
         ranking_inputs inputs;
         uint64_t idle_notifications;
+
+        bool operator==(const ranking_start&) const noexcept = default;
     };
     std::optional<ranking_start> _empty_ranking_start;
+    // True when the last wait for candidates ended by the timeout. When the next ranking starts in
+    // the state of the empty ranking and finds a batch, an event did not wake the driver, so the
+    // ranking warns.
+    bool _candidates_wait_timed_out{false};
+    // True when a job waited for credit since the last tick.
+    bool _throttled_since_tick{false};
+    // The credit that the candidate of a driver that waits for credit needs.
+    size_t _credit_needed{0};
 
     // The anchor and the ceiling of the threshold curve, as fractions of the disk. 0 selects the
     // default points: the anchor at twice the space floor, and the ceiling one segment above the
@@ -204,6 +239,8 @@ private:
 
     compaction_rate_controller _rate_controller;
     timer<lowres_clock> _rate_timer;
+    lowres_clock::time_point _last_rate_tick{};
+    uint64_t _last_segments_allocated{0};
 
     // The candidates of the last ranking, worst first, the limits that ranked them, and the best
     // batch of the ranking that copies data, which the marginal admission gate measures against.
@@ -216,7 +253,12 @@ private:
 
     void set_space_floor(double fraction) noexcept;
     void tick_rate_controller() noexcept;
-    future<> wait_for_work(wait_reason, std::chrono::milliseconds timeout);
+    // Wakes a driver that found nothing to compact when the inputs of the selection in `shard`
+    // differ from the inputs of the ranking that found nothing.
+    void wake_if_inputs_changed(const shard_sample& shard) noexcept;
+    ranking_inputs make_ranking_inputs(const shard_sample& shard) const noexcept;
+    // Returns true when the wait ended by the timeout.
+    future<bool> wait_for_work(wait_reason, std::chrono::milliseconds timeout);
     future<> run();
     // Runs one step of the driver: a wait for work, a ranking, or the start of one job.
     future<> run_step(ranking_state& ranking);
@@ -229,12 +271,15 @@ private:
     // the best batch of the ranking that copies data, or a job in flight that reclaims better. It
     // returns nothing while no job runs, so that the first job always starts.
     std::optional<compaction_candidate_score> admission_bar(const ranking_state& ranking) const;
+    // Waits until the bucket holds the credit for a batch that reclaims `needed` segments. A
+    // controller tick fills the bucket, and a job that ends can give back part of its charge.
+    future<> wait_for_credit(size_t needed);
     future<> wait_for_job_end();
     // Returns true when the marginal admission gate refuses `c`, a batch that would run next to the
     // jobs in flight, against `admission_bar`. It counts each refusal in batches_refused.
     bool refuse_marginal(const candidate& c, const compaction_candidate_score& admission_bar);
-    // Submits the job of `c` under `limits`. The job holds `units` of the driver's semaphore until
-    // the job finishes.
+    // Charges the batch of `c` to the rate controller and submits its job under `limits`. The job
+    // holds `units` of the driver's semaphore until the job finishes, and then settles the charge.
     void start_job(candidate c, compaction_batch_limits limits, semaphore_units<> units);
     void on_job_end(std::list<compaction_candidate_score>::iterator job) noexcept;
     // Waits for the jobs still in flight, so that the end of run() is the end of the driver.

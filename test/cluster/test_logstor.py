@@ -247,10 +247,10 @@ async def test_recovery_with_segment_reuse(manager: ScyllaClusterManager):
     """
     disk_size_mb = 4
     file_size_mb = 1
-    value_size = 50 * 1024
+    value_size = 3800
     num_keys = 10
 
-    cmdline = ['--logger-log-level', 'logstor=trace', '--smp=1']
+    cmdline = ['--logger-log-level', 'logstor=debug', '--smp=1']
     cfg = {
         'logstor_disk_size_in_mb': disk_size_mb,
         'logstor_file_size_in_mb': file_size_mb,
@@ -1004,10 +1004,10 @@ async def test_automatic_compaction_skips_a_table_with_autocompaction_disabled(m
             return int(metrics.get("scylla_column_family_logstor_segments", {'ks': ks, 'cf': table}) or 0)
 
         async def overwrite(table: str, keys: int):
-            # A segment holds 15 or 16 records, and each key is written twice, so the segments of
+            # A segment holds 31 or 32 records, and each key is written twice, so the segments of
             # the first values hold only dead records.
             stmt = cql.prepare(f"INSERT INTO {ks}.{table} (pk, v) VALUES (?, ?)")
-            for value in ['a' * 8000, 'b' * 8000]:
+            for value in ['a' * 3800, 'b' * 3800]:
                 for i in range(keys):
                     await cql.run_async(stmt, [i, value])
 
@@ -1016,7 +1016,7 @@ async def test_automatic_compaction_skips_a_table_with_autocompaction_disabled(m
         await manager.api.disable_autocompaction(server.ip_addr, ks, "skipped")
 
         # About 10 dead segments, more than the batch cap of this disk.
-        await overwrite("skipped", 160)
+        await overwrite("skipped", 320)
         await manager.api.flush_all_keyspaces(server.ip_addr)
         skipped_segments = await table_segments("skipped")
         assert await segments_in() == 0, "automatic compaction took segments of a table with automatic compaction disabled"
@@ -1024,7 +1024,7 @@ async def test_automatic_compaction_skips_a_table_with_autocompaction_disabled(m
         # About 3 dead segments. A batch of dead segments copies nothing, and the ranking prefers
         # the batch that reclaims more segments, so a job on this table shows that the driver
         # ranked the groups while the table with automatic compaction off had the better batch.
-        await overwrite("control", 48)
+        await overwrite("control", 96)
         async def automatic_compaction_ran():
             if await segments_in() > 0:
                 return True
@@ -1053,10 +1053,10 @@ async def test_automatic_compaction_follows_the_utilization_threshold(manager: S
     # The fewest candidates that a group must have for a job above the anchor,
     # min_segments_per_compaction.
     min_batch = 8
-    # A segment holds 15 or 16 records, so each set of keys fills about 10 segments of the 64 of the
+    # A segment holds 31 or 32 records, so each set of keys fills about 10 segments of the 64 of the
     # disk, and the free level stays above the anchor.
-    keys_per_set = 160
-    value_size = 8000
+    keys_per_set = 320
+    value_size = 3800
 
     cmdline = ['--logger-log-level', 'logstor=debug', '--smp=1']
     cfg = {

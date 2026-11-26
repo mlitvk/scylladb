@@ -479,8 +479,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_select_compaction_batch_threshold) {
     }
 }
 
-// The backlog counts the segments under the threshold, and the count does not decrease as the
-// threshold increases.
+// The backlog counts the segments under the threshold. The segments that a compaction of them frees
+// are at most their number, and neither count decreases as the threshold increases.
 SEASTAR_THREAD_TEST_CASE(test_logstor_reclaimable_backlog) {
     utilization_histogram utilization{};
     // Ten dead segments, four in the bucket just under a half, two just over it, one full.
@@ -493,6 +493,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_reclaimable_backlog) {
     BOOST_REQUIRE_CLOSE(reclaimable_backlog(utilization, 0.0).candidate_segments, 10.0, 1e-9);
     BOOST_REQUIRE_CLOSE(reclaimable_backlog(utilization, 0.5).candidate_segments, 14.0, 1e-9);
     BOOST_REQUIRE_CLOSE(reclaimable_backlog(utilization, 1.0).candidate_segments, 17.0, 1e-9);
+    BOOST_REQUIRE_GT(reclaimable_backlog(utilization, 0.0).reclaimable_segments, 9.5);
 
     compaction_backlog previous{};
     for (int i = 0; i <= 100; ++i) {
@@ -500,6 +501,8 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_reclaimable_backlog) {
         const auto backlog = reclaimable_backlog(utilization, threshold);
         BOOST_TEST_CONTEXT("threshold=" << threshold) {
             BOOST_REQUIRE_GE(backlog.candidate_segments, previous.candidate_segments);
+            BOOST_REQUIRE_GE(backlog.reclaimable_segments, previous.reclaimable_segments);
+            BOOST_REQUIRE_LE(backlog.reclaimable_segments, backlog.candidate_segments);
         }
         previous = backlog;
     }
@@ -507,29 +510,256 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_reclaimable_backlog) {
     BOOST_REQUIRE_EQUAL(reclaimable_backlog(utilization_histogram{}, 0.5).candidate_segments, 0.0);
 }
 
-// The controller applies the curve and the minimum batch at the free level of each sample, and counts
-// the backlog under the threshold it applies. So space pressure adds fuller segments to the backlog.
-SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_rate_controller_space_pressure) {
-    const auto curve = make_utilization_threshold_curve(20000, 200, 0.5, 0, 0, 0.5);
+namespace {
+
+// Drives a compaction_rate_controller through `ticks` periods with the same sample, the way the
+// engine's timer does. The histogram outlives the sample, which only refers to it.
+struct controller_bench {
     utilization_histogram utilization{};
+    uint64_t available = 10000;
+    // A disk of 20000 segments, with the anchor at twice the space floor and a threshold that is
+    // constant above it.
+    uint64_t space_floor = 200;
+    double threshold = 0.5;
+    uint64_t allocated_per_tick = 0;
+    double burst_cap = 32;
+    bool candidates_empty = false;
+    bool throttled = false;
+    static constexpr double dt = 0.25;
+
+    compaction_rate_controller::sample make_sample() const noexcept {
+        return compaction_rate_controller::sample{
+            .available_segments = available,
+            .curve = make_utilization_threshold_curve(20000, space_floor, threshold, 0, 0, threshold),
+            .utilization = utilization,
+            .segments_allocated = allocated_per_tick,
+            .burst_cap = burst_cap,
+            .dt = dt,
+            .candidates_empty = candidates_empty,
+            .throttled = throttled,
+        };
+    }
+
+    void run(compaction_rate_controller& c, size_t ticks) const noexcept {
+        for (size_t i = 0; i < ticks; ++i) {
+            c.tick(make_sample());
+        }
+    }
+};
+
+} // anonymous namespace
+
+// With nothing under the threshold the controller commands the allocation rate, and a driver that
+// starts a batch each time it can afford one runs at that rate. The bucket keeps at most one batch of
+// credit and of debt from one period to the next.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_rate_controller_follows_the_write_rate) {
+    compaction_rate_controller controller;
+    // No job starts before the first tick gives a rate.
+    BOOST_REQUIRE(!controller.can_afford(1));
+
+    controller_bench bench;
+    bench.allocated_per_tick = 10;
+    bench.run(controller, 1);
+    BOOST_REQUIRE_CLOSE(controller.rate(), 10 / controller_bench::dt, 1e-9);
+    const auto accrual = controller.rate() * controller_bench::dt;
+
+    double charged = 0;
+    constexpr size_t ticks = 400;
+    for (size_t i = 0; i < ticks; ++i) {
+        bench.run(controller, 1);
+        while (controller.can_afford(compaction_admission_credit)) {
+            controller.charge_job(compaction_admission_credit);
+            charged += compaction_admission_credit;
+        }
+    }
+    BOOST_REQUIRE_CLOSE(charged, accrual * ticks, 1);
+    // A controller that spends its rate does not ask for more CPU.
+    BOOST_REQUIRE_EQUAL(controller.shares_demand(), 0.0);
+
+    bench.run(controller, 40);
+    BOOST_REQUIRE_LE(controller.credit(), bench.burst_cap + accrual);
+    controller.charge_job(1000);
+    bench.run(controller, 1);
+    BOOST_REQUIRE_GE(controller.credit(), -bench.burst_cap);
+    BOOST_REQUIRE(!controller.can_afford(1));
+}
+
+// A backlog under the threshold adds to the rate, so compaction runs also with no writes, and a
+// shorter drain time drains it faster.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_rate_controller_drains_the_backlog) {
+    controller_bench bench;
+    compaction_rate_controller idle;
+    bench.run(idle, 1);
+    BOOST_REQUIRE_EQUAL(idle.rate(), 0.0);
+
+    bench.utilization[0] = 600;   // dead segments
+    bench.utilization[3] = 200;   // about a fifth full
+    compaction_rate_controller controller;
+    bench.run(controller, 1);
+    const auto drain = controller.rate();
+    BOOST_REQUIRE_GT(drain, 0.0);
+
+    bench.allocated_per_tick = 10;
+    bench.run(controller, 1);
+    BOOST_REQUIRE_CLOSE(controller.rate(), drain + 10 / controller_bench::dt, 1e-9);
+
+    compaction_rate_controller fast{compaction_rate_controller::tuning{.drain_time = compaction_backlog_drain_time / 6}};
+    bench.allocated_per_tick = 0;
+    bench.run(fast, 1);
+    BOOST_REQUIRE_GT(fast.rate(), drain);
+}
+
+// The controller applies the curve and the minimum batch at the free level of each sample, so space
+// pressure adds fuller segments to the backlog. At the space floor the throttle is off, and the
+// bucket keeps no debt from that time.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_rate_controller_space_pressure) {
+    controller_bench bench;
     // Dead segments, and segments about 0.65 and 0.9 full.
-    utilization[0] = 8;
-    utilization[utilization_bucket_count * 5 / 8] = 5;
-    utilization[utilization_bucket_count * 7 / 8] = 2;
+    bench.utilization[0] = 8;
+    bench.utilization[utilization_bucket_count * 5 / 8] = 5;
+    bench.utilization[utilization_bucket_count * 7 / 8] = 2;
     compaction_rate_controller controller;
 
     double previous_candidates = 0;
     for (uint64_t available : {600u, 300u, 200u}) {
-        controller.tick({.available_segments = available, .curve = curve, .utilization = utilization});
+        bench.available = available;
+        bench.run(controller, 1);
+        const auto curve = bench.make_sample().curve;
         BOOST_TEST_CONTEXT("available=" << available) {
             const auto pressure = compaction_space_pressure(available, curve);
             BOOST_REQUIRE_EQUAL(controller.space_pressure(), pressure);
             BOOST_REQUIRE_EQUAL(controller.utilization_threshold(), effective_utilization_threshold(available, curve));
             BOOST_REQUIRE_EQUAL(controller.min_batch(), effective_min_batch(pressure));
             BOOST_REQUIRE_GT(controller.backlog().candidate_segments, previous_candidates);
+            BOOST_REQUIRE_GE(controller.shares_demand(), pressure);
+            BOOST_REQUIRE_EQUAL(controller.bypassed(), available <= bench.space_floor);
         }
         previous_candidates = controller.backlog().candidate_segments;
     }
+
+    BOOST_REQUIRE(controller.can_afford(1000));
+    controller.charge_job(1000);
+    bench.run(controller, 1);
+    BOOST_REQUIRE_GE(controller.credit(), 0.0);
+
+    bench.available = 3 * bench.space_floor;
+    bench.run(controller, 1);
+    BOOST_REQUIRE(!controller.bypassed());
+    BOOST_REQUIRE_GE(controller.credit(), 0.0);
+}
+
+// The shares demand increases while compaction cannot use its rate, and decreases while the throttle
+// holds compaction back or there is nothing to compact.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_rate_controller_shares_demand) {
+    controller_bench bench;
+    bench.allocated_per_tick = 10;
+    compaction_rate_controller controller;
+
+    // Nothing spends the credit, so it spills over the cap.
+    bench.run(controller, 40);
+    const auto starved = controller.shares_demand();
+    BOOST_REQUIRE_GT(starved, 0.5);
+
+    bench.throttled = true;
+    bench.run(controller, 8);
+    BOOST_REQUIRE_LT(controller.shares_demand(), starved);
+
+    bench.throttled = false;
+    bench.candidates_empty = true;
+    const auto before = controller.shares_demand();
+    bench.run(controller, 8);
+    BOOST_REQUIRE_LT(controller.shares_demand(), before);
+
+    // With no writes and no backlog there is no rate, and the demand decays to nothing.
+    bench.candidates_empty = false;
+    bench.allocated_per_tick = 0;
+    bench.run(controller, 800);
+    BOOST_REQUIRE_LT(controller.shares_demand(), 1e-3);
+}
+
+// The credit that spills while there is nothing to compact does not count as unused rate, so the
+// demand does not jump when candidates come back and compaction spends its rate.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_rate_controller_no_demand_after_idle) {
+    controller_bench bench;
+    bench.allocated_per_tick = 10;
+    bench.candidates_empty = true;
+    compaction_rate_controller controller;
+    bench.run(controller, 400);
+    BOOST_REQUIRE_EQUAL(controller.shares_demand(), 0.0);
+
+    bench.candidates_empty = false;
+    double peak = 0;
+    for (size_t i = 0; i < 40; ++i) {
+        bench.run(controller, 1);
+        while (controller.can_afford(compaction_admission_credit)) {
+            controller.charge_job(compaction_admission_credit);
+        }
+        peak = std::max(peak, controller.shares_demand());
+    }
+    BOOST_REQUIRE_LT(peak, 0.1);
+}
+
+// The space pressure is the lowest demand, but the demand does not keep it: when the pressure ends
+// and compaction spends its rate, the demand falls at once.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_rate_controller_demand_after_pressure) {
+    controller_bench bench;
+    bench.allocated_per_tick = 10;
+    bench.available = bench.space_floor;
+    compaction_rate_controller controller;
+    bench.run(controller, 40);
+    BOOST_REQUIRE_EQUAL(controller.shares_demand(), 1.0);
+
+    bench.available = 10000;
+    bench.run(controller, 1);
+    BOOST_REQUIRE_EQUAL(controller.space_pressure(), 0.0);
+    BOOST_REQUIRE_LT(controller.shares_demand(), 0.1);
+}
+
+// When a tick drops debt that jobs in flight hold, the refunds of those jobs do not give back the
+// dropped part, and they give back all of the rest.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_rate_controller_refund_after_dropped_debt) {
+    controller_bench bench;
+    compaction_rate_controller controller;
+    bench.run(controller, 1);
+    BOOST_REQUIRE_EQUAL(controller.credit(), 0.0);
+
+    // Two jobs take the credit 1 segment under the debt that the bucket keeps.
+    controller.charge_job(20);
+    controller.charge_job(13);
+    bench.run(controller, 1);
+    BOOST_REQUIRE_EQUAL(controller.credit(), -bench.burst_cap);
+
+    // Both jobs reclaim nothing. The first refund pays the dropped segment.
+    controller.settle_job(20, 0);
+    BOOST_REQUIRE_EQUAL(controller.credit(), -bench.burst_cap + 19);
+    controller.settle_job(13, 0);
+    BOOST_REQUIRE_EQUAL(controller.credit(), 0.0);
+}
+
+// A refund does not take the credit over the cap, so a job that reclaims less than its estimate
+// does not increase the unspent rate.
+SEASTAR_THREAD_TEST_CASE(test_logstor_compaction_rate_controller_refund_does_not_spill) {
+    controller_bench bench;
+    bench.allocated_per_tick = 10;
+    compaction_rate_controller controller;
+    bench.run(controller, 1);
+    // A job that holds a charge of one batch.
+    controller.charge_job(bench.burst_cap);
+
+    // The other jobs spend the credit as fast as it fills.
+    for (size_t i = 0; i < 20; ++i) {
+        bench.run(controller, 1);
+        while (controller.can_afford(compaction_admission_credit)) {
+            controller.charge_job(compaction_admission_credit);
+        }
+    }
+    BOOST_REQUIRE_EQUAL(controller.unspent_rate(), 0.0);
+
+    // The job reclaims nothing.
+    controller.settle_job(bench.burst_cap, 0);
+    BOOST_REQUIRE_EQUAL(controller.credit(), bench.burst_cap);
+    bench.run(controller, 1);
+    BOOST_REQUIRE_EQUAL(controller.unspent_rate(), 0.0);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
