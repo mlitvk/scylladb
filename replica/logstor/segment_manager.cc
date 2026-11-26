@@ -1543,9 +1543,10 @@ static void check_no_group_joined(table_id table, const dht::token_range& range,
 //
 // The erased range is exact when no copy of a record of the range is above S, and no write that
 // follows the erase is at or below S.
-// The caller must allow no write to the range from before the call until the erase returns. A
-// write that lands before the index erase is erased with the rest, and a write that lands in the
-// active segment after the index erase is at or below S, so the next restart loses it.
+// The caller must fence the writes to the range with primary_index::fence_writes() from before the
+// call until the erase returns. A write that lands before the index erase is erased with the rest,
+// and a write that lands in the active segment after the index erase is at or below S, so the next
+// restart would lose it.
 // The caller must also drain the write path into the separator first. A drained write is in the
 // index too, because a write holds the gate of its write buffer until index.insert() returns, and
 // the flush of the buffer closes the gate. The caller can skip the drain when `range` is inside
@@ -1564,8 +1565,8 @@ static void check_no_group_joined(table_id table, const dht::token_range& range,
 //    have no live record.
 // 6. Raise the floor of the active segment to S, so that the next write to the range lands above
 //    S. The erase does not wait for a new active segment, and the next write takes it. This step
-//    runs also when a step after step 2 fails, because writes to the range can start again when
-//    the erase returns.
+//    runs also when a step after step 2 fails, because the caller releases the fence when the
+//    erase returns.
 //
 // The caller must also make sure that no group of `index` that overlaps `range` joins the registry
 // during the erase, for example a child of a tablet split or the group of a tablet that migrates
@@ -1577,6 +1578,9 @@ static void check_no_group_joined(table_id table, const dht::token_range& range,
 // the caller gives one. A stopped group is no longer registered, so the erase cannot find it.
 future<> segment_manager_impl::erase(table_id table, primary_index& index, dht::token_range range, logstor_group* stopped_group) {
     auto holder = _async_gate.hold();
+    if (!index.writes_fenced(range)) {
+        on_internal_error(logstor_logger, fmt::format("Erasing table {} range {} with writes to the range not fenced", table, range));
+    }
 
     // Step 1. The flush comes before compaction is disabled, because a flush needs a free segment
     // for each group and compaction frees segments. A copy that compaction makes in between is in a
@@ -1616,8 +1620,8 @@ future<> segment_manager_impl::erase(table_id table, primary_index& index, dht::
     });
 
     // Step 3. Every sequence issued so far is below _next_segment_seq, and from here on nothing
-    // issues a sequence for a copy of a record of the range, because the caller allows no write to
-    // the range, and compaction and the separator do not run.
+    // issues a sequence for a copy of a record of the range, because the writes are fenced and
+    // compaction and the separator do not run.
     //
     // An erased range that is not durable does not erase anything, so the erase fails. When only
     // the sync of the directory failed, the file can still hold the erased range until the next save
@@ -1667,11 +1671,13 @@ future<> segment_manager_impl::erase_index_and_segments(table_id table, primary_
 
     co_await index.erase(range);
     if (index.has_keys_in(range)) {
-        // A write that lands in the range during the erase leaves a key in the range, so this is a
-        // warning and not an error. Such a write can be at or below S, where the erased range covers
-        // it (SCYLLADB-5484).
-        logstor_logger.warn("Erase of table {} range {} left keys that writes added during the erase, and the next restart can lose them",
-                table, range);
+        // Nothing adds a key to the range during the erase:
+        // - The fence holds the writes.
+        // - The topology coordinator drains the tablet streams before a truncate and before the
+        //   cleanup of a pending replica, and a leaving replica receives no stream of its tablet.
+        // - A drop removes the table before its erase, so the adoption of a streamed segment finds
+        //   no index for the records of the table.
+        on_internal_error(logstor_logger, fmt::format("Erase of table {} range {} left keys in the range", table, range));
     }
     // A reader that took a location of the range before the index erase can still read it, so the
     // readers must finish before the segments are freed, see free_segment().

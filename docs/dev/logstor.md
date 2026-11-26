@@ -89,6 +89,9 @@ them. So the erase saves an erased range in the erased range file of the shard (
 [Erased Ranges](#erased-ranges)) before it erases the index entries. The erased range holds the
 table, the token range of the erase and `S`, the last segment sequence that the shard issued. The
 erase does this work:
+- It fences the writes to the range on the index of the table (`primary_index::fence_writes()`), so
+  the writes wait during the erase. The fence is on the index, so it holds the writes to every
+  group of the table in the range.
 - It drains the write path and the separator buffers of the groups and disables their compaction
   before it chooses `S`, so every record of the range is in a segment at a sequence of at most `S`.
 - It flushes the separator buffers before it takes the erase semaphore of the index, because the
@@ -103,24 +106,13 @@ erase does this work:
   sequence above `S`. The erase does not stop the active segment and does not wait for a new one.
   The next write switches from an active segment at or below the floor.
 
-The erase does not hold the writes to the range, so its caller must allow no write to the range
-until the erase ends. The caller must also make sure that no group of the table that overlaps the
-range joins during the erase, for example a child of a tablet split or the group of a tablet that
-migrates in, because the erase does not disable the compaction of such a group. The callers are in
-these cases:
-- A tablet cleanup stops the group first, so no write reaches the range.
-- A drop removes the table and waits for its writes before the erase.
-- A truncate does not stop the writes to the table, which is a known limit (SCYLLADB-5484). A
-  write that runs during the truncate can get a wrong result at the next restart:
-  - When the truncate kept the write, reads return it until the restart, and the restart loses it,
-    because the write is in the active segment at a sequence of at most `S`.
-  - When the truncate erased the write, the restart brings it back, because the separator writes
-    the copy of the write in its buffer to a segment above `S`.
-
-A tablet split adds no group to a stopped storage group, and adds none while the compaction of the
-group that it splits is disabled. A tablet cleanup stops the storage group first, and a truncate or
-a drop disables the compaction of every group of the table first, so no split adds a group during
-their erase. No tablet migrates in during their erase either:
+The caller must make sure that no group of the table that overlaps the range joins during the
+erase, for example a child of a tablet split or the group of a tablet that migrates in, because the
+erase does not disable the compaction of such a group. A tablet split adds no group to a stopped
+storage group, and adds none while the compaction of the group that it splits is disabled. A tablet
+cleanup stops the storage group first, and a truncate or a drop disables the compaction of every
+group of the table first, so no split adds a group during their erase. No tablet migrates in during
+their erase either:
 - The topology coordinator runs a truncate only when no tablet transition runs.
 - A cleanup is a stage of the transition of its tablet.
 - A drop removes the table from the database before its erase, and a change of the tablet map

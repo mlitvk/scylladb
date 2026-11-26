@@ -1264,10 +1264,10 @@ future<> compaction_group::split(compaction::compaction_type_options::split opt,
 }
 
 future<> compaction_group::erase_logstor() {
-    // The erase cannot find a stopped group in the registry, so the call gives the group when it is
-    // stopped. A live group is registered, so the erase finds it and drains its writes like the
-    // writes of other groups. The gate of a stopped group is closed, so no write reaches its range
-    // during the erase.
+    // logstor::erase() fences the writes to the range. The erase cannot find a stopped group in the
+    // registry, so the call gives the group when it is stopped, and the closed gate of a stopped
+    // group shows that no write to the group is queued. A live group is registered, so the erase
+    // finds it and drains its writes like the writes of other groups.
     co_await _t._logstor->erase(_t.schema()->id(), _t.logstor_index(), token_range(), stopped() ? &as_logstor_group() : nullptr);
 }
 
@@ -5186,9 +5186,6 @@ future<> table::truncate_logstor() {
     // the erased range alone makes the truncate durable.
     // The caller must disable the compaction of every group of the table first, so that a tablet
     // split adds no group during the erase.
-    // The erased range is exact only when no write to the table runs during the erase. A truncate
-    // does not stop the writes to the table, so a write that runs during the truncate can be lost
-    // or come back at the next restart (SCYLLADB-5484).
     co_await _logstor->erase(_schema->id(), *_logstor_index, dht::token_range());
 }
 
