@@ -602,6 +602,8 @@ public:
         // with no valid chunk has no segment info.
         utils::chunked_vector<std::optional<segment_info>> segment_infos;
         segment_sequence max_segment_seq{0};
+        // The lowest segment sequence found. It is empty when no segment holds a valid chunk.
+        std::optional<segment_sequence> min_segment_seq;
         // The records that an erased range covers, which the scan left out.
         uint64_t erased_records{0};
     };
@@ -2332,7 +2334,10 @@ class segment_manager_impl::recovery {
     file_manager::recovery _files;
     recovery_summary _summary;
     recovery_stats _stats;
+    // The highest and the lowest segment sequence on disk. The lowest is empty when no segment
+    // holds a valid chunk.
     segment_sequence _max_segment_seq{0};
+    std::optional<segment_sequence> _min_segment_seq;
     // The segment info of the first chunk of each found segment, by segment id, which the scan
     // returns. The placement of the used segments reads it, so it does not read the segments again.
     utils::chunked_vector<std::optional<segment_info>> _segment_infos;
@@ -2355,6 +2360,7 @@ private:
     future<> place_found_segments();
     future<> retire_unused_files();
     void resume_segment_sequence();
+    future<> drop_obsolete_erased_ranges();
 };
 
 future<recovery_summary> segment_manager_impl::recovery::run() {
@@ -2366,6 +2372,7 @@ future<recovery_summary> segment_manager_impl::recovery::run() {
     co_await place_found_segments();
     co_await retire_unused_files();
     resume_segment_sequence();
+    co_await drop_obsolete_erased_ranges();
     co_await _files.finish();
 
     _summary.dropped_records = _stats.dropped_records;
@@ -2416,6 +2423,7 @@ future<> segment_manager_impl::recovery::index_found_segments() {
         co_await coroutine::maybe_yield();
     }
     _max_segment_seq = rebuilt.max_segment_seq;
+    _min_segment_seq = rebuilt.min_segment_seq;
     logstor_logger.info("Recovery indexed {} live records", _sm._stats.live_record_count);
 }
 
@@ -2465,10 +2473,26 @@ future<> segment_manager_impl::recovery::retire_unused_files() {
 
 // New segments get sequences above every sequence on disk and every sequence of an erased range.
 // Otherwise a write after an erase can get a sequence that the erase covers, and the next recovery
-// drops the write.
+// drops the write. The floor is the highest sequence of every erased range that the shard ever had,
+// so the counter does not go back when recovery drops the erased ranges below it.
 void segment_manager_impl::recovery::resume_segment_sequence() {
     _sm._next_segment_seq = std::max(_max_segment_seq, _sm._erased_ranges.seq_floor()) + 1;
     _summary.next_segment_seq = _sm._next_segment_seq;
+}
+
+// An erased range below every chunk on the shard has nothing left to erase, so it is obsolete.
+future<> segment_manager_impl::recovery::drop_obsolete_erased_ranges() {
+    if (!co_await _sm._erased_ranges.drop_obsolete(_min_segment_seq)) {
+        co_return;
+    }
+    logstor_logger.info("Recovery: {} erased ranges left after dropping the obsolete ones", _sm._erased_ranges.size());
+    // The file keeps the dropped erased ranges until the next save, and they match nothing, so a
+    // save that fails only keeps them in the file and does not fail the recovery.
+    auto saved = co_await coroutine::as_future(_sm._erased_ranges.save(_sm._cfg.base_dir, _sm._file_mgr.shard()));
+    if (saved.failed()) {
+        logstor_logger.warn("Recovery: failed to save the erased ranges after dropping the obsolete ones, the file keeps them: {}",
+                saved.get_exception());
+    }
 }
 
 future<recovery_summary> segment_manager_impl::do_recovery(recovery_catalog& catalog) {
@@ -2544,6 +2568,7 @@ future<segment_manager_impl::rebuild_index_result> segment_manager_impl::rebuild
                 logstor_logger.trace("Recovering segment {} with sequence {}", seg_id, info->segment_seq);
                 const auto seq = info->segment_seq;
                 result.max_segment_seq = std::max(result.max_segment_seq, seq);
+                result.min_segment_seq = result.min_segment_seq ? std::min(*result.min_segment_seq, seq) : seq;
                 segment_infos[seg_idx] = std::move(info);
                 const auto indexed = co_await index_segment_records(seg_id, seq, cmp_with_seq, resolve, erased);
                 result.erased_records += indexed.erased_records;

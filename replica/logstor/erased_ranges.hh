@@ -93,9 +93,21 @@ public:
 
     // Returns the sequence floor, which is the highest sequence of any erased range that this set
     // held, in memory or in its file, or 0 when the shard never had an erased range.
+    // drop_obsolete() does not lower it, so the recovered sequence counter stays above every erase
+    // even after the erased ranges are dropped.
     segment_sequence seq_floor() const noexcept {
         return _seq_floor;
     }
+
+    // Drops the obsolete erased ranges, and returns whether it dropped one. An erased range is
+    // obsolete in these cases:
+    // - When `min_seq_present` is empty, because the shard holds no chunk.
+    // - When its sequence is below `min_seq_present`, the lowest sequence of a chunk on the shard.
+    // An erased range of a dropped table is not obsolete while its records are on disk, because a
+    // table that is created again with the same id would index them. The sequence floor does not
+    // change.
+    // The caller must not change the set until the returned future resolves.
+    future<bool> drop_obsolete(std::optional<segment_sequence> min_seq_present);
 
 private:
     // Holds one step of the step function of a table, see table_state.

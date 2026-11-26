@@ -267,7 +267,7 @@ The file holds these parts, in this order:
 
 - the **header**, which identifies the file and its format version, and gives the number of erased
   ranges and the sequence floor. The sequence floor is the highest sequence of every erased range
-  that the shard ever had.
+  that the shard ever had, and the drop of an erased range does not lower it.
 - the **erased ranges**, in the order of their table and then of their tokens. An erased range
   gives a table, an inclusive range of raw tokens and a segment sequence. It erases each record of
   the table in the range that is in a chunk with a `segment_seq` of at most that sequence. The

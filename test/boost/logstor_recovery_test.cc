@@ -35,6 +35,7 @@
 #include "test/lib/mutation_assertions.hh"
 #include "test/lib/tmpdir.hh"
 #include "utils/UUID_gen.hh"
+#include "utils/error_injection.hh"
 
 using namespace replica::logstor;
 using namespace tests::logstor;
@@ -355,9 +356,35 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_recovery_drops_the_records_of_a_tablet_tha
     require_no_value(ls, left.logstor_index(), right_record);
 }
 
+#ifdef SCYLLA_ENABLE_ERROR_INJECTION
+// Recovery drops the obsolete erased ranges and saves the file without them. The file on disk is
+// a superset of the set in memory either way, so a save that fails does not fail the recovery:
+// recovery completes, and the file keeps the dropped erased ranges until the next save.
+SEASTAR_THREAD_TEST_CASE(test_logstor_recovery_survives_a_failed_erased_range_save) {
+    tmpdir dir;
+    const auto table = table_id(utils::UUID_gen::get_time_UUID());
+    erased_ranges{}.insert_and_save(erased_ranges::make(table, dht::token_range(), segment_sequence(1)), dir.path(), this_shard_id()).get();
+    BOOST_REQUIRE_EQUAL(erased_ranges::load(dir.path(), this_shard_id()).get().size(), 1u);
+
+    test_store store(dir);
+    auto& ls = store.ls();
+    test_recovery_catalog no_tables;
+    utils::get_local_injector().enable("logstor_erased_ranges_save_fail", true);
+    ls.do_recovery(no_tables).get();
+    ls.start().get();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+
+    // The shard holds no chunk, so the erased range is obsolete, but the drop was not saved, so the
+    // file still holds the erased range.
+    BOOST_REQUIRE_EQUAL(erased_ranges::load(dir.path(), this_shard_id()).get().size(), 1u);
+}
+#endif
+
 // Recovery starts the sequence counter above the sequence floor of the erased range file, also
-// when no segment on disk is above the floor. Otherwise a write after the restart could get a
-// sequence that an erased range covers, and the next recovery would drop the write.
+// when no segment on disk is above the floor and recovery drops every erased range. Otherwise a
+// write after the restart could get a sequence that an erased range covers, and the next recovery
+// would drop the write. The floor stays in the file after the drop, so the restart after that
+// starts above it too.
 SEASTAR_THREAD_TEST_CASE(test_logstor_recovery_resumes_the_sequence_above_the_erased_range_floor) {
     tmpdir dir;
     const auto table = table_id(utils::UUID_gen::get_time_UUID());
@@ -372,6 +399,11 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_recovery_resumes_the_sequence_above_the_er
         ls.stop().get();
         return summary;
     };
+
+    BOOST_REQUIRE_EQUAL(recover().next_segment_seq.value, 101u);
+    const auto saved = erased_ranges::load(dir.path(), this_shard_id()).get();
+    BOOST_REQUIRE(saved.empty());
+    BOOST_REQUIRE(saved.seq_floor() == segment_sequence(100));
 
     BOOST_REQUIRE_EQUAL(recover().next_segment_seq.value, 101u);
 }
@@ -745,6 +777,48 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_recovery_honors_an_erase) {
     auto actual = read_mutation(ls, schema, cg.logstor_index(), after.decorated_key(), schema->full_slice()).get();
     BOOST_REQUIRE(actual);
     assert_that(*actual).is_equal_to(after);
+}
+
+// A drop erases the whole table, and the restart after it does not have the table. That restart
+// must keep the erased range, because the records stay in the free segments, and a table that is
+// created again with the same id would index them at the restart after that.
+SEASTAR_THREAD_TEST_CASE(test_logstor_recovery_keeps_the_erased_range_of_a_dropped_table) {
+    auto schema = make_kv_schema("cf");
+    const auto m = make_kv_mutation(schema, "pk0", "v0", api::timestamp_type(1));
+    tmpdir dir;
+
+    {
+        test_store store(dir);
+        auto& ls = store.ls();
+        test_recovery_catalog no_tables;
+        ls.do_recovery(no_tables).get();
+        ls.start().get();
+        auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+        test_logstor_group cg(schema, ls);
+        write_to_full_segment(ls, cg, m);
+        ls.erase(schema->id(), cg.logstor_index(), dht::token_range()).get();
+    }
+
+    {
+        test_store store(dir);
+        auto& ls = store.ls();
+        test_recovery_catalog no_tables;
+        ls.do_recovery(no_tables).get();
+        ls.start().get();
+        ls.stop().get();
+    }
+    BOOST_REQUIRE_EQUAL(erased_ranges::load(dir.path(), this_shard_id()).get().size(), 1u);
+
+    test_store store(dir);
+    auto& ls = store.ls();
+    auto stop_store = seastar::defer([&ls] noexcept { ls.stop().get(); });
+    test_logstor_group cg(schema, ls);
+    test_recovery_catalog catalog;
+    catalog.add(cg);
+    ls.do_recovery(catalog).get();
+    ls.start().get();
+    BOOST_REQUIRE_EQUAL(cg.logstor_index().get_usage().key_count, 0u);
+    require_no_value(ls, cg.logstor_index(), m);
 }
 
 // A fixed pseudo-random mix of writes and overwrites, with timestamps that do not follow the write

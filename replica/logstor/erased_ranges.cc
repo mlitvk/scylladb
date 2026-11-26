@@ -252,6 +252,32 @@ bool erased_ranges::covers(table_id table, dht::token token, segment_sequence se
     return seq <= std::prev(after)->seq;
 }
 
+future<bool> erased_ranges::drop_obsolete(std::optional<segment_sequence> min_seq_present) {
+    bool dropped = false;
+    for (auto it = _tables.begin(); it != _tables.end();) {
+        auto& current = it->second;
+        table_state kept;
+        for (const auto& s : current.steps) {
+            const bool obsolete = !min_seq_present || s.seq < *min_seq_present;
+            append_step(kept, s.from, obsolete ? segment_sequence{0} : s.seq);
+            co_await coroutine::maybe_yield();
+        }
+        if (kept.range_count == current.range_count) {
+            ++it;
+            continue;
+        }
+        dropped = true;
+        _size = _size - current.range_count + kept.range_count;
+        if (kept.range_count == 0) {
+            it = _tables.erase(it);
+        } else {
+            current = std::move(kept);
+            ++it;
+        }
+    }
+    co_return dropped;
+}
+
 void erased_ranges::append_step(table_state& state, int64_t from, segment_sequence seq) {
     if (!state.steps.empty() && state.steps.back().from == from) {
         state.range_count -= state.steps.back().seq != segment_sequence{0};

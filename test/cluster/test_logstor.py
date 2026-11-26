@@ -1032,6 +1032,39 @@ async def test_drop_table(manager: ScyllaClusterManager):
             assert len(rows) == 1, f"Expected 1 row for key {i} in test2 after all operations, but got {len(rows)}"
             assert rows[0].v == value, f"Expected value of size {value_size} for key {i} in test2 after all operations, but got {len(rows[0].v)}"
 
+async def test_create_table_with_the_id_of_a_dropped_table(manager: ScyllaClusterManager):
+    """
+    Test that a table that is created again with the id of a dropped table does not see the records
+    of the dropped table, also after the restarts before and after the create. A restore of the
+    schema creates a table with its old id in this way. One shard makes sure that the records of
+    the dropped table are on the shard that recovers the new table.
+    """
+    cmdline = ['--logger-log-level', 'logstor=debug', '--smp', '1']
+    servers = await manager.servers_add(1, cmdline=cmdline)
+    cql = manager.get_cql()
+
+    async def restart():
+        await manager.server_stop_gracefully(servers[0].server_id)
+        await manager.server_start(servers[0].server_id)
+        cql, _ = await manager.get_ready_cql(servers)
+        return cql
+
+    async with new_test_keyspace(manager, "WITH tablets={'initial': 4}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v text) WITH storage_engine = 'logstor'")
+        for i in range(20):
+            await cql.run_async(f"INSERT INTO {ks}.test (pk, v) VALUES ({i}, 'old_{i}')")
+        rows = await cql.run_async(f"SELECT id FROM system_schema.tables WHERE keyspace_name = '{ks}' AND table_name = 'test'")
+        table_id = rows[0].id
+        await cql.run_async(f"DROP TABLE {ks}.test")
+
+        cql = await restart()
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v text) WITH ID = {table_id} AND storage_engine = 'logstor'")
+        await cql.run_async(f"INSERT INTO {ks}.test (pk, v) VALUES (1, 'new_1')")
+
+        cql = await restart()
+        rows = await cql.run_async(f"SELECT pk, v FROM {ks}.test")
+        assert sorted((row.pk, row.v) for row in rows) == [(1, 'new_1')]
+
 @pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
 @pytest.mark.parametrize("operation", ["drop", pytest.param("truncate", marks=pytest.mark.skip_bug(
     link="https://scylladb.atlassian.net/browse/SCYLLADB-5484",

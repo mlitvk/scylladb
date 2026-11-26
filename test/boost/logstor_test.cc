@@ -5055,6 +5055,27 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_erased_ranges_file_layout) {
             "aee69c7e");
 }
 
+// An erased range below the lowest sequence on disk is obsolete, and so is every erased range when
+// the shard holds no chunk. The sequence floor stays when the erased ranges go, in memory and
+// through the file, because the recovered sequence counter must not go back to a sequence that an
+// erase covered.
+SEASTAR_THREAD_TEST_CASE(test_logstor_erased_ranges_drop_obsolete) {
+    tmpdir dir;
+    const erased_ranges_example example;
+    auto erased = example.set;
+
+    BOOST_REQUIRE(!erased.drop_obsolete(segment_sequence(3)).get());
+    BOOST_REQUIRE(erased.drop_obsolete(segment_sequence(6)).get());
+    BOOST_REQUIRE(erased.all() == std::vector<erased_range>{example.a2});
+    erased.insert_and_save(example.b, dir.path(), this_shard_id()).get();
+    BOOST_REQUIRE(erased.drop_obsolete(std::nullopt).get());
+    BOOST_REQUIRE(erased.empty());
+
+    BOOST_REQUIRE(erased.seq_floor() == segment_sequence(9));
+    erased.save(dir.path(), this_shard_id()).get();
+    BOOST_REQUIRE(erased_ranges::load(dir.path(), this_shard_id()).get().seq_floor() == segment_sequence(9));
+}
+
 // load() refuses a file of a format version that this release does not read, and a corrupt file.
 // The save replaces the file by a rename, so a torn write does not leave a corrupt file, and these
 // checks find damage to the file itself.
