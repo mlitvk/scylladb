@@ -505,6 +505,13 @@ public:
         return _reads_phaser.advance_and_await();
     }
 
+    // Returns whether the index holds a key in `tr`.
+    bool has_keys_in(const dht::token_range& tr) const {
+        logalloc::reclaim_lock lock(_region);
+        auto [begin, end] = range_positions(tr);
+        return begin != end;
+    }
+
     // The number of entries in one batch of a scan whose caller has no reason to choose another
     // number, and in one page of a range erase. A batch or a page runs without a yield, so this
     // number also limits the time of one batch or page.

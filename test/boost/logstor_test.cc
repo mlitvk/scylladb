@@ -4504,3 +4504,59 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_uses_free_segments_when_file_format_fails)
         write_and_flush_segment(ls, cg, make_kv_mutation(schema, seastar::format("pk{}", i), value));
     }
 }
+
+namespace {
+
+// A started logstor over a new test directory, with its cache. The destructor stops the logstor.
+class started_logstor {
+    tmpdir _dir;
+    shared_logstor_cache _cache;
+    logstor _ls;
+    test_recovery_catalog _no_tables;
+public:
+    started_logstor()
+        : _ls(make_test_logstor_config(_dir.path()), _cache.shared_tracker) {
+        _ls.do_recovery(_no_tables).get();
+        _ls.start().get();
+    }
+
+    ~started_logstor() {
+        _ls.stop().get();
+    }
+
+    logstor& ls() noexcept {
+        return _ls;
+    }
+
+    const std::filesystem::path& dir() const noexcept {
+        return _dir.path();
+    }
+};
+
+} // anonymous namespace
+
+// A range that holds no token has nothing to erase, so the erase returns before it drains anything
+// and leaves the index as it was.
+SEASTAR_THREAD_TEST_CASE(test_logstor_erase_of_an_empty_range_does_nothing) {
+    auto schema = make_kv_schema();
+    started_logstor store;
+    auto& ls = store.ls();
+
+    test_logstor_group cg(schema, ls);
+    auto compaction_guard = ls.get_compaction_manager().disable_compaction(cg).get();
+
+    ls.write(make_kv_mutation(schema, "pk0", "v0"), write_target(&cg, {}), db::no_timeout).get();
+    BOOST_REQUIRE_EQUAL(cg.logstor_index().get_usage().key_count, 1u);
+
+    const auto token = dht::token::from_int64(10);
+    for (const auto& range : {
+            dht::token_range::make({token, false}, {dht::token::from_int64(11), false}),
+            dht::token_range::make({token, true}, {dht::token::from_int64(9), true}),
+            dht::token_range::make_starting_with({dht::token::from_int64(std::numeric_limits<int64_t>::max()), false})}) {
+        ls.erase(schema->id(), cg.logstor_index(), range, {&cg}).get();
+    }
+
+    BOOST_REQUIRE_EQUAL(cg.logstor_index().get_usage().key_count, 1u);
+    ls.flush_to_separator().get();
+    require_recovery_matches(ls, schema->id(), cg.logstor_index());
+}

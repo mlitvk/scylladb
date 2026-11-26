@@ -358,7 +358,8 @@ public:
         _repair_sstable_classifier = std::move(repair_sstable_classifier);
     }
 
-    future<> discard_logstor_segments();
+    // Erases the logstor records of the group.
+    future<> erase_logstor();
 
     // Flushes the separator buffers of the group. The table must use logstor.
     future<> flush_separator();
