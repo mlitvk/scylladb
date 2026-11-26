@@ -22,6 +22,7 @@ target_sources(replica
     logstor/readers.cc
     logstor/write_buffer.cc
     logstor/record_value.cc
+    logstor/column_mapping_registry.cc
     multishard_query.cc
     mutation_dump.cc
     schema_describe_helper.cc

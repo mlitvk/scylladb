@@ -9,6 +9,7 @@
 #pragma once
 
 #include <array>
+#include <concepts>
 #include <limits>
 #include <optional>
 #include <span>
@@ -28,8 +29,8 @@
 namespace replica::logstor::ondisk {
 
 // This file defines the logstor on-disk format: the fixed-size headers, the encodings of their
-// fields, and the record frame, whose size varies with the partition key and the record value.
-// docs/dev/logstor.md gives the purpose of each part.
+// fields, the record frame, whose size varies with the partition key and the record value, and the
+// schema table of a chunk. docs/dev/logstor.md gives the purpose of each part.
 //
 // A fixed-size type derives from fixed_layout, and fixed_serializer writes its fields one after
 // another in declaration order, so the order of the members is the on-disk layout.
@@ -96,15 +97,18 @@ struct field<utils::UUID> {
 template <>
 struct field<table_id> : projected_field<utils::UUID, &table_id::uuid> {};
 
+template <>
+struct field<table_schema_version> : projected_field<utils::UUID, &table_schema_version::uuid> {};
+
 // api::timestamp_type is an alias, so it cannot have its own field<>, and fixed_serializer encodes
 // it as int64_t.
 static_assert(std::is_same_v<api::timestamp_type, int64_t>, "The timestamp must be of the on-disk type");
 
 // A segment holds one or more chunks, each starting at a block_alignment boundary and padded to
-// a multiple of it. A chunk is the chunk header and the record frames, which are the chunk's body.
-// Chunks are appended to a mixed segment one at a time; a full segment is a single chunk. A write
-// buffer builds a chunk in memory and seals it - pads it and fills in its header - before it is
-// written.
+// a multiple of it. A chunk is the chunk header and the chunk's body: the record frames and the
+// schema table that follows them. Chunks are appended to a mixed segment one at a time; a full
+// segment is a single chunk. A write buffer builds a chunk in memory and seals it - writes its
+// schema table, pads it and fills in its header - before it is written.
 //
 // The chunk header has a layout that depends on the kind of the segment. chunk_header_common is the
 // start of the header in every kind, and chunk_header_full_part follows it in a full segment. The
@@ -116,9 +120,9 @@ static_assert(std::is_same_v<api::timestamp_type, int64_t>, "The timestamp must 
 //       0                   4    5    6         8                                       16
 //       +-------------------+----+----+---------+---------------------------------------+
 //    0  |       magic       |ver |kind|  flags  |              segment_seq              |
-//       +-------------------+----+----+---------+---------------------------------------+
-//   16  |    records_size   |      body_crc     |                reserved               |
-//       +-------------------+-------------------+---------------------------------------+
+//       +-------------------+----+----+---------+-------------------+-------------------+
+//   16  |    records_size   |      body_crc     | schema_table_size |      reserved     |
+//       +-------------------+-------------------+-------------------+-------------------+
 //   32  |                                    reserved                                   |
 //       +-----------------------------------------------------------+-------------------+
 //   48  |                          reserved                         |        crc        |
@@ -136,13 +140,15 @@ struct chunk_header_common : fixed_layout {
     uint16_t flags;
     segment_sequence segment_seq;
     uint32_t records_size; // size of the record frames following the header, padding included
-    // CRC32 of the chunk's body: the record frames, records_size bytes after the header. It is what
-    // tells a chunk whose header is durable but whose body was only partly written - a crash mid-write
-    // over a reused segment - from a whole one.
+    // CRC32 of the chunk's body: the record frames and the schema table, `records_size` +
+    // `schema_table_size` bytes after the header. It is what tells a chunk whose header is durable
+    // but whose body was only partly written - a crash mid-write over a reused segment - from a
+    // whole one.
     uint32_t body_crc;
+    uint32_t schema_table_size; // Size of the schema table that follows the record frames.
     // The writer sets these bytes to zero. A new field uses part of these bytes, so that the header
     // keeps its size.
-    std::array<char, 36> reserved;
+    std::array<char, 32> reserved;
     // crc is the CRC32 of the fields above it and, in a full segment, of chunk_header_full_part.
     // crc must stay the last field, because calculate_chunk_header_crc() covers the serialized
     // bytes before crc.
@@ -204,13 +210,14 @@ struct record_frame_header : fixed_layout {
 static_assert(max_key_size == std::numeric_limits<decltype(record_frame_header::key_size)>::max(),
         "record_frame_header::key_size must hold every key size up to max_key_size");
 
-// A record header starts with the token, the timestamp and the table id, as four little-endian
-// 64-bit words. The partition key follows them, in key_size bytes of its internal representation:
+// A record header starts with the token, the timestamp, the table id and the schema version, as six
+// little-endian 64-bit words. The partition key follows them, in key_size bytes of its internal
+// representation:
 //
-//   0         8             16                    32                  32 + key_size
-//   +---------+-------------+---------------------+-------------------+
-//   |  token  |  timestamp  |      table id       |   partition key   |
-//   +---------+-------------+---------------------+-------------------+
+//   0         8             16           32                 48                 48 + key_size
+//   +---------+-------------+------------+------------------+-------------------+
+//   |  token  |  timestamp  |  table id  |  schema version  |   partition key   |
+//   +---------+-------------+------------+------------------+-------------------+
 //
 // The fixed fields come first so that they are at constant offsets. The key is the only variable
 // part, and the record_frame_header before the record header holds the key size.
@@ -218,6 +225,16 @@ struct record_header_fixed : fixed_layout {
     dht::token token;
     api::timestamp_type timestamp;
     table_id table;
+    table_schema_version schema_version;
+};
+
+// The start of an entry of the schema table. The column mapping follows it, `mapping_size` bytes.
+struct schema_table_entry_fixed : fixed_layout {
+    table_id table;
+    table_schema_version schema_version;
+    uint32_t mapping_size;
+
+    bool operator==(const schema_table_entry_fixed& other) const noexcept = default;
 };
 
 // These constants are the on-disk sizes, which fixed_size calculates from the fields of each type.
@@ -228,6 +245,7 @@ static constexpr size_t record_header_fixed_size = fixed_size<record_header_fixe
 // min_record_frame_size is the size of the smallest record frame, which holds a
 // record_frame_header and a record header with an empty key.
 static constexpr size_t min_record_frame_size = record_frame_header_size + record_header_fixed_size;
+static constexpr size_t schema_table_entry_fixed_size = fixed_size<schema_table_entry_fixed>;
 
 // Reports an internal error for a `kind` that segment_kind does not define. This function is out
 // of line, so that the formatting is not in the inlined code.
@@ -285,6 +303,7 @@ struct chunk_header {
     uint16_t flags;
     uint32_t records_size;
     uint32_t body_crc;
+    uint32_t schema_table_size;
 
     segment_kind kind() const noexcept {
         return segment.kind();
@@ -327,17 +346,10 @@ inline uint16_t unknown_chunk_flags(const chunk_header& ch) noexcept {
 // The CRC a chunk header carries in body_crc, over the chunk's body.
 uint32_t calculate_body_crc(std::span<const char> body);
 
-// Whether the body of the chunk - its record frames - is the one the header was written with.
+// Whether the body of the chunk - its record frames and schema table - is the one the header was
+// written with.
 inline bool validate_chunk_body(const chunk_header& ch, std::span<const char> body) {
     return calculate_body_crc(body) == ch.body_crc;
-}
-
-inline bool validate_record_frame_header(const record_frame_header& frame_header) noexcept {
-    // A record always carries an encoded value, so a zero value_size cannot come from a record
-    // this code wrote. A scan finds a zero value_size in the zero-filled end of a torn chunk, and
-    // this check stops the scan there, so that the scan does not read the end as a run of
-    // zero-length records.
-    return frame_header.value_size != 0;
 }
 
 // Returns the flags of `frame_header` that are not in known_record_flags. A record with such a flag
@@ -365,12 +377,28 @@ constexpr size_t record_header_size(const record_frame_header& frame_header) noe
     return record_header_size(frame_header.key_size);
 }
 
+// Returns the size of the partition key in a record header of `header_size` bytes.
+// The caller must make sure that `header_size` is at least record_header_fixed_size.
+constexpr size_t record_key_size(size_t header_size) noexcept {
+    return header_size - record_header_fixed_size;
+}
+
+// The size of the largest record header, whose partition key has max_key_size bytes.
+inline constexpr size_t max_record_header_size = record_header_size(max_key_size);
+
+// Returns true if a record frame header can describe a record header of `header_size` bytes: the
+// record header holds the fixed part, and its key fits in record_frame_header::key_size.
+constexpr bool validate_record_header_size(size_t header_size) noexcept {
+    return header_size >= record_header_fixed_size && header_size <= max_record_header_size;
+}
+
 template <typename Output>
 void write_record_header(Output& out, const record_header& h) {
     ser::serializer<record_header_fixed>::write(out, record_header_fixed {
         .token = h.key.token(),
         .timestamp = h.timestamp,
         .table = h.table,
+        .schema_version = h.schema_version,
     });
     for (bytes_view frag : fragment_range(managed_bytes_view(h.key.key().representation()))) {
         out.write(reinterpret_cast<const char*>(frag.data()), frag.size());
@@ -386,6 +414,7 @@ inline record_header read_record_header(bytes_view header) {
         .key = dht::decorated_key(fixed.token, partition_key::from_bytes(header.substr(record_header_fixed_size))),
         .timestamp = fixed.timestamp,
         .table = fixed.table,
+        .schema_version = fixed.schema_version,
     };
 }
 
@@ -414,7 +443,7 @@ template <typename Output>
 void write_record_frame(Output& out, const record_header& header, const record_value& value) {
     const size_t header_size = record_header_size(header);
     ser::serializer<record_frame_header>::write(out, record_frame_header {
-        .key_size = static_cast<uint16_t>(header_size - record_header_fixed_size),
+        .key_size = static_cast<uint16_t>(record_key_size(header_size)),
         .flags = 0,
         .value_size = static_cast<uint32_t>(value.size()),
     });
@@ -429,7 +458,7 @@ template <typename Output>
 void write_record_frame(Output& out, log_record_bytes_view record_view) {
     static_assert(known_record_flags == 0, "A copied record must carry its flags before a record flag is defined");
     ser::serializer<record_frame_header>::write(out, record_frame_header {
-        .key_size = static_cast<uint16_t>(record_view.header.size() - record_header_fixed_size),
+        .key_size = static_cast<uint16_t>(record_key_size(record_view.header.size())),
         .flags = 0,
         .value_size = static_cast<uint32_t>(record_view.value.size()),
     });
@@ -439,7 +468,7 @@ void write_record_frame(Output& out, log_record_bytes_view record_view) {
 
 // Reads the record frame at the start of `in`, without its padding, and returns the bytes of its
 // record header and record value, which point into `in`. Returns nullopt, and leaves `in` as it
-// was, if the frame header is invalid or the frame does not fit in `in`.
+// was, if the frame does not fit in `in`.
 //
 // This function checks the sizes in the frame header before it uses them, because the chunk CRC
 // shows only that the bytes did not change after the write, and not that the writer wrote correct
@@ -454,14 +483,14 @@ inline std::optional<log_record_bytes_view> parse_record_frame(seastar::simple_m
     }
     auto rest = in;
     auto frame_header = ser::serializer<record_frame_header>::read(rest);
-    if (!validate_record_frame_header(frame_header)
-            || size_t(frame_header.key_size) + frame_header.value_size > in.size() - min_record_frame_size) {
+    const size_t header_size = record_header_size(frame_header);
+    if (header_size + frame_header.value_size > rest.size()) {
         return std::nullopt;
     }
     if (const auto unknown = unknown_record_flags(frame_header)) [[unlikely]] {
         throw_unknown_record_flags(unknown);
     }
-    auto header = rest.read_substream(record_header_size(frame_header));
+    auto header = rest.read_substream(header_size);
     auto value = rest.read_substream(frame_header.value_size);
     in = rest;
     return log_record_bytes_view{
@@ -502,6 +531,73 @@ inline std::optional<parsed_record_frame> try_read_record_frame(seastar::simple_
             .bytes = bytes,
         };
     });
+}
+
+// The schema table of a chunk lists the column mapping of every schema version the records of
+// the chunk were written under, once per version. The table follows the records of the chunk,
+// because which versions a chunk holds is only known once its buffer is finished, and
+// chunk_header carries its size. Its encoding:
+//
+//   u32  entry count
+//   per entry:
+//     schema_table_entry_fixed   the table id, the schema version and the mapping size
+//     column_mapping             ser::serializer<column_mapping>, from idl/mutation.idl.hh
+//
+// Every record of a chunk names a version that the table has an entry for, with the record's own
+// table, and a scan checks that.
+struct schema_table_entry {
+    table_id table;
+    table_schema_version schema_version;
+    bytes_view mapping; // the IDL-serialized column_mapping
+
+    bool operator==(const schema_table_entry& other) const noexcept = default;
+};
+
+static constexpr size_t schema_table_header_size = sizeof(uint32_t);
+
+constexpr size_t schema_table_entry_size(size_t mapping_size) noexcept {
+    return schema_table_entry_fixed_size + mapping_size;
+}
+
+template <typename Output>
+void write_schema_table_entry(Output& out, const schema_table_entry& e) {
+    ser::serializer<schema_table_entry_fixed>::write(out, schema_table_entry_fixed {
+        .table = e.table,
+        .schema_version = e.schema_version,
+        .mapping_size = static_cast<uint32_t>(e.mapping.size()),
+    });
+    out.write(reinterpret_cast<const char*>(e.mapping.data()), e.mapping.size());
+}
+
+// Calls `f(const schema_table_entry&)` for each entry of the schema table in `table`, whose
+// mapping views point into `table`. Throws std::runtime_error if the table is malformed, and
+// whatever `f` throws.
+template <std::invocable<const schema_table_entry&> F>
+void for_each_schema_table_entry(bytes_view table, F&& f) {
+    auto in = seastar::simple_memory_input_stream(reinterpret_cast<const char*>(table.data()), table.size());
+    if (in.size() < schema_table_header_size) {
+        throw std::runtime_error(fmt::format("Schema table of {} bytes is shorter than its header", table.size()));
+    }
+    const auto count = ser::serializer<uint32_t>::read(in);
+    for (uint32_t i = 0; i < count; ++i) {
+        if (in.size() < schema_table_entry_fixed_size) {
+            throw std::runtime_error(fmt::format("Schema table entry {} of {} is truncated", i, count));
+        }
+        const auto fixed = ser::serializer<schema_table_entry_fixed>::read(in);
+        if (in.size() < fixed.mapping_size) {
+            throw std::runtime_error(fmt::format("Schema table entry {} of {} claims a mapping of {} bytes with {} left", i, count, fixed.mapping_size, in.size()));
+        }
+        auto mapping = bytes_view(reinterpret_cast<const int8_t*>(in.begin()), fixed.mapping_size);
+        in.skip(fixed.mapping_size);
+        f(schema_table_entry{
+            .table = fixed.table,
+            .schema_version = fixed.schema_version,
+            .mapping = mapping,
+        });
+    }
+    if (in.size() != 0) {
+        throw std::runtime_error(fmt::format("Schema table has {} bytes past its {} entries", in.size(), count));
+    }
 }
 
 } // namespace replica::logstor::ondisk

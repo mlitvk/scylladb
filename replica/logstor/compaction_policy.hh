@@ -220,6 +220,10 @@ struct compaction_batch_limits {
     double extension_tolerance = compaction_batch_extension_tolerance;
 };
 
+// Returns how many full segments `record_count` records of `record_bytes` bytes take.
+// `schema_table_size` is the estimated size of the schema table of one segment.
+size_t estimate_required_segments(size_t record_bytes, size_t record_count, size_t segment_size, size_t schema_table_size);
+
 // Picks the segments one compaction job should read, out of the ones a group owns.
 //
 // The free-space histogram of the set gives the segments in ascending utilization, which is close
@@ -234,8 +238,10 @@ struct compaction_batch_limits {
 // Returns nothing when there is no such batch or no prefix reclaims a segment. This answer holds
 // for the whole group and not only for this batch, because a longer prefix would only add fuller
 // segments, except for a candidate behind the skipped segments.
+//
+// `schema_table_size` is the estimated size of the schema table of one output segment.
 std::optional<compaction_batch> select_compaction_batch(const segment_set& segments,
-        uint64_t segment_size, const compaction_batch_limits& limits);
+        uint64_t segment_size, const compaction_batch_limits& limits, size_t schema_table_size);
 
 // Gives the score of a compaction candidate, which top_compaction_candidates ranks it by.
 struct compaction_score_of {

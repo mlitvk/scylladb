@@ -57,18 +57,17 @@ primary_index_key::primary_index_key(const dht::decorated_key& dk)
 
 logstor::logstor(logstor_config config, ::cache_tracker& shared_cache_tracker)
     : _segment_manager(config.segment_manager_cfg)
-    , _write_buffer(buffered_writer_config{
+    , _write_buffer(write_buffer_ring_config{
             .buffer_size = _segment_manager.get_segment_size(),
-            .ring_size = config.write_buffer_ring_size,
             .flush_sg = config.flush_sg,
-        }, [&sm = _segment_manager] (write_buffer& buf) { return sm.write(buf); })
+        }, [&sm = _segment_manager] (mixed_write_buffer& buf) { return sm.write(buf); })
     , _cache_tracker(shared_cache_tracker) {
 
     namespace sm = seastar::metrics;
 
     _metrics.add_group("logstor", {
         sm::make_gauge("queued_write_count", [this] { return _write_buffer.queued_write_count(); },
-                       sm::description("Number of writes currently queued in the write buffer.")),
+                       sm::description("Number of writes currently queued in the write buffer ring.")),
         sm::make_gauge("queued_write_bytes", [this] { return _write_buffer.queued_write_bytes(); },
                        sm::description("Bytes of the records that wait in the write buffer queue for room in a buffer.")),
         sm::make_counter("total_queued_writes", [this] { return _write_buffer.total_queued_writes(); },
@@ -151,7 +150,7 @@ future<> logstor::write(const mutation& m, write_target target, db::timeout_cloc
 future<> logstor::write(const frozen_mutation& m, const schema& s, write_target target, db::timeout_clock::time_point timeout) noexcept {
     try {
         check_schema_version(m.schema_version(), s);
-        return do_write(s, m.decorated_key(s), record_timestamp(m), encode_record_value(m, s),
+        return do_write(s, m.decorated_key(s), record_timestamp(m), encode_record_value(m),
                 std::move(target), timeout);
     } catch (...) {
         return current_exception_as_future();
@@ -170,9 +169,10 @@ future<> logstor::do_write(const schema& s, dht::decorated_key dk, api::timestam
             .key = std::move(dk),
             .timestamp = ts,
             .table = s.id(),
+            .schema_version = s.version(),
         },
         .value = std::move(value),
-    });
+    }, _segment_manager.column_mappings().add(s));
 
     auto [location, op] = co_await coroutine::try_future(
             _write_buffer.write(std::move(writer), timeout, std::move(target)));

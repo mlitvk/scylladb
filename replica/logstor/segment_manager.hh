@@ -21,6 +21,7 @@
 #include <seastar/util/bool_class.hh>
 #include "bytes_fwd.hh"
 #include "mutation_writer/token_group_based_splitting_writer.hh"
+#include "replica/logstor/column_mapping_registry.hh"
 #include "replica/logstor/segment_io.hh"
 #include "replica/logstor/write_buffer.hh"
 #include "replica/logstor/compaction.hh"
@@ -113,7 +114,7 @@ struct segment_manager_usage {
     uint64_t space_on_disk{0};
     // Memory the segment manager holds: the descriptors of every segment and the buffers of the
     // compaction and separator pools. The indexes of the tables are not part of it, nor is the
-    // buffered writer of the write path, which logstor holds rather than the segment manager.
+    // write buffer ring of the write path, which logstor holds rather than the segment manager.
     size_t memory_usage{0};
 };
 
@@ -164,11 +165,15 @@ public:
     future<> start();
     future<> stop();
 
-    future<> write(write_buffer& wb);
+    future<> write(mixed_write_buffer& wb);
 
     // Reads the record at a location from the index. Keep the guard of the location until the
     // read is complete, so that the segment stays allocated.
     future<log_record> read(const index_read_guard&, record_location location);
+
+    // The column mappings of the schema versions in the segments of this shard.
+    column_mapping_registry& column_mappings() noexcept;
+    const column_mapping_registry& column_mappings() const noexcept;
 
     void on_add_record(record_location location) noexcept override;
     void on_free_record(record_location location) noexcept override;
