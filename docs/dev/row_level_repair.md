@@ -312,8 +312,8 @@ repair sends only the repair rows that differ, so a replica can receive only one
 of them. The replica then stores a record that is not the same as the record on
 the master, or its index ignores the write because the record timestamp is lower
 than the timestamp of the stored record. Reads return the same data, but the
-repair hashes of the replicas never become equal, so each later repair sends the
-partition again. This is the reason for all the adjustments below.
+records of the replicas stay different, so each later repair finds the partition
+different again. This is the reason for all the adjustments below.
 
 ### Sync boundaries are partition aligned
 
@@ -321,9 +321,9 @@ Whole-partition reconciliation only works if all fragments of a partition land i
 the same sync window. A logstor partition can produce two repair rows: a
 `partition_start` carrying a partition tombstone, plus the row. A sync boundary
 between them would make the master converge each part of the partition alone, so
-a replica can store a record without the tombstone or without the row, and the
-replicas do not converge. Logstor sessions therefore align the sync windows to
-partitions.
+the replicas can store a record without the tombstone or without the row, which
+is not the cell level merge of the versions. Logstor sessions therefore align the
+sync windows to partitions.
 
 ### Whole-partition convergence on the master
 
