@@ -1306,17 +1306,17 @@ async def set_config_on_all(cql: Any, hosts: list[Any], name: str, value: str) -
 async def test_repair_does_not_purge_logstor_tombstones(manager: ScyllaClusterManager):
     """Test that repair of a logstor table purges no tombstone from the stream.
 
-    Node1 stores v1 at timestamp 2000 with a TTL of one second, and node2
-    stores v2 at timestamp 1000. The table uses the immediate tombstone GC mode,
-    so the expired row of node1 can be purged as soon as it expires, and
-    enable_tombstone_gc_for_streaming_and_repair is on.
+    Node1 stores a row at timestamp 2000 with a TTL of one second, and node2
+    stores a row at timestamp 1000 without a TTL. The table uses the immediate
+    tombstone GC mode, so the expired row of node1 can be purged as soon as it
+    expires, and enable_tombstone_gc_for_streaming_and_repair is on.
 
     If the stream of node1 purged the expired row, node1 would send nothing,
     and node2 would send its row at timestamp 1000. The logstor index of node1
     keeps the expired record at timestamp 2000, so node1 would refuse that row,
-    and the replicas would never converge. The stream of a logstor table keeps
-    the expired row as dead data, so repair merges the two versions and both
-    replicas store the merged record, in which v2 is live.
+    and node2 would keep its live row. The stream of a logstor table keeps the
+    expired row as dead data, so repair merges the two versions, and the
+    expired row at timestamp 2000 deletes the row of node2.
     """
     servers, cql, hosts = await create_logstor_cluster(manager)
 
@@ -1327,13 +1327,13 @@ async def test_repair_does_not_purge_logstor_tombstones(manager: ScyllaClusterMa
         await set_config_on_all(cql, hosts, "enable_tombstone_gc_for_streaming_and_repair", "1")
 
         await write_only_on(manager, servers, cql, hosts, ks, "test", 0,
-                            [f"INSERT INTO {table} (pk, v1) VALUES (1, 'a') USING TIMESTAMP 2000 AND TTL 1"])
+                            [f"INSERT INTO {table} (pk, v1, v2) VALUES (1, 'a', 'a2') USING TIMESTAMP 2000 AND TTL 1"])
         await write_only_on(manager, servers, cql, hosts, ks, "test", 1,
-                            [f"INSERT INTO {table} (pk, v2) VALUES (1, 'b') USING TIMESTAMP 1000"])
+                            [f"INSERT INTO {table} (pk, v1, v2) VALUES (1, 'b', 'b2') USING TIMESTAMP 1000"])
 
         # Wait until the row of node1 expires. A read of the row cannot show this,
-        # because node2, which holds v2, can answer it, so the wait uses the
-        # expiry of the row marker in the record of node1.
+        # because node2, which holds a live row, can answer it, so the wait uses
+        # the expiry of the row marker in the record of node1.
         rows = await cql.run_async(f"SELECT * FROM MUTATION_FRAGMENTS({table}) WHERE pk = 1", host=hosts[0])
         markers = [json.loads(row.metadata)['marker'] for row in rows
                    if row.mutation_source.startswith(LOG_SOURCE_PREFIX) and row.mutation_fragment_kind == CLUSTERING_ROW]
@@ -1348,13 +1348,18 @@ async def test_repair_does_not_purge_logstor_tombstones(manager: ScyllaClusterMa
             assert await get_injection_params(manager, server, "maybe_compact_for_streaming") == {
                     "compaction_enabled": "true", "compaction_can_gc": "false"}
 
-        records = await check_converged(cql, hosts, table, {1: LIVE})
-        assert records[1].cell_values().get('v2') == 'b', f"v2 is lost from the merged record: {records[1]}"
-        assert records[1].cell_values().get('v1') is None, f"the expired v1 is live again: {records[1]}"
+        # Node2 must store the merged record, in which the expired cells of node1
+        # delete its own cells.
+        record = await read_record(cql, hosts[1], table, 1)
+        assert record is not None and record.cell_timestamps() == {'v1': 2000, 'v2': 2000}, \
+            f"node2 did not store the merged record: {record}"
 
-        rows = await cql.run_async(SimpleStatement(f"SELECT v1, v2 FROM {table} WHERE pk = 1",
-                                                   consistency_level=ConsistencyLevel.ALL))
-        assert [(row.v1, row.v2) for row in rows] == [(None, 'b')]
+        # Each node must answer a read of the partition out of its own storage
+        # with no row. A read at a higher consistency level cannot show a
+        # difference, because its own read repair merges the two versions.
+        for host in hosts:
+            rows = await read_locally(cql, host, f"SELECT v1, v2 FROM {table} WHERE pk = 1")
+            assert list(rows) == [], f"host {host} still returns a live row: {list(rows)}"
 
 
 @pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
