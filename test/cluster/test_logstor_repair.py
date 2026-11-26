@@ -1419,6 +1419,98 @@ async def test_repair_compacts_converged_partition(manager: ScyllaClusterManager
                 f"pk {pk}: repair rewrote the record that already was the converged partition"
 
 
+# The limit on the disk bytes for each byte of the records that repair writes. A chunk for each
+# record of test_repair_writes_share_chunks writes about 14 times the bytes of the records.
+MAX_DISK_BYTES_PER_RECORD_BYTE = 4
+
+
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
+async def test_repair_writes_share_chunks(manager: ScyllaClusterManager):
+    """Test that repair writes many missing partitions together, so that their records share chunks.
+
+    A repair that waits for each partition to reach a segment before it writes the next one puts
+    each record in a chunk of its own, which is padded to a whole block. The records here are much
+    smaller than a block, so the bytes written to disk would be many times the bytes of the records.
+    """
+    servers, cql, hosts = await create_logstor_cluster(manager)
+    keys = range(1000)
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 2} AND tablets = {'initial': 1}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v text) WITH storage_engine = 'logstor'")
+        await write_only_on(manager, servers, cql, hosts, ks, "test", 0,
+                            [f"INSERT INTO {ks}.test (pk, v) VALUES ({pk}, 'v{pk}')" for pk in keys])
+
+        before = await manager.metrics.query(servers[1].ip_addr)
+        await manager.api.repair(servers[0].ip_addr, ks, "test")
+        after = await manager.metrics.query(servers[1].ip_addr)
+
+        await check_converged(cql, hosts, f"{ks}.test", {pk: {'v': f'v{pk}'} for pk in keys})
+        disk_bytes = metric_delta(before, after, 'scylla_logstor_sm_bytes_written')
+        record_bytes = metric_delta(before, after, 'scylla_logstor_sm_data_bytes_written')
+        assert record_bytes > 0, "node2 wrote no records"
+        assert disk_bytes < MAX_DISK_BYTES_PER_RECORD_BYTE * record_bytes, \
+            f"repair wrote {disk_bytes} bytes to disk for {record_bytes} bytes of records"
+
+
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
+async def test_repair_fails_on_a_failed_partition_write(manager: ScyllaClusterManager):
+    """Test that a failed write of a repaired partition fails the repair.
+
+    Repair writes the partitions in the background, so the failure of one write must still reach
+    the repair. Otherwise the tablet repair would succeed with the partition missing, and the
+    replicas would stay different.
+    """
+    servers, cql, hosts = await create_logstor_cluster(manager)
+    keys = range(100)
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 2} AND tablets = {'initial': 1}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v text) WITH storage_engine = 'logstor'")
+        await write_only_on(manager, servers, cql, hosts, ks, "test", 0,
+                            [f"INSERT INTO {ks}.test (pk, v) VALUES ({pk}, 'v{pk}')" for pk in keys])
+
+        logs = await mark_logs(manager, servers)
+        await manager.api.enable_injection(servers[1].ip_addr, "logstor_repair_writer_apply_fail", one_shot=True)
+        # The repair scheduler retries the failed tablet repair, and the retry writes every partition.
+        await manager.api.repair(servers[0].ip_addr, ks, "test")
+
+        failures = [line for log, mark in logs
+                    for line, _ in await log.grep(rf"Repair tablet for table={ks}\.test .*status=failed", from_mark=mark)]
+        assert failures, "the tablet repair did not fail when a partition write failed"
+        await check_converged(cql, hosts, f"{ks}.test", {pk: {'v': f'v{pk}'} for pk in keys})
+
+
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
+async def test_repair_waits_for_partition_writes(manager: ScyllaClusterManager):
+    """Test that repair does not finish before every partition it writes is applied.
+
+    Repair writes the partitions in the background and waits for them when it stops. The test pauses
+    the write of one partition, and the repair must not finish until the write continues.
+    """
+    servers, cql, hosts = await create_logstor_cluster(manager)
+    keys = range(20)
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 2} AND tablets = {'initial': 1}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, v text) WITH storage_engine = 'logstor'")
+        await write_only_on(manager, servers, cql, hosts, ks, "test", 0,
+                            [f"INSERT INTO {ks}.test (pk, v) VALUES ({pk}, 'v{pk}')" for pk in keys])
+
+        injection = "logstor_repair_writer_apply_wait"
+        log = await manager.server_open_log(servers[1].server_id)
+        mark = await log.mark()
+        await manager.api.enable_injection(servers[1].ip_addr, injection, one_shot=True)
+        repair = asyncio.create_task(manager.api.repair(servers[0].ip_addr, ks, "test"))
+        try:
+            await log.wait_for(f"{injection}: waiting for message", from_mark=mark, timeout=60)
+            # The other partitions take much less than this time to be written.
+            await asyncio.sleep(2)
+            assert not repair.done(), "repair finished while the write of a partition was paused"
+        finally:
+            await manager.api.message_injection(servers[1].ip_addr, injection)
+        await repair
+
+        await check_converged(cql, hosts, f"{ks}.test", {pk: {'v': f'v{pk}'} for pk in keys})
+
+
 #############################################################################
 # Read repair on logstor tables.
 #
