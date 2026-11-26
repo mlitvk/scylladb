@@ -4955,6 +4955,62 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_erased_ranges_save_and_load) {
     }
 }
 
+// A file of more erased ranges than the streams of a load and a save buffer, of more tables than
+// one, loads, and the save of the loaded set writes the same bytes.
+SEASTAR_THREAD_TEST_CASE(test_logstor_erased_ranges_save_and_load_many) {
+    tmpdir dir;
+    std::vector<table_id> tables;
+    for (int i = 0; i < 3; ++i) {
+        tables.push_back(table_id(utils::UUID_gen::get_time_UUID()));
+    }
+    std::ranges::sort(tables);
+
+    // 3 tables of 2000 disjoint ranges each give 6000 erased ranges, 240000 bytes. The test writes
+    // the file in the layout that test_logstor_erased_ranges_file_layout checks, with the tables in
+    // the order of their ids and the ranges of a table in the order of their tokens.
+    constexpr int64_t ranges_per_table = 2000;
+    std::string contents;
+    auto put = [&contents] (auto value) {
+        std::array<char, sizeof(value)> bytes;
+        seastar::write_le(bytes.data(), value);
+        contents.append(bytes.data(), bytes.size());
+    };
+    put(uint32_t(0x4c475345));
+    put(uint8_t(1));
+    put(uint8_t(0));
+    put(uint16_t(0));
+    put(uint32_t(tables.size() * ranges_per_table));
+    put(uint64_t(ranges_per_table));
+    for (const auto& table : tables) {
+        for (int64_t i = 0; i < ranges_per_table; ++i) {
+            put(table.uuid().get_most_significant_bits());
+            put(table.uuid().get_least_significant_bits());
+            put(10 * i);
+            put(10 * i + 4);
+            put(uint64_t(i + 1));
+        }
+    }
+    utils::crc32 crc;
+    crc.process(reinterpret_cast<const uint8_t*>(contents.data()), contents.size());
+    put(crc.get());
+    const auto path = erased_ranges::file_path(dir.path(), this_shard_id()).string();
+    auto out = seastar::make_file_output_stream(seastar::open_file_dma(path, seastar::open_flags::wo | seastar::open_flags::create).get()).get();
+    out.write(contents.data(), contents.size()).get();
+    out.close().get();
+
+    const auto loaded = erased_ranges::load(dir.path(), this_shard_id()).get();
+    BOOST_REQUIRE_EQUAL(loaded.size(), 6000u);
+    BOOST_REQUIRE(loaded.seq_floor() == segment_sequence(ranges_per_table));
+    for (const auto& table : tables) {
+        BOOST_REQUIRE(loaded.covers(table, raw_token(10 * 1999 + 4), segment_sequence(2000)));
+        BOOST_REQUIRE(!loaded.covers(table, raw_token(10 * 1999 + 5), segment_sequence(1)));
+    }
+
+    loaded.save(dir.path(), this_shard_id()).get();
+    const auto saved = seastar::util::read_entire_file_contiguous(path).get();
+    BOOST_REQUIRE(saved == contents);
+}
+
 #ifdef SCYLLA_ENABLE_ERROR_INJECTION
 // An insert_and_save() whose save fails leaves the set in memory and the file as they were, also
 // for a table that had no erased range.

@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <map>
+#include <optional>
 #include <vector>
 
 #include <seastar/core/future.hh>
@@ -19,6 +20,7 @@
 #include "replica/logstor/types.hh"
 #include "schema/schema_fwd.hh"
 #include "seastarx.hh"
+#include "utils/chunked_vector.hh"
 
 namespace replica::logstor {
 
@@ -108,7 +110,7 @@ private:
     // at the lowest raw token, and two adjacent steps never have the same sequence.
     // Each step at a sequence above 0 is one erased range, and the file holds it as one.
     struct table_state {
-        std::vector<step> steps;
+        utils::chunked_vector<step> steps;
         // The number of steps at a sequence above 0.
         size_t range_count = 0;
     };
@@ -131,7 +133,7 @@ private:
     static void append_step(table_state& state, int64_t from, segment_sequence seq);
 
     // Returns the state of the table of `r` with `r` added. The set does not change.
-    table_state with_range(const erased_range& r) const;
+    future<table_state> with_range(const erased_range& r) const;
 
     // Puts `state` in place of the state of `table`, and raises the sequence floor to `seq`.
     // The caller must have added an entry of `table` to `_tables`.
