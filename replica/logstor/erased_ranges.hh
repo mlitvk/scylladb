@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <vector>
 
 #include <seastar/core/future.hh>
@@ -48,9 +49,9 @@ struct erased_range : ondisk::fixed_layout {
 // without this file an erase does not survive a restart. Recovery leaves out every record that an
 // erased range covers.
 //
-// The set keeps the erased ranges in the order of the erases, and the file holds them in the same
-// order. The set and the file grow by one erased range with each erase, and covers() checks every
-// erased range.
+// The set keeps, for each table, the highest sequence of the erases that cover each token. So the
+// erased ranges of a table do not overlap, an erase splits or replaces the erased ranges under it,
+// and the size of the set does not grow with the number of erases.
 class erased_ranges {
 public:
     // Returns the erased range of an erase of `range` at `seq`. The caller must pass a range that
@@ -60,7 +61,8 @@ public:
     static std::filesystem::path file_path(const std::filesystem::path& base_dir, unsigned shard);
 
     // Reads the file of `shard` in `base_dir`. It returns an empty set when there is no file.
-    // Throws when the file does not parse.
+    // Throws when the file does not parse, or when the erased ranges of a table in it overlap or are
+    // not in order.
     static future<erased_ranges> load(const std::filesystem::path& base_dir, unsigned shard);
 
     // Replaces the file of `shard` in `base_dir` with the current set, atomically and durably.
@@ -72,15 +74,15 @@ public:
     // The caller must not change the set until the returned future resolves.
     future<> insert_and_save(erased_range r, const std::filesystem::path& base_dir, unsigned shard);
 
-    // Returns the erased ranges, in the order of the erases.
+    // Returns the erased ranges, in the order of their table and then of their first token.
     std::vector<erased_range> all() const;
 
     bool empty() const noexcept {
-        return _ranges.empty();
+        return _size == 0;
     }
 
     size_t size() const noexcept {
-        return _ranges.size();
+        return _size;
     }
 
     // Returns whether an erased range covers a record of `table` at `token` that is in a chunk
@@ -94,12 +96,50 @@ public:
     }
 
 private:
-    std::vector<erased_range> _ranges;
+    // Holds one step of the step function of a table, see table_state.
+    struct step {
+        int64_t from;
+        segment_sequence seq;
+    };
+
+    // The step function of one table, which gives, for each raw token, the highest sequence of the
+    // erases that cover the token. A step applies from its token up to the token of the next step,
+    // and a step at sequence 0 covers nothing, because sequences start at 1. The first step starts
+    // at the lowest raw token, and two adjacent steps never have the same sequence.
+    // Each step at a sequence above 0 is one erased range, and the file holds it as one.
+    struct table_state {
+        std::vector<step> steps;
+        // The number of steps at a sequence above 0.
+        size_t range_count = 0;
+    };
+
+    // The table whose state a save writes in place of the state in `_tables`.
+    struct replacement {
+        table_id table;
+        const table_state& state;
+    };
+
+    // The map keeps the tables in the order of their ids, so the save writes them in that order with
+    // no sort, and the bytes of the file do not depend on the order of the inserts.
+    std::map<table_id, table_state> _tables;
+    // The number of erased ranges of all tables.
+    size_t _size = 0;
     segment_sequence _seq_floor{0};
 
-    // Writes `ranges` and `seq_floor` to the file of `shard` in `base_dir`, atomically and durably.
-    static future<> write_file(const std::filesystem::path& base_dir, unsigned shard, const std::vector<erased_range>& ranges,
-            segment_sequence seq_floor);
+    // Adds a step at `from` to the end of `state`. A step at the same token as the last step
+    // replaces it, and a step at the sequence of the step before it adds nothing.
+    static void append_step(table_state& state, int64_t from, segment_sequence seq);
+
+    // Returns the state of the table of `r` with `r` added. The set does not change.
+    table_state with_range(const erased_range& r) const;
+
+    // Puts `state` in place of the state of `table`, and raises the sequence floor to `seq`.
+    // The caller must have added an entry of `table` to `_tables`.
+    void replace(table_id table, table_state&& state, segment_sequence seq) noexcept;
+
+    // Writes the set, with `replaced` in place of the state of its table when it is given, to the
+    // file of `shard` in `base_dir`, atomically and durably.
+    future<> write_file(const std::filesystem::path& base_dir, unsigned shard, const replacement* replaced, segment_sequence seq_floor) const;
 };
 
 } // namespace replica::logstor

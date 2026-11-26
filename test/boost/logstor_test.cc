@@ -66,6 +66,7 @@
 #include "test/lib/mutation_reader_assertions.hh"
 #include "test/lib/reader_concurrency_semaphore.hh"
 #include "test/lib/tmpdir.hh"
+#include "utils/crc.hh"
 #include "utils/disk-error-handler.hh"
 #include "utils/error_injection.hh"
 #include "utils/exceptions.hh"
@@ -4886,6 +4887,46 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_erased_ranges_coverage) {
     }
 }
 
+// The set keeps, for each token, the highest sequence of the erases that cover it. So an erase
+// splits or replaces the erased ranges under it, the erased ranges of a table do not overlap, and
+// the number of erases does not change the size of the set.
+SEASTAR_THREAD_TEST_CASE(test_logstor_erased_ranges_keep_the_highest_sequence) {
+    const erased_ranges_example example;
+    auto r = [&] (int64_t first, int64_t last, uint64_t seq) {
+        return erased_range{.table = example.table_c, .first_token = first, .last_token = last, .seq = segment_sequence(seq)};
+    };
+    using list = std::vector<erased_range>;
+    tmpdir dir;
+    erased_ranges set;
+    auto insert = [&] (erased_range added) {
+        set.insert_and_save(added, dir.path(), this_shard_id()).get();
+        return set.all();
+    };
+    // A wider later erase replaces the erased range under it.
+    insert(r(100, 300, 100));
+    BOOST_REQUIRE((insert(r(50, 500, 200)) == list{r(50, 500, 200)}));
+    // A narrower later erase splits the erased range under it.
+    BOOST_REQUIRE((insert(r(100, 300, 300)) == list{r(50, 99, 200), r(100, 300, 300), r(301, 500, 200)}));
+    // Two later erases together replace every erased range under them.
+    insert(r(50, 200, 400));
+    BOOST_REQUIRE((insert(r(201, 500, 500)) == list{r(50, 200, 400), r(201, 500, 500)}));
+    // An erase at a lower sequence changes only the tokens where its sequence is the highest.
+    BOOST_REQUIRE((insert(r(0, 600, 450)) == list{r(0, 200, 450), r(201, 500, 500), r(501, 600, 450)}));
+    // Adjacent erases at one sequence are one erased range, and an erase inside it, or a retry of
+    // the same erase, adds nothing.
+    for (const auto& erased : {make_erased_ranges({r(0, 100, 5), r(101, 200, 5)}),
+                               make_erased_ranges({r(0, 200, 5), r(10, 20, 5)}),
+                               make_erased_ranges({r(10, 20, 5), r(0, 200, 5), r(0, 200, 5)})}) {
+        BOOST_REQUIRE((erased.all() == list{r(0, 200, 5)}));
+    }
+    // An erase of the whole ring leaves only itself for its table, and the other tables alone.
+    const auto whole = erased_ranges::make(example.table_c, dht::token_range(), segment_sequence(600));
+    insert(example.b);
+    BOOST_REQUIRE(std::ranges::is_permutation(insert(whole), list{example.b, whole}));
+    BOOST_REQUIRE(set.covers(example.table_c, raw_token(0), segment_sequence(600)));
+    BOOST_REQUIRE(!set.covers(example.table_c, raw_token(0), segment_sequence(601)));
+}
+
 // The erased ranges survive a save and a load, and insert_and_save() adds an erased range to the
 // file and to the set in memory.
 SEASTAR_THREAD_TEST_CASE(test_logstor_erased_ranges_save_and_load) {
@@ -5001,6 +5042,25 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_erased_ranges_refuse_a_corrupt_file) {
     save_and_change([] (std::span<char> contents) { contents[0] ^= 0x55; });
     BOOST_REQUIRE_EXCEPTION(erased_ranges::load(dir.path(), this_shard_id()).get(), std::runtime_error,
             exception_predicate::message_contains("magic"));
+
+    // The erased ranges of a table must not overlap. The example set saves a2 as [15, 30], next to
+    // [11, 14] of a1, so a first token of 14 makes them overlap. The header has 20 bytes, an erased
+    // range has 40 bytes, and its first token is at byte 16 of it, see
+    // test_logstor_erased_ranges_file_layout. The change also writes a new CRC, so that the order is
+    // the only damage.
+    save_and_change([] (std::span<char> contents) {
+        const size_t crc_offset = contents.size() - sizeof(uint32_t);
+        for (size_t offset = 20; offset < crc_offset; offset += 40) {
+            if (seastar::read_le<int64_t>(contents.data() + offset + 16) == 15) {
+                seastar::write_le<int64_t>(contents.data() + offset + 16, 14);
+            }
+        }
+        utils::crc32 crc;
+        crc.process(reinterpret_cast<const uint8_t*>(contents.data()), crc_offset);
+        seastar::write_le<uint32_t>(contents.data() + crc_offset, crc.get());
+    });
+    BOOST_REQUIRE_EXCEPTION(erased_ranges::load(dir.path(), this_shard_id()).get(), std::runtime_error,
+            exception_predicate::message_contains("out of order"));
 
     // A file that ends inside the header is corrupt before the load reads the version.
     example.set.save(dir.path(), this_shard_id()).get();

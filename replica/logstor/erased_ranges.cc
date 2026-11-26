@@ -10,6 +10,8 @@
 
 #include <algorithm>
 #include <array>
+#include <iterator>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -68,6 +70,9 @@ constexpr size_t crc_size = ondisk::field<uint32_t>::size;
 
 static_assert(header_size == 20, "The header must keep the layout of the diagram");
 static_assert(erased_range_size == 40, "An erased range must keep the layout of the diagram at erased_range");
+
+constexpr int64_t min_raw_token = std::numeric_limits<int64_t>::min();
+constexpr int64_t max_raw_token = std::numeric_limits<int64_t>::max();
 
 size_t file_size_for(size_t count) {
     return header_size + count * erased_range_size + crc_size;
@@ -132,6 +137,8 @@ future<erased_ranges> erased_ranges::load(const std::filesystem::path& base_dir,
             throw std::runtime_error(fmt::format("Corrupt logstor erased range file {}: count {} size {}", path, header.count, size));
         }
 
+        // The load checks the CRC before the order of the erased ranges, so that it reports damage to
+        // the file as a CRC mismatch.
         utils::crc32 crc;
         add_to_crc(crc, contents.get(), size - crc_size);
         auto crc_in = seastar::simple_memory_input_stream(contents.get() + size - crc_size, crc_size);
@@ -140,43 +147,144 @@ future<erased_ranges> erased_ranges::load(const std::filesystem::path& base_dir,
         }
 
         result._seq_floor = header.seq_floor;
-        result._ranges.reserve(header.count);
+        // The save writes the tables in the order of their ids, and the erased ranges of a table in
+        // the order of their tokens, with no overlap, so the load appends each erased range to the
+        // steps of its table.
+        table_state* state = nullptr;
+        erased_range last;
         for (size_t i = 0; i < header.count; ++i) {
-            result._ranges.push_back(ser::serializer<erased_range>::read(contents_in));
+            const auto r = ser::serializer<erased_range>::read(contents_in);
+            const bool same_table = state && r.table == last.table;
+            if (r.first_token > r.last_token || (state && r.table < last.table) || (same_table && r.first_token <= last.last_token)) {
+                throw std::runtime_error(fmt::format("Corrupt logstor erased range file {}: erased range {} of table {} [{}, {}] is out of order",
+                        path, i, r.table, r.first_token, r.last_token));
+            }
+            if (!same_table) {
+                state = &result._tables[r.table];
+                append_step(*state, min_raw_token, segment_sequence{0});
+            }
+            append_step(*state, r.first_token, r.seq);
+            if (r.last_token < max_raw_token) {
+                append_step(*state, r.last_token + 1, segment_sequence{0});
+            }
+            last = r;
             // save() never writes a floor below an erased range, but the counter must not depend on
             // that.
-            result._seq_floor = std::max(result._seq_floor, result._ranges.back().seq);
+            result._seq_floor = std::max(result._seq_floor, r.seq);
         }
     });
+
+    for (const auto& [table, state] : result._tables) {
+        result._size += state.range_count;
+    }
     co_return result;
 }
 
 future<> erased_ranges::save(const std::filesystem::path& base_dir, unsigned shard) const {
-    return write_file(base_dir, shard, _ranges, _seq_floor);
+    return write_file(base_dir, shard, nullptr, _seq_floor);
 }
 
 future<> erased_ranges::insert_and_save(erased_range r, const std::filesystem::path& base_dir, unsigned shard) {
-    auto ranges = _ranges;
-    ranges.push_back(r);
-    const auto seq_floor = std::max(_seq_floor, r.seq);
-    co_await write_file(base_dir, shard, ranges, seq_floor);
-    _ranges = std::move(ranges);
-    _seq_floor = seq_floor;
+    auto state = with_range(r);
+    // The entry of the table exists before the save, so replace() cannot fail after the file holds
+    // `r`. A new entry has no steps and covers nothing, so the lookups during the save see the set
+    // as it was.
+    const bool inserted = _tables.try_emplace(r.table).second;
+    const replacement replaced{.table = r.table, .state = state};
+    auto saved = co_await coroutine::as_future(write_file(base_dir, shard, &replaced, std::max(_seq_floor, r.seq)));
+    if (saved.failed()) {
+        if (inserted) {
+            _tables.erase(r.table);
+        }
+        co_await std::move(saved);
+    }
+    replace(r.table, std::move(state), r.seq);
 }
 
 std::vector<erased_range> erased_ranges::all() const {
-    return _ranges;
+    std::vector<erased_range> result;
+    result.reserve(_size);
+    for (const auto& [table, state] : _tables) {
+        for (auto s = state.steps.begin(); s != state.steps.end(); ++s) {
+            if (s->seq != segment_sequence{0}) {
+                const auto next = std::next(s);
+                result.push_back(erased_range{.table = table, .first_token = s->from,
+                        .last_token = next == state.steps.end() ? max_raw_token : next->from - 1, .seq = s->seq});
+            }
+        }
+    }
+    return result;
 }
 
 bool erased_ranges::covers(table_id table, dht::token token, segment_sequence seq) const noexcept {
-    const auto raw = token.raw();
-    return std::ranges::any_of(_ranges, [&] (const erased_range& r) {
-        return r.table == table && r.first_token <= raw && raw <= r.last_token && seq <= r.seq;
-    });
+    const auto it = _tables.find(table);
+    if (it == _tables.end() || it->second.steps.empty()) {
+        return false;
+    }
+    const auto& steps = it->second.steps;
+    // The first step starts at the lowest raw token, so there is always one at or before the token.
+    const auto after = std::ranges::upper_bound(steps, token.raw(), std::less<>{}, &step::from);
+    return seq <= std::prev(after)->seq;
 }
 
-future<> erased_ranges::write_file(const std::filesystem::path& base_dir, unsigned shard, const std::vector<erased_range>& ranges,
-        segment_sequence seq_floor) {
+void erased_ranges::append_step(table_state& state, int64_t from, segment_sequence seq) {
+    if (!state.steps.empty() && state.steps.back().from == from) {
+        state.range_count -= state.steps.back().seq != segment_sequence{0};
+        state.steps.pop_back();
+    }
+    if (state.steps.empty() || state.steps.back().seq != seq) {
+        state.steps.push_back(step{.from = from, .seq = seq});
+        state.range_count += seq != segment_sequence{0};
+    }
+}
+
+erased_ranges::table_state erased_ranges::with_range(const erased_range& r) const {
+    // A table with no erased range has one step at sequence 0.
+    std::vector<step> no_steps;
+    const auto it = _tables.find(r.table);
+    const auto& steps = it != _tables.end() && !it->second.steps.empty() ? it->second.steps : no_steps;
+    if (steps.empty()) {
+        no_steps.push_back(step{.from = min_raw_token, .seq = segment_sequence{0}});
+    }
+
+    // Each token of `r` gets the higher of its sequence and the sequence of `r`, and the other tokens
+    // keep their sequence. `current` is the sequence of the last step that the loops passed.
+    table_state state;
+    auto s = steps.begin();
+    auto current = segment_sequence{0};
+    for (; s != steps.end() && s->from < r.first_token; ++s) {
+        current = s->seq;
+        append_step(state, s->from, s->seq);
+    }
+    if (s != steps.end() && s->from == r.first_token) {
+        current = s->seq;
+        ++s;
+    }
+    append_step(state, r.first_token, std::max(current, r.seq));
+    for (; s != steps.end() && s->from <= r.last_token; ++s) {
+        current = s->seq;
+        append_step(state, s->from, std::max(s->seq, r.seq));
+    }
+    if (r.last_token < max_raw_token) {
+        // The token after `r` gets back the sequence that it had, unless a step starts there.
+        if (s == steps.end() || s->from != r.last_token + 1) {
+            append_step(state, r.last_token + 1, current);
+        }
+        for (; s != steps.end(); ++s) {
+            append_step(state, s->from, s->seq);
+        }
+    }
+    return state;
+}
+
+void erased_ranges::replace(table_id table, table_state&& state, segment_sequence seq) noexcept {
+    auto& current = _tables.find(table)->second;
+    _size = _size - current.range_count + state.range_count;
+    current = std::move(state);
+    _seq_floor = std::max(_seq_floor, seq);
+}
+
+future<> erased_ranges::write_file(const std::filesystem::path& base_dir, unsigned shard, const replacement* replaced, segment_sequence seq_floor) const {
     utils::get_local_injector().inject("logstor_erased_ranges_save_fail", [] {
         throw std::runtime_error("erased range save failed by injection");
     });
@@ -184,17 +292,31 @@ future<> erased_ranges::write_file(const std::filesystem::path& base_dir, unsign
     const auto path = name.in(base_dir).string();
     const auto tmp_path = name.tmp().in(base_dir).string();
 
-    auto contents = seastar::temporary_buffer<char>(file_size_for(ranges.size()));
+    // The map holds an entry of the replaced table, see insert_and_save().
+    auto count = _size;
+    if (replaced) {
+        count = count - _tables.at(replaced->table).range_count + replaced->state.range_count;
+    }
+
+    auto contents = seastar::temporary_buffer<char>(file_size_for(count));
     auto contents_out = seastar::simple_memory_output_stream(contents.get_write(), contents.size());
     ser::serializer<file_header>::write(contents_out, file_header{
         .magic = file_magic,
         .version = file_version,
         .reserved = {},
-        .count = static_cast<uint32_t>(ranges.size()),
+        .count = static_cast<uint32_t>(count),
         .seq_floor = seq_floor,
     });
-    for (const auto& r : ranges) {
-        ser::serializer<erased_range>::write(contents_out, r);
+    for (const auto& [table, current] : _tables) {
+        const auto& state = replaced && table == replaced->table ? replaced->state : current;
+        for (auto s = state.steps.begin(); s != state.steps.end(); ++s) {
+            if (s->seq == segment_sequence{0}) {
+                continue;
+            }
+            const auto next = std::next(s);
+            ser::serializer<erased_range>::write(contents_out, erased_range{.table = table, .first_token = s->from,
+                    .last_token = next == state.steps.end() ? max_raw_token : next->from - 1, .seq = s->seq});
+        }
     }
     utils::crc32 crc;
     add_to_crc(crc, contents.get(), contents.size() - crc_size);
@@ -214,7 +336,7 @@ future<> erased_ranges::write_file(const std::filesystem::path& base_dir, unsign
 
     co_await seastar::rename_file(tmp_path, path);
     co_await seastar::sync_directory(base_dir.string());
-    logstor_logger.debug("Saved {} erased ranges to {}", ranges.size(), path);
+    logstor_logger.debug("Saved {} erased ranges to {}", count, path);
 }
 
 } // namespace replica::logstor

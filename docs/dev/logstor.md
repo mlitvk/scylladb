@@ -261,15 +261,19 @@ Each shard keeps the erases whose records can still be on disk in
 erase, through `logstor-{shard}-Erase.db.tmp`, which replaces it once it is durable, so a crash
 leaves either version.
 When the file is missing, the shard has no erased ranges. When the file does not parse, has a format
-version that this release does not read, or has a CRC that does not match, the shard does not start.
+version that this release does not read, has a CRC that does not match, or has erased ranges of a
+table that overlap or are not in order, the shard does not start.
 The file holds these parts, in this order:
 
 - the **header**, which identifies the file and its format version, and gives the number of erased
   ranges and the sequence floor. The sequence floor is the highest sequence of every erased range
   that the shard ever had.
-- the **erased ranges**, in the order of the erases. An erased range gives a table, an inclusive
-  range of raw tokens and a segment sequence. It erases each record of the table in the range that
-  is in a chunk with a `segment_seq` of at most that sequence.
+- the **erased ranges**, in the order of their table and then of their tokens. An erased range
+  gives a table, an inclusive range of raw tokens and a segment sequence. It erases each record of
+  the table in the range that is in a chunk with a `segment_seq` of at most that sequence. The
+  erased ranges of a table do not overlap, because the shard keeps, for each token, only the
+  highest sequence of the erases that cover it. So an erase splits or replaces the erased ranges
+  under it, and the number of erases does not change the size of the file.
 - a **CRC32** of all the bytes before it.
 
 ### Segments
