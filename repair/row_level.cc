@@ -34,6 +34,9 @@
 #include <seastar/core/metrics_registration.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/when_all.hh>
+#include <seastar/core/condition-variable.hh>
+#include <seastar/core/gate.hh>
+#include <seastar/core/semaphore.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/coroutine/parallel_for_each.hh>
 #include <list>
@@ -608,20 +611,40 @@ sharder_helper get_sharder_helper(replica::table& t, const schema& s, service::f
     }
 }
 
-class logstor_direct_writer_queue_impl : public mutation_fragment_queue::impl {
+// Applies the partitions that repair rebuilt to a logstor table. The writes run in the background,
+// so that the writes of many partitions are in flight together and share the chunks of the logstor
+// write buffer. A write that waited for its record to reach a segment before the next partition
+// could start would take a chunk and a disk write for each partition.
+class logstor_direct_writer_queue_impl : public mutation_fragment_queue::impl,
+        public seastar::enable_shared_from_this<logstor_direct_writer_queue_impl> {
+    // The limit on the bytes of the frozen partitions in flight, which is two write buffers of the
+    // default logstor segment size. Each repair_meta has its own writer, so a shard can have this
+    // much in flight for each repair_meta on it.
+    static constexpr size_t max_in_flight_bytes = 256 * 1024;
+    // The smallest charge of a write, so that the limit also sets a maximum number of writes.
+    static constexpr size_t min_write_charge = 256;
+
     schema_ptr _schema;
     sharded<replica::database>& _db;
     service::frozen_topology_guard _topo_guard;
     sharder_helper _sharder;
     db::timeout_clock::time_point _timeout;
     std::optional<mutation_rebuilder_v2> _rebuilder;
-    std::exception_ptr _aborted;
+    // The first failure, of a push or of a write. Every later push fails with it.
+    std::exception_ptr _error;
+    semaphore _in_flight_bytes{max_in_flight_bytes};
+    gate _in_flight;
+    bool _started = false;
+    bool _stream_closed = false;
+    condition_variable _stream_closed_cv;
 
 private:
-    future<> apply_rebuilt_partition(mutation m) {
+    // Starts the write of a rebuilt partition and returns when the write is in flight. It waits
+    // when the writes in flight hold the whole limit.
+    future<> start_write(mutation m) {
         auto shards = _sharder.sharder.shard_for_writes(m.token());
         if (shards.empty()) {
-            return make_exception_future<>(std::runtime_error(format("No local shards for token {} of {}.{}",
+            co_await coroutine::return_exception(std::runtime_error(format("No local shards for token {} of {}.{}",
                     m.token(), _schema->ks_name(), _schema->cf_name())));
         }
 
@@ -629,7 +652,29 @@ private:
                 _schema->ks_name(), _schema->cf_name(), m.token(), shards,
                 m.partition().clustered_rows().empty());
 
-        return parallel_for_each(shards, [&db = _db, fm = freeze(m), gs = global_schema_ptr(_schema), topo_guard = _topo_guard, timeout = _timeout] (shard_id shard) mutable {
+        auto fm = freeze(m);
+        // A partition larger than the limit is charged the whole limit, so that it can still start.
+        auto charge = std::clamp<size_t>(fm.representation().size(), min_write_charge, max_in_flight_bytes);
+        auto units = co_await get_units(_in_flight_bytes, charge);
+        if (_error) {
+            co_await coroutine::return_exception_ptr(_error);
+        }
+
+        auto holder = _in_flight.hold();
+        // The continuation keeps the queue alive, and it releases the gate holder in its body, so
+        // that the order in which the captures are destroyed does not matter.
+        (void)apply_on_shards(std::move(shards), std::move(fm)).then_wrapped(
+                [this, self = shared_from_this(), holder = std::move(holder), units = std::move(units)] (future<> f) mutable {
+            if (f.failed()) {
+                fail(f.get_exception());
+            }
+            units.return_all();
+            holder.release();
+        });
+    }
+
+    future<> apply_on_shards(dht::shard_replica_set shards, frozen_mutation fm) {
+        return parallel_for_each(shards, [&db = _db, fm = std::move(fm), gs = global_schema_ptr(_schema), topo_guard = _topo_guard, timeout = _timeout] (shard_id shard) mutable {
             return db.invoke_on(shard, [fm, gs, topo_guard, timeout] (replica::database& db) mutable -> future<> {
                 service::topology_guard guard(topo_guard);
                 guard.check();
@@ -638,6 +683,10 @@ private:
                 auto stream_op = table.stream_in_progress();
                 rlogger.debug("logstor repair writer: applying rebuilt partition on shard={} table={}.{}",
                         this_shard_id(), schema->ks_name(), schema->cf_name());
+                co_await utils::get_local_injector().inject("logstor_repair_writer_apply_wait", utils::wait_for_message(std::chrono::minutes(5)));
+                utils::get_local_injector().inject("logstor_repair_writer_apply_fail", [] {
+                    throw std::runtime_error("logstor repair write failed by injection");
+                });
                 co_await table.apply(fm, schema, db::rp_handle(), timeout, db::noop_large_data_guardrail::instance());
             });
         });
@@ -673,11 +722,25 @@ private:
             }
             rlogger.debug("logstor repair writer: finished rebuilding partition table={}.{} token={}",
                     _schema->ks_name(), _schema->cf_name(), mut->token());
-            return apply_rebuilt_partition(std::move(*mut));
+            return start_write(std::move(*mut));
         }
 
         (void)_rebuilder->consume(std::move(mf));
         return make_ready_future<>();
+    }
+
+    // Stores the first failure and drops the partition that is rebuilt now. A logstor write
+    // replaces the whole partition, so an incomplete partition must never be applied.
+    void fail(std::exception_ptr ep) noexcept {
+        if (!_error) {
+            _error = std::move(ep);
+        }
+        _rebuilder.reset();
+    }
+
+    void close_stream() noexcept {
+        _stream_closed = true;
+        _stream_closed_cv.broadcast();
     }
 
 public:
@@ -691,8 +754,8 @@ public:
     }
 
     virtual future<> push(mutation_fragment_v2 mf) override {
-        if (_aborted) {
-            co_await coroutine::return_exception_ptr(_aborted);
+        if (_error) {
+            co_await coroutine::return_exception_ptr(_error);
         }
         std::exception_ptr ep;
         try {
@@ -701,45 +764,58 @@ public:
         } catch (...) {
             ep = std::current_exception();
         }
-        // The partition being rebuilt is incomplete now, and a logstor write
-        // replaces the whole partition, so it must never be applied. Drop it and
-        // fail every later push, which also keeps push_end_of_stream() from
-        // reporting the dropped partition as an error of its own and masking
-        // the failure that repair actually propagates.
-        this->abort(ep);
+        // Failing every later push also keeps push_end_of_stream() from reporting the dropped
+        // partition as an error of its own and masking the failure that repair propagates.
+        fail(ep);
         co_await coroutine::return_exception_ptr(std::move(ep));
     }
 
     virtual void abort(std::exception_ptr ep) override {
-        _aborted = std::move(ep);
-        // Drop any partially rebuilt partition so it can never be applied.
-        _rebuilder.reset();
+        fail(std::move(ep));
+        close_stream();
     }
 
     virtual void push_end_of_stream() override {
         // repair_writer closes the open partition before signaling end of
         // stream, so a live rebuilder here means a partition_end was lost. A
-        // failed push cannot land here: it aborts the queue, which drops the
-        // rebuilder, so this never masks an earlier failure.
+        // failed push cannot land here: it drops the rebuilder, so this never
+        // masks an earlier failure.
         if (_rebuilder) {
             on_internal_error(rlogger, format("Logstor repair writer: end of stream with an open partition, table={}.{}",
                     _schema->ks_name(), _schema->cf_name()));
+        }
+        close_stream();
+    }
+
+    void start() noexcept {
+        _started = true;
+    }
+
+    // Waits until the stream is closed and every write that started is complete, and returns the
+    // first failure.
+    // repair_writer::wait_for_writer_done() calls this together with write_end_of_stream(), so the
+    // last partition_end, which starts the last write, can come after this call. So the wait for
+    // the end of the stream must come before the wait for the writes.
+    future<> wait_for_writes() {
+        if (!_started) {
+            co_return;
+        }
+        co_await _stream_closed_cv.wait([this] { return _stream_closed; });
+        co_await _in_flight.close();
+        if (_error) {
+            co_await coroutine::return_exception_ptr(_error);
         }
     }
 };
 
 class logstor_repair_writer_impl : public repair_writer::impl {
+    seastar::shared_ptr<logstor_direct_writer_queue_impl> _writer_queue;
     mutation_fragment_queue _mq;
 
-    static mutation_fragment_queue make_queue(schema_ptr schema, reader_permit permit, sharded<replica::database>& db,
-            service::frozen_topology_guard topo_guard) {
-        auto timeout = permit.timeout();
-        return mutation_fragment_queue(schema, std::move(permit), seastar::shared_ptr<mutation_fragment_queue::impl>(
-                seastar::make_shared<logstor_direct_writer_queue_impl>(schema, db, topo_guard, timeout)));
-    }
 public:
     logstor_repair_writer_impl(schema_ptr schema, reader_permit permit, sharded<replica::database>& db, service::frozen_topology_guard topo_guard)
-        : _mq(make_queue(schema, std::move(permit), db, topo_guard)) {
+        : _writer_queue(seastar::make_shared<logstor_direct_writer_queue_impl>(schema, db, topo_guard, permit.timeout()))
+        , _mq(schema, std::move(permit), _writer_queue) {
     }
 
     virtual mutation_fragment_queue& queue() override {
@@ -747,10 +823,11 @@ public:
     }
 
     virtual future<> wait_for_writer_done() override {
-        return make_ready_future<>();
+        return _writer_queue->wait_for_writes();
     }
 
     virtual void create_writer(lw_shared_ptr<repair_writer>) override {
+        _writer_queue->start();
     }
 };
 
