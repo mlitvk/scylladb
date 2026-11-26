@@ -139,8 +139,7 @@ future<> logstor::do_flush_to_separator() {
     co_await _segment_manager.await_pending_writes();
 }
 
-future<> logstor::erase(table_id table, primary_index& index, dht::token_range range, std::vector<logstor_group*> groups,
-        logstor_group* stopped_group) {
+future<> logstor::erase(table_id table, primary_index& index, dht::token_range range, logstor_group* stopped_group) {
     auto gate_holder = _async_gate.hold();
     if (!raw_token_bounds::of(range)) {
         // The range holds no token, so the erase has nothing to do. The early return also skips the
@@ -154,7 +153,7 @@ future<> logstor::erase(table_id table, primary_index& index, dht::token_range r
     if (!stopped_group || !stopped_group->token_range().contains(range, dht::token_comparator())) {
         co_await flush_to_separator();
     }
-    co_await _segment_manager.erase(table, index, std::move(range), std::move(groups), stopped_group);
+    co_await _segment_manager.erase(table, index, std::move(range), stopped_group);
 }
 
 future<> logstor::write(const mutation& m, write_target target, db::timeout_clock::time_point timeout) noexcept {

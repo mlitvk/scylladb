@@ -10,6 +10,7 @@
 #include "dht/i_partitioner.hh"
 #include <functional>
 #include <limits>
+#include <seastar/core/semaphore.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 #include <optional>
 #include "dht/token.hh"
@@ -217,6 +218,10 @@ class primary_index final {
     // Each read guard holds an operation of this phaser, so that await_read_guards() can wait
     // for the guards that exist.
     mutable utils::phased_barrier _reads_phaser{"logstor_primary_index"};
+
+    // Serializes the erases of the index with each other and with the removal of the index's groups
+    // from the compaction manager, see segment_manager::erase().
+    seastar::semaphore _erase_sem{1};
 
     // Non-owning pointer to the cache tracker, which is null when the cache is not set up.
     cache_tracker* _cache_tracker = nullptr;
@@ -503,6 +508,10 @@ public:
     // the wait.
     future<> await_read_guards() {
         return _reads_phaser.advance_and_await();
+    }
+
+    seastar::semaphore& erase_semaphore() noexcept {
+        return _erase_sem;
     }
 
     // Returns whether the index holds a key in `tr`.

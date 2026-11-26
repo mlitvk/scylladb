@@ -1264,10 +1264,10 @@ future<> compaction_group::split(compaction::compaction_type_options::split opt,
 }
 
 future<> compaction_group::erase_logstor() {
-    // The erase skips the drain of the write path for a stopped group, because the gate of the group
-    // closed after each write to the group was done.
-    auto& group = as_logstor_group();
-    co_await _t._logstor->erase(_t.schema()->id(), _t.logstor_index(), token_range(), {&group}, stopped() ? &group : nullptr);
+    // The erase cannot find a stopped group in the registry, so the call gives the group when it is
+    // stopped. A live group is registered, so the erase finds it and drains its writes like the
+    // writes of other groups.
+    co_await _t._logstor->erase(_t.schema()->id(), _t.logstor_index(), token_range(), stopped() ? &as_logstor_group() : nullptr);
 }
 
 class compaction_group_logstor_state final : public logstor::logstor_group {
@@ -5181,15 +5181,8 @@ future<> table::truncate_logstor() {
         co_return;
     }
 
-    // The erase uses the groups of the table, so the gate holders keep each group alive until the
-    // erase ends.
-    std::vector<logstor::logstor_group*> groups;
-    std::vector<gate::holder> group_holders;
-    for_each_compaction_group([&] (compaction_group& cg) {
-        groups.push_back(&cg.as_logstor_group());
-        group_holders.push_back(cg.async_gate().hold());
-    });
-    co_await _logstor->erase(_schema->id(), *_logstor_index, dht::token_range(), std::move(groups));
+    // The erase finds the table's groups itself.
+    co_await _logstor->erase(_schema->id(), *_logstor_index, dht::token_range());
 }
 
 void table::mark_ready_for_writes(db::commitlog* cl) {

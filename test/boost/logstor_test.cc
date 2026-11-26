@@ -4553,7 +4553,7 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_erase_of_an_empty_range_does_nothing) {
             dht::token_range::make({token, false}, {dht::token::from_int64(11), false}),
             dht::token_range::make({token, true}, {dht::token::from_int64(9), true}),
             dht::token_range::make_starting_with({dht::token::from_int64(std::numeric_limits<int64_t>::max()), false})}) {
-        ls.erase(schema->id(), cg.logstor_index(), range, {&cg}).get();
+        ls.erase(schema->id(), cg.logstor_index(), range).get();
     }
 
     BOOST_REQUIRE_EQUAL(cg.logstor_index().get_usage().key_count, 1u);

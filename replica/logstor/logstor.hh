@@ -123,12 +123,11 @@ public:
     // since the cache entry may be evicted before the source is read from.
     std::map<sstring, mutation_source> make_mutation_sources_for_dump(schema_ptr, const primary_index&, const dht::decorated_key&, reader_permit);
 
-    // Erases every record of `table` in `range` that is written before the call. `groups` are the
-    // groups of the table in the range, and `stopped_group` is the one of them that is stopped, if
-    // any. The caller must allow no write to the range until the erase ends, see
-    // segment_manager::erase().
-    future<> erase(table_id table, primary_index& index, dht::token_range range, std::vector<logstor_group*> groups,
-            logstor_group* stopped_group = nullptr);
+    // Erases every record of `table` in `range` that is written before the call. The erase finds
+    // the groups of the table in the range itself. `stopped_group` is a stopped group of the range,
+    // which is no longer registered. The caller must allow no write to the range until the erase
+    // ends, see segment_manager::erase().
+    future<> erase(table_id table, primary_index& index, dht::token_range range, logstor_group* stopped_group = nullptr);
 
 private:
     future<> do_flush_to_separator();

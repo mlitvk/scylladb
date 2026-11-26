@@ -195,9 +195,9 @@ public:
 
     // Erases all the records of `table` in `range`, so that reads do not find them. The caller must
     // allow no write to the range until the erase ends, and must drain the write path first.
-    // `groups` are the groups of `table` in `range`, and `stopped_group` is the one of them that is
-    // stopped, if any.
-    future<> erase(table_id, primary_index&, dht::token_range, std::vector<logstor_group*> groups, logstor_group* stopped_group = nullptr);
+    // `stopped_group` is a stopped group of the range, which is no longer registered, so the erase
+    // cannot find it.
+    future<> erase(table_id, primary_index&, dht::token_range, logstor_group* stopped_group = nullptr);
 
     segment_manager_usage get_usage() const noexcept;
 
