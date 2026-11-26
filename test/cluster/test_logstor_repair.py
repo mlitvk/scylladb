@@ -847,12 +847,10 @@ async def test_repair_window_never_splits_partition(manager: ScyllaClusterManage
       that boundary is the minimum across the replicas and cuts node2's row for
       the same partition into the next window.
 
-    A split window converges each part of the partition alone, so a replica can
-    store a record without the tombstone, which the assertions below catch. The
-    row is newer than the tombstone, so a read still returns the same row, but
-    the records differ from the cell level merge of the versions. When the
-    replicas end up with different records, their repair hashes never become
-    equal, and each later repair sends the partition again.
+    A split window converges each part of the partition alone, so the replicas
+    can store a record without the tombstone, which the assertions below catch.
+    The row is newer than the tombstone, so a read still returns the same row,
+    but the record is not the cell level merge of the versions.
 
     Both groups converge to the same value, and differ only in which replica
     holds the tombstone and in the fragment shape that produces the boundary:
