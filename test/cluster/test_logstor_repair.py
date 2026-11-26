@@ -332,18 +332,9 @@ class Deleted:
     timestamp: int
 
 
-class _Live:
-    """The expected state of a live partition whose cells the caller checks itself."""
-
-    def __repr__(self) -> str:
-        return 'LIVE'
-
-
-LIVE = _Live()
-
 # What a partition is expected to hold after the tested operation: the exact cell
-# values of its converged record, Deleted(timestamp), or LIVE.
-Expected = dict[int, dict[str, Any] | Deleted | _Live]
+# values of its converged record, or Deleted(timestamp).
+Expected = dict[int, dict[str, Any] | Deleted]
 
 
 async def check_converged(cql: Any, hosts: list[Any], table: str, expected: Expected) -> dict[int, Record]:
@@ -372,7 +363,7 @@ async def check_converged(cql: Any, hosts: list[Any], table: str, expected: Expe
     for pk, want in expected.items():
         if isinstance(want, Deleted):
             check_deleted_record(records[pk], want.timestamp)
-        elif want is not LIVE:
+        else:
             assert records[pk].cell_values() == want, f"pk {pk}: expected {want}, got {records[pk]}"
             tombstone = records[pk].tombstone_timestamp()
             if tombstone is not None:
