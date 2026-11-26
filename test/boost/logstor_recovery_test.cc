@@ -24,6 +24,7 @@
 #include <seastar/testing/thread_test_case.hh>
 #include <seastar/util/defer.hh>
 
+#include "replica/logstor/erased_ranges.hh"
 #include "replica/logstor/index.hh"
 #include "replica/logstor/logstor.hh"
 #include "replica/logstor/segment_file.hh"
@@ -33,6 +34,7 @@
 #include "test/lib/logstor_test_utils.hh"
 #include "test/lib/mutation_assertions.hh"
 #include "test/lib/tmpdir.hh"
+#include "utils/UUID_gen.hh"
 
 using namespace replica::logstor;
 using namespace tests::logstor;
@@ -351,6 +353,27 @@ SEASTAR_THREAD_TEST_CASE(test_logstor_recovery_drops_the_records_of_a_tablet_tha
     BOOST_REQUIRE_EQUAL(left.logstor_segments().segment_count(), 1u);
     require_value(ls, left.logstor_index(), left_record);
     require_no_value(ls, left.logstor_index(), right_record);
+}
+
+// Recovery starts the sequence counter above the sequence floor of the erased range file, also
+// when no segment on disk is above the floor. Otherwise a write after the restart could get a
+// sequence that an erased range covers, and the next recovery would drop the write.
+SEASTAR_THREAD_TEST_CASE(test_logstor_recovery_resumes_the_sequence_above_the_erased_range_floor) {
+    tmpdir dir;
+    const auto table = table_id(utils::UUID_gen::get_time_UUID());
+    erased_ranges{}.insert_and_save(erased_ranges::make(table, dht::token_range(), segment_sequence(100)), dir.path(), this_shard_id()).get();
+
+    auto recover = [&dir] {
+        test_store store(dir);
+        auto& ls = store.ls();
+        test_recovery_catalog no_tables;
+        const auto summary = ls.do_recovery(no_tables).get();
+        ls.start().get();
+        ls.stop().get();
+        return summary;
+    };
+
+    BOOST_REQUIRE_EQUAL(recover().next_segment_seq.value, 101u);
 }
 
 // A full segment whose range fits no single group of the shard is separated: each record goes to the

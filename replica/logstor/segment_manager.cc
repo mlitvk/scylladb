@@ -7,6 +7,7 @@
  */
 #include "replica/logstor/segment_manager.hh"
 #include "replica/logstor/segment_file.hh"
+#include "replica/logstor/erased_ranges.hh"
 #include "replica/logstor/ondisk.hh"
 #include "replica/logstor/segment_io.hh"
 #include "exceptions/exceptions.hh"
@@ -455,6 +456,9 @@ class segment_manager_impl {
     std::optional<shared_future<>> _switch_segment_fut;
     segment_sequence _next_segment_seq{1};
 
+    // The shard keeps its erased ranges here. Recovery loads them before it scans the segments.
+    erased_ranges _erased_ranges;
+
     seastar::gate _async_gate;
     // The reserve replenisher keeps `_segment_pool` full.
     future<> _reserve_replenisher{make_ready_future<>()};
@@ -591,18 +595,32 @@ public:
         // with no valid chunk has no segment info.
         utils::chunked_vector<std::optional<segment_info>> segment_infos;
         segment_sequence max_segment_seq{0};
+        // The records that an erased range covers, which the scan left out.
+        uint64_t erased_records{0};
     };
 
     // Scans every segment below segment_count into the indexes the resolver names, the way
-    // recovery does.
-    future<rebuild_index_result> rebuild_index(uint64_t segment_count, const index_resolver&);
+    // recovery does, and leaves out the records that the erased ranges cover.
+    future<rebuild_index_result> rebuild_index(uint64_t segment_count, const index_resolver&, const erased_ranges&);
 
-    // Scans one segment into the resolver's indexes. `cmp` decides between two records of the same
-    // key.
-    future<> index_segment_records(log_segment_id, const primary_index::entry_cmp_fn& cmp, const index_resolver&);
+    struct index_segment_result {
+        // The records that an erased range covers, which the scan left out.
+        uint64_t erased_records{0};
+    };
 
+    // Scans one segment into the resolver's indexes, and leaves out the records that the erased
+    // ranges cover. `seq` is the sequence of the segment, and `cmp` decides between two records of
+    // the same key.
+    future<index_segment_result> index_segment_records(log_segment_id, segment_sequence seq, const primary_index::entry_cmp_fn& cmp, const index_resolver&,
+            const erased_ranges&);
+
+    // Rebuilds the indexes from disk, see segment_manager::rebuild_index_from_disk(). The function
+    // reads the erased ranges from the file, as recovery does, so that an erase counts only once it
+    // is durable. The function is a coroutine, so that the resolver and the erased ranges stay
+    // alive until the scan ends.
     future<> rebuild_index_from_disk(index_resolver resolve) {
-        co_await rebuild_index(_file_mgr.allocated_file_count() * _geometry.segments_per_file(), resolve);
+        const auto erased = co_await erased_ranges::load(_cfg.base_dir, _file_mgr.shard());
+        co_await rebuild_index(_file_mgr.allocated_file_count() * _geometry.segments_per_file(), resolve, erased);
     }
 
     compaction_manager& get_compaction_manager() noexcept {
@@ -990,6 +1008,8 @@ segment_manager_impl::segment_manager_impl(segment_manager_config config)
                        sm::description("Number of segments that are not freed until the node restarts, because the index can still point into them.")),
         sm::make_gauge("separator_task_queue_size", [this]() { return _separator_task_queue.size(); },
                        sm::description("Current number of pending tasks in the separator task queue.")),
+        sm::make_gauge("erased_ranges", [this] { return _erased_ranges.size(); },
+                       sm::description("Number of erased ranges of the shard in memory. The erased range file holds the same erased ranges, or more after a save that failed.")),
     });
 }
 
@@ -2207,6 +2227,7 @@ public:
 
 private:
     future<> open_found_files();
+    future<> load_erased_ranges();
     future<> index_found_segments();
     future<> place_found_segments();
     future<> retire_unused_files();
@@ -2217,6 +2238,7 @@ future<recovery_summary> segment_manager_impl::recovery::run() {
     logstor_logger.info("Starting recovery for shard {} in directory {}", this_shard_id(), _sm._cfg.base_dir.string());
 
     co_await open_found_files();
+    co_await load_erased_ranges();
     co_await index_found_segments();
     co_await place_found_segments();
     co_await retire_unused_files();
@@ -2226,9 +2248,9 @@ future<recovery_summary> segment_manager_impl::recovery::run() {
     _summary.dropped_records = _stats.dropped_records;
     _summary.separated_segments = _stats.separated_segments;
     logstor_logger.info("Recovery complete: {} live records in {} used segments, {} free segments, {} found segments, "
-            "{} dropped records, {} full segments to separate, next segment sequence {}",
+            "{} dropped records, {} erased records, {} full segments to separate, next segment sequence {}",
             _sm._stats.live_record_count, _summary.used_segments, _summary.free_segments, _summary.found_segments,
-            _summary.dropped_records, _summary.separated_segments, _summary.next_segment_seq);
+            _summary.dropped_records, _summary.erased_records, _summary.separated_segments, _summary.next_segment_seq);
     co_return _summary;
 }
 
@@ -2251,10 +2273,20 @@ future<> segment_manager_impl::recovery::open_found_files() {
     }
 }
 
-// Scans every found segment into the indexes of the catalog.
+// Loads the erased ranges that the scan applies.
+future<> segment_manager_impl::recovery::load_erased_ranges() {
+    _sm._erased_ranges = co_await erased_ranges::load(_sm._cfg.base_dir, _sm._file_mgr.shard());
+    if (!_sm._erased_ranges.empty()) {
+        logstor_logger.info("Recovery: {} erased ranges, sequence floor {}", _sm._erased_ranges.size(), _sm._erased_ranges.seq_floor());
+    }
+}
+
+// Scans every found segment into the indexes of the catalog, leaving out the records that an
+// erased range covers.
 future<> segment_manager_impl::recovery::index_found_segments() {
-    auto rebuilt = co_await _sm.rebuild_index(_summary.found_segments, _sm.make_index_resolver(_catalog, _stats));
+    auto rebuilt = co_await _sm.rebuild_index(_summary.found_segments, _sm.make_index_resolver(_catalog, _stats), _sm._erased_ranges);
     _segment_infos = std::move(rebuilt.segment_infos);
+    _summary.erased_records = rebuilt.erased_records;
     for (uint64_t seg_idx = 0; seg_idx < _summary.found_segments; ++seg_idx) {
         const auto& info = _segment_infos[seg_idx];
         _sm.get_segment_descriptor(log_segment_id(seg_idx)).seq = info ? info->segment_seq : segment_sequence(0);
@@ -2308,9 +2340,11 @@ future<> segment_manager_impl::recovery::retire_unused_files() {
     co_await _files.retire_unused_files(_used_file_count);
 }
 
-// New segments get sequences above every sequence on disk.
+// New segments get sequences above every sequence on disk and every sequence of an erased range.
+// Otherwise a write after an erase can get a sequence that the erase covers, and the next recovery
+// drops the write.
 void segment_manager_impl::recovery::resume_segment_sequence() {
-    _sm._next_segment_seq = _max_segment_seq + 1;
+    _sm._next_segment_seq = std::max(_max_segment_seq, _sm._erased_ranges.seq_floor()) + 1;
     _summary.next_segment_seq = _sm._next_segment_seq;
 }
 
@@ -2337,7 +2371,8 @@ segment_manager_impl::index_resolver segment_manager_impl::make_index_resolver(r
     };
 }
 
-future<segment_manager_impl::rebuild_index_result> segment_manager_impl::rebuild_index(uint64_t segment_count, const index_resolver& resolve) {
+future<segment_manager_impl::rebuild_index_result> segment_manager_impl::rebuild_index(uint64_t segment_count, const index_resolver& resolve,
+        const erased_ranges& erased) {
     rebuild_index_result result;
     auto& segment_infos = result.segment_infos;
     segment_infos.resize(static_cast<size_t>(segment_count));
@@ -2374,7 +2409,7 @@ future<segment_manager_impl::rebuild_index_result> segment_manager_impl::rebuild
     };
 
     co_await max_concurrent_for_each(std::views::iota(uint64_t(0), segment_count), 32,
-        [this, &cmp_with_seq, &resolve, &segment_infos, &result, &on_segment_scanned] (uint64_t seg_idx) -> future<> {
+        [this, &cmp_with_seq, &resolve, &erased, &segment_infos, &result, &on_segment_scanned] (uint64_t seg_idx) -> future<> {
             const log_segment_id seg_id(seg_idx);
             // The scan reads a whole segment in its first read, also when the first chunk is not
             // valid. A segment that was never written, or that discard_segments() freed, starts
@@ -2384,9 +2419,11 @@ future<segment_manager_impl::rebuild_index_result> segment_manager_impl::rebuild
             // no chunk in the segments that this check skips.
             if (auto info = co_await read_segment_info(seg_id)) {
                 logstor_logger.trace("Recovering segment {} with sequence {}", seg_id, info->segment_seq);
-                result.max_segment_seq = std::max(result.max_segment_seq, info->segment_seq);
+                const auto seq = info->segment_seq;
+                result.max_segment_seq = std::max(result.max_segment_seq, seq);
                 segment_infos[seg_idx] = std::move(info);
-                co_await index_segment_records(seg_id, cmp_with_seq, resolve);
+                const auto indexed = co_await index_segment_records(seg_id, seq, cmp_with_seq, resolve, erased);
+                result.erased_records += indexed.erased_records;
             }
             on_segment_scanned();
         }
@@ -2395,16 +2432,25 @@ future<segment_manager_impl::rebuild_index_result> segment_manager_impl::rebuild
     co_return result;
 }
 
-future<> segment_manager_impl::index_segment_records(log_segment_id segment_id, const primary_index::entry_cmp_fn& cmp,
-        const index_resolver& resolve) {
+future<segment_manager_impl::index_segment_result> segment_manager_impl::index_segment_records(log_segment_id segment_id, segment_sequence seq,
+        const primary_index::entry_cmp_fn& cmp, const index_resolver& resolve, const erased_ranges& erased) {
+    index_segment_result result;
     co_await for_each_record(segment_id, [&] (const chunk_record& record) {
         const auto& header = record.header;
         logstor_logger.trace("Recovery: read record at {} key {} ts {}", record.location, header.key, header.timestamp);
+        // An erased record is not a candidate for the index, because a later record of the key
+        // can have an older timestamp and must win. The scan of a segment stops at a chunk of
+        // another sequence, so every record of the segment has the sequence `seq`.
+        if (erased.covers(header.table, header.key.token(), seq)) {
+            ++result.erased_records;
+            return make_ready_future<>();
+        }
         if (auto* index = resolve(header)) {
             index->insert(header.index_key(), index_entry{.location = record.location, .timestamp = header.timestamp}, cmp);
         }
         return make_ready_future<>();
     });
+    co_return result;
 }
 
 void segment_manager::on_add_record(record_location location) noexcept {
@@ -2715,7 +2761,8 @@ future<> segment_manager_impl::adopt_streamed_segment(recovery_catalog& catalog,
         // The segment has no valid chunk, so it holds no record.
         co_return;
     }
-    co_await index_segment_records(seg_id, primary_index::default_entry_cmp{}, make_index_resolver(catalog, stats));
+    co_await index_segment_records(seg_id, info->segment_seq, primary_index::default_entry_cmp{}, make_index_resolver(catalog, stats),
+            _erased_ranges);
     if (place_recovered_segment(catalog, seg_id, *info, stats) == needs_separation::yes) {
         co_await separate_segment_records(catalog, seg_id, stats);
     }
