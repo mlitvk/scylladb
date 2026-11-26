@@ -617,7 +617,7 @@ sharder_helper get_sharder_helper(replica::table& t, const schema& s, service::f
 // could start would take a chunk and a disk write for each partition.
 class logstor_direct_writer_queue_impl : public mutation_fragment_queue::impl,
         public seastar::enable_shared_from_this<logstor_direct_writer_queue_impl> {
-    // The limit on the bytes of the frozen partitions in flight, which is two write buffers of the
+    // The limit on the memory of the rebuilt partitions in flight, which is two write buffers of the
     // default logstor segment size. Each repair_meta has its own writer, so a shard can have this
     // much in flight for each repair_meta on it.
     static constexpr size_t max_in_flight_bytes = 256 * 1024;
@@ -652,18 +652,23 @@ private:
                 _schema->ks_name(), _schema->cf_name(), m.token(), shards,
                 m.partition().clustered_rows().empty());
 
-        auto fm = freeze(m);
         // A partition larger than the limit is charged the whole limit, so that it can still start.
-        auto charge = std::clamp<size_t>(fm.representation().size(), min_write_charge, max_in_flight_bytes);
+        auto charge = std::clamp<size_t>(m.memory_usage(*_schema), min_write_charge, max_in_flight_bytes);
         auto units = co_await get_units(_in_flight_bytes, charge);
         if (_error) {
             co_await coroutine::return_exception_ptr(_error);
         }
 
         auto holder = _in_flight.hold();
+        // With tablets, the only shard that takes the writes of a token is almost always the shard
+        // that runs the repair. There the partition is applied as it is, without the freeze and the
+        // cross-shard call.
+        auto write = shards.size() == 1 && shards.front() == this_shard_id()
+                ? apply_locally(std::move(m))
+                : apply_on_shards(std::move(shards), freeze(m));
         // The continuation keeps the queue alive, and it releases the gate holder in its body, so
         // that the order in which the captures are destroyed does not matter.
-        (void)apply_on_shards(std::move(shards), std::move(fm)).then_wrapped(
+        (void)std::move(write).then_wrapped(
                 [this, self = shared_from_this(), holder = std::move(holder), units = std::move(units)] (future<> f) mutable {
             if (f.failed()) {
                 fail(f.get_exception());
@@ -673,23 +678,37 @@ private:
         });
     }
 
+    future<> apply_locally(mutation m) {
+        co_await apply_on_this_shard(_db.local(), *_schema, _topo_guard, [&] (replica::table& table) {
+            return table.apply(m, db::rp_handle(), _timeout);
+        });
+    }
+
     future<> apply_on_shards(dht::shard_replica_set shards, frozen_mutation fm) {
         return parallel_for_each(shards, [&db = _db, fm = std::move(fm), gs = global_schema_ptr(_schema), topo_guard = _topo_guard, timeout = _timeout] (shard_id shard) mutable {
             return db.invoke_on(shard, [fm, gs, topo_guard, timeout] (replica::database& db) mutable -> future<> {
-                service::topology_guard guard(topo_guard);
-                guard.check();
                 schema_ptr schema = co_await gs.get(timeout);
-                auto& table = db.find_column_family(schema->id());
-                auto stream_op = table.stream_in_progress();
-                rlogger.debug("logstor repair writer: applying rebuilt partition on shard={} table={}.{}",
-                        this_shard_id(), schema->ks_name(), schema->cf_name());
-                co_await utils::get_local_injector().inject("logstor_repair_writer_apply_wait", utils::wait_for_message(std::chrono::minutes(5)));
-                utils::get_local_injector().inject("logstor_repair_writer_apply_fail", [] {
-                    throw std::runtime_error("logstor repair write failed by injection");
+                co_await apply_on_this_shard(db, *schema, topo_guard, [&] (replica::table& table) {
+                    return table.apply(fm, schema, db::rp_handle(), timeout, db::noop_large_data_guardrail::instance());
                 });
-                co_await table.apply(fm, schema, db::rp_handle(), timeout, db::noop_large_data_guardrail::instance());
             });
         });
+    }
+
+    // Applies a rebuilt partition to the table on the current shard with `apply`.
+    template <typename Apply>
+    static future<> apply_on_this_shard(replica::database& db, const schema& s, service::frozen_topology_guard topo_guard, Apply apply) {
+        service::topology_guard guard(topo_guard);
+        guard.check();
+        auto& table = db.find_column_family(s.id());
+        auto stream_op = table.stream_in_progress();
+        rlogger.debug("logstor repair writer: applying rebuilt partition on shard={} table={}.{}",
+                this_shard_id(), s.ks_name(), s.cf_name());
+        co_await utils::get_local_injector().inject("logstor_repair_writer_apply_wait", utils::wait_for_message(std::chrono::minutes(5)));
+        utils::get_local_injector().inject("logstor_repair_writer_apply_fail", [] {
+            throw std::runtime_error("logstor repair write failed by injection");
+        });
+        co_await apply(table);
     }
 
     future<> rebuild(mutation_fragment_v2 mf) {
