@@ -297,26 +297,33 @@ tombstone, or both.
 - A logstor write *replaces* the partition. The index keeps the record with the
 highest record timestamp, and two records of the same key are never merged.
 
-The LSM storage engine works the other way: a write only adds a new mutation, and
-the engine merges all the mutations of a partition at cell level, on every read
-and during compaction. Normal row level repair relies on this LSM merge. It sends
-only the differing rows, and the LSM merge combines them with the version already
-stored on the receiving node.
+- Logstor does not support partial writes (SCYLLADB-2723). Every write sets all
+the columns of the row, or deletes the partition.
 
-Logstor has no such merge, so writing only the differing rows would replace the
-whole partition and lose the cells that exist only in the other version.
+The LSM storage engine merges all the mutations of a partition at cell level. For
+two versions of a logstor partition with different timestamps, this cell level
+merge and the replacement rule of logstor give the same result, which is the
+newer version. The two rules give different results only for versions that have
+the same timestamp (see "Known limitations" below).
 
-So repair of a logstor table has to reconcile whole partitions before it writes
-or sends anything. This is the reason for all the adjustments below.
+Repair still has to reconcile and write whole partitions, because a partition can
+produce two repair rows: the partition tombstone and the row. Normal row level
+repair sends only the repair rows that differ, so a replica can receive only one
+of them. The replica then stores a record that is not the same as the record on
+the master, or its index ignores the write because the record timestamp is lower
+than the timestamp of the stored record. Reads return the same data, but the
+repair hashes of the replicas never become equal, so each later repair sends the
+partition again. This is the reason for all the adjustments below.
 
 ### Sync boundaries are partition aligned
 
 Whole-partition reconciliation only works if all fragments of a partition land in
 the same sync window. A logstor partition can produce two repair rows: a
 `partition_start` carrying a partition tombstone, plus the row. A sync boundary
-between them would make the master merge a partial partition and drop the
-tombstone or the row, which can resurrect deleted data. Logstor sessions
-therefore align the sync windows to partitions.
+between them would make the master converge each part of the partition alone, so
+a replica can store a record without the tombstone or without the row, and the
+replicas do not converge. Logstor sessions therefore align the sync windows to
+partitions.
 
 ### Whole-partition convergence on the master
 
@@ -335,10 +342,9 @@ master's own rows, which are not dirty, and drop the pulled rows, so that the
 master does not write a partition that it already stores
 
 This is the same cell level reconciliation the LSM merge does, with the same row
-marker, cell and tombstone rules. Repair does not rely on logstor's index level
-replacement
-rule, which compares record timestamps only: it computes the reconciled partition
-first and writes it as a single record.
+marker, cell and tombstone rules. Repair does not rely on the replacement rule of
+the logstor index, which compares only the record timestamps. Repair computes the
+reconciled partition first and writes it as a single record.
 
 The rest of the pipeline is unchanged. The master flush writes the converged
 partition to the local logstor, replacing the stale version, and Step C computes
@@ -348,9 +354,10 @@ Step C has one adjustment. Instead of selecting the rows whose hash is in the se
 diff, `put_row_diff` uses
 `copy_partitions_from_working_row_buf_within_set_diff()`, which sends every row
 of a partition that has at least one row in the set diff. A follower must receive
-the complete converged partition; a partial partition would replace its record
-and lose data. The `needs_all_rows` case sends the whole row buffer as before, so
-it is whole-partition already.
+the complete converged partition, because a partial partition replaces its record
+with a record that is not the converged partition, or the index of the follower
+ignores the partial partition. The `needs_all_rows` case sends the whole row buffer
+as before, so it is whole-partition already.
 
 ### Applying rows
 
@@ -367,3 +374,20 @@ The sink consumes the fragment stream and, per partition:
 3. sends the frozen mutation to every destination shard
 4. on the destination shard,  calls `table::apply()`, which routes to
 `logstor::write()`
+
+### Known limitations
+
+- Equal timestamps (SCYLLADB-6194): repair merges two versions that have the same
+timestamp cell by cell, but the index replaces a record with a new record of an
+equal timestamp. So a retried or replayed write can undo the repair.
+
+- Large merged partitions (SCYLLADB-6644): when the merged partition is larger
+than the maximum record size, the write fails. Repair of the tablet then fails on
+every run, and read repair of the partition fails.
+
+- Write speed (SCYLLADB-6683): the repair writer applies the partitions one at a
+time, so repair of many small partitions is slow.
+
+- Incremental repair (SCYLLADB-5765): logstor tables do not support incremental
+repair. A logstor table always gets a full repair, also when an incremental
+repair is requested.
