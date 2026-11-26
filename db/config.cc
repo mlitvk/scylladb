@@ -1040,6 +1040,9 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "at a lower write amplification than logstor_compaction_utilization_threshold. A value at or above logstor_compaction_utilization_threshold keeps that threshold also when more of the disk is free.")
     , logstor_compaction_max_shares(this, "logstor_compaction_max_shares", liveness::LiveUpdate, value_status::Used, 2000,
         "Maximum CPU shares of the logstor compaction scheduling group, reached when compaction cannot keep up with the write rate or at logstor_compaction_space_floor. As the free space falls from twice the space floor to the space floor, the shares increase at least linearly to this value. While compaction is idle or throttled, the shares decrease to 50.")
+    , logstor_separator_shares(this, "logstor_separator_shares", liveness::LiveUpdate, value_status::Used, 1000,
+        "CPU shares of the logstor separator scheduling group. Unlike compaction, the separator is not discretionary - it is the second half of a write that was already accepted - so its shares are a fixed number rather than a controller output. "
+        "The default gives it the same weight as the group that writes the record the first time, which is right as long as the two cost about the same per record.")
     , file_cache_size_in_mb(this, "file_cache_size_in_mb", value_status::Unused, 512,
         "Total memory to use for SSTable-reading buffers.")
     , memtable_flush_queue_size(this, "memtable_flush_queue_size", value_status::Unused, 4,
