@@ -522,13 +522,6 @@ void segment::start(segment_ref seg_ref, segment_sequence seq_num) {
     _seq_num = seq_num;
 }
 
-future<> segment::stop() {
-    if (_write_gate.is_closed()) {
-        co_return;
-    }
-    co_await _write_gate.close();
-}
-
 future<std::optional<segment::appender>> segment::begin_append(size_t size) {
     if (_failed) [[unlikely]] {
         co_return std::nullopt;

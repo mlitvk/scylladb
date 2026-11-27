@@ -922,10 +922,6 @@ future<> segment_manager_impl::stop() {
 
     co_await _compaction_mgr.flush_all_separator_buffers(std::nullopt);
 
-    if (_active_segment) {
-        co_await _active_segment->stop();
-    }
-
     if (_switch_segment_fut) {
         auto f = co_await coroutine::as_future(_switch_segment_fut->get_future());
         f.ignore_ready_future();
@@ -981,7 +977,6 @@ future<> segment_manager_impl::write(write_buffer& wb) {
         }
 
         seg_ptr seg = _active_segment;
-        auto seg_holder = seg->hold();
 
         auto appender = co_await seg->begin_append(chunk_size);
         if (!appender) {
@@ -1066,7 +1061,6 @@ future<> segment_manager_impl::write_full_segment(write_buffer& wb, logstor_grou
     segment_keep_guard keep_guard(seg->ref());
 
     co_await wb.complete_writes(pos);
-    co_await seg->stop();
 
     // add the segment after all index updates are completed.
     auto& desc = get_segment_descriptor(seg->id());
@@ -1187,12 +1181,7 @@ future<> segment_manager_impl::request_segment_switch() {
 future<> segment_manager_impl::switch_active_segment() {
     auto new_seg = co_await take_segment(write_source::normal);
 
-    auto old_seg = std::exchange(_active_segment, std::move(new_seg));
-
-    if (old_seg) {
-        // close old segment in background
-        (void)old_seg->stop().finally([old_seg] {}).handle_exception([] (std::exception_ptr) {});
-    }
+    _active_segment = std::move(new_seg);
 
     // trigger separator flush for separator buffers that hold old segments
     auto u = std::max<size_t>(1, _geometry.segment_count() / 100);
@@ -2377,11 +2366,10 @@ public:
         co_return std::move(stream);
     }
     future<> close() override {
-        co_await _seg->stop();
         co_await _sm.adopt_streamed_segment(_catalog, _seg->id());
     }
     future<> abort() override {
-        co_await _seg->stop();
+        return make_ready_future<>();
     }
 };
 

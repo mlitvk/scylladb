@@ -347,8 +347,7 @@ private:
 
 // A segment is a fixed-size region of a file of the file manager, and appends fill it from the
 // start of the region to its end. The segment writes through the open file of the file manager,
-// so the writes must end before file_manager::stop() closes the file. stop() waits for the
-// writers that hold the write gate.
+// so the caller must end its writes before file_manager::stop() closes the file.
 //
 // An append takes an appender with begin_append() and writes the data with appender::append().
 // _append_sem has one unit, and an appender holds the unit until its write completes, so the
@@ -388,12 +387,6 @@ public:
 
     void start(segment_ref, segment_sequence);
 
-    future<> stop();
-
-    seastar::gate::holder hold() {
-        return _write_gate.hold();
-    }
-
     // Waits until no other append runs on the segment, and returns an appender if data of this
     // size fits in the segment. Returns nullopt if the data does not fit, or if the segment failed.
     // In both cases nothing is written, and the caller must write to another segment.
@@ -421,7 +414,6 @@ private:
     // The size of the region of the segment in the file.
     const uint64_t _size;
 
-    seastar::gate _write_gate;
     seastar::semaphore _append_sem{1};
     segment_ref _seg_ref;
     segment_sequence _seq_num;

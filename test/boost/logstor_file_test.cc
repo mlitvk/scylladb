@@ -23,7 +23,6 @@
 #include <seastar/core/align.hh>
 #include <seastar/core/aligned_buffer.hh>
 #include <seastar/core/coroutine.hh>
-#include <seastar/core/gate.hh>
 #include <seastar/core/on_internal_error.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/shard_id.hh>
@@ -695,9 +694,6 @@ public:
     }
 
     ~segment_test_env() {
-        for (auto& seg : _segments) {
-            seg->stop().get();
-        }
         _files.stop().get();
     }
 
@@ -905,22 +901,6 @@ SEASTAR_THREAD_TEST_CASE(test_segment_fails_after_a_failed_write) {
     BOOST_REQUIRE(!seg.begin_append(block).get());
     BOOST_REQUIRE_THROW(seg.append(test_data(block, 'b').view()).get(), std::runtime_error);
     BOOST_REQUIRE(env.file_holds(0, test_segment_size, 0));
-}
-
-// Checks that stop() waits for the writers that hold the segment, that a second stop() returns at
-// once, and that no writer can hold the segment after stop().
-SEASTAR_THREAD_TEST_CASE(test_segment_stop_waits_for_the_writers) {
-    segment_test_env env;
-    auto& seg = env.make_segment(0);
-
-    std::optional<seastar::gate::holder> writer = seg.hold();
-    auto stopped = seg.stop();
-    BOOST_REQUIRE(!stopped.available());
-    BOOST_REQUIRE_THROW(seg.hold(), seastar::gate_closed_exception);
-
-    writer.reset();
-    stopped.get();
-    seg.stop().get();
 }
 
 // Checks that a short write continues from the last boundary of the larger device alignment that it
